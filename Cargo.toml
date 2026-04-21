@@ -1,0 +1,14 @@
+[package]
+name = "fensor"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A filesystem-backed Tensor with dense and sparse indexing"
+repository = "https://github.com/TinyChain-Inc/fensor"
+
+[dependencies]
+b-table = { path = "../b-table", features = ["stream"] }
+freqfs = "0.12"
+ha-ndarray = { path = "../ha-ndarray" }
+rand = "0.8"
+safecast = "0.2"
