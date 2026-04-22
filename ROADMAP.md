@@ -103,6 +103,12 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Ensure unsupported/invalid states map to typed `Error` variants with user-facing messages.
    - Gate: targeted tests assert error variant and message quality for each unsupported path.
 
+7. **Async trait performance gate.**
+   - Keep `BoxFuture` in trait methods during interface stabilization to avoid API churn.
+   - Treat `BoxFuture` as an intentional tradeoff (allocation + dynamic dispatch) acceptable for I/O-bound paths.
+   - Profile hot compute paths (`read_value` loops, reductions, matmul plumbing); if overhead is measurable, migrate those traits to associated future types (GAT-style) for static dispatch.
+   - Gate: benchmark evidence recorded before/after any async-signature migration.
+
 ## Next execution checklist
 
 1. **Complete trait-backed base/view implementation.**

@@ -20,8 +20,10 @@ pub use schema::{
     DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, contiguous_strides,
 };
 pub use traits::{
-    BoxFuture, Tensor, TensorBlockStore, TensorRead, TensorSparseIndex, TensorTransform,
-    TensorWrite,
+    BoxFuture, SparseZeroPolicy, TensorArray, TensorBlockStore, TensorMatMul, TensorMath,
+    TensorMathScalar, TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll,
+    TensorReduceBoolean, TensorSparseIndex, TensorSparseLifecycle, TensorTransform, TensorUnary,
+    TensorViewSemantics, TensorWrite, TensorWriteBulk,
 };
 
 use view::{TensorView, default_permutation};
@@ -442,7 +444,7 @@ where
     }
 }
 
-impl<FE> Tensor for Tensor<FE>
+impl<FE> TensorArray for Tensor<FE>
 where
     FE: FileLoad + AsType<b_table::Node<u64>> + AsType<Vec<f32>> + Send + Sync + 'static,
 {
