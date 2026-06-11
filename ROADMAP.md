@@ -155,3 +155,44 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 - **Adaptive block sizing.** Evaluate configurable or data-driven block sizing after baseline persistence semantics are stable.
 - **Typed tensor families.** Expand beyond `f32` once core lifecycle and sparse-index behavior are validated.
 - **Cross-host sharding hooks.** Keep routing/sharding orchestration in client libraries while exposing reusable shard-local primitives in `fensor`.
+
+## ha-ndarray execution dependency acknowledgement
+
+`fensor` will not implement direct CubeCL execution. `fensor` remains a storage
+and indexing substrate, while `ha-ndarray` owns execution planning,
+accelerator support, runtime fusion strategy, and backend selection.
+
+### How `fensor` benefits from the `ha-ndarray` roadmap
+
+- Streaming execution aligned with block-oriented persistence.
+- More efficient block-oriented processing flows for large tensors.
+- Out-of-core tensor execution through block iteration and streamed outputs.
+- Runtime fusion benefits without embedding backend-specific executors in
+  `fensor`.
+- WebGPU/browser deployment path through `ha-ndarray` execution layers.
+- Backend-independent accelerator support inherited from `ha-ndarray`
+  execution contracts.
+
+### Sequencing and dependency notes
+
+1. **Contract alignment first.** `fensor` work should align with the
+   `ha-ndarray` execution IR and block-stream contract boundaries before
+   optimizing integration pathways.
+2. **Storage invariants remain primary.** `fensor` continues prioritizing
+   deterministic persistence/index correctness independently of accelerator
+   details.
+3. **Execution ownership remains external.** Backend choice, fusion policies,
+   kernel caching strategy, and placement policy are dependencies from
+   `ha-ndarray`, not responsibilities of `fensor`.
+
+### Risks and mitigations
+
+1. **Risk: contract drift between execution and storage layers.**
+   - Mitigation: maintain explicit integration gates for block iteration,
+     materialization boundaries, and sparse/dense parity expectations.
+2. **Risk: accidental accelerator coupling in storage codepaths.**
+   - Mitigation: keep `fensor` APIs backend-agnostic and avoid backend-specific
+     assumptions in persistence logic.
+3. **Risk: sequencing mismatch with browser and out-of-core milestones.**
+   - Mitigation: stage `fensor` integration work behind published
+     `ha-ndarray` execution milestones and shared parity tests.
