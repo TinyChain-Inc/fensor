@@ -8,7 +8,12 @@ repository = "https://github.com/TinyChain-Inc/fensor"
 
 [dependencies]
 b-table = { path = "../b-table", features = ["stream"] }
+destream = "0.10"
 freqfs = "0.12"
 ha-ndarray = { path = "../ha-ndarray" }
 rand = "0.8"
 safecast = "0.2"
+smallvec = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }

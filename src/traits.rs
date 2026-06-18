@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use ha_ndarray::{Axes, Range, Shape};
 
-use crate::schema::{Layout, TensorSchema};
+use crate::schema::{DType, Layout, TensorSchema};
 use crate::{Error, Result};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -16,16 +16,20 @@ pub trait TensorArray: Send + Sync {
 
     fn dtype(&self) -> Self::DType;
 
+    fn schema_dtype(&self) -> DType {
+        self.schema().dtype()
+    }
+
     fn shape(&self) -> &[usize] {
-        &self.schema().shape
+        self.schema().shape()
     }
 
     fn layout(&self) -> &Layout {
-        &self.schema().layout
+        self.schema().layout()
     }
 
     fn strides(&self) -> &[usize] {
-        &self.schema().strides
+        self.schema().strides()
     }
 
     fn ndim(&self) -> usize {

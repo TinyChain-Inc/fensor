@@ -50,9 +50,10 @@ impl TestTensor {
         let block_shape: Shape = shape![1, 1, 4];
         let schema = TensorSchema::new(DType::F32, shape, layout, block_shape, strides)
             .expect("valid schema");
+        let schema_shape = schema.shape().clone();
 
         Self {
-            values: vec![0.0; schema.shape.iter().product()],
+            values: vec![0.0; schema_shape.iter().product()],
             schema,
             base_offset: 0,
         }
@@ -62,7 +63,7 @@ impl TestTensor {
         self.base_offset
             + coord
                 .iter()
-                .zip(self.schema.strides.iter())
+                .zip(self.schema.strides().iter())
                 .map(|(c, s)| (*c as usize) * *s)
                 .sum::<usize>()
     }
@@ -115,7 +116,7 @@ impl TensorWrite for TestTensor {
 
 impl TensorTransform for TestTensor {
     fn reshape(mut self, shape: Shape) -> fensor::Result<Self> {
-        let old_size: usize = self.schema.shape.iter().product();
+        let old_size: usize = self.schema.shape().iter().product();
         let new_size: usize = shape.iter().product();
 
         if old_size != new_size {
@@ -124,14 +125,15 @@ impl TensorTransform for TestTensor {
             ));
         }
 
-        self.schema.shape = shape;
-        self.schema.strides = contiguous_strides(&self.schema.shape);
+        self.schema.set_shape(shape)?;
+        self.schema
+            .set_strides(contiguous_strides(self.schema.shape()))?;
         self.base_offset = 0;
         Ok(self)
     }
 
     fn slice(mut self, range: Range) -> fensor::Result<Self> {
-        if range.len() != self.schema.shape.len() {
+        if range.len() != self.schema.shape().len() {
             return Err(Error::InvalidLayout(
                 "slice range rank must match tensor rank".to_string(),
             ));
@@ -139,20 +141,22 @@ impl TensorTransform for TestTensor {
 
         let mut next_shape = Shape::with_capacity(range.len());
         let mut next_strides = Strides::with_capacity(range.len());
+        let shape = self.schema.shape().clone();
+        let strides = self.schema.strides().clone();
 
-        for (axis, (bound, dim)) in range.iter().zip(self.schema.shape.iter()).enumerate() {
+        for (axis, (bound, dim)) in range.iter().zip(shape.iter()).enumerate() {
             match bound {
                 AxisRange::In(start, stop, step)
                     if *step > 0 && *start <= *stop && *stop <= *dim =>
                 {
-                    self.base_offset += start * self.schema.strides[axis];
+                    self.base_offset += start * strides[axis];
                     next_shape.push((stop - start) / step);
-                    next_strides.push(self.schema.strides[axis] * step);
+                    next_strides.push(strides[axis] * step);
                 }
                 AxisRange::At(i) if *i < *dim => {
-                    self.base_offset += i * self.schema.strides[axis];
+                    self.base_offset += i * strides[axis];
                     next_shape.push(1);
-                    next_strides.push(self.schema.strides[axis]);
+                    next_strides.push(strides[axis]);
                 }
                 _ => {
                     return Err(Error::InvalidLayout(format!(
@@ -162,13 +166,15 @@ impl TensorTransform for TestTensor {
             }
         }
 
-        self.schema.shape = next_shape;
-        self.schema.strides = next_strides;
+        self.schema.set_shape(next_shape)?;
+        self.schema.set_strides(next_strides)?;
         Ok(self)
     }
 
     fn transpose(mut self, permutation: Option<Axes>) -> fensor::Result<Self> {
-        let ndim = self.schema.shape.len();
+        let shape = self.schema.shape().clone();
+        let base_strides = self.schema.strides().clone();
+        let ndim = shape.len();
         let axes = permutation.unwrap_or_else(|| (0..ndim).collect());
 
         if axes.len() != ndim {
@@ -190,12 +196,12 @@ impl TensorTransform for TestTensor {
         let mut shape = Shape::with_capacity(ndim);
         let mut strides = Strides::with_capacity(ndim);
         for axis in axes {
-            shape.push(self.schema.shape[axis]);
-            strides.push(self.schema.strides[axis]);
+            shape.push(self.schema.shape()[axis]);
+            strides.push(base_strides[axis]);
         }
 
-        self.schema.shape = shape;
-        self.schema.strides = strides;
+        self.schema.set_shape(shape)?;
+        self.schema.set_strides(strides)?;
         Ok(self)
     }
 }
@@ -220,7 +226,7 @@ fn iter_coords(shape: &[usize]) -> Vec<Vec<u64>> {
 }
 
 fn seed_values(tensor: &TestTensor) {
-    for coord in iter_coords(&tensor.schema.shape) {
+    for coord in iter_coords(tensor.schema.shape()) {
         let value = (coord[0] * 100 + coord[1] * 10 + coord[2]) as f32;
         block_on(tensor.write_value(&coord, value)).expect("write value");
     }
