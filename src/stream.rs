@@ -4,39 +4,131 @@ use crate::{
     DType, Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema, ViewAxisMapSchema,
     ViewAxisSchema, ViewSchema, contiguous_strides,
 };
+use crate::wire_tags::{
+    AXIS_MAP_TAG_AFFINE, AXIS_MAP_TAG_GATHER, AXIS_MAP_TAG_IDENTITY, LAYOUT_TAG_DENSE,
+    LAYOUT_TAG_SPARSE,
+};
+
+fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
+    axis.map(|axis| u64::try_from(axis).map_err(|_| E::custom("sparse axis overflow")))
+        .transpose()
+}
+
+fn encode_layout<E: en::Error>(layout: Layout) -> Result<(u8, Option<u64>), E> {
+    match layout {
+        Layout::Dense => Ok((LAYOUT_TAG_DENSE, None)),
+        Layout::Sparse { axis } => Ok((LAYOUT_TAG_SPARSE, encode_sparse_axis(axis)?)),
+    }
+}
+
+fn encode_axis_map_ref(axis_map: &ViewAxisMapSchema) -> (u8, Vec<u64>) {
+    match axis_map {
+        ViewAxisMapSchema::Identity => (AXIS_MAP_TAG_IDENTITY, Vec::new()),
+        ViewAxisMapSchema::Affine { start, step } => (AXIS_MAP_TAG_AFFINE, vec![*start, *step]),
+        ViewAxisMapSchema::Gather(indices) => {
+            (AXIS_MAP_TAG_GATHER, indices.iter().copied().collect::<Vec<u64>>())
+        }
+    }
+}
+
+fn encode_axis_map(axis_map: ViewAxisMapSchema) -> (u8, Vec<u64>) {
+    match axis_map {
+        ViewAxisMapSchema::Identity => (AXIS_MAP_TAG_IDENTITY, Vec::new()),
+        ViewAxisMapSchema::Affine { start, step } => (AXIS_MAP_TAG_AFFINE, vec![start, step]),
+        ViewAxisMapSchema::Gather(indices) => {
+            (AXIS_MAP_TAG_GATHER, indices.into_iter().collect::<Vec<u64>>())
+        }
+    }
+}
+
+fn encode_tensor_schema_ref(schema: &TensorSchema) -> Result<(DType, Vec<u64>, Layout), String> {
+    let shape = schema
+        .shape_u64()
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .collect::<Vec<u64>>();
+    Ok((schema.dtype(), shape, schema.layout().clone()))
+}
+
+fn encode_tensor_schema(schema: TensorSchema) -> Result<(DType, Vec<u64>, Layout), String> {
+    encode_tensor_schema_ref(&schema)
+}
+
+fn encode_view_axis_ref(schema: &ViewAxisSchema) -> Result<(u64, ViewAxisMapSchema), String> {
+    let base_axis = u64::try_from(schema.base_axis)
+        .map_err(|_| "view axis overflow".to_string())?;
+    Ok((base_axis, schema.map.clone()))
+}
+
+fn encode_view_axis(schema: ViewAxisSchema) -> Result<(u64, ViewAxisMapSchema), String> {
+    let base_axis = u64::try_from(schema.base_axis)
+        .map_err(|_| "view axis overflow".to_string())?;
+    Ok((base_axis, schema.map))
+}
+
+fn encode_view_schema_ref(
+    schema: &ViewSchema,
+) -> Result<(u64, Vec<ViewAxisSchema>, Vec<Option<u64>>), String> {
+    let axes = schema.axes.iter().cloned().collect::<Vec<ViewAxisSchema>>();
+    let base_fixed = schema.base_fixed.iter().cloned().collect::<Vec<Option<u64>>>();
+    let base_rank = u64::try_from(schema.base_rank)
+        .map_err(|_| "base rank overflow".to_string())?;
+
+    Ok((base_rank, axes, base_fixed))
+}
+
+fn encode_view_schema(
+    schema: ViewSchema,
+) -> Result<(u64, Vec<ViewAxisSchema>, Vec<Option<u64>>), String> {
+    let axes = schema.axes.into_iter().collect::<Vec<ViewAxisSchema>>();
+    let base_fixed = schema.base_fixed.into_iter().collect::<Vec<Option<u64>>>();
+    let base_rank = u64::try_from(schema.base_rank)
+        .map_err(|_| "base rank overflow".to_string())?;
+
+    Ok((base_rank, axes, base_fixed))
+}
+
+fn encode_tensor_ref<FE, T>(tensor: &Tensor<FE, T>) -> Result<(TensorSchema, ViewSchema), String>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
+    let schema = tensor.schema.clone();
+    let view = tensor.view_schema().map_err(|err| err.to_string())?;
+
+    Ok((schema, view))
+}
+
+fn encode_tensor<FE, T>(tensor: Tensor<FE, T>) -> Result<(TensorSchema, ViewSchema), String>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
+    let view = tensor.view_schema().map_err(|err| err.to_string())?;
+    let schema = tensor.schema;
+
+    Ok((schema, view))
+}
 
 impl de::FromStream for DType {
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         let dtype = String::from_stream((), decoder).await?;
-        match dtype.as_str() {
-            "f32" => Ok(Self::F32),
-            "f64" => Ok(Self::F64),
-            _ => Err(de::Error::custom(format!("unsupported dtype {dtype}"))),
-        }
+        DType::from_str(dtype.as_str())
+            .ok_or_else(|| de::Error::custom(format!("unsupported dtype {dtype}")))
     }
 }
 
 impl<'en> en::ToStream<'en> for DType {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let tag = match self {
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-        };
-
-        encoder.encode_str(tag)
+        encoder.encode_str(self.as_str())
     }
 }
 
 impl<'en> en::IntoStream<'en> for DType {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let tag = match self {
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-        };
-
-        encoder.encode_str(tag)
+        encoder.encode_str(self.as_str())
     }
 }
 
@@ -47,14 +139,14 @@ impl de::FromStream for Layout {
         let (tag, axis): (u8, Option<u64>) = <(u8, Option<u64>)>::from_stream((), decoder).await?;
 
         match tag {
-            0 => {
+            LAYOUT_TAG_DENSE => {
                 if axis.is_some() {
                     return Err(de::Error::custom("dense layout must not include a sparse axis"));
                 }
 
                 Ok(Self::Dense)
             }
-            1 => {
+            LAYOUT_TAG_SPARSE => {
                 let axis = axis
                     .map(|axis| {
                         usize::try_from(axis)
@@ -71,41 +163,13 @@ impl de::FromStream for Layout {
 
 impl<'en> en::ToStream<'en> for Layout {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let encoded = match self {
-            Self::Dense => (0u8, None),
-            Self::Sparse { axis } => {
-                let axis = axis
-                    .map(|axis| {
-                        u64::try_from(axis)
-                            .map_err(|_| en::Error::custom("sparse axis overflow"))
-                    })
-                    .transpose()?;
-
-                (1u8, axis)
-            }
-        };
-
-        en::IntoStream::into_stream(encoded, encoder)
+        en::IntoStream::into_stream(encode_layout(self.clone())?, encoder)
     }
 }
 
 impl<'en> en::IntoStream<'en> for Layout {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let encoded = match self {
-            Self::Dense => (0u8, None),
-            Self::Sparse { axis } => {
-                let axis = axis
-                    .map(|axis| {
-                        u64::try_from(axis)
-                            .map_err(|_| en::Error::custom("sparse axis overflow"))
-                    })
-                    .transpose()?;
-
-                (1u8, axis)
-            }
-        };
-
-        en::IntoStream::into_stream(encoded, encoder)
+        en::IntoStream::into_stream(encode_layout(self)?, encoder)
     }
 }
 
@@ -126,24 +190,16 @@ impl de::FromStream for TensorSchema {
 
 impl<'en> en::ToStream<'en> for TensorSchema {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let shape = self
-            .shape_u64()
-            .map_err(en::Error::custom)?
-            .into_iter()
-            .collect::<Vec<u64>>();
-        en::IntoStream::into_stream((self.dtype(), shape, self.layout().clone()), encoder)
+        en::IntoStream::into_stream(
+            encode_tensor_schema_ref(self).map_err(en::Error::custom)?,
+            encoder,
+        )
     }
 }
 
 impl<'en> en::IntoStream<'en> for TensorSchema {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let dtype = self.dtype();
-        let shape = self
-            .shape_u64()
-            .map_err(en::Error::custom)?
-            .into_iter()
-            .collect::<Vec<u64>>();
-        en::IntoStream::into_stream((dtype, shape, self.layout().clone()), encoder)
+        en::IntoStream::into_stream(encode_tensor_schema(self).map_err(en::Error::custom)?, encoder)
     }
 }
 
@@ -154,13 +210,13 @@ impl de::FromStream for ViewAxisMapSchema {
         let (tag, data): (u8, Vec<u64>) = <(u8, Vec<u64>)>::from_stream((), decoder).await?;
 
         match tag {
-            0 => {
+            AXIS_MAP_TAG_IDENTITY => {
                 if !data.is_empty() {
                     return Err(de::Error::custom("identity axis map expects no payload"));
                 }
                 Ok(Self::Identity)
             }
-            1 => {
+            AXIS_MAP_TAG_AFFINE => {
                 if data.len() != 2 {
                     return Err(de::Error::custom("affine axis map expects [start, step]"));
                 }
@@ -169,7 +225,7 @@ impl de::FromStream for ViewAxisMapSchema {
                     step: data[1],
                 })
             }
-            2 => Ok(Self::Gather(data.into())),
+            AXIS_MAP_TAG_GATHER => Ok(Self::Gather(data.into())),
             _ => Err(de::Error::custom(format!("unknown axis map tag {tag}"))),
         }
     }
@@ -177,30 +233,13 @@ impl de::FromStream for ViewAxisMapSchema {
 
 impl<'en> en::ToStream<'en> for ViewAxisMapSchema {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Self::Identity => en::IntoStream::into_stream((0u8, Vec::<u64>::new()), encoder),
-            Self::Affine { start, step } => {
-                en::IntoStream::into_stream((1u8, vec![*start, *step]), encoder)
-            }
-            Self::Gather(indices) => en::IntoStream::into_stream(
-                (2u8, indices.iter().copied().collect::<Vec<u64>>()),
-                encoder,
-            ),
-        }
+        en::IntoStream::into_stream(encode_axis_map_ref(self), encoder)
     }
 }
 
 impl<'en> en::IntoStream<'en> for ViewAxisMapSchema {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Self::Identity => en::IntoStream::into_stream((0u8, Vec::<u64>::new()), encoder),
-            Self::Affine { start, step } => {
-                en::IntoStream::into_stream((1u8, vec![start, step]), encoder)
-            }
-            Self::Gather(indices) => {
-                en::IntoStream::into_stream((2u8, indices.into_iter().collect::<Vec<u64>>()), encoder)
-            }
-        }
+        en::IntoStream::into_stream(encode_axis_map(self), encoder)
     }
 }
 
@@ -211,19 +250,22 @@ impl de::FromStream for ViewAxisSchema {
         let (base_axis, map): (u64, ViewAxisMapSchema) =
             <(u64, ViewAxisMapSchema)>::from_stream((), decoder).await?;
 
+        let base_axis = usize::try_from(base_axis)
+            .map_err(|_| de::Error::custom("view axis overflow"))?;
+
         Ok(Self { base_axis, map })
     }
 }
 
 impl<'en> en::ToStream<'en> for ViewAxisSchema {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream((self.base_axis, self.map.clone()), encoder)
+        en::IntoStream::into_stream(encode_view_axis_ref(self).map_err(en::Error::custom)?, encoder)
     }
 }
 
 impl<'en> en::IntoStream<'en> for ViewAxisSchema {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream((self.base_axis, self.map), encoder)
+        en::IntoStream::into_stream(encode_view_axis(self).map_err(en::Error::custom)?, encoder)
     }
 }
 
@@ -233,6 +275,9 @@ impl de::FromStream for ViewSchema {
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         let (base_rank, axes, base_fixed): (u64, Vec<ViewAxisSchema>, Vec<Option<u64>>) =
             <(u64, Vec<ViewAxisSchema>, Vec<Option<u64>>)>::from_stream((), decoder).await?;
+
+        let base_rank = usize::try_from(base_rank)
+            .map_err(|_| de::Error::custom("base rank overflow"))?;
 
         Ok(Self {
             base_rank,
@@ -244,19 +289,13 @@ impl de::FromStream for ViewSchema {
 
 impl<'en> en::ToStream<'en> for ViewSchema {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let axes = self.axes.iter().cloned().collect::<Vec<ViewAxisSchema>>();
-        let base_fixed = self.base_fixed.iter().cloned().collect::<Vec<Option<u64>>>();
-
-        en::IntoStream::into_stream((self.base_rank, axes, base_fixed), encoder)
+        en::IntoStream::into_stream(encode_view_schema_ref(self).map_err(en::Error::custom)?, encoder)
     }
 }
 
 impl<'en> en::IntoStream<'en> for ViewSchema {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let axes = self.axes.into_iter().collect::<Vec<ViewAxisSchema>>();
-        let base_fixed = self.base_fixed.into_iter().collect::<Vec<Option<u64>>>();
-
-        en::IntoStream::into_stream((self.base_rank, axes, base_fixed), encoder)
+        en::IntoStream::into_stream(encode_view_schema(self).map_err(en::Error::custom)?, encoder)
     }
 }
 
@@ -288,10 +327,7 @@ where
     T: TensorElement,
 {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        let schema = self.schema.clone();
-        let view = self.view_schema().map_err(en::Error::custom)?;
-
-        en::IntoStream::into_stream((schema, view), encoder)
+        en::IntoStream::into_stream(encode_tensor_ref(self).map_err(en::Error::custom)?, encoder)
     }
 }
 
@@ -301,10 +337,7 @@ where
     T: TensorElement,
 {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let view = self.view_schema().map_err(en::Error::custom)?;
-        let schema = self.schema;
-
-        en::IntoStream::into_stream((schema, view), encoder)
+        en::IntoStream::into_stream(encode_tensor(self).map_err(en::Error::custom)?, encoder)
     }
 }
 

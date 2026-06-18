@@ -18,12 +18,37 @@ enum FsEntry {
     Text(String),
 }
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum FsEntryTag {
+    Node = 0,
+    F32 = 1,
+    F64 = 2,
+    Text = 3,
+}
+
+impl FsEntryTag {
+    fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            x if x == Self::Node as u8 => Some(Self::Node),
+            x if x == Self::F32 as u8 => Some(Self::F32),
+            x if x == Self::F64 as u8 => Some(Self::F64),
+            x if x == Self::Text as u8 => Some(Self::Text),
+            _ => None,
+        }
+    }
+}
+
 impl<'en> en::ToStream<'en> for FsEntry {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
             Self::Node(node) => en::IntoStream::into_stream(
                 (
-                    0u8,
+                    FsEntryTag::Node.to_u8(),
                     Some(node.clone()),
                     None::<Vec<f32>>,
                     None::<Vec<f64>>,
@@ -33,7 +58,7 @@ impl<'en> en::ToStream<'en> for FsEntry {
             ),
             Self::F32(values) => en::IntoStream::into_stream(
                 (
-                    1u8,
+                    FsEntryTag::F32.to_u8(),
                     None::<Node<u64>>,
                     Some(values.clone()),
                     None::<Vec<f64>>,
@@ -43,7 +68,7 @@ impl<'en> en::ToStream<'en> for FsEntry {
             ),
             Self::F64(values) => en::IntoStream::into_stream(
                 (
-                    2u8,
+                    FsEntryTag::F64.to_u8(),
                     None::<Node<u64>>,
                     None::<Vec<f32>>,
                     Some(values.clone()),
@@ -53,7 +78,7 @@ impl<'en> en::ToStream<'en> for FsEntry {
             ),
             Self::Text(text) => en::IntoStream::into_stream(
                 (
-                    3u8,
+                    FsEntryTag::Text.to_u8(),
                     None::<Node<u64>>,
                     None::<Vec<f32>>,
                     None::<Vec<f64>>,
@@ -84,20 +109,20 @@ impl de::FromStream for FsEntry {
         )>::from_stream((), decoder)
         .await?;
 
-        match tag {
-            0 => node
+        match FsEntryTag::from_u8(tag) {
+            Some(FsEntryTag::Node) => node
                 .map(Self::Node)
                 .ok_or_else(|| de::Error::custom("missing node payload")),
-            1 => f32_values
+            Some(FsEntryTag::F32) => f32_values
                 .map(Self::F32)
                 .ok_or_else(|| de::Error::custom("missing f32 payload")),
-            2 => f64_values
+            Some(FsEntryTag::F64) => f64_values
                 .map(Self::F64)
                 .ok_or_else(|| de::Error::custom("missing f64 payload")),
-            3 => text
+            Some(FsEntryTag::Text) => text
                 .map(Self::Text)
                 .ok_or_else(|| de::Error::custom("missing string payload")),
-            _ => Err(de::Error::custom(format!("unknown fs entry tag {tag}"))),
+            None => Err(de::Error::custom(format!("unknown fs entry tag {tag}"))),
         }
     }
 }

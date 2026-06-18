@@ -10,7 +10,7 @@ use crate::{
 pub struct TensorView {
     base_rank: usize,
     axes: Vec<ViewAxis>,
-    base_fixed: Vec<Option<usize>>,
+    base_fixed: Vec<Option<u64>>,
 }
 
 #[derive(Clone)]
@@ -29,6 +29,10 @@ enum AxisMap {
 impl TensorView {
     pub fn rank(&self) -> usize {
         self.axes.len()
+    }
+
+    pub fn base_rank(&self) -> usize {
+        self.base_rank
     }
 
     pub fn identity(schema: &TensorSchema) -> Self {
@@ -54,8 +58,8 @@ impl TensorView {
             ));
         }
 
-        let mut resolved = vec![0usize; self.base_rank];
-        let mut assigned = vec![false; self.base_rank];
+        let mut resolved = vec![0u64; self.base_rank()];
+        let mut assigned = vec![false; self.base_rank()];
 
         for (base_axis, fixed) in self.base_fixed.iter().enumerate() {
             if let Some(value) = fixed {
@@ -69,7 +73,8 @@ impl TensorView {
                 .try_into()
                 .map_err(|_| Error::InvalidCoord("coordinate does not fit in usize".to_string()))?;
 
-            resolved[axis.base_axis] = axis.map.resolve(coord_value)?;
+            resolved[axis.base_axis] = u64::try_from(axis.map.resolve(coord_value)?)
+                .map_err(|_| Error::InvalidCoord("coordinate does not fit in u64".to_string()))?;
             assigned[axis.base_axis] = true;
         }
 
@@ -79,13 +84,7 @@ impl TensorView {
             ));
         }
 
-        resolved
-            .into_iter()
-            .map(|coord| {
-                u64::try_from(coord)
-                    .map_err(|_| Error::InvalidCoord("coordinate does not fit in u64".to_string()))
-            })
-            .collect()
+        Ok(resolved)
     }
 
     pub fn transpose(&self, permutation: &[usize]) -> Result<Self> {
@@ -145,7 +144,10 @@ impl TensorView {
                     }
 
                     let base_coord = view_axis.map.resolve(*i)?;
-                    base_fixed[view_axis.base_axis] = Some(base_coord);
+                    base_fixed[view_axis.base_axis] = Some(
+                        u64::try_from(base_coord)
+                            .map_err(|_| Error::InvalidCoord("coordinate does not fit in u64".to_string()))?,
+                    );
                 }
                 AxisRange::In(start, stop, step) => {
                     if *step == 0 || *start > *stop || *stop > *dim {
@@ -204,60 +206,35 @@ impl TensorView {
             .map(ViewAxis::to_schema)
             .collect::<Result<_>>()?;
 
-        let base_rank = u64::try_from(self.base_rank)
-            .map_err(|_| Error::InvalidSchema("base rank overflow".to_string()))?;
-
-        let base_fixed = self
-            .base_fixed
-            .iter()
-            .map(|value| {
-                value
-                    .map(|coord| {
-                        u64::try_from(coord)
-                            .map_err(|_| Error::InvalidSchema("view coord overflow".to_string()))
-                    })
-                    .transpose()
-            })
-            .collect::<Result<_>>()?;
-
         Ok(ViewSchema {
-            base_rank,
+            base_rank: self.base_rank(),
             axes,
-            base_fixed,
+            base_fixed: self.base_fixed.iter().copied().collect(),
         })
     }
 
     pub fn from_schema(schema: &ViewSchema) -> Result<Self> {
-        let base_rank = usize::try_from(schema.base_rank)
-            .map_err(|_| Error::InvalidSchema("base rank overflow".to_string()))?;
-
         let axes = schema
             .axes
             .iter()
             .map(ViewAxis::from_schema)
             .collect::<Result<Vec<_>>>()?;
 
-        let base_fixed = schema
-            .base_fixed
-            .iter()
-            .map(|value| {
-                value
-                    .map(|coord| {
-                        usize::try_from(coord)
-                            .map_err(|_| Error::InvalidSchema("view coord overflow".to_string()))
-                    })
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let base_fixed = schema.base_fixed.iter().copied().collect::<Vec<_>>();
 
-        if base_fixed.len() != base_rank {
+        if base_fixed.len() != schema.base_rank {
             return Err(Error::InvalidSchema(
                 "view base_fixed rank must match base_rank".to_string(),
             ));
         }
 
+        for coord in base_fixed.iter().flatten() {
+            let _ = usize::try_from(*coord)
+                .map_err(|_| Error::InvalidSchema("view coord overflow".to_string()))?;
+        }
+
         Ok(Self {
-            base_rank,
+            base_rank: schema.base_rank,
             axes,
             base_fixed,
         })
@@ -266,21 +243,15 @@ impl TensorView {
 
 impl ViewAxis {
     fn to_schema(&self) -> Result<ViewAxisSchema> {
-        let base_axis = u64::try_from(self.base_axis)
-            .map_err(|_| Error::InvalidSchema("view axis overflow".to_string()))?;
-
         Ok(ViewAxisSchema {
-            base_axis,
+            base_axis: self.base_axis,
             map: self.map.to_schema()?,
         })
     }
 
     fn from_schema(schema: &ViewAxisSchema) -> Result<Self> {
-        let base_axis = usize::try_from(schema.base_axis)
-            .map_err(|_| Error::InvalidSchema("view axis overflow".to_string()))?;
-
         Ok(Self {
-            base_axis,
+            base_axis: schema.base_axis,
             map: AxisMap::from_schema(&schema.map)?,
         })
     }

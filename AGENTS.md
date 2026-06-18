@@ -20,6 +20,10 @@ non-transactional, and explicit about supported/unsupported behavior.
 
 - Preserve base/view semantics: one writable base tensor with trait-compatible
   views and explicit write-through constraints.
+- Canonical numeric typing rule:
+  - shape dimensions and coordinate payloads are `u64` at schema/wire boundaries,
+  - axis identifiers and axis indexing are `usize` in runtime structs and APIs.
+  Keep conversions centralized at schema/stream boundaries.
 - Sparse behavior must be deterministic and documented:
   - ordered iteration support boundaries,
   - structured errors for incompatible order,

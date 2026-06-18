@@ -11,7 +11,7 @@ pub type TensorShape = SmallVec<[u64; PORTABLE_INLINE_RANK]>;
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ViewAxisSchema {
-    pub base_axis: u64,
+    pub base_axis: usize,
     pub map: ViewAxisMapSchema,
 }
 
@@ -24,7 +24,7 @@ pub enum ViewAxisMapSchema {
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ViewSchema {
-    pub base_rank: u64,
+    pub base_rank: usize,
     pub axes: SmallVec<[ViewAxisSchema; PORTABLE_INLINE_RANK]>,
     pub base_fixed: SmallVec<[Option<u64>; PORTABLE_INLINE_RANK]>,
 }
@@ -40,6 +40,23 @@ struct InternalLayoutMetadata {
 pub enum DType {
     F32,
     F64,
+}
+
+impl DType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "f32" => Some(Self::F32),
+            "f64" => Some(Self::F64),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -61,7 +78,7 @@ impl TensorSchema {
     }
 
     pub(crate) fn shape_usize_from_u64(shape: &[u64]) -> FResult<Shape> {
-        validate_shape_u64(shape)?;
+        validate_shape_dims(shape)?;
 
         shape
             .iter()
@@ -74,7 +91,7 @@ impl TensorSchema {
     }
 
     fn shape_u64_from_shape(shape: &Shape) -> FResult<TensorShape> {
-        validate_shape_usize(shape)?;
+        validate_shape_dims(shape.as_slice())?;
 
         shape
             .iter()
@@ -92,7 +109,7 @@ impl TensorSchema {
         block_shape: Shape,
         strides: Strides,
     ) -> FResult<Self> {
-        validate_shape_usize(&shape)?;
+        validate_shape_dims(shape.as_slice())?;
 
         if block_shape.len() != shape.len() || block_shape.iter().any(|dim| *dim == 0) {
             return Err(Error::InvalidSchema(
@@ -185,7 +202,7 @@ impl TensorSchema {
     }
 
     pub fn set_shape(&mut self, shape: Shape) -> FResult<()> {
-        validate_shape_usize(&shape)?;
+        validate_shape_dims(shape.as_slice())?;
 
         // Preserve portability invariant by ensuring we can encode this shape as u64.
         let _ = Self::shape_u64_from_shape(&shape)?;
@@ -221,30 +238,17 @@ impl TensorSchema {
     }
 }
 
-fn validate_shape_u64(shape: &[u64]) -> FResult<()> {
+fn validate_shape_dims<T>(shape: &[T]) -> FResult<()>
+where
+    T: Copy + PartialEq + From<u8>,
+{
     if shape.is_empty() {
         return Err(Error::InvalidSchema(
             "tensor shape cannot be empty".to_string(),
         ));
     }
 
-    if shape.iter().any(|dim| *dim == 0) {
-        return Err(Error::InvalidSchema(
-            "tensor shape dimensions must be non-zero".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_shape_usize(shape: &Shape) -> FResult<()> {
-    if shape.is_empty() {
-        return Err(Error::InvalidSchema(
-            "tensor shape cannot be empty".to_string(),
-        ));
-    }
-
-    if shape.iter().any(|dim| *dim == 0) {
+    if shape.iter().any(|dim| *dim == T::from(0u8)) {
         return Err(Error::InvalidSchema(
             "tensor shape dimensions must be non-zero".to_string(),
         ));

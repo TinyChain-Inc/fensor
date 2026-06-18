@@ -12,6 +12,7 @@ mod stream;
 mod traits;
 mod validate;
 mod view;
+mod wire_tags;
 
 pub use error::{Error, Result};
 pub use schema::{
@@ -188,12 +189,18 @@ where
         Ok(base_coord)
     }
 
-    pub(crate) fn linear_offset_from_base_coord(&self, base_coord: &[u64]) -> u64 {
-        base_coord
+    pub(crate) fn block_position_from_base_coord(&self, base_coord: &[u64]) -> (u64, usize) {
+        let offset: u64 = base_coord
             .iter()
             .zip(self.storage.schema.strides().iter())
             .map(|(coord, stride)| *coord * (*stride as u64))
-            .sum()
+            .sum();
+
+        let block_len = self.block_len() as u64;
+        let block_offset = offset / block_len;
+        let offset_in_block = (offset % block_len) as usize;
+
+        (block_offset, offset_in_block)
     }
 
     pub(crate) fn sparse_key(&self, coords: &[u64], block_offset: u64) -> Vec<u64> {
@@ -208,6 +215,64 @@ where
 
     pub(crate) fn has_sparse_index(&self) -> bool {
         self.storage.index.is_some()
+    }
+
+    async fn lookup_sparse_block_for_coord(
+        &self,
+        base_coord: &[u64],
+        block_offset: u64,
+    ) -> Result<Option<u64>> {
+        let key = self.sparse_key(base_coord, block_offset);
+        self.lookup_block_id(&key).await
+    }
+
+    fn default_block(&self) -> Vec<T> {
+        vec![T::default(); self.block_len()]
+    }
+
+    async fn resolve_sparse_block_for_write(
+        &self,
+        base_coord: &[u64],
+        block_offset: u64,
+        value: T,
+    ) -> Result<Option<u64>> {
+        let key = self.sparse_key(base_coord, block_offset);
+
+        if let Some(block_id) = self.lookup_sparse_block_for_coord(base_coord, block_offset).await? {
+            return Ok(Some(block_id));
+        }
+
+        if value == T::default() {
+            return Ok(None);
+        }
+
+        let block_id: u64 = rand::random();
+        self.write_block(block_id, self.default_block()).await?;
+        self.upsert_block_id(key, block_id).await?;
+
+        Ok(Some(block_id))
+    }
+
+    async fn write_value_to_block(
+        &self,
+        block_id: u64,
+        offset_in_block: usize,
+        value: T,
+        create_if_missing: bool,
+    ) -> Result<()> {
+        let mut block = match self.read_block(block_id).await? {
+            Some(block) => block,
+            None if create_if_missing => self.default_block(),
+            None => {
+                return Err(Error::SparseIndex(
+                    "sparse index points to missing block".to_string(),
+                ));
+            }
+        };
+
+        validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
+        block[offset_in_block] = value;
+        self.write_block(block_id, block).await
     }
 
     async fn persist_metadata(&self) -> Result<()>
@@ -279,6 +344,10 @@ where
     fn dtype(&self) -> Self::DType {
         T::default()
     }
+
+    fn schema_dtype(&self) -> DType {
+        self.schema.dtype()
+    }
 }
 
 impl<FE, T> TensorRead for Tensor<FE, T>
@@ -289,15 +358,11 @@ where
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
             let base_coord = self.resolve_base_coord(coord)?;
-
-            let offset = self.linear_offset_from_base_coord(&base_coord);
-            let block_len = self.block_len() as u64;
-            let block_offset = offset / block_len;
-            let offset_in_block = (offset % block_len) as usize;
+            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
 
             let block_id = if self.has_sparse_index() {
-                let key = self.sparse_key(&base_coord, block_offset);
-                self.lookup_block_id(&key).await?
+                self.lookup_sparse_block_for_coord(&base_coord, block_offset)
+                    .await?
             } else {
                 Some(block_offset)
             };
@@ -328,47 +393,21 @@ where
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let base_coord = self.resolve_base_coord(coord)?;
-
-            let offset = self.linear_offset_from_base_coord(&base_coord);
-            let block_len = self.block_len() as u64;
-            let block_offset = offset / block_len;
-            let offset_in_block = (offset % block_len) as usize;
+            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
 
             if self.has_sparse_index() {
-                let key = self.sparse_key(&base_coord, block_offset);
-                let existing_block = self.lookup_block_id(&key).await?;
-
-                let block_id = if let Some(block_id) = existing_block {
-                    block_id
-                } else if value != T::default() {
-                    let block_id: u64 = rand::random();
-                    self.write_block(block_id, vec![T::default(); self.block_len()])
-                        .await?;
-                    self.upsert_block_id(key, block_id).await?;
-                    block_id
+                if let Some(block_id) = self
+                    .resolve_sparse_block_for_write(&base_coord, block_offset, value)
+                    .await?
+                {
+                    self.write_value_to_block(block_id, offset_in_block, value, false)
+                        .await
                 } else {
-                    return Ok(());
-                };
-
-                if let Some(mut block) = self.read_block(block_id).await? {
-                    validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-                    block[offset_in_block] = value;
-                    self.write_block(block_id, block).await
-                } else {
-                    Err(Error::SparseIndex(
-                        "sparse index points to missing block".to_string(),
-                    ))
+                    Ok(())
                 }
             } else {
-                let block_id = block_offset;
-                let mut block = self
-                    .read_block(block_id)
-                    .await?
-                    .unwrap_or_else(|| vec![T::default(); self.block_len()]);
-
-                validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-                block[offset_in_block] = value;
-                self.write_block(block_id, block).await
+                self.write_value_to_block(block_offset, offset_in_block, value, true)
+                    .await
             }
         })
     }
@@ -533,10 +572,7 @@ fn default_block_shape(shape: &Shape) -> Shape {
 }
 
 fn encode_schema(schema: &TensorSchema) -> String {
-    let dtype = match schema.dtype() {
-        DType::F32 => "f32",
-        DType::F64 => "f64",
-    };
+    let dtype = schema.dtype().as_str();
 
     let layout = match schema.layout() {
         Layout::Dense => "dense".to_string(),
@@ -592,20 +628,12 @@ fn decode_schema(payload: &str) -> Result<TensorSchema> {
         )));
     }
 
-    let dtype = match fields.get("dtype").map(String::as_str) {
-        Some("f32") => DType::F32,
-        Some("f64") => DType::F64,
-        Some(other) => {
-            return Err(Error::InvalidSchema(format!(
-                "unsupported dtype in metadata: {other}"
-            )));
-        }
-        None => {
-            return Err(Error::InvalidSchema(
-                "missing dtype in metadata".to_string(),
-            ));
-        }
-    };
+    let dtype_value = fields
+        .get("dtype")
+        .ok_or_else(|| Error::InvalidSchema("missing dtype in metadata".to_string()))?;
+    let dtype = DType::from_str(dtype_value).ok_or_else(|| {
+        Error::InvalidSchema(format!("unsupported dtype in metadata: {dtype_value}"))
+    })?;
 
     let layout = parse_layout(
         fields
