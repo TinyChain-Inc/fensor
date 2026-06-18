@@ -17,15 +17,15 @@ pub trait TensorArray: Send + Sync {
     fn dtype(&self) -> Self::DType;
 
     fn shape(&self) -> &[usize] {
-        &self.schema().shape
+        self.schema().shape()
     }
 
     fn layout(&self) -> &Layout {
-        &self.schema().layout
+        self.schema().layout()
     }
 
     fn strides(&self) -> &[usize] {
-        &self.schema().strides
+        self.schema().strides()
     }
 
     fn ndim(&self) -> usize {

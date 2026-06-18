@@ -2,31 +2,37 @@ use std::sync::Arc;
 
 use ha_ndarray::{Axes, AxisRange, Range, Shape, Strides};
 
-use crate::{Error, Result, TensorSchema};
+use crate::{
+    Error, Result, TensorSchema, TensorShape, ViewAxisMapSchema, ViewAxisSchema, ViewSchema,
+};
 
 #[derive(Clone)]
 pub struct TensorView {
-    pub base_rank: usize,
-    pub axes: Vec<ViewAxis>,
-    pub base_fixed: Vec<Option<usize>>,
+    base_rank: usize,
+    axes: Vec<ViewAxis>,
+    base_fixed: Vec<Option<usize>>,
 }
 
 #[derive(Clone)]
-pub struct ViewAxis {
-    pub base_axis: usize,
-    pub map: AxisMap,
+struct ViewAxis {
+    base_axis: usize,
+    map: AxisMap,
 }
 
 #[derive(Clone)]
-pub enum AxisMap {
+enum AxisMap {
     Identity,
     Affine { start: usize, step: usize },
     Gather(Arc<[usize]>),
 }
 
 impl TensorView {
+    pub fn rank(&self) -> usize {
+        self.axes.len()
+    }
+
     pub fn identity(schema: &TensorSchema) -> Self {
-        let base_rank = schema.shape.len();
+        let base_rank = schema.shape().len();
         let axes = (0..base_rank)
             .map(|base_axis| ViewAxis {
                 base_axis,
@@ -73,7 +79,13 @@ impl TensorView {
             ));
         }
 
-        Ok(resolved.into_iter().map(|coord| coord as u64).collect())
+        resolved
+            .into_iter()
+            .map(|coord| {
+                u64::try_from(coord)
+                    .map_err(|_| Error::InvalidCoord("coordinate does not fit in u64".to_string()))
+            })
+            .collect()
     }
 
     pub fn transpose(&self, permutation: &[usize]) -> Result<Self> {
@@ -184,16 +196,154 @@ impl TensorView {
             new_strides,
         ))
     }
+
+    pub fn to_schema(&self) -> Result<ViewSchema> {
+        let axes = self
+            .axes
+            .iter()
+            .map(ViewAxis::to_schema)
+            .collect::<Result<_>>()?;
+
+        let base_rank = u64::try_from(self.base_rank)
+            .map_err(|_| Error::InvalidSchema("base rank overflow".to_string()))?;
+
+        let base_fixed = self
+            .base_fixed
+            .iter()
+            .map(|value| {
+                value
+                    .map(|coord| {
+                        u64::try_from(coord)
+                            .map_err(|_| Error::InvalidSchema("view coord overflow".to_string()))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(ViewSchema {
+            base_rank,
+            axes,
+            base_fixed,
+        })
+    }
+
+    pub fn from_schema(schema: &ViewSchema) -> Result<Self> {
+        let base_rank = usize::try_from(schema.base_rank)
+            .map_err(|_| Error::InvalidSchema("base rank overflow".to_string()))?;
+
+        let axes = schema
+            .axes
+            .iter()
+            .map(ViewAxis::from_schema)
+            .collect::<Result<Vec<_>>>()?;
+
+        let base_fixed = schema
+            .base_fixed
+            .iter()
+            .map(|value| {
+                value
+                    .map(|coord| {
+                        usize::try_from(coord)
+                            .map_err(|_| Error::InvalidSchema("view coord overflow".to_string()))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if base_fixed.len() != base_rank {
+            return Err(Error::InvalidSchema(
+                "view base_fixed rank must match base_rank".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            base_rank,
+            axes,
+            base_fixed,
+        })
+    }
+}
+
+impl ViewAxis {
+    fn to_schema(&self) -> Result<ViewAxisSchema> {
+        let base_axis = u64::try_from(self.base_axis)
+            .map_err(|_| Error::InvalidSchema("view axis overflow".to_string()))?;
+
+        Ok(ViewAxisSchema {
+            base_axis,
+            map: self.map.to_schema()?,
+        })
+    }
+
+    fn from_schema(schema: &ViewAxisSchema) -> Result<Self> {
+        let base_axis = usize::try_from(schema.base_axis)
+            .map_err(|_| Error::InvalidSchema("view axis overflow".to_string()))?;
+
+        Ok(Self {
+            base_axis,
+            map: AxisMap::from_schema(&schema.map)?,
+        })
+    }
 }
 
 impl AxisMap {
     fn resolve(&self, index: usize) -> Result<usize> {
         match self {
             Self::Identity => Ok(index),
-            Self::Affine { start, step } => Ok(start + index * step),
+            Self::Affine { start, step } => start
+                .checked_add(index.checked_mul(*step).ok_or_else(|| {
+                    Error::InvalidCoord("affine axis mapping overflow".to_string())
+                })?)
+                .ok_or_else(|| Error::InvalidCoord("affine axis mapping overflow".to_string())),
             Self::Gather(indices) => indices.get(index).copied().ok_or_else(|| {
                 Error::InvalidCoord("coordinate out of bounds for gathered axis".to_string())
             }),
+        }
+    }
+
+    fn to_schema(&self) -> Result<ViewAxisMapSchema> {
+        match self {
+            Self::Identity => Ok(ViewAxisMapSchema::Identity),
+            Self::Affine { start, step } => {
+                let start = u64::try_from(*start)
+                    .map_err(|_| Error::InvalidSchema("view start overflow".to_string()))?;
+                let step = u64::try_from(*step)
+                    .map_err(|_| Error::InvalidSchema("view step overflow".to_string()))?;
+                Ok(ViewAxisMapSchema::Affine { start, step })
+            }
+            Self::Gather(indices) => {
+                let gathered = indices
+                    .iter()
+                    .map(|index| {
+                        u64::try_from(*index)
+                            .map_err(|_| Error::InvalidSchema("view gather overflow".to_string()))
+                    })
+                    .collect::<Result<TensorShape>>()?;
+                Ok(ViewAxisMapSchema::Gather(gathered))
+            }
+        }
+    }
+
+    fn from_schema(schema: &ViewAxisMapSchema) -> Result<Self> {
+        match schema {
+            ViewAxisMapSchema::Identity => Ok(Self::Identity),
+            ViewAxisMapSchema::Affine { start, step } => {
+                let start = usize::try_from(*start)
+                    .map_err(|_| Error::InvalidSchema("view start overflow".to_string()))?;
+                let step = usize::try_from(*step)
+                    .map_err(|_| Error::InvalidSchema("view step overflow".to_string()))?;
+                Ok(Self::Affine { start, step })
+            }
+            ViewAxisMapSchema::Gather(indices) => {
+                let gathered = indices
+                    .iter()
+                    .map(|index| {
+                        usize::try_from(*index)
+                            .map_err(|_| Error::InvalidSchema("view gather overflow".to_string()))
+                    })
+                    .collect::<Result<Vec<usize>>>()?;
+                Ok(Self::Gather(gathered.into()))
+            }
         }
     }
 }
@@ -286,7 +436,7 @@ mod tests {
             AxisRange::Of(shape![0, 3, 4])
         ];
 
-        let (sliced, shape, _strides) = view.slice(&schema.shape, &range).expect("slice");
+        let (sliced, shape, _strides) = view.slice(schema.shape(), &range).expect("slice");
         assert_eq!(shape.as_slice(), &[2, 3]);
 
         let resolved = sliced.resolve_coord(&[1, 2]).expect("resolve");
@@ -322,5 +472,16 @@ mod tests {
 
         let resolved = sliced.resolve_coord(&[1, 1]).expect("resolve");
         assert_eq!(resolved, vec![2, 2, 3]);
+    }
+
+    #[test]
+    fn view_schema_roundtrip() {
+        let schema = schema(&[5, 4, 3]);
+        let identity = TensorView::identity(&schema);
+        let transposed = identity.transpose(&[2, 0, 1]).expect("transpose");
+        let view_schema = transposed.to_schema().expect("schema");
+
+        let restored = TensorView::from_schema(&view_schema).expect("restore");
+        assert_eq!(restored.resolve_coord(&[1, 2, 3]).expect("coord"), vec![2, 3, 1]);
     }
 }
