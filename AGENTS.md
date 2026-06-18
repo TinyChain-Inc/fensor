@@ -11,6 +11,10 @@ non-transactional, and explicit about supported/unsupported behavior.
   or data files.
 - Keep one obvious code path per feature. Prefer general primitives over
   special-case branches.
+- For tensor behavior surfaced by traits (`TensorRead`, `TensorWrite`,
+  `TensorTransform`, `TensorBlockStore`, `TensorSparseIndex`), keep the
+  canonical implementation in the trait methods themselves. Avoid parallel
+  `*_impl` forwarding layers that create a second path to inspect/debug.
 
 ## Tensor semantics
 

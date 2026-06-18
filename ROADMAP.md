@@ -13,14 +13,14 @@
   - No commit/rollback/finalize orchestration.
   - No transaction visibility or isolation policy.
 
-Transactional orchestration belongs to `tc-collection`, which composes `fensor` as the storage engine (analogous to `b-tree`/`b-table` usage in v1).
+Transactional orchestration belongs to `tc-collection`, which composes `fensor` as the storage engine.
 
 ## Data integrity contract (fail-closed)
 
 `fensor` must treat corruption as a hard error, not a recoverable condition.
 
 - No in-place auto-repair of metadata or block files.
-- No automatic fallback from a corrupted source to alternate metadata/data copies.
+- No alternate-source read path for corrupted metadata/data.
 - Corruption must surface as a structured, user-facing error describing the failed file/field.
 - Any recovery path (restore from backup, rebuild index, re-materialize data) is owned by external tooling and/or `tc-collection` orchestration, not by `fensor`.
 
@@ -71,7 +71,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Then validate composition (`transpose(slice(x))`, `slice(transpose(x))`, chained operations) as a separate gate.
    - Gate: separate and composed transform tests both pass with identical logical results across Dense/Sparse layouts.
 
-## v1 parity gates (excluding LSM transactionality)
+## Correctness gates (excluding transactionality)
 
 1. **Sparse ordered iteration contract.**
    - Specify when sparse elements can be streamed in requested logical order without re-materialization.
@@ -131,7 +131,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 5. **Phase exit criteria lock-in.**
    - Phase 1 exits only when accessor and standalone transform tests pass.
    - Phase 2 exits only when composed transforms and Dense/Sparse parity tests pass.
-   - v1 non-transactional parity exits only when all gates in `v1 parity gates (excluding LSM transactionality)` pass.
+   - Non-transactional parity exits only when all gates in `Correctness gates (excluding transactionality)` pass.
 
 ## Active deliverables
 
@@ -147,7 +147,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 
 3. **TinyChain integration milestones.**
    - Integrate `fensor` as a non-transactional storage primitive in host/state lifecycle so tensor storage participates in install, queue, capability checks, and telemetry emission.
-   - Replace `tc-state` transitional in-memory tensor plumbing with `fensor`-backed persistence once lifecycle hooks are wired.
+   - Use `fensor`-backed persistence for tensor plumbing once lifecycle hooks are wired.
    - Keep URI and serialization behavior aligned with canonical `/state/collection/tensor` and tuple payload contracts.
 
 ## Deferred explorations
