@@ -140,7 +140,11 @@ impl TensorSchema {
             strides,
         };
 
-        Ok(Self { dtype, shape, internal })
+        Ok(Self {
+            dtype,
+            shape,
+            internal,
+        })
     }
 
     pub fn dense_with_dtype(dtype: DType, shape: Shape, block_shape: Shape) -> FResult<Self> {
@@ -180,8 +184,9 @@ impl TensorSchema {
         }
 
         for (i, (c, dim)) in coord.iter().zip(shape.iter()).enumerate() {
-            let coord = usize::try_from(*c)
-                .map_err(|_| Error::InvalidCoord(format!("coordinate at axis {i} overflows usize")))?;
+            let coord = usize::try_from(*c).map_err(|_| {
+                Error::InvalidCoord(format!("coordinate at axis {i} overflows usize"))
+            })?;
 
             if coord >= *dim {
                 return Err(Error::InvalidCoord(format!(

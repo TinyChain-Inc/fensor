@@ -238,7 +238,10 @@ where
     ) -> Result<Option<u64>> {
         let key = self.sparse_key(base_coord, block_offset);
 
-        if let Some(block_id) = self.lookup_sparse_block_for_coord(base_coord, block_offset).await? {
+        if let Some(block_id) = self
+            .lookup_sparse_block_for_coord(base_coord, block_offset)
+            .await?
+        {
             return Ok(Some(block_id));
         }
 
@@ -327,7 +330,6 @@ where
 
         Ok(())
     }
-
 }
 
 impl<FE, T> TensorArray for Tensor<FE, T>
@@ -552,6 +554,38 @@ where
             }
         })
     }
+}
+
+// Trait-surface wiring only: every method inherits the default `Unsupported`
+// behavior from `traits.rs`. These exist so the test matrix can call into the
+// trait surface and observe failures in the right places. They are NOT a
+// feature implementation — see Requirements_1.md.
+impl<FE, T> TensorReadBulk for Tensor<FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
+}
+
+impl<FE, T> TensorWriteBulk for Tensor<FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
+}
+
+impl<FE, T> TensorViewSemantics for Tensor<FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
+}
+
+impl<FE, T> TensorSparseLifecycle for Tensor<FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
 }
 
 fn default_block_shape(shape: &Shape) -> Shape {
@@ -800,11 +834,7 @@ fn create_or_load_index<FE>(
     Option<TableLock<SparseTableSchema, SparseIndexSchema, b_table::collate::Collator<u64>, FE>>,
 >
 where
-    FE: FileLoad
-        + AsType<b_table::Node<u64>>
-        + Send
-        + Sync
-        + 'static,
+    FE: FileLoad + AsType<b_table::Node<u64>> + Send + Sync + 'static,
 {
     if matches!(schema.layout(), Layout::Sparse { .. }) {
         let index_dir = if create_if_missing {

@@ -144,10 +144,10 @@ impl TensorView {
                     }
 
                     let base_coord = view_axis.map.resolve(*i)?;
-                    base_fixed[view_axis.base_axis] = Some(
-                        u64::try_from(base_coord)
-                            .map_err(|_| Error::InvalidCoord("coordinate does not fit in u64".to_string()))?,
-                    );
+                    base_fixed[view_axis.base_axis] =
+                        Some(u64::try_from(base_coord).map_err(|_| {
+                            Error::InvalidCoord("coordinate does not fit in u64".to_string())
+                        })?);
                 }
                 AxisRange::In(start, stop, step) => {
                     if *step == 0 || *start > *stop || *stop > *dim {
@@ -453,6 +453,9 @@ mod tests {
         let view_schema = transposed.to_schema().expect("schema");
 
         let restored = TensorView::from_schema(&view_schema).expect("restore");
-        assert_eq!(restored.resolve_coord(&[1, 2, 3]).expect("coord"), vec![2, 3, 1]);
+        assert_eq!(
+            restored.resolve_coord(&[1, 2, 3]).expect("coord"),
+            vec![2, 3, 1]
+        );
     }
 }
