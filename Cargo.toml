@@ -10,7 +10,7 @@ repository = "https://github.com/TinyChain-Inc/fensor"
 b-table = { path = "../b-table", features = ["stream"] }
 destream = "0.10"
 freqfs = "0.12"
-ha-ndarray = { path = "../ha-ndarray" }
+ha-ndarray = "0.5"
 rand = "0.8"
 safecast = "0.2"
 smallvec = "1"
