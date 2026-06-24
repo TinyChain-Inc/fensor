@@ -1,6 +1,7 @@
+use std::io;
 use std::sync::Arc;
 
-use b_table::TableLock;
+use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
 use ha_ndarray::{Axes, Range, Shape};
@@ -68,9 +69,7 @@ where
 
 struct TensorStorage<FE> {
     blocks: DirLock<FE>,
-    index: Option<
-        TableLock<SparseTableSchema, SparseIndexSchema, b_table::collate::Collator<u64>, FE>,
-    >,
+    index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
     schema: TensorSchema,
 }
 
@@ -99,7 +98,7 @@ where
         let mut dir_guard = dir.try_write()?;
 
         let blocks_dir = dir_guard.create_dir(BLOCKS.to_string())?;
-        let index = create_or_load_index(&schema, &mut dir_guard, true)?;
+        let index = create_sparse_index(&schema, &mut dir_guard)?;
 
         let tensor = Self::new_storage(blocks_dir, index, schema);
         tensor.persist_metadata().await?;
@@ -115,7 +114,7 @@ where
         let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
         let schema = Self::load_metadata(&blocks_dir).await?;
         validate_tensor_dtype::<T>(&schema)?;
-        let index = create_or_load_index(&schema, &mut dir_guard, false)?;
+        let index = load_sparse_index(&schema, &mut dir_guard)?;
 
         Ok(Self::new_storage(blocks_dir, index, schema))
     }
@@ -140,9 +139,7 @@ where
 
     fn new_storage(
         blocks: DirLock<FE>,
-        index: Option<
-            TableLock<SparseTableSchema, SparseIndexSchema, b_table::collate::Collator<u64>, FE>,
-        >,
+        index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
         schema: TensorSchema,
     ) -> Self {
         let view = TensorView::identity(&schema);
@@ -439,7 +436,7 @@ where
 
         self.schema.set_shape(shape)?;
         self.schema
-            .set_strides(contiguous_strides(&self.schema.shape()))?;
+            .set_strides(contiguous_strides(self.schema.shape()))?;
         self.view = TensorView::identity(&self.schema);
 
         Ok(self)
@@ -447,7 +444,7 @@ where
 
     fn slice(mut self, range: Range) -> Result<Self> {
         let current_shape = self.schema.shape();
-        let (view, shape, strides) = self.view.slice(&current_shape, &range)?;
+        let (view, shape, strides) = self.view.slice(current_shape, &range)?;
         self.view = view;
         self.schema.set_shape(shape)?;
         self.schema.set_strides(strides)?;
@@ -665,7 +662,7 @@ fn decode_schema(payload: &str) -> Result<TensorSchema> {
     let dtype_value = fields
         .get("dtype")
         .ok_or_else(|| Error::InvalidSchema("missing dtype in metadata".to_string()))?;
-    let dtype = DType::from_str(dtype_value).ok_or_else(|| {
+    let dtype = DType::try_parse(dtype_value).ok_or_else(|| {
         Error::InvalidSchema(format!("unsupported dtype in metadata: {dtype_value}"))
     })?;
 
@@ -748,6 +745,46 @@ fn validate_tensor_dtype<T: TensorElement>(schema: &TensorSchema) -> Result<()> 
     Ok(())
 }
 
+type SparseIndex<FE> = TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>;
+
+fn create_sparse_index<FE>(
+    schema: &TensorSchema,
+    dir_guard: &mut freqfs::DirWriteGuard<'_, FE>,
+) -> io::Result<Option<SparseIndex<FE>>>
+where
+    FE: FileLoad + AsType<b_table::Node<u64>> + Send + Sync + 'static,
+{
+    if matches!(schema.layout(), Layout::Sparse { .. }) {
+        let index_dir = dir_guard.create_dir(INDEX.to_string())?;
+
+        let table_schema = SparseTableSchema::default();
+        let collator = Collator::default();
+
+        TableLock::create(table_schema, collator, index_dir).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn load_sparse_index<FE>(
+    schema: &TensorSchema,
+    dir_guard: &mut freqfs::DirWriteGuard<'_, FE>,
+) -> io::Result<Option<SparseIndex<FE>>>
+where
+    FE: FileLoad + AsType<b_table::Node<u64>> + Send + Sync + 'static,
+{
+    if matches!(schema.layout(), Layout::Sparse { .. })
+        && let Some(index_dir) = dir_guard.get_dir(INDEX).cloned()
+    {
+        let table_schema = SparseTableSchema::default();
+        let collator = Collator::default();
+
+        TableLock::load(table_schema, collator, index_dir).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
@@ -823,37 +860,5 @@ mod metadata_tests {
 
         let err = validate_tensor_dtype::<f32>(&schema).expect_err("expected mismatch");
         assert!(matches!(err, Error::InvalidSchema(_)));
-    }
-}
-
-fn create_or_load_index<FE>(
-    schema: &TensorSchema,
-    dir_guard: &mut freqfs::DirWriteGuard<'_, FE>,
-    create_if_missing: bool,
-) -> std::io::Result<
-    Option<TableLock<SparseTableSchema, SparseIndexSchema, b_table::collate::Collator<u64>, FE>>,
->
-where
-    FE: FileLoad + AsType<b_table::Node<u64>> + Send + Sync + 'static,
-{
-    if matches!(schema.layout(), Layout::Sparse { .. }) {
-        let index_dir = if create_if_missing {
-            dir_guard.create_dir(INDEX.to_string())?
-        } else if dir_guard.contains(INDEX) {
-            dir_guard.get_or_create_dir(INDEX.to_string())?
-        } else {
-            return Ok(None);
-        };
-
-        let table_schema = SparseTableSchema::default();
-        let collator = b_table::collate::Collator::default();
-
-        if create_if_missing {
-            TableLock::create(table_schema, collator, index_dir).map(Some)
-        } else {
-            TableLock::load(table_schema, collator, index_dir).map(Some)
-        }
-    } else {
-        Ok(None)
     }
 }

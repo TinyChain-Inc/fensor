@@ -41,6 +41,8 @@ pub trait TensorArray: Send + Sync {
     }
 }
 
+type OrderedSparseElements<ET> = Vec<(Vec<u64>, ET)>;
+
 /// Async value reads aligned with ndarray coordinate semantics.
 pub trait TensorRead: TensorArray {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>>;
@@ -49,7 +51,7 @@ pub trait TensorRead: TensorArray {
         &'a self,
         _range: Range,
         requested_order: Axes,
-    ) -> BoxFuture<'a, Result<Vec<(Vec<u64>, Self::DType)>>> {
+    ) -> BoxFuture<'a, Result<OrderedSparseElements<Self::DType>>> {
         let base_order = (0..self.ndim()).collect::<Vec<_>>();
         let requested_order = requested_order.into_iter().collect::<Vec<_>>();
 

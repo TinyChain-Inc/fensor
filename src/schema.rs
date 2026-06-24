@@ -50,7 +50,7 @@ impl DType {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn try_parse(value: &str) -> Option<Self> {
         match value {
             "f32" => Some(Self::F32),
             "f64" => Some(Self::F64),
@@ -111,7 +111,7 @@ impl TensorSchema {
     ) -> FResult<Self> {
         validate_shape_dims(shape.as_slice())?;
 
-        if block_shape.len() != shape.len() || block_shape.iter().any(|dim| *dim == 0) {
+        if block_shape.len() != shape.len() || block_shape.contains(&0) {
             return Err(Error::InvalidSchema(
                 "block_shape must be non-zero and match tensor rank".to_string(),
             ));
@@ -123,12 +123,12 @@ impl TensorSchema {
             ));
         }
 
-        if let Layout::Sparse { axis: Some(axis) } = layout {
-            if axis >= shape.len() {
-                return Err(Error::InvalidSchema(
-                    "sparse axis hint out of bounds".to_string(),
-                ));
-            }
+        if let Layout::Sparse { axis: Some(axis) } = layout
+            && axis >= shape.len()
+        {
+            return Err(Error::InvalidSchema(
+                "sparse axis hint out of bounds".to_string(),
+            ));
         }
 
         // Validate that shape dimensions are representable in the portable u64 form.

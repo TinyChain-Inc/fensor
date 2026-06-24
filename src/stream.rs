@@ -68,9 +68,9 @@ fn encode_view_axis(schema: ViewAxisSchema) -> Result<(u64, ViewAxisMapSchema), 
     Ok((base_axis, schema.map))
 }
 
-fn encode_view_schema_ref(
-    schema: &ViewSchema,
-) -> Result<(u64, Vec<ViewAxisSchema>, Vec<Option<u64>>), String> {
+type EncodedViewSchema = (u64, Vec<ViewAxisSchema>, Vec<Option<u64>>);
+
+fn encode_view_schema_ref(schema: &ViewSchema) -> Result<EncodedViewSchema, String> {
     let axes = schema.axes.iter().cloned().collect::<Vec<ViewAxisSchema>>();
     let base_fixed = schema
         .base_fixed
@@ -83,9 +83,7 @@ fn encode_view_schema_ref(
     Ok((base_rank, axes, base_fixed))
 }
 
-fn encode_view_schema(
-    schema: ViewSchema,
-) -> Result<(u64, Vec<ViewAxisSchema>, Vec<Option<u64>>), String> {
+fn encode_view_schema(schema: ViewSchema) -> Result<EncodedViewSchema, String> {
     let axes = schema.axes.into_iter().collect::<Vec<ViewAxisSchema>>();
     let base_fixed = schema.base_fixed.into_iter().collect::<Vec<Option<u64>>>();
     let base_rank =
@@ -121,7 +119,7 @@ impl de::FromStream for DType {
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         let dtype = String::from_stream((), decoder).await?;
-        DType::from_str(dtype.as_str())
+        DType::try_parse(&dtype)
             .ok_or_else(|| de::Error::custom(format!("unsupported dtype {dtype}")))
     }
 }
