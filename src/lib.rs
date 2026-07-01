@@ -186,7 +186,11 @@ where
         }
         let k = k as u64;
 
-        let base_coord: Vec<u64> = self.storage.schema.strides().iter()
+        let base_coord: Vec<u64> = self
+            .storage
+            .schema
+            .strides()
+            .iter()
             .zip(self.storage.schema.shape().iter())
             .map(|(stride, dim)| (k / *stride as u64) % *dim as u64)
             .collect();
@@ -439,7 +443,8 @@ where
 
         self.view = self.view.reshape(self.schema.shape(), &shape)?;
         self.schema.set_shape(shape)?;
-        self.schema.set_strides(contiguous_strides(self.schema.shape()))?;
+        self.schema
+            .set_strides(contiguous_strides(self.schema.shape()))?;
 
         Ok(self)
     }

@@ -6,9 +6,9 @@ use crate::{AxisContribSchema, Error, Result, TensorSchema, ViewSchema, schema};
 
 #[derive(Clone)]
 pub struct TensorView {
-    base_rank:   usize,
+    base_rank: usize,
     base_offset: i64,
-    axes:        Vec<AxisContrib>,
+    axes: Vec<AxisContrib>,
 }
 
 #[derive(Clone)]
@@ -28,9 +28,11 @@ impl TensorView {
 
     pub fn identity(schema: &TensorSchema) -> Self {
         Self {
-            base_rank:   schema.rank(),
+            base_rank: schema.rank(),
             base_offset: 0,
-            axes: schema.strides().iter()
+            axes: schema
+                .strides()
+                .iter()
                 .map(|&s| AxisContrib::Stride(s as i64))
                 .collect(),
         }
@@ -58,7 +60,7 @@ impl TensorView {
         }
 
         Ok(Self {
-            base_rank:   self.base_rank,
+            base_rank: self.base_rank,
             base_offset: self.base_offset,
             axes,
         })
@@ -88,11 +90,11 @@ impl TensorView {
                     }
                     new_base_offset += match current {
                         AxisContrib::Stride(s) => (*i as i64) * s,
-                        AxisContrib::Gather(g) => {
-                            *g.get(*i).ok_or_else(|| Error::InvalidLayout(format!(
+                        AxisContrib::Gather(g) => *g.get(*i).ok_or_else(|| {
+                            Error::InvalidLayout(format!(
                                 "slice bound at axis {axis_index} out of bounds for gather"
-                            )))?
-                        }
+                            ))
+                        })?,
                     };
                 }
                 AxisRange::In(start, stop, step) => {
@@ -143,13 +145,11 @@ impl TensorView {
                         .map(|idx| {
                             Ok(match current {
                                 AxisContrib::Stride(s) => (*idx as i64) * s,
-                                AxisContrib::Gather(g) => {
-                                    *g.get(*idx).ok_or_else(|| {
-                                        Error::InvalidLayout(format!(
-                                            "slice bound at axis {axis_index} out of bounds for gather"
-                                        ))
-                                    })?
-                                }
+                                AxisContrib::Gather(g) => *g.get(*idx).ok_or_else(|| {
+                                    Error::InvalidLayout(format!(
+                                        "slice bound at axis {axis_index} out of bounds for gather"
+                                    ))
+                                })?,
                             })
                         })
                         .collect::<Result<Vec<i64>>>()?;
@@ -163,9 +163,9 @@ impl TensorView {
 
         Ok((
             Self {
-                base_rank:   self.base_rank,
+                base_rank: self.base_rank,
                 base_offset: new_base_offset,
-                axes:        new_axes,
+                axes: new_axes,
             },
             new_shape,
             new_strides,
@@ -174,25 +174,35 @@ impl TensorView {
 
     pub fn to_schema(&self) -> Result<ViewSchema> {
         Ok(ViewSchema {
-            base_rank:   self.base_rank,
+            base_rank: self.base_rank,
             base_offset: self.base_offset,
-            axes: self.axes.iter().map(|a| match a {
-                AxisContrib::Stride(s) => AxisContribSchema::Stride(*s),
-                AxisContrib::Gather(g) => AxisContribSchema::Gather(g.iter().copied().collect()),
-            }).collect(),
+            axes: self
+                .axes
+                .iter()
+                .map(|a| match a {
+                    AxisContrib::Stride(s) => AxisContribSchema::Stride(*s),
+                    AxisContrib::Gather(g) => {
+                        AxisContribSchema::Gather(g.iter().copied().collect())
+                    }
+                })
+                .collect(),
         })
     }
 
     pub fn from_schema(schema: &ViewSchema) -> Result<Self> {
-        let axes = schema.axes.iter().map(|a| match a {
-            AxisContribSchema::Stride(s) => Ok(AxisContrib::Stride(*s)),
-            AxisContribSchema::Gather(g) => {
-                Ok(AxisContrib::Gather(g.iter().copied().collect::<Vec<_>>().into()))
-            }
-        }).collect::<Result<Vec<_>>>()?;
+        let axes = schema
+            .axes
+            .iter()
+            .map(|a| match a {
+                AxisContribSchema::Stride(s) => Ok(AxisContrib::Stride(*s)),
+                AxisContribSchema::Gather(g) => Ok(AxisContrib::Gather(
+                    g.iter().copied().collect::<Vec<_>>().into(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            base_rank:   schema.base_rank,
+            base_rank: schema.base_rank,
             base_offset: schema.base_offset,
             axes,
         })
@@ -202,11 +212,12 @@ impl TensorView {
         if !self.is_c_contiguous(current_shape) {
             return Err(Error::Unsupported(
                 "reshape requires a C-contiguous view; copy the tensor before reshaping \
-                a transposed, flip, step-strided, or gather-sliced view".to_string(),
+                a transposed, flip, step-strided, or gather-sliced view"
+                    .to_string(),
             ));
         }
         Ok(Self {
-            base_rank:   self.base_rank,
+            base_rank: self.base_rank,
             base_offset: self.base_offset,
             axes: schema::contiguous_strides(new_shape)
                 .iter()
@@ -217,7 +228,9 @@ impl TensorView {
 
     pub fn flat_offset(&self, coord: &[u64]) -> Result<i64> {
         if coord.len() != self.axes.len() {
-            return Err(Error::InvalidCoord("incorrect number of coordinates".to_string()));
+            return Err(Error::InvalidCoord(
+                "incorrect number of coordinates".to_string(),
+            ));
         }
 
         let mut k: i64 = self.base_offset;
@@ -242,10 +255,13 @@ impl TensorView {
             return false;
         }
         let expected = schema::contiguous_strides(shape);
-        self.axes.iter().zip(expected.iter()).all(|pair| match pair {
-            (AxisContrib::Stride(s), e) => *s >= 0 && *s as usize == *e,
-            _ => false,
-        })
+        self.axes
+            .iter()
+            .zip(expected.iter())
+            .all(|pair| match pair {
+                (AxisContrib::Stride(s), e) => *s >= 0 && *s as usize == *e,
+                _ => false,
+            })
     }
 }
 
@@ -400,7 +416,10 @@ mod tests {
         let schema = schema(&[3, 4]);
         let view = TensorView::identity(&schema);
         let transposed = view.transpose(&[1, 0]).expect("transpose");
-        assert!(matches!(transposed.reshape(&[4, 3], &[12]), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            transposed.reshape(&[4, 3], &[12]),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -410,7 +429,10 @@ mod tests {
         let view = TensorView::identity(&schema);
         let range = range![AxisRange::In(0, 6, 2), AxisRange::In(0, 4, 1)];
         let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        assert!(matches!(sliced.reshape(&new_shape, &[12]), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            sliced.reshape(&new_shape, &[12]),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -420,7 +442,10 @@ mod tests {
         let view = TensorView::identity(&schema);
         let range = range![AxisRange::Of(shape![0, 2, 4]), AxisRange::In(0, 4, 1)];
         let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        assert!(matches!(sliced.reshape(&new_shape, &[12]), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            sliced.reshape(&new_shape, &[12]),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -430,7 +455,10 @@ mod tests {
         let view = TensorView::identity(&schema);
         let range = range![AxisRange::In(0, 3, 1), AxisRange::At(0)];
         let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        assert!(matches!(sliced.reshape(&new_shape, &[3]), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            sliced.reshape(&new_shape, &[3]),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     // -- valid reshape chains -----------------------------------------------------
@@ -444,7 +472,9 @@ mod tests {
         let view = TensorView::identity(&schema);
         let range = range![AxisRange::In(1, 4, 1), AxisRange::In(0, 4, 1)];
         let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        let reshaped = sliced.reshape(&new_shape, &[12]).expect("reshape must succeed");
+        let reshaped = sliced
+            .reshape(&new_shape, &[12])
+            .expect("reshape must succeed");
         assert_eq!(reshaped.flat_offset(&[5]).expect("offset"), 9);
     }
 
@@ -457,7 +487,9 @@ mod tests {
         let view = TensorView::identity(&schema);
         let range = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
         let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        let reshaped = sliced.reshape(&new_shape, &[2, 2]).expect("reshape must succeed");
+        let reshaped = sliced
+            .reshape(&new_shape, &[2, 2])
+            .expect("reshape must succeed");
         assert_eq!(reshaped.flat_offset(&[1, 1]).expect("offset"), 7);
     }
 
@@ -469,7 +501,9 @@ mod tests {
         let schema = schema(&[6, 4]);
         let view = TensorView::identity(&schema);
         let reshaped_shape = [2usize, 3, 4];
-        let reshaped = view.reshape(schema.shape(), &reshaped_shape).expect("reshape");
+        let reshaped = view
+            .reshape(schema.shape(), &reshaped_shape)
+            .expect("reshape");
         let range = range![
             AxisRange::In(0, 2, 1),
             AxisRange::In(0, 2, 1),

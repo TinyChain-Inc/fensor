@@ -17,9 +17,9 @@ pub enum AxisContribSchema {
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ViewSchema {
-    pub base_rank:   usize,
+    pub base_rank: usize,
     pub base_offset: i64,
-    pub axes:        SmallVec<[AxisContribSchema; PORTABLE_INLINE_RANK]>,
+    pub axes: SmallVec<[AxisContribSchema; PORTABLE_INLINE_RANK]>,
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]

@@ -1,6 +1,8 @@
 use destream::{de, en};
 
-use crate::wire_tags::{AXIS_CONTRIB_TAG_GATHER, AXIS_CONTRIB_TAG_STRIDE, LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
+use crate::wire_tags::{
+    AXIS_CONTRIB_TAG_GATHER, AXIS_CONTRIB_TAG_STRIDE, LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE,
+};
 use crate::{
     AxisContribSchema, DType, Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema,
     ViewSchema, contiguous_strides,
@@ -190,7 +192,9 @@ impl de::FromStream for AxisContribSchema {
         match tag {
             AXIS_CONTRIB_TAG_STRIDE => {
                 if data.len() != 1 {
-                    return Err(de::Error::custom("stride axis contrib expects one i64 payload"));
+                    return Err(de::Error::custom(
+                        "stride axis contrib expects one i64 payload",
+                    ));
                 }
                 Ok(Self::Stride(data[0]))
             }
