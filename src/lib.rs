@@ -17,8 +17,8 @@ mod wire_tags;
 
 pub use error::{Error, Result};
 pub use schema::{
-    DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape,
-    ViewAxisMapSchema, ViewAxisSchema, ViewSchema, contiguous_strides,
+    AxisContribSchema, DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema,
+    TensorShape, ViewSchema, contiguous_strides,
 };
 pub use traits::{
     BoxFuture, SparseZeroPolicy, TensorArray, TensorBlockStore, TensorMatMul, TensorMath,
@@ -180,9 +180,22 @@ where
     pub(crate) fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
         self.schema.validate_coord(coord)?;
 
-        let base_coord = self.view.resolve_coord(coord)?;
-        self.storage.schema.validate_coord(&base_coord)?;
+        let k = self.view.flat_offset(coord)?;
+        if k < 0 {
+            return Err(Error::InvalidCoord("negative linear offset".to_string()));
+        }
+        let k = k as u64;
 
+        let base_coord: Vec<u64> = self
+            .storage
+            .schema
+            .strides()
+            .iter()
+            .zip(self.storage.schema.shape().iter())
+            .map(|(stride, dim)| (k / *stride as u64) % *dim as u64)
+            .collect();
+
+        self.storage.schema.validate_coord(&base_coord)?;
         Ok(base_coord)
     }
 
@@ -428,16 +441,10 @@ where
             ));
         }
 
-        if self.schema.shape() != self.storage.schema.shape() {
-            return Err(Error::Unsupported(
-                "reshape over transformed views is not implemented".to_string(),
-            ));
-        }
-
+        self.view = self.view.reshape(self.schema.shape(), &shape)?;
         self.schema.set_shape(shape)?;
         self.schema
             .set_strides(contiguous_strides(self.schema.shape()))?;
-        self.view = TensorView::identity(&self.schema);
 
         Ok(self)
     }
