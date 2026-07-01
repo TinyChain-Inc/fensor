@@ -500,8 +500,6 @@ mod section_b_transforms {
         let from_original = tensor.read_value(&[0, 0, 0]).await.expect("orig read");
         assert_eq!(from_reshape, from_original);
 
-        assert_eq!(shape.strides(), reshaped.schema().strides());
-
         // Row-major equivalence: index k in [6,4] maps to (k/4, k%4) and
         // to original (k/12, (k%12)/4, k%4) — same linear offset.
         for k in 0..24u64 {

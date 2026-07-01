@@ -10,23 +10,16 @@ pub const PORTABLE_INLINE_RANK: usize = 8;
 pub type TensorShape = SmallVec<[u64; PORTABLE_INLINE_RANK]>;
 
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub struct ViewAxisSchema {
-    pub base_axis: usize,
-    pub map: ViewAxisMapSchema,
-}
-
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub enum ViewAxisMapSchema {
-    Identity,
-    Affine { start: u64, step: u64 },
-    Gather(TensorShape),
+pub enum AxisContribSchema {
+    Stride(i64),
+    Gather(SmallVec<[i64; PORTABLE_INLINE_RANK]>),
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ViewSchema {
-    pub base_rank: usize,
-    pub axes: SmallVec<[ViewAxisSchema; PORTABLE_INLINE_RANK]>,
-    pub base_fixed: SmallVec<[Option<u64>; PORTABLE_INLINE_RANK]>,
+    pub base_rank:   usize,
+    pub base_offset: i64,
+    pub axes:        SmallVec<[AxisContribSchema; PORTABLE_INLINE_RANK]>,
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]

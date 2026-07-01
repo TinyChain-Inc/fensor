@@ -1,12 +1,9 @@
 use destream::{de, en};
 
-use crate::wire_tags::{
-    AXIS_MAP_TAG_AFFINE, AXIS_MAP_TAG_GATHER, AXIS_MAP_TAG_IDENTITY, LAYOUT_TAG_DENSE,
-    LAYOUT_TAG_SPARSE,
-};
+use crate::wire_tags::{AXIS_CONTRIB_TAG_GATHER, AXIS_CONTRIB_TAG_STRIDE, LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
 use crate::{
-    DType, Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema, ViewAxisMapSchema,
-    ViewAxisSchema, ViewSchema, contiguous_strides,
+    AxisContribSchema, DType, Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema,
+    ViewSchema, contiguous_strides,
 };
 
 fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
@@ -21,25 +18,17 @@ fn encode_layout<E: en::Error>(layout: Layout) -> Result<(u8, Option<u64>), E> {
     }
 }
 
-fn encode_axis_map_ref(axis_map: &ViewAxisMapSchema) -> (u8, Vec<u64>) {
-    match axis_map {
-        ViewAxisMapSchema::Identity => (AXIS_MAP_TAG_IDENTITY, Vec::new()),
-        ViewAxisMapSchema::Affine { start, step } => (AXIS_MAP_TAG_AFFINE, vec![*start, *step]),
-        ViewAxisMapSchema::Gather(indices) => (
-            AXIS_MAP_TAG_GATHER,
-            indices.iter().copied().collect::<Vec<u64>>(),
-        ),
+fn encode_axis_contrib_ref(a: &AxisContribSchema) -> (u8, Vec<i64>) {
+    match a {
+        AxisContribSchema::Stride(s) => (AXIS_CONTRIB_TAG_STRIDE, vec![*s]),
+        AxisContribSchema::Gather(g) => (AXIS_CONTRIB_TAG_GATHER, g.iter().copied().collect()),
     }
 }
 
-fn encode_axis_map(axis_map: ViewAxisMapSchema) -> (u8, Vec<u64>) {
-    match axis_map {
-        ViewAxisMapSchema::Identity => (AXIS_MAP_TAG_IDENTITY, Vec::new()),
-        ViewAxisMapSchema::Affine { start, step } => (AXIS_MAP_TAG_AFFINE, vec![start, step]),
-        ViewAxisMapSchema::Gather(indices) => (
-            AXIS_MAP_TAG_GATHER,
-            indices.into_iter().collect::<Vec<u64>>(),
-        ),
+fn encode_axis_contrib(a: AxisContribSchema) -> (u8, Vec<i64>) {
+    match a {
+        AxisContribSchema::Stride(s) => (AXIS_CONTRIB_TAG_STRIDE, vec![s]),
+        AxisContribSchema::Gather(g) => (AXIS_CONTRIB_TAG_GATHER, g.into_iter().collect()),
     }
 }
 
@@ -56,40 +45,20 @@ fn encode_tensor_schema(schema: TensorSchema) -> Result<(DType, Vec<u64>, Layout
     encode_tensor_schema_ref(&schema)
 }
 
-fn encode_view_axis_ref(schema: &ViewAxisSchema) -> Result<(u64, ViewAxisMapSchema), String> {
-    let base_axis =
-        u64::try_from(schema.base_axis).map_err(|_| "view axis overflow".to_string())?;
-    Ok((base_axis, schema.map.clone()))
-}
-
-fn encode_view_axis(schema: ViewAxisSchema) -> Result<(u64, ViewAxisMapSchema), String> {
-    let base_axis =
-        u64::try_from(schema.base_axis).map_err(|_| "view axis overflow".to_string())?;
-    Ok((base_axis, schema.map))
-}
-
-type EncodedViewSchema = (u64, Vec<ViewAxisSchema>, Vec<Option<u64>>);
+type EncodedViewSchema = (u64, i64, Vec<AxisContribSchema>);
 
 fn encode_view_schema_ref(schema: &ViewSchema) -> Result<EncodedViewSchema, String> {
-    let axes = schema.axes.iter().cloned().collect::<Vec<ViewAxisSchema>>();
-    let base_fixed = schema
-        .base_fixed
-        .iter()
-        .cloned()
-        .collect::<Vec<Option<u64>>>();
     let base_rank =
         u64::try_from(schema.base_rank).map_err(|_| "base rank overflow".to_string())?;
-
-    Ok((base_rank, axes, base_fixed))
+    let axes = schema.axes.iter().cloned().collect();
+    Ok((base_rank, schema.base_offset, axes))
 }
 
 fn encode_view_schema(schema: ViewSchema) -> Result<EncodedViewSchema, String> {
-    let axes = schema.axes.into_iter().collect::<Vec<ViewAxisSchema>>();
-    let base_fixed = schema.base_fixed.into_iter().collect::<Vec<Option<u64>>>();
     let base_rank =
         u64::try_from(schema.base_rank).map_err(|_| "base rank overflow".to_string())?;
-
-    Ok((base_rank, axes, base_fixed))
+    let axes = schema.axes.into_iter().collect();
+    Ok((base_rank, schema.base_offset, axes))
 }
 
 fn encode_tensor_ref<FE, T>(tensor: &Tensor<FE, T>) -> Result<(TensorSchema, ViewSchema), String>
@@ -212,72 +181,34 @@ impl<'en> en::IntoStream<'en> for TensorSchema {
     }
 }
 
-impl de::FromStream for ViewAxisMapSchema {
+impl de::FromStream for AxisContribSchema {
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (tag, data): (u8, Vec<u64>) = <(u8, Vec<u64>)>::from_stream((), decoder).await?;
+        let (tag, data): (u8, Vec<i64>) = <(u8, Vec<i64>)>::from_stream((), decoder).await?;
 
         match tag {
-            AXIS_MAP_TAG_IDENTITY => {
-                if !data.is_empty() {
-                    return Err(de::Error::custom("identity axis map expects no payload"));
+            AXIS_CONTRIB_TAG_STRIDE => {
+                if data.len() != 1 {
+                    return Err(de::Error::custom("stride axis contrib expects one i64 payload"));
                 }
-                Ok(Self::Identity)
+                Ok(Self::Stride(data[0]))
             }
-            AXIS_MAP_TAG_AFFINE => {
-                if data.len() != 2 {
-                    return Err(de::Error::custom("affine axis map expects [start, step]"));
-                }
-                Ok(Self::Affine {
-                    start: data[0],
-                    step: data[1],
-                })
-            }
-            AXIS_MAP_TAG_GATHER => Ok(Self::Gather(data.into())),
-            _ => Err(de::Error::custom(format!("unknown axis map tag {tag}"))),
+            AXIS_CONTRIB_TAG_GATHER => Ok(Self::Gather(data.into())),
+            _ => Err(de::Error::custom(format!("unknown axis contrib tag {tag}"))),
         }
     }
 }
 
-impl<'en> en::ToStream<'en> for ViewAxisMapSchema {
+impl<'en> en::ToStream<'en> for AxisContribSchema {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(encode_axis_map_ref(self), encoder)
+        en::IntoStream::into_stream(encode_axis_contrib_ref(self), encoder)
     }
 }
 
-impl<'en> en::IntoStream<'en> for ViewAxisMapSchema {
+impl<'en> en::IntoStream<'en> for AxisContribSchema {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(encode_axis_map(self), encoder)
-    }
-}
-
-impl de::FromStream for ViewAxisSchema {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (base_axis, map): (u64, ViewAxisMapSchema) =
-            <(u64, ViewAxisMapSchema)>::from_stream((), decoder).await?;
-
-        let base_axis =
-            usize::try_from(base_axis).map_err(|_| de::Error::custom("view axis overflow"))?;
-
-        Ok(Self { base_axis, map })
-    }
-}
-
-impl<'en> en::ToStream<'en> for ViewAxisSchema {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(
-            encode_view_axis_ref(self).map_err(en::Error::custom)?,
-            encoder,
-        )
-    }
-}
-
-impl<'en> en::IntoStream<'en> for ViewAxisSchema {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(encode_view_axis(self).map_err(en::Error::custom)?, encoder)
+        en::IntoStream::into_stream(encode_axis_contrib(self), encoder)
     }
 }
 
@@ -285,16 +216,16 @@ impl de::FromStream for ViewSchema {
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (base_rank, axes, base_fixed): (u64, Vec<ViewAxisSchema>, Vec<Option<u64>>) =
-            <(u64, Vec<ViewAxisSchema>, Vec<Option<u64>>)>::from_stream((), decoder).await?;
+        let (base_rank, base_offset, axes): (u64, i64, Vec<AxisContribSchema>) =
+            <(u64, i64, Vec<AxisContribSchema>)>::from_stream((), decoder).await?;
 
         let base_rank =
             usize::try_from(base_rank).map_err(|_| de::Error::custom("base rank overflow"))?;
 
         Ok(Self {
             base_rank,
+            base_offset,
             axes: axes.into(),
-            base_fixed: base_fixed.into(),
         })
     }
 }
@@ -375,8 +306,7 @@ mod tests {
         assert_stream::<DType>();
         assert_stream::<Layout>();
         assert_stream::<TensorSchema>();
-        assert_stream::<ViewAxisMapSchema>();
-        assert_stream::<ViewAxisSchema>();
+        assert_stream::<AxisContribSchema>();
         assert_stream::<ViewSchema>();
     }
 }
