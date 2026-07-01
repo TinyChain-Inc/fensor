@@ -489,8 +489,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn reshape_then_read_dense() {
-        let (root, tensor, shape) =
-            create_dense("b_reshape", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_reshape", shape![2, 3, 4], shape![1, 1, 4]).await;
         seed_values(&tensor).await;
 
         let reshaped = tensor.clone().reshape(shape![6, 4]).expect("reshape");
@@ -697,6 +696,194 @@ mod section_b_transforms {
 
         let err = sliced.reshape(shape![16]).err().expect("must reject");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn slice_axis_range_at() {
+        let (root, tensor, _) = create_dense("b_at_dense", shape![3, 4, 5], shape![1, 1, 5]).await;
+        seed_values(&tensor).await;
+
+        let sliced = tensor
+            .clone()
+            .slice(range![
+                AxisRange::At(1),
+                AxisRange::In(0, 4, 1),
+                AxisRange::In(0, 5, 1)
+            ])
+            .expect("slice At dense");
+        assert_eq!(sliced.shape(), &[4, 5]);
+
+        for coord in iter_coords(sliced.shape()) {
+            let src = vec![1u64, coord[0], coord[1]];
+            let expected = tensor.read_value(&src).await.expect("orig dense At");
+            let actual = sliced.read_value(&coord).await.expect("sliced dense At");
+            assert_eq!(actual, expected, "At dense coord {:?}", coord);
+        }
+        cleanup(&root).await;
+
+        let (root, tensor, _) =
+            create_sparse("b_at_sparse", shape![3, 4, 5], shape![1, 1, 5], Some(0)).await;
+        seed_values(&tensor).await;
+
+        let sliced = tensor
+            .clone()
+            .slice(range![
+                AxisRange::At(1),
+                AxisRange::In(0, 4, 1),
+                AxisRange::In(0, 5, 1)
+            ])
+            .expect("slice At sparse");
+        assert_eq!(sliced.shape(), &[4, 5]);
+
+        for coord in iter_coords(sliced.shape()) {
+            let src = vec![1u64, coord[0], coord[1]];
+            let expected = tensor.read_value(&src).await.expect("orig sparse At");
+            let actual = sliced.read_value(&coord).await.expect("sliced sparse At");
+            assert_eq!(actual, expected, "At sparse coord {:?}", coord);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn slice_axis_range_in_with_step_gt_one() {
+        let (root, tensor, _) =
+            create_dense("b_step2_dense", shape![4, 6, 8], shape![1, 1, 8]).await;
+        seed_values(&tensor).await;
+
+        let sliced = tensor
+            .clone()
+            .slice(range![
+                AxisRange::In(0, 4, 2),
+                AxisRange::In(0, 6, 2),
+                AxisRange::In(0, 8, 2)
+            ])
+            .expect("slice step=2 dense");
+        assert_eq!(sliced.shape(), &[2, 3, 4]);
+
+        for coord in iter_coords(sliced.shape()) {
+            let src = vec![coord[0] * 2, coord[1] * 2, coord[2] * 2];
+            let expected = tensor.read_value(&src).await.expect("orig dense step2");
+            let actual = sliced.read_value(&coord).await.expect("sliced dense step2");
+            assert_eq!(actual, expected, "step2 dense coord {:?}", coord);
+        }
+        cleanup(&root).await;
+
+        let (root, tensor, _) =
+            create_sparse("b_step2_sparse", shape![4, 6, 8], shape![1, 1, 8], Some(1)).await;
+        seed_values(&tensor).await;
+
+        let sliced = tensor
+            .clone()
+            .slice(range![
+                AxisRange::In(0, 4, 2),
+                AxisRange::In(0, 6, 2),
+                AxisRange::In(0, 8, 2)
+            ])
+            .expect("slice step=2 sparse");
+        assert_eq!(sliced.shape(), &[2, 3, 4]);
+
+        for coord in iter_coords(sliced.shape()) {
+            let src = vec![coord[0] * 2, coord[1] * 2, coord[2] * 2];
+            let expected = tensor.read_value(&src).await.expect("orig sparse step2");
+            let actual = sliced
+                .read_value(&coord)
+                .await
+                .expect("sliced sparse step2");
+            assert_eq!(actual, expected, "step2 sparse coord {:?}", coord);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn slice_axis_range_of_gather() {
+        let src_indices: &[u64] = &[0, 2, 3];
+
+        let (root, tensor, _) =
+            create_dense("b_gather_dense", shape![4, 5, 6], shape![1, 1, 6]).await;
+        seed_values(&tensor).await;
+
+        let sliced = tensor
+            .clone()
+            .slice(range![
+                AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
+                AxisRange::In(0, 5, 1),
+                AxisRange::In(0, 6, 1)
+            ])
+            .expect("slice Of dense");
+        assert_eq!(sliced.shape(), &[3, 5, 6]);
+
+        for coord in iter_coords(sliced.shape()) {
+            let src = vec![src_indices[coord[0] as usize], coord[1], coord[2]];
+            let expected = tensor.read_value(&src).await.expect("orig dense gather");
+            let actual = sliced
+                .read_value(&coord)
+                .await
+                .expect("sliced dense gather");
+            assert_eq!(actual, expected, "Of dense coord {:?}", coord);
+        }
+        cleanup(&root).await;
+
+        let (root, tensor, _) =
+            create_sparse("b_gather_sparse", shape![4, 5, 6], shape![1, 1, 6], Some(0)).await;
+        seed_values(&tensor).await;
+
+        let sliced = tensor
+            .clone()
+            .slice(range![
+                AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
+                AxisRange::In(0, 5, 1),
+                AxisRange::In(0, 6, 1)
+            ])
+            .expect("slice Of sparse");
+        assert_eq!(sliced.shape(), &[3, 5, 6]);
+
+        for coord in iter_coords(sliced.shape()) {
+            let src = vec![src_indices[coord[0] as usize], coord[1], coord[2]];
+            let expected = tensor.read_value(&src).await.expect("orig sparse gather");
+            let actual = sliced
+                .read_value(&coord)
+                .await
+                .expect("sliced sparse gather");
+            assert_eq!(actual, expected, "Of sparse coord {:?}", coord);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn degenerate_slice_empty_axis() {
+        let (root, tensor, _) =
+            create_dense("b_empty_axis", shape![4, 5, 6], shape![1, 1, 6]).await;
+
+        // In(2, 2, 1) produces extent = 0 on axis 0. The schema rejects zero-dim
+        // shapes, so slice must return an error rather than panic.
+        let result = tensor.clone().slice(range![
+            AxisRange::In(2, 2, 1),
+            AxisRange::In(0, 5, 1),
+            AxisRange::In(0, 6, 1)
+        ]);
+        assert!(result.is_err(), "zero-extent slice must fail, got Ok");
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn transpose_identity_permutation_is_noop() {
+        let (root, tensor, _) = create_dense("b_id_perm", shape![2, 3, 4], shape![1, 1, 4]).await;
+        seed_values(&tensor).await;
+
+        let transposed = tensor
+            .clone()
+            .transpose(Some(axes![0, 1, 2]))
+            .expect("identity tx");
+        assert_eq!(transposed.shape(), tensor.shape());
+
+        for coord in iter_coords(tensor.shape()) {
+            let expected = tensor.read_value(&coord).await.expect("orig");
+            let actual = transposed.read_value(&coord).await.expect("identity tx");
+            assert_eq!(actual, expected, "identity perm coord {:?}", coord);
+        }
 
         cleanup(&root).await;
     }

@@ -22,10 +22,6 @@ impl TensorView {
         self.axes.len()
     }
 
-    pub fn base_rank(&self) -> usize {
-        self.base_rank
-    }
-
     pub fn identity(schema: &TensorSchema) -> Self {
         Self {
             base_rank: schema.rank(),
