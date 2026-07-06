@@ -22,108 +22,29 @@ pub enum FsEntry {
     Text(String),
 }
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
-pub enum FsEntryTag {
-    Node = 0,
-    F32 = 1,
-    F64 = 2,
-    Text = 3,
-}
-
-impl FsEntryTag {
-    fn to_u8(self) -> u8 {
-        self as u8
-    }
-
-    fn from_u8(tag: u8) -> Option<Self> {
-        match tag {
-            x if x == Self::Node as u8 => Some(Self::Node),
-            x if x == Self::F32 as u8 => Some(Self::F32),
-            x if x == Self::F64 as u8 => Some(Self::F64),
-            x if x == Self::Text as u8 => Some(Self::Text),
-            _ => None,
-        }
-    }
-}
-
 impl<'en> en::ToStream<'en> for FsEntry {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
-            Self::Node(node) => en::IntoStream::into_stream(
-                (
-                    FsEntryTag::Node.to_u8(),
-                    Some(node.clone()),
-                    None::<Vec<f32>>,
-                    None::<Vec<f64>>,
-                    None::<String>,
-                ),
-                encoder,
-            ),
-            Self::F32(values) => en::IntoStream::into_stream(
-                (
-                    FsEntryTag::F32.to_u8(),
-                    None::<Node<u64>>,
-                    Some(values.clone()),
-                    None::<Vec<f64>>,
-                    None::<String>,
-                ),
-                encoder,
-            ),
-            Self::F64(values) => en::IntoStream::into_stream(
-                (
-                    FsEntryTag::F64.to_u8(),
-                    None::<Node<u64>>,
-                    None::<Vec<f32>>,
-                    Some(values.clone()),
-                    None::<String>,
-                ),
-                encoder,
-            ),
-            Self::Text(text) => en::IntoStream::into_stream(
-                (
-                    FsEntryTag::Text.to_u8(),
-                    None::<Node<u64>>,
-                    None::<Vec<f32>>,
-                    None::<Vec<f64>>,
-                    Some(text.clone()),
-                ),
-                encoder,
-            ),
+            Self::Node(node) => node.to_stream(encoder),
+            Self::F32(values) => values.to_stream(encoder),
+            Self::F64(values) => values.to_stream(encoder),
+            Self::Text(text) => text.to_stream(encoder),
         }
     }
 }
 
-type DecodedFsEntry = (
-    u8,
-    Option<Node<u64>>,
-    Option<Vec<f32>>,
-    Option<Vec<f64>>,
-    Option<String>,
-);
-
+// `TensorFileEntry<T>: FileLoad` is only satisfiable via the blanket
+// `impl<T: FromStream> FileLoad for T`, so `FsEntry` needs a `FromStream` impl to
+// type-check. Every read in this codebase goes through a concrete `AsType` target
+// (`String`/`Vec<f32>`/`Vec<f64>`/`Node<u64>`), never through `FsEntry` itself, so
+// this is never actually invoked at runtime.
 impl de::FromStream for FsEntry {
     type Context = ();
 
-    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (tag, node, f32_values, f64_values, text): DecodedFsEntry =
-            <DecodedFsEntry>::from_stream((), decoder).await?;
-
-        match FsEntryTag::from_u8(tag) {
-            Some(FsEntryTag::Node) => node
-                .map(Self::Node)
-                .ok_or_else(|| de::Error::custom("missing node payload")),
-            Some(FsEntryTag::F32) => f32_values
-                .map(Self::F32)
-                .ok_or_else(|| de::Error::custom("missing f32 payload")),
-            Some(FsEntryTag::F64) => f64_values
-                .map(Self::F64)
-                .ok_or_else(|| de::Error::custom("missing f64 payload")),
-            Some(FsEntryTag::Text) => text
-                .map(Self::Text)
-                .ok_or_else(|| de::Error::custom("missing string payload")),
-            None => Err(de::Error::custom(format!("unknown fs entry tag {tag}"))),
-        }
+    async fn from_stream<D: de::Decoder>(_: (), _decoder: &mut D) -> Result<Self, D::Error> {
+        Err(de::Error::custom(
+            "FsEntry does not support generic decoding; read via a concrete AsType target",
+        ))
     }
 }
 
