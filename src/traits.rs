@@ -209,12 +209,12 @@ impl SparseZeroPolicy {
         }
     }
 
-    pub fn from_str(s: &str) -> crate::Result<Self> {
+    pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "remove_row" => Ok(Self::RemoveRow),
             "tombstone" => Ok(Self::Tombstone),
             "retain_zero" => Ok(Self::RetainZero),
-            other => Err(crate::Error::InvalidSchema(format!(
+            other => Err(Error::InvalidSchema(format!(
                 "unsupported sparse zero policy: {other}"
             ))),
         }
