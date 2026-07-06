@@ -171,6 +171,14 @@ pub trait TensorSparseIndex: Send + Sync {
     fn lookup_block_id<'a>(&'a self, key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>>;
 
     fn upsert_block_id<'a>(&'a self, key: Vec<u64>, block_id: u64) -> BoxFuture<'a, Result<()>>;
+
+    fn delete_row<'a>(&'a self, _key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Err(Error::Unsupported(
+                "delete_row is not implemented for this tensor backend".to_string(),
+            ))
+        })
+    }
 }
 
 /// Base/view capability contract, aligned with v1 writeability semantics.
@@ -190,6 +198,27 @@ pub enum SparseZeroPolicy {
     RemoveRow,
     Tombstone,
     RetainZero,
+}
+
+impl SparseZeroPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RemoveRow => "remove_row",
+            Self::Tombstone => "tombstone",
+            Self::RetainZero => "retain_zero",
+        }
+    }
+
+    pub fn from_str(s: &str) -> crate::Result<Self> {
+        match s {
+            "remove_row" => Ok(Self::RemoveRow),
+            "tombstone" => Ok(Self::Tombstone),
+            "retain_zero" => Ok(Self::RetainZero),
+            other => Err(crate::Error::InvalidSchema(format!(
+                "unsupported sparse zero policy: {other}"
+            ))),
+        }
+    }
 }
 
 pub trait TensorSparseLifecycle: TensorArray {

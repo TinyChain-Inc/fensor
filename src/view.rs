@@ -246,6 +246,16 @@ impl TensorView {
         Ok(k)
     }
 
+    pub fn is_identity(&self, base_schema: &TensorSchema) -> bool {
+        self.base_offset == 0 && self.is_c_contiguous(base_schema.shape())
+    }
+
+    pub fn has_gather_axes(&self) -> bool {
+        self.axes
+            .iter()
+            .any(|a| matches!(a, AxisContrib::Gather(_)))
+    }
+
     fn is_c_contiguous(&self, shape: &[usize]) -> bool {
         if self.axes.len() != shape.len() {
             return false;

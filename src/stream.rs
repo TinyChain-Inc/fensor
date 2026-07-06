@@ -4,8 +4,8 @@ use crate::wire_tags::{
     AXIS_CONTRIB_TAG_GATHER, AXIS_CONTRIB_TAG_STRIDE, LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE,
 };
 use crate::{
-    AxisContribSchema, DType, Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema,
-    ViewSchema, contiguous_strides,
+    AxisContribSchema, DType, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry,
+    TensorSchema, ViewSchema, contiguous_strides,
 };
 
 fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
@@ -68,7 +68,7 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    let schema = tensor.schema.clone();
+    let schema = tensor.schema().clone();
     let view = tensor.view_schema().map_err(|err| err.to_string())?;
 
     Ok((schema, view))
@@ -80,7 +80,7 @@ where
     T: TensorElement,
 {
     let view = tensor.view_schema().map_err(|err| err.to_string())?;
-    let schema = tensor.schema;
+    let schema = tensor.schema().clone();
 
     Ok((schema, view))
 }

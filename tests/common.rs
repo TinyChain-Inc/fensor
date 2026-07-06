@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use b_table::Node;
 use destream::{de, en};
-use fensor::{Layout, Tensor, TensorSchema, TensorSparseIndex};
+use fensor::{Layout, TensorSchema, TensorSparseIndex};
 use freqfs::{Cache, DirLock};
 use safecast::as_type;
 
@@ -195,8 +195,8 @@ pub fn block_key_for_coord(schema: &TensorSchema, coord: &[u64]) -> Vec<u64> {
 /// Test helper: probe the sparse index for the block backing `coord`.
 /// Wraps `block_key_for_coord` + `TensorSparseIndex::lookup_block_id` so test
 /// bodies can talk in coord-space instead of hand-spelling block keys.
-pub async fn block_id_for_coord(
-    tensor: &Tensor<FsEntry, f32>,
+pub async fn block_id_for_coord<T: TensorSparseIndex>(
+    tensor: &T,
     schema: &TensorSchema,
     coord: &[u64],
 ) -> Option<u64> {
