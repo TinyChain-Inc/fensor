@@ -20,6 +20,8 @@ pub struct ViewSchema {
     pub base_rank: usize,
     pub base_offset: i64,
     pub axes: SmallVec<[AxisContribSchema; PORTABLE_INLINE_RANK]>,
+    pub shape: TensorShape,
+    pub strides: TensorShape,
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -93,6 +95,28 @@ impl TensorSchema {
                     .map_err(|_| Error::InvalidSchema("shape dimension overflow".to_string()))
             })
             .collect::<FResult<TensorShape>>()
+    }
+
+    pub(crate) fn strides_u64(&self) -> FResult<TensorShape> {
+        self.internal
+            .strides
+            .iter()
+            .map(|stride| {
+                u64::try_from(*stride)
+                    .map_err(|_| Error::InvalidSchema("stride overflow".to_string()))
+            })
+            .collect::<FResult<TensorShape>>()
+    }
+
+    pub(crate) fn strides_usize_from_u64(strides: &[u64]) -> FResult<Strides> {
+        strides
+            .iter()
+            .map(|stride| {
+                usize::try_from(*stride)
+                    .map_err(|_| Error::InvalidSchema("stride overflow".to_string()))
+            })
+            .collect::<FResult<Vec<usize>>>()
+            .map(Into::into)
     }
 
     pub fn new(

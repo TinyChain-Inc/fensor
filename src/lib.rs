@@ -155,7 +155,10 @@ where
     }
 
     pub fn view_schema(&self) -> Result<ViewSchema> {
-        self.view.to_schema()
+        let mut view_schema = self.view.to_schema()?;
+        view_schema.shape = self.schema.shape_u64()?;
+        view_schema.strides = self.schema.strides_u64()?;
+        Ok(view_schema)
     }
 
     pub fn with_view_schema(mut self, view_schema: &ViewSchema) -> Result<Self> {
@@ -165,6 +168,10 @@ where
                 "view rank must match tensor rank".to_string(),
             ));
         }
+        self.schema
+            .set_shape(TensorSchema::shape_usize_from_u64(&view_schema.shape)?)?;
+        self.schema
+            .set_strides(TensorSchema::strides_usize_from_u64(&view_schema.strides)?)?;
         self.view = view;
         Ok(self)
     }
@@ -342,7 +349,10 @@ where
     }
 
     pub fn view_schema(&self) -> Result<ViewSchema> {
-        self.view.to_schema()
+        let mut view_schema = self.view.to_schema()?;
+        view_schema.shape = self.schema.shape_u64()?;
+        view_schema.strides = self.schema.strides_u64()?;
+        Ok(view_schema)
     }
 
     pub fn with_view_schema(mut self, view_schema: &ViewSchema) -> Result<Self> {
@@ -352,6 +362,10 @@ where
                 "view rank must match tensor rank".to_string(),
             ));
         }
+        self.schema
+            .set_shape(TensorSchema::shape_usize_from_u64(&view_schema.shape)?)?;
+        self.schema
+            .set_strides(TensorSchema::strides_usize_from_u64(&view_schema.strides)?)?;
         self.view = view;
         Ok(self)
     }

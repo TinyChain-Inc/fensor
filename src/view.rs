@@ -168,6 +168,9 @@ impl TensorView {
         ))
     }
 
+    /// Note: `shape`/`strides` are left empty here — `TensorView` has no notion of per-axis
+    /// extent for `Stride` axes. Callers (`DenseTensor`/`SparseTensor::view_schema`) fill
+    /// those in from the tensor's current `TensorSchema` after calling this.
     pub fn to_schema(&self) -> Result<ViewSchema> {
         Ok(ViewSchema {
             base_rank: self.base_rank,
@@ -182,6 +185,8 @@ impl TensorView {
                     }
                 })
                 .collect(),
+            shape: schema::TensorShape::new(),
+            strides: schema::TensorShape::new(),
         })
     }
 

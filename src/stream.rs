@@ -47,20 +47,24 @@ fn encode_tensor_schema(schema: TensorSchema) -> Result<(DType, Vec<u64>, Layout
     encode_tensor_schema_ref(&schema)
 }
 
-type EncodedViewSchema = (u64, i64, Vec<AxisContribSchema>);
+type EncodedViewSchema = (u64, i64, Vec<AxisContribSchema>, Vec<u64>, Vec<u64>);
 
 fn encode_view_schema_ref(schema: &ViewSchema) -> Result<EncodedViewSchema, String> {
     let base_rank =
         u64::try_from(schema.base_rank).map_err(|_| "base rank overflow".to_string())?;
     let axes = schema.axes.iter().cloned().collect();
-    Ok((base_rank, schema.base_offset, axes))
+    let shape = schema.shape.iter().copied().collect();
+    let strides = schema.strides.iter().copied().collect();
+    Ok((base_rank, schema.base_offset, axes, shape, strides))
 }
 
 fn encode_view_schema(schema: ViewSchema) -> Result<EncodedViewSchema, String> {
     let base_rank =
         u64::try_from(schema.base_rank).map_err(|_| "base rank overflow".to_string())?;
     let axes = schema.axes.into_iter().collect();
-    Ok((base_rank, schema.base_offset, axes))
+    let shape = schema.shape.into_iter().collect();
+    let strides = schema.strides.into_iter().collect();
+    Ok((base_rank, schema.base_offset, axes, shape, strides))
 }
 
 fn encode_tensor_ref<FE, T>(tensor: &Tensor<FE, T>) -> Result<(TensorSchema, ViewSchema), String>
@@ -220,8 +224,14 @@ impl de::FromStream for ViewSchema {
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (base_rank, base_offset, axes): (u64, i64, Vec<AxisContribSchema>) =
-            <(u64, i64, Vec<AxisContribSchema>)>::from_stream((), decoder).await?;
+        let (base_rank, base_offset, axes, shape, strides): (
+            u64,
+            i64,
+            Vec<AxisContribSchema>,
+            Vec<u64>,
+            Vec<u64>,
+        ) = <(u64, i64, Vec<AxisContribSchema>, Vec<u64>, Vec<u64>)>::from_stream((), decoder)
+            .await?;
 
         let base_rank =
             usize::try_from(base_rank).map_err(|_| de::Error::custom("base rank overflow"))?;
@@ -230,6 +240,8 @@ impl de::FromStream for ViewSchema {
             base_rank,
             base_offset,
             axes: axes.into(),
+            shape: shape.into(),
+            strides: strides.into(),
         })
     }
 }
