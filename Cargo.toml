@@ -11,6 +11,7 @@ b-table = { path = "../b-table", features = ["stream"] }
 destream = "0.10"
 freqfs = "0.12"
 ha-ndarray = "0.5"
+futures = "0.3"
 rand = "0.8"
 safecast = "0.2"
 smallvec = "1"
