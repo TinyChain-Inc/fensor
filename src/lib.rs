@@ -686,7 +686,7 @@ where
                     validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
                     Ok(block[offset_in_block])
                 } else {
-                    Ok(T::default())
+                    Err(Error::SparseIndex("Block is missing".to_string()))
                 }
             } else {
                 Ok(T::default())
