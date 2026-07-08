@@ -17,8 +17,8 @@ mod wire_tags;
 
 pub use error::{Error, Result};
 pub use schema::{
-    AxisContribSchema, DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema,
-    TensorShape, ViewSchema, contiguous_strides,
+    DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape,
+    contiguous_strides,
 };
 pub use traits::{
     BoxFuture, SparseZeroPolicy, TensorArray, TensorBlockStore, TensorMatMul, TensorMath,
@@ -152,28 +152,6 @@ where
             view,
             _dtype: std::marker::PhantomData,
         }
-    }
-
-    pub fn view_schema(&self) -> Result<ViewSchema> {
-        let mut view_schema = self.view.to_schema()?;
-        view_schema.shape = self.schema.shape_u64()?;
-        view_schema.strides = self.schema.strides_u64()?;
-        Ok(view_schema)
-    }
-
-    pub fn with_view_schema(mut self, view_schema: &ViewSchema) -> Result<Self> {
-        let view = TensorView::from_schema(view_schema)?;
-        if view.rank() != self.schema.rank() {
-            return Err(Error::InvalidSchema(
-                "view rank must match tensor rank".to_string(),
-            ));
-        }
-        self.schema
-            .set_shape(TensorSchema::shape_usize_from_u64(&view_schema.shape)?)?;
-        self.schema
-            .set_strides(TensorSchema::strides_usize_from_u64(&view_schema.strides)?)?;
-        self.view = view;
-        Ok(self)
     }
 
     pub(crate) fn block_len(&self) -> usize {
@@ -346,28 +324,6 @@ where
             view,
             _dtype: std::marker::PhantomData,
         }
-    }
-
-    pub fn view_schema(&self) -> Result<ViewSchema> {
-        let mut view_schema = self.view.to_schema()?;
-        view_schema.shape = self.schema.shape_u64()?;
-        view_schema.strides = self.schema.strides_u64()?;
-        Ok(view_schema)
-    }
-
-    pub fn with_view_schema(mut self, view_schema: &ViewSchema) -> Result<Self> {
-        let view = TensorView::from_schema(view_schema)?;
-        if view.rank() != self.schema.rank() {
-            return Err(Error::InvalidSchema(
-                "view rank must match tensor rank".to_string(),
-            ));
-        }
-        self.schema
-            .set_shape(TensorSchema::shape_usize_from_u64(&view_schema.shape)?)?;
-        self.schema
-            .set_strides(TensorSchema::strides_usize_from_u64(&view_schema.strides)?)?;
-        self.view = view;
-        Ok(self)
     }
 
     pub(crate) fn block_len(&self) -> usize {
@@ -560,20 +516,6 @@ where
             )));
         }
         Ok(tensor)
-    }
-
-    pub fn view_schema(&self) -> Result<ViewSchema> {
-        match self {
-            Self::Dense(inner) => inner.view_schema(),
-            Self::Sparse(inner) => inner.view_schema(),
-        }
-    }
-
-    pub fn with_view_schema(self, view_schema: &ViewSchema) -> Result<Self> {
-        match self {
-            Self::Dense(inner) => inner.with_view_schema(view_schema).map(Self::Dense),
-            Self::Sparse(inner) => inner.with_view_schema(view_schema).map(Self::Sparse),
-        }
     }
 
     pub fn as_sparse(&self) -> Option<&SparseTensor<FE, T>> {
