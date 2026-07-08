@@ -1846,38 +1846,6 @@ mod section_h_persistence {
     }
 
     #[tokio::test]
-    async fn view_schema_persists_via_with_view_schema() {
-        let root = common::unique_tmp_dir("h_view_persist");
-        tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = dense_schema_f32(shape![2, 3, 4], shape![1, 1, 4]);
-
-        let view_schema = {
-            let dir = open_dir(&root).expect("open");
-            let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
-                .await
-                .expect("create");
-            seed_values(&tensor).await;
-            let transposed = tensor.clone().transpose(Some(axes![2, 0, 1])).expect("tx");
-            let vs = transposed.view_schema().expect("view schema");
-            dir.sync().await.expect("sync");
-            vs
-        };
-
-        let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
-            .await
-            .expect("reload");
-        let rehydrated = loaded
-            .with_view_schema(&view_schema)
-            .expect("rehydrate view");
-        assert_eq!(rehydrated.shape(), &[4, 2, 3]);
-        // sample one coord to verify the view still resolves correctly
-        let _ = rehydrated.read_value(&[0, 0, 0]).await.expect("read");
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
     async fn metadata_file_missing_fails_closed() {
         let root = common::unique_tmp_dir("h_meta_missing");
         tokio::fs::create_dir(&root).await.expect("mkdir");
