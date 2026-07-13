@@ -293,10 +293,6 @@ impl b_table::BTreeSchema for SparseIndexSchema {
         self.columns.len()
     }
 
-    fn is_empty(&self) -> bool {
-        self.columns.is_empty()
-    }
-
     fn order(&self) -> usize {
         16
     }
