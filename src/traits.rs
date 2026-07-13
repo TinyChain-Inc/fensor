@@ -192,49 +192,6 @@ pub trait TensorViewSemantics: TensorArray {
     }
 }
 
-/// Sparse lifecycle policy for zero-write handling and index cleanup.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum SparseZeroPolicy {
-    RemoveRow,
-    Tombstone,
-    RetainZero,
-}
-
-impl SparseZeroPolicy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RemoveRow => "remove_row",
-            Self::Tombstone => "tombstone",
-            Self::RetainZero => "retain_zero",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "remove_row" => Ok(Self::RemoveRow),
-            "tombstone" => Ok(Self::Tombstone),
-            "retain_zero" => Ok(Self::RetainZero),
-            other => Err(Error::InvalidSchema(format!(
-                "unsupported sparse zero policy: {other}"
-            ))),
-        }
-    }
-}
-
-pub trait TensorSparseLifecycle: TensorArray {
-    fn sparse_zero_policy(&self) -> SparseZeroPolicy {
-        SparseZeroPolicy::RemoveRow
-    }
-
-    fn compact_sparse<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sparse compaction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
-}
-
 /// Unary tensor math operations.
 pub trait TensorUnary: TensorArray + Sized {
     fn exp<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {

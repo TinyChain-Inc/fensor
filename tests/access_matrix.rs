@@ -17,10 +17,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, SparseTensor, SparseZeroPolicy, Tensor, TensorArray,
-    TensorBlockStore, TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex,
-    TensorSparseLifecycle, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
-    contiguous_strides,
+    BoxFuture, DType, Error, Layout, SparseTensor, Tensor, TensorArray, TensorBlockStore,
+    TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform,
+    TensorViewSemantics, TensorWrite, TensorWriteBulk, contiguous_strides,
 };
 use ha_ndarray::{Axes, AxisRange, Range, Shape, axes, range, shape};
 
@@ -66,30 +65,9 @@ async fn create_sparse(
 ) -> (PathBuf, SparseTensor<FsEntry, f32>, TensorSchema) {
     let (root, dir) = new_dir(name).await;
     let schema = sparse_schema_f32(shape, block_shape, axis);
-    let tensor =
-        SparseTensor::<FsEntry, f32>::create(dir, schema.clone(), SparseZeroPolicy::RemoveRow)
-            .await
-            .expect("create sparse");
-    (root, tensor, schema)
-}
-
-async fn create_sparse_with_policy(
-    name: &str,
-    shape: Shape,
-    block_shape: Shape,
-    axis: Option<usize>,
-    policy: SparseZeroPolicy,
-) -> (PathBuf, SparseTensor<FsEntry, f32>, TensorSchema) {
-    let (root, dir) = new_dir(name).await;
-    let schema = sparse_schema_f32(shape, block_shape, axis);
-    assert!(
-        matches!(schema.layout(), Layout::Sparse { .. }),
-        "create_sparse_with_policy requires a sparse schema; got {:?}",
-        schema.layout()
-    );
-    let tensor = SparseTensor::<FsEntry, f32>::create(dir, schema.clone(), policy)
+    let tensor = SparseTensor::<FsEntry, f32>::create(dir, schema.clone())
         .await
-        .expect("create sparse with policy");
+        .expect("create sparse");
     (root, tensor, schema)
 }
 
@@ -1265,56 +1243,6 @@ mod section_e_sparse_lifecycle {
     }
 
     #[tokio::test]
-    async fn sparse_nonzero_to_zero_retain_zero_policy() {
-        let (root, tensor, schema) = create_sparse_with_policy(
-            "e_retain_zero",
-            shape![2, 3, 4],
-            shape![1, 1, 4],
-            Some(1),
-            SparseZeroPolicy::RetainZero,
-        )
-        .await;
-
-        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write nz");
-        tensor.write_value(&[0, 1, 2], 0.0).await.expect("write z");
-
-        assert!(
-            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
-                .await
-                .is_some(),
-            "RetainZero must keep the row after zero write"
-        );
-        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 0.0);
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn sparse_nonzero_to_zero_tombstone_policy() {
-        let (root, tensor, schema) = create_sparse_with_policy(
-            "e_tombstone",
-            shape![2, 3, 4],
-            shape![1, 1, 4],
-            Some(1),
-            SparseZeroPolicy::Tombstone,
-        )
-        .await;
-
-        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write nz");
-        tensor.write_value(&[0, 1, 2], 0.0).await.expect("write z");
-
-        assert!(
-            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
-                .await
-                .is_some(),
-            "Tombstone policy must retain the row after zero write"
-        );
-        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 0.0);
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
     async fn sparse_overwrite_nonzero_preserves_row_id() {
         let (root, tensor, schema) =
             create_sparse("e_overwrite", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
@@ -1359,71 +1287,6 @@ mod section_e_sparse_lifecycle {
     }
 
     #[tokio::test]
-    async fn sparse_zero_policy_persists_across_reload() {
-        let root = common::unique_tmp_dir("e_policy_persist");
-        tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = sparse_schema_f32(shape![2, 3, 4], shape![1, 1, 4], Some(1));
-
-        {
-            let dir = open_dir(&root).expect("open");
-            let _ = SparseTensor::<FsEntry, f32>::create(
-                dir.clone(),
-                schema.clone(),
-                SparseZeroPolicy::RetainZero,
-            )
-            .await
-            .expect("create");
-            dir.sync().await.expect("sync");
-        }
-
-        let dir2 = open_dir(&root).expect("reopen");
-        let loaded = SparseTensor::<FsEntry, f32>::load(dir2)
-            .await
-            .expect("reload");
-
-        assert_eq!(
-            loaded.sparse_zero_policy(),
-            SparseZeroPolicy::RetainZero,
-            "policy must survive round-trip through disk"
-        );
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn compact_sparse_retain_zero_cleans_rows() {
-        let (root, tensor, schema) = create_sparse_with_policy(
-            "e_compact_retain",
-            shape![2, 3, 4],
-            shape![1, 1, 4],
-            Some(1),
-            SparseZeroPolicy::RetainZero,
-        )
-        .await;
-
-        tensor.write_value(&[0, 1, 2], 5.0).await.expect("nz");
-        tensor.write_value(&[0, 1, 2], 0.0).await.expect("zero");
-
-        assert!(
-            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
-                .await
-                .is_some(),
-            "RetainZero: row must be present before compact"
-        );
-
-        tensor.compact_sparse().await.expect("compact");
-
-        assert!(
-            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
-                .await
-                .is_none(),
-            "compact must remove all-zero rows regardless of policy"
-        );
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
     async fn compact_sparse_preserves_nonzero_rows() {
         let (root, tensor, schema) = create_sparse(
             "e_compact_preserve",
@@ -1449,47 +1312,29 @@ mod section_e_sparse_lifecycle {
     }
 
     #[tokio::test]
-    async fn sparse_write_zero_to_new_coord_is_noop_all_policies() {
-        for (name_suffix, policy) in [
-            ("remove", SparseZeroPolicy::RemoveRow),
-            ("tombstone", SparseZeroPolicy::Tombstone),
-            ("retain", SparseZeroPolicy::RetainZero),
-        ] {
-            let (root, tensor, schema) = create_sparse_with_policy(
-                &format!("e_noop_{name_suffix}"),
-                shape![2, 3, 4],
-                shape![1, 1, 4],
-                Some(1),
-                policy,
-            )
-            .await;
+    async fn sparse_write_zero_to_new_coord_is_noop() {
+        let (root, tensor, schema) =
+            create_sparse("e_noop", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
 
-            tensor
-                .write_value(&[0, 1, 2], 0.0)
+        tensor
+            .write_value(&[0, 1, 2], 0.0)
+            .await
+            .expect("write zero");
+
+        assert!(
+            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
                 .await
-                .expect("write zero");
+                .is_none(),
+            "zero write to new coord must not create a row"
+        );
 
-            assert!(
-                block_id_for_coord(&tensor, &schema, &[0, 1, 2])
-                    .await
-                    .is_none(),
-                "policy {policy:?}: zero write to new coord must not create a row"
-            );
-
-            cleanup(&root).await;
-        }
+        cleanup(&root).await;
     }
 
     #[tokio::test]
     async fn compact_sparse_idempotent() {
-        let (root, tensor, schema) = create_sparse_with_policy(
-            "e_compact_idem",
-            shape![2, 3, 4],
-            shape![1, 1, 4],
-            Some(1),
-            SparseZeroPolicy::RetainZero,
-        )
-        .await;
+        let (root, tensor, schema) =
+            create_sparse("e_compact_idem", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
 
         tensor.write_value(&[0, 1, 2], 5.0).await.expect("nz");
         tensor.write_value(&[1, 2, 3], 3.0).await.expect("nz2");

@@ -21,10 +21,10 @@ pub use schema::{
     contiguous_strides,
 };
 pub use traits::{
-    BoxFuture, SparseZeroPolicy, TensorArray, TensorBlockStore, TensorMatMul, TensorMath,
-    TensorMathScalar, TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll,
-    TensorReduceBoolean, TensorSparseIndex, TensorSparseLifecycle, TensorTransform, TensorUnary,
-    TensorViewSemantics, TensorWrite, TensorWriteBulk,
+    BoxFuture, TensorArray, TensorBlockStore, TensorMatMul, TensorMath, TensorMathScalar,
+    TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll, TensorReduceBoolean,
+    TensorSparseIndex, TensorTransform, TensorUnary, TensorViewSemantics, TensorWrite,
+    TensorWriteBulk,
 };
 
 use view::{TensorView, default_permutation};
@@ -80,7 +80,6 @@ struct SparseStorage<FE> {
     blocks: DirLock<FE>,
     index: TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>,
     schema: TensorSchema,
-    policy: SparseZeroPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +118,7 @@ where
     {
         let mut dir_guard = dir.try_write()?;
         let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-        let (schema, _) = load_metadata_inner(&blocks_dir).await?;
+        let schema = load_metadata_inner(&blocks_dir).await?;
         validate_tensor_dtype::<T>(&schema)?;
         Ok(Self::new_storage(blocks_dir, schema))
     }
@@ -218,7 +217,7 @@ where
     where
         FE: AsType<String> + From<String>,
     {
-        let payload = encode_schema(&self.storage.schema, None);
+        let payload = encode_schema(&self.storage.schema);
         let _ = decode_schema(&payload)?;
         write_metadata_file(&self.storage.blocks, METADATA, &payload).await
     }
@@ -247,11 +246,7 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    pub async fn create(
-        dir: DirLock<FE>,
-        schema: TensorSchema,
-        policy: SparseZeroPolicy,
-    ) -> Result<Self>
+    pub async fn create(dir: DirLock<FE>, schema: TensorSchema) -> Result<Self>
     where
         FE: AsType<String> + From<String>,
     {
@@ -267,7 +262,7 @@ where
         let index_dir = dir_guard.create_dir(INDEX.to_string())?;
         let index =
             TableLock::create(SparseTableSchema::default(), Collator::default(), index_dir)?;
-        let tensor = Self::new_storage(blocks_dir, index, schema, policy);
+        let tensor = Self::new_storage(blocks_dir, index, schema);
         tensor.persist_metadata().await?;
         Ok(tensor)
     }
@@ -278,15 +273,13 @@ where
     {
         let mut dir_guard = dir.try_write()?;
         let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-        let (schema, policy_opt) = load_metadata_inner(&blocks_dir).await?;
+        let schema = load_metadata_inner(&blocks_dir).await?;
         validate_tensor_dtype::<T>(&schema)?;
-        let policy = policy_opt
-            .ok_or_else(|| Error::InvalidSchema("missing policy in sparse metadata".to_string()))?;
         let index_dir = dir_guard.get_dir(INDEX).cloned().ok_or_else(|| {
             Error::InvalidSchema("sparse tensor missing index directory".to_string())
         })?;
         let index = TableLock::load(SparseTableSchema::default(), Collator::default(), index_dir)?;
-        Ok(Self::new_storage(blocks_dir, index, schema, policy))
+        Ok(Self::new_storage(blocks_dir, index, schema))
     }
 
     pub async fn load_with_schema(dir: DirLock<FE>, expected: &TensorSchema) -> Result<Self>
@@ -309,14 +302,12 @@ where
         blocks: DirLock<FE>,
         index: TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>,
         schema: TensorSchema,
-        policy: SparseZeroPolicy,
     ) -> Self {
         let view = TensorView::identity(&schema);
         let storage = Arc::new(SparseStorage {
             blocks,
             index,
             schema: schema.clone(),
-            policy,
         });
         Self {
             storage,
@@ -396,12 +387,7 @@ where
             .await?
         {
             if value == T::default() {
-                return match self.storage.policy {
-                    SparseZeroPolicy::RemoveRow => Ok(SparseWriteAction::DeleteRow(block_id)),
-                    SparseZeroPolicy::Tombstone | SparseZeroPolicy::RetainZero => {
-                        Ok(SparseWriteAction::Write(block_id))
-                    }
-                };
+                return Ok(SparseWriteAction::DeleteRow(block_id));
             }
             return Ok(SparseWriteAction::Write(block_id));
         }
@@ -446,9 +432,42 @@ where
     where
         FE: AsType<String> + From<String>,
     {
-        let payload = encode_schema(&self.storage.schema, Some(self.storage.policy));
+        let payload = encode_schema(&self.storage.schema);
         let _ = decode_schema(&payload)?;
         write_metadata_file(&self.storage.blocks, METADATA, &payload).await
+    }
+
+    pub async fn compact_sparse(&self) -> Result<()> {
+        let all_rows = {
+            let guard = self.storage.index.read().await;
+            let mut rows = guard.into_rows().await.map_err(Error::from)?;
+            let mut collected: Vec<Vec<u64>> = Vec::new();
+            while let Some(row) = rows.next().await {
+                let row = row.map_err(Error::from)?;
+                collected.push(row.to_vec());
+            }
+            collected
+        };
+
+        let mut to_delete: Vec<(Vec<u64>, u64)> = Vec::new();
+        for row in &all_rows {
+            let key = vec![row[0], row[1]];
+            let block_id = row[2];
+            let all_zero = match self.read_block(block_id).await? {
+                Some(block) => block.iter().all(|v| *v == T::default()),
+                None => true,
+            };
+            if all_zero {
+                to_delete.push((key, block_id));
+            }
+        }
+
+        for (key, block_id) in to_delete {
+            self.delete_row(key).await?;
+            self.delete_block(block_id).await;
+        }
+
+        Ok(())
     }
 }
 
@@ -480,9 +499,7 @@ where
     {
         match schema.layout() {
             Layout::Dense => DenseTensor::create(dir, schema).await.map(Self::Dense),
-            Layout::Sparse { .. } => SparseTensor::create(dir, schema, SparseZeroPolicy::RemoveRow)
-                .await
-                .map(Self::Sparse),
+            Layout::Sparse { .. } => SparseTensor::create(dir, schema).await.map(Self::Sparse),
         }
     }
 
@@ -493,7 +510,7 @@ where
         let layout = {
             let mut dir_guard = dir.try_write()?;
             let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-            let (schema, _) = load_metadata_inner(&blocks_dir).await?;
+            let schema = load_metadata_inner(&blocks_dir).await?;
             schema.layout().clone()
         };
         match layout {
@@ -1102,82 +1119,6 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// TensorSparseLifecycle impls
-// ---------------------------------------------------------------------------
-
-impl<FE, T> TensorSparseLifecycle for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-}
-
-impl<FE, T> TensorSparseLifecycle for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn sparse_zero_policy(&self) -> SparseZeroPolicy {
-        self.storage.policy
-    }
-
-    fn compact_sparse<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let all_rows = {
-                let guard = self.storage.index.read().await;
-                let mut rows = guard.into_rows().await.map_err(Error::from)?;
-                let mut collected: Vec<Vec<u64>> = Vec::new();
-                while let Some(row) = rows.next().await {
-                    let row = row.map_err(Error::from)?;
-                    collected.push(row.to_vec());
-                }
-                collected
-            };
-
-            let mut to_delete: Vec<(Vec<u64>, u64)> = Vec::new();
-            for row in &all_rows {
-                let key = vec![row[0], row[1]];
-                let block_id = row[2];
-                let all_zero = match self.read_block(block_id).await? {
-                    Some(block) => block.iter().all(|v| *v == T::default()),
-                    None => true,
-                };
-                if all_zero {
-                    to_delete.push((key, block_id));
-                }
-            }
-
-            for (key, block_id) in to_delete {
-                self.delete_row(key).await?;
-                self.delete_block(block_id).await;
-            }
-
-            Ok(())
-        })
-    }
-}
-
-impl<FE, T> TensorSparseLifecycle for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn sparse_zero_policy(&self) -> SparseZeroPolicy {
-        match self {
-            Self::Dense(inner) => inner.sparse_zero_policy(),
-            Self::Sparse(inner) => inner.sparse_zero_policy(),
-        }
-    }
-
-    fn compact_sparse<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-        match self {
-            Self::Dense(inner) => inner.compact_sparse(),
-            Self::Sparse(inner) => inner.compact_sparse(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Unsupported bulk traits (trait-surface wiring only)
 // ---------------------------------------------------------------------------
 
@@ -1242,9 +1183,7 @@ pub fn default_block_shape(shape: &Shape) -> Shape {
     block_shape
 }
 
-async fn load_metadata_inner<FE>(
-    blocks: &DirLock<FE>,
-) -> Result<(TensorSchema, Option<SparseZeroPolicy>)>
+async fn load_metadata_inner<FE>(blocks: &DirLock<FE>) -> Result<TensorSchema>
 where
     FE: AsType<String> + FileLoad + Send + Sync + 'static,
 {
@@ -1279,7 +1218,7 @@ where
     Ok(())
 }
 
-fn encode_schema(schema: &TensorSchema, policy: Option<SparseZeroPolicy>) -> String {
+fn encode_schema(schema: &TensorSchema) -> String {
     let dtype = schema.dtype().as_str();
     let layout = match schema.layout() {
         Layout::Dense => "dense".to_string(),
@@ -1307,16 +1246,13 @@ fn encode_schema(schema: &TensorSchema, policy: Option<SparseZeroPolicy>) -> Str
         .map(|dim| dim.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let mut s = format!(
+    let s = format!(
         "version={METADATA_VERSION}\ndtype={dtype}\nlayout={layout}\nshape={shape}\nblock_shape={block_shape}\nstrides={strides}\n"
     );
-    if let Some(p) = policy {
-        s.push_str(&format!("policy={}\n", p.as_str()));
-    }
     s
 }
 
-fn decode_schema(payload: &str) -> Result<(TensorSchema, Option<SparseZeroPolicy>)> {
+fn decode_schema(payload: &str) -> Result<TensorSchema> {
     let mut fields = std::collections::HashMap::<String, String>::new();
     for line in payload.lines().filter(|line| !line.is_empty()) {
         let (key, value) = line
@@ -1366,16 +1302,6 @@ fn decode_schema(payload: &str) -> Result<(TensorSchema, Option<SparseZeroPolicy
             .ok_or_else(|| Error::InvalidSchema("missing strides in metadata".to_string()))?,
     )?;
 
-    let policy = match &layout {
-        Layout::Dense => None,
-        Layout::Sparse { .. } => {
-            let policy_str = fields.get("policy").ok_or_else(|| {
-                Error::InvalidSchema("missing policy in sparse metadata".to_string())
-            })?;
-            Some(SparseZeroPolicy::from_str(policy_str)?)
-        }
-    };
-
     let schema = TensorSchema::new(
         dtype,
         shape.into(),
@@ -1384,7 +1310,7 @@ fn decode_schema(payload: &str) -> Result<(TensorSchema, Option<SparseZeroPolicy
         strides.into(),
     )?;
 
-    Ok((schema, policy))
+    Ok(schema)
 }
 
 fn parse_layout(layout: &str) -> Result<Layout> {
@@ -1450,10 +1376,9 @@ mod metadata_tests {
         )
         .expect("schema");
 
-        let encoded = encode_schema(&schema, Some(SparseZeroPolicy::RemoveRow));
-        let (decoded, policy) = decode_schema(&encoded).expect("decode");
+        let encoded = encode_schema(&schema);
+        let decoded = decode_schema(&encoded).expect("decode");
         assert_eq!(decoded, schema);
-        assert_eq!(policy, Some(SparseZeroPolicy::RemoveRow));
     }
 
     #[test]
@@ -1467,12 +1392,11 @@ mod metadata_tests {
         )
         .expect("schema");
 
-        let encoded = encode_schema(&schema, None);
+        let encoded = encode_schema(&schema);
         assert!(encoded.contains("dtype=f64"));
 
-        let (decoded, policy) = decode_schema(&encoded).expect("decode");
+        let decoded = decode_schema(&encoded).expect("decode");
         assert_eq!(decoded, schema);
-        assert_eq!(policy, None);
     }
 
     #[test]
@@ -1495,14 +1419,6 @@ mod metadata_tests {
     fn metadata_rejects_missing_fields() {
         let payload = "version=2\ndtype=f32\nlayout=dense\nshape=2,3\n";
         let err = decode_schema(payload).expect_err("should reject");
-        assert!(matches!(err, Error::InvalidSchema(_)));
-    }
-
-    #[test]
-    fn sparse_metadata_rejects_missing_policy() {
-        let payload =
-            "version=2\ndtype=f32\nlayout=sparse:0\nshape=2,3\nblock_shape=1,3\nstrides=3,1\n";
-        let err = decode_schema(payload).expect_err("sparse must require policy");
         assert!(matches!(err, Error::InvalidSchema(_)));
     }
 
