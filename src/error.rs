@@ -15,6 +15,7 @@ pub enum Error {
         hint: String,
     },
     Unsupported(String),
+    DataMismatch(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -40,7 +41,8 @@ impl fmt::Display for Error {
             | Self::InvalidCoord(cause)
             | Self::InvalidLayout(cause)
             | Self::SparseIndex(cause)
-            | Self::Unsupported(cause) => f.write_str(cause),
+            | Self::Unsupported(cause)
+            | Self::DataMismatch(cause) => f.write_str(cause),
             Self::UnsupportedSparseIterationOrder {
                 requested_order,
                 base_order,

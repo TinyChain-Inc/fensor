@@ -20,6 +20,7 @@ pub use schema::{
     DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape,
     contiguous_strides,
 };
+pub use stream::{TensorViewDecoder, TensorViewEncoder};
 pub use traits::{
     BoxFuture, TensorArray, TensorBlockStore, TensorMatMul, TensorMath, TensorMathScalar,
     TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll, TensorReduceBoolean,
@@ -45,14 +46,44 @@ pub trait TensorElement:
     + for<'en> en::ToStream<'en>
 {
     const DTYPE: DType;
+
+    /// Little-endian byte representation, used for the checksum fold and
+    /// the streamed wire payload of a single value.
+    fn to_le_bytes(&self) -> smallvec::SmallVec<[u8; 8]>;
+
+    /// Inverse of `to_le_bytes`; fails closed on a malformed/wrong-length
+    /// byte slice rather than panicking.
+    fn from_le_bytes(bytes: &[u8]) -> Result<Self>;
 }
 
 impl TensorElement for f32 {
     const DTYPE: DType = DType::F32;
+
+    fn to_le_bytes(&self) -> smallvec::SmallVec<[u8; 8]> {
+        smallvec::SmallVec::from_slice(&f32::to_le_bytes(*self))
+    }
+
+    fn from_le_bytes(bytes: &[u8]) -> Result<Self> {
+        let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+            Error::InvalidSchema("invalid f32 byte length in tensor view stream".to_string())
+        })?;
+        Ok(f32::from_le_bytes(arr))
+    }
 }
 
 impl TensorElement for f64 {
     const DTYPE: DType = DType::F64;
+
+    fn to_le_bytes(&self) -> smallvec::SmallVec<[u8; 8]> {
+        smallvec::SmallVec::from_slice(&f64::to_le_bytes(*self))
+    }
+
+    fn from_le_bytes(bytes: &[u8]) -> Result<Self> {
+        let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+            Error::InvalidSchema("invalid f64 byte length in tensor view stream".to_string())
+        })?;
+        Ok(f64::from_le_bytes(arr))
+    }
 }
 
 pub trait TensorFileEntry<T: TensorElement>:
@@ -533,6 +564,16 @@ where
             )));
         }
         Ok(tensor)
+    }
+
+    /// Build a lazily-streamed encoder for this tensor's current view
+    /// (identity or transformed, dense or sparse): schema followed by a
+    /// nested sequence of non-default `(coord, value)` pairs and a trailing
+    /// verification record. No full in-memory buffering -- each value is
+    /// read from storage only as the returned value is actually driven by
+    /// a destream encoder (e.g. `tbon::en::encode(tensor.view_encoder())`).
+    pub fn view_encoder(&self) -> stream::TensorViewEncoder<'_, FE, T> {
+        stream::TensorViewEncoder::new(self)
     }
 
     pub fn as_sparse(&self) -> Option<&SparseTensor<FE, T>> {
