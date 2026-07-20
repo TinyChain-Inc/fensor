@@ -1,11 +1,11 @@
+use std::fmt;
+
 use destream::{de, en};
 
-use crate::wire_tags::{
-    ELEM_TAG_ERROR, ELEM_TAG_PAIR, ELEM_TAG_TRAILER, LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE,
-};
+use crate::wire_tags::{ELEM_TAG_ERROR, ELEM_TAG_PAIR, LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
 use crate::{
-    DType, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
-    TensorViewSemantics, TensorWrite, contiguous_strides,
+    DType, Error, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorRead,
+    TensorSchema, TensorViewSemantics, TensorWrite, contiguous_strides, schema,
 };
 
 fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
@@ -193,30 +193,77 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Tensor view streaming: lazy encode + streaming decode with verification
+// Tensor view streaming: lazy encode + streaming decode
 // ---------------------------------------------------------------------------
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
+/// A closed, wire-safe classification of a `crate::Error` that occurred while
+/// the encoder was lazily reading values from storage. Carries no payload
+/// data (no paths, no coordinates, no underlying `io::Error` text) since this
+/// crosses a machine boundary; only which failure shape occurred survives.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum ElemErrorCode {
+    Io = 0,
+    Nd = 1,
+    InvalidSchema = 2,
+    InvalidCoord = 3,
+    InvalidLayout = 4,
+    SparseIndex = 5,
+    UnsupportedSparseIterationOrder = 6,
+    Unsupported = 7,
+    DataMismatch = 8,
+}
 
-fn fnv1a_update<T: TensorElement>(mut hash: u64, coord: &[u64], value: T) -> u64 {
-    for c in coord {
-        for byte in c.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
+impl ElemErrorCode {
+    fn from_error(err: &Error) -> Self {
+        match err {
+            Error::Io(_) => Self::Io,
+            Error::Nd(_) => Self::Nd,
+            Error::InvalidSchema(_) => Self::InvalidSchema,
+            Error::InvalidCoord(_) => Self::InvalidCoord,
+            Error::InvalidLayout(_) => Self::InvalidLayout,
+            Error::SparseIndex(_) => Self::SparseIndex,
+            Error::UnsupportedSparseIterationOrder { .. } => Self::UnsupportedSparseIterationOrder,
+            Error::Unsupported(_) => Self::Unsupported,
+            Error::DataMismatch(_) => Self::DataMismatch,
         }
     }
-    for byte in value.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
+
+    fn try_from_u8(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Io),
+            1 => Some(Self::Nd),
+            2 => Some(Self::InvalidSchema),
+            3 => Some(Self::InvalidCoord),
+            4 => Some(Self::InvalidLayout),
+            5 => Some(Self::SparseIndex),
+            6 => Some(Self::UnsupportedSparseIterationOrder),
+            7 => Some(Self::Unsupported),
+            8 => Some(Self::DataMismatch),
+            _ => None,
+        }
     }
-    hash
+}
+
+impl fmt::Display for ElemErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Io => "I/O error",
+            Self::Nd => "array computation error",
+            Self::InvalidSchema => "invalid schema",
+            Self::InvalidCoord => "invalid coordinate",
+            Self::InvalidLayout => "invalid layout",
+            Self::SparseIndex => "sparse index error",
+            Self::UnsupportedSparseIterationOrder => "unsupported sparse iteration order",
+            Self::Unsupported => "unsupported operation",
+            Self::DataMismatch => "data mismatch",
+        })
+    }
 }
 
 enum Elem<T> {
     Pair(Vec<u64>, T),
-    Trailer { count: u64, checksum: u64 },
-    Error(String),
+    Error(ElemErrorCode),
 }
 
 impl<T> de::FromStream for Elem<T>
@@ -226,27 +273,22 @@ where
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (tag, coord, payload): (u8, Vec<u64>, Vec<u8>) =
-            <(u8, Vec<u64>, Vec<u8>)>::from_stream((), decoder).await?;
+        let (tag, coord, value, error_code): (u8, Vec<u64>, Option<T>, Option<u8>) =
+            <(u8, Vec<u64>, Option<T>, Option<u8>)>::from_stream((), decoder).await?;
 
         match tag {
             ELEM_TAG_PAIR => {
-                let value = T::from_le_bytes(&payload).map_err(de::Error::custom)?;
+                let value =
+                    value.ok_or_else(|| de::Error::custom("missing tensor view pair value"))?;
                 Ok(Elem::Pair(coord, value))
             }
-            ELEM_TAG_TRAILER => {
-                if payload.len() != 16 {
-                    return Err(de::Error::custom(
-                        "trailer payload must be exactly 16 bytes (8 for count, 8 for checksum)",
-                    ));
-                }
-                let count = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-                let checksum = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-                Ok(Elem::Trailer { count, checksum })
-            }
             ELEM_TAG_ERROR => {
-                let message = String::from_utf8(payload).map_err(de::Error::custom)?;
-                Ok(Elem::Error(message))
+                let code = error_code
+                    .ok_or_else(|| de::Error::custom("missing tensor view error code"))?;
+                let code = ElemErrorCode::try_from_u8(code).ok_or_else(|| {
+                    de::Error::custom(format!("unknown tensor view error code {code}"))
+                })?;
+                Ok(Elem::Error(code))
             }
             _ => Err(de::Error::custom(format!(
                 "unknown tensor view stream element tag {tag}"
@@ -261,20 +303,19 @@ where
 {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
-            Elem::Pair(coord, value) => {
-                let payload = value.to_le_bytes().to_vec();
-                en::IntoStream::into_stream((ELEM_TAG_PAIR, coord.clone(), payload), encoder)
-            }
-            Elem::Trailer { count, checksum } => {
-                let mut payload = Vec::with_capacity(16);
-                payload.extend_from_slice(&count.to_le_bytes());
-                payload.extend_from_slice(&checksum.to_le_bytes());
-                en::IntoStream::into_stream((ELEM_TAG_TRAILER, Vec::<u64>::new(), payload), encoder)
-            }
-            Elem::Error(message) => {
-                let payload = message.clone().into_bytes();
-                en::IntoStream::into_stream((ELEM_TAG_ERROR, Vec::<u64>::new(), payload), encoder)
-            }
+            Elem::Pair(coord, value) => en::IntoStream::into_stream(
+                (ELEM_TAG_PAIR, coord.clone(), Some(*value), None::<u8>),
+                encoder,
+            ),
+            Elem::Error(code) => en::IntoStream::into_stream(
+                (
+                    ELEM_TAG_ERROR,
+                    Vec::<u64>::new(),
+                    None::<T>,
+                    Some(*code as u8),
+                ),
+                encoder,
+            ),
         }
     }
 }
@@ -285,20 +326,19 @@ where
 {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
-            Elem::Pair(coord, value) => {
-                let payload = value.to_le_bytes().to_vec();
-                en::IntoStream::into_stream((ELEM_TAG_PAIR, coord, payload), encoder)
-            }
-            Elem::Trailer { count, checksum } => {
-                let mut payload = Vec::with_capacity(16);
-                payload.extend_from_slice(&count.to_le_bytes());
-                payload.extend_from_slice(&checksum.to_le_bytes());
-                en::IntoStream::into_stream((ELEM_TAG_TRAILER, Vec::<u64>::new(), payload), encoder)
-            }
-            Elem::Error(message) => {
-                let payload = message.into_bytes();
-                en::IntoStream::into_stream((ELEM_TAG_ERROR, Vec::<u64>::new(), payload), encoder)
-            }
+            Elem::Pair(coord, value) => en::IntoStream::into_stream(
+                (ELEM_TAG_PAIR, coord, Some(value), None::<u8>),
+                encoder,
+            ),
+            Elem::Error(code) => en::IntoStream::into_stream(
+                (
+                    ELEM_TAG_ERROR,
+                    Vec::<u64>::new(),
+                    None::<T>,
+                    Some(code as u8),
+                ),
+                encoder,
+            ),
         }
     }
 }
@@ -321,7 +361,7 @@ where
 {
     let is_identity = tensor.is_base_tensor();
     let schema =
-        crate::schema::snapshot_schema(tensor.schema(), is_identity).map_err(en::Error::custom)?;
+        schema::snapshot_schema(tensor.schema(), is_identity).map_err(en::Error::custom)?;
     let shape: Vec<usize> = tensor.schema().shape().iter().copied().collect();
     let pairs = TensorPairs { tensor, shape };
     en::IntoStream::into_stream((schema, pairs), encoder)
@@ -357,8 +397,6 @@ enum PairState<'a, FE, T> {
     Walking {
         tensor: &'a Tensor<FE, T>,
         coords: crate::schema::RowMajorCoords,
-        count: u64,
-        checksum: u64,
     },
     Done,
 }
@@ -374,38 +412,27 @@ where
         let initial = PairState::Walking {
             tensor: self.tensor,
             coords,
-            count: 0,
-            checksum: FNV_OFFSET_BASIS,
         };
         let stream = Box::pin(futures::stream::unfold(initial, |state| async move {
             match state {
-                PairState::Walking {
-                    tensor,
-                    mut coords,
-                    mut count,
-                    mut checksum,
-                } => loop {
+                PairState::Walking { tensor, mut coords } => loop {
                     match coords.next() {
                         Some(coord) => match tensor.read_value(&coord).await {
                             Ok(value) if value == T::default() => continue,
                             Ok(value) => {
-                                count += 1;
-                                checksum = fnv1a_update(checksum, &coord, value);
                                 break Some((
                                     Elem::Pair(coord, value),
-                                    PairState::Walking {
-                                        tensor,
-                                        coords,
-                                        count,
-                                        checksum,
-                                    },
+                                    PairState::Walking { tensor, coords },
                                 ));
                             }
                             Err(err) => {
-                                break Some((Elem::Error(err.to_string()), PairState::Done));
+                                break Some((
+                                    Elem::Error(ElemErrorCode::from_error(&err)),
+                                    PairState::Done,
+                                ));
                             }
                         },
-                        None => break Some((Elem::Trailer { count, checksum }, PairState::Done)),
+                        None => break None,
                     }
                 },
                 PairState::Done => None,
@@ -479,15 +506,12 @@ where
             .await
             .map_err(de::Error::custom)?;
 
-        // Decode the nested pairs-with-verification sequence, moving `tensor`
-        // in by value (Context) and getting it back out as the decoded
-        // Value on success -- each nonzero value is written to storage as
-        // soon as it arrives off the wire, with no in-memory buffering.
-        match seq
-            .next_element::<PairsWithVerification<FE, T>>(tensor)
-            .await
-        {
-            Ok(Some(PairsWithVerification { tensor })) => Ok(TensorViewDecoder { tensor }),
+        // Decode the nested pairs sequence, moving `tensor` in by value
+        // (Context) and getting it back out as the decoded Value on success
+        // -- each nonzero value is written to storage as soon as it arrives
+        // off the wire, with no in-memory buffering.
+        match seq.next_element::<DecodedPairs<FE, T>>(tensor).await {
+            Ok(Some(DecodedPairs { tensor })) => Ok(TensorViewDecoder { tensor }),
             Ok(None) => {
                 let mut dir_guard = self.dir.write().await;
                 let _ = dir_guard.truncate_and_sync().await;
@@ -502,11 +526,11 @@ where
     }
 }
 
-struct PairsWithVerification<FE, T> {
+struct DecodedPairs<FE, T> {
     tensor: Tensor<FE, T>,
 }
 
-impl<FE, T> de::FromStream for PairsWithVerification<FE, T>
+impl<FE, T> de::FromStream for DecodedPairs<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
@@ -517,21 +541,13 @@ where
         tensor: Tensor<FE, T>,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        let tensor = decoder
-            .decode_seq(PairsVisitor {
-                tensor,
-                count: 0,
-                checksum: FNV_OFFSET_BASIS,
-            })
-            .await?;
+        let tensor = decoder.decode_seq(PairsVisitor { tensor }).await?;
         Ok(Self { tensor })
     }
 }
 
 struct PairsVisitor<FE, T> {
     tensor: Tensor<FE, T>,
-    count: u64,
-    checksum: u64,
 }
 
 impl<FE, T> de::Visitor for PairsVisitor<FE, T>
@@ -542,10 +558,10 @@ where
     type Value = Tensor<FE, T>;
 
     fn expecting() -> &'static str {
-        "a sequence of tensor view element pairs (coord, value) plus trailer"
+        "a sequence of tensor view element pairs (coord, value)"
     }
 
-    async fn visit_seq<A: de::SeqAccess>(mut self, mut seq: A) -> Result<Self::Value, A::Error> {
+    async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         while let Some(elem) = seq.next_element::<Elem<T>>(()).await? {
             match elem {
                 Elem::Pair(coord, value) => {
@@ -558,26 +574,19 @@ where
                         .write_value(&coord, value)
                         .await
                         .map_err(de::Error::custom)?;
-                    self.count += 1;
-                    self.checksum = fnv1a_update(self.checksum, &coord, value);
                 }
-                Elem::Trailer { count, checksum } => {
-                    if count != self.count || checksum != self.checksum {
-                        return Err(de::Error::custom(format!(
-                            "tensor view transfer verification failed: expected {count} entries/checksum {checksum:#x}, got {}/{:#x}",
-                            self.count, self.checksum,
-                        )));
-                    }
-                    return Ok(self.tensor);
-                }
-                Elem::Error(message) => {
+                Elem::Error(code) => {
                     return Err(de::Error::custom(format!(
-                        "tensor view encode-side failure: {message}"
+                        "tensor view encode-side failure: {code}"
                     )));
                 }
             }
         }
-        Err(de::Error::custom("tensor view stream ended before trailer"))
+        // Natural exhaustion of the sequence is itself the success signal --
+        // `tbon`'s SeqAccess only returns `None` after consuming a real
+        // `LIST_END` delimiter, so a genuinely truncated stream surfaces as
+        // a decode error before this point is ever reached.
+        Ok(self.tensor)
     }
 }
 

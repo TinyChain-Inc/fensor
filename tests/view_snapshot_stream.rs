@@ -296,7 +296,7 @@ async fn only_nonzero_values_are_transmitted() {
 }
 
 #[tokio::test]
-async fn verification_mismatch_fails_closed_and_removes_partial_storage() {
+async fn truncated_stream_fails_closed_and_removes_partial_storage() {
     let root = unique_tmp_dir("view_snapshot_verification_mismatch");
     tokio::fs::create_dir(&root).await.expect("mkdir");
     let schema = dense_schema_f32(shape![2, 3], shape![1, 3]);
@@ -318,8 +318,10 @@ async fn verification_mismatch_fails_closed_and_removes_partial_storage() {
         .expect("collect encoded stream");
 
     // Create a corrupted stream that is incomplete: keep only the first chunk (schema).
-    // The decoder will create the tensor, then try to read pairs and a trailer.
-    // Since the stream ends immediately, it should fail with "stream ended before trailer".
+    // The decoder will create the tensor, then try to read the pairs sequence. Since the
+    // stream ends immediately, the underlying `tbon` decoder itself fails with an
+    // "unexpected end of stream" error (it never sees the pairs sequence's closing
+    // delimiter), before the decoder-side visitor ever gets a chance to return.
     let corrupted_parts: Vec<_> = if !encoded_parts.is_empty() {
         vec![encoded_parts[0].clone()]
     } else {
@@ -336,7 +338,7 @@ async fn verification_mismatch_fails_closed_and_removes_partial_storage() {
     let encoded_stream_corrupted =
         futures::stream::iter(corrupted_parts.into_iter().map(Ok::<_, tbon::de::Error>));
 
-    // Attempt to decode with incomplete stream; should fail due to missing pairs/trailer
+    // Attempt to decode with incomplete stream; should fail due to the truncated pairs sequence
     let result: std::result::Result<TensorViewDecoder<FsEntry, f32>, _> =
         tbon::de::try_decode(dir2.clone(), encoded_stream_corrupted).await;
 
