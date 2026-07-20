@@ -84,6 +84,27 @@ struct SparseStorage<FE> {
     schema: TensorSchema,
 }
 
+enum Storage<FE> {
+    Dense(DenseStorage<FE>),
+    Sparse(SparseStorage<FE>)
+}
+
+impl<FE> Storage<FE> {
+    pub(crate) fn blocks(&self) -> &DirLock<FE> {
+        match self {
+            Self::Dense(s) => &s.blocks,
+            Self::Sparse(s) => &s.blocks
+        }
+    }
+
+    pub(crate) fn schema(&self) -> &TensorSchema {
+        match self {
+            Self::Dense(s) => &s.schema,
+            Self::Sparse(s) => &s.schema
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DenseTensor
 // ---------------------------------------------------------------------------
