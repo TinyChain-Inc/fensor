@@ -395,47 +395,6 @@ where
 // ---------------------------------------------------------------------------
 // TensorArray impls
 // ---------------------------------------------------------------------------
-
-impl<FE, T> TensorArray for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    type DType = T;
-
-    fn schema(&self) -> &TensorSchema {
-        &self.schema
-    }
-
-    fn dtype(&self) -> Self::DType {
-        T::default()
-    }
-
-    fn schema_dtype(&self) -> DType {
-        self.schema.dtype()
-    }
-}
-
-impl<FE, T> TensorArray for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    type DType = T;
-
-    fn schema(&self) -> &TensorSchema {
-        &self.schema
-    }
-
-    fn dtype(&self) -> Self::DType {
-        T::default()
-    }
-
-    fn schema_dtype(&self) -> DType {
-        self.schema.dtype()
-    }
-}
-
 impl<FE, T> TensorArray for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
@@ -444,10 +403,7 @@ where
     type DType = T;
 
     fn schema(&self) -> &TensorSchema {
-        match self {
-            Self::Dense(inner) => inner.schema(),
-            Self::Sparse(inner) => inner.schema(),
-        }
+        &self.schema
     }
 
     fn dtype(&self) -> Self::DType {
@@ -455,10 +411,9 @@ where
     }
 
     fn schema_dtype(&self) -> DType {
-        self.schema().dtype()
+        self.schema.dtype()
     }
 }
-
 // ---------------------------------------------------------------------------
 // TensorRead impls
 // ---------------------------------------------------------------------------
