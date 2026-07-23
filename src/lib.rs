@@ -144,7 +144,7 @@ where
         for row in &all_rows {
             let key = vec![row[0], row[1]];
             let block_id = row[2];
-            let all_zero = match self.0.read_block(block_id).await? {
+            let all_zero = match tensor.read_block(block_id).await? {
                 Some(block) => block.iter().all(|v| *v == T::default()),
                 None => true,
             };
@@ -417,64 +417,32 @@ where
 // ---------------------------------------------------------------------------
 // TensorRead impls
 // ---------------------------------------------------------------------------
-
-impl<FE, T> TensorRead for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            let base_coord = self.resolve_base_coord(coord)?;
-            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
-
-            if let Some(block) = self.read_block(block_offset).await? {
-                validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-                Ok(block[offset_in_block])
-            } else {
-                Ok(T::default())
-            }
-        })
-    }
-}
-
-impl<FE, T> TensorRead for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            let base_coord = self.resolve_base_coord(coord)?;
-            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
-
-            if let Some(block_id) = self
-                .lookup_sparse_block_for_coord(&base_coord, block_offset)
-                .await?
-            {
-                if let Some(block) = self.read_block(block_id).await? {
-                    validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-                    Ok(block[offset_in_block])
-                } else {
-                    Err(Error::SparseIndex("Block is missing".to_string()))
-                }
-            } else {
-                Ok(T::default())
-            }
-        })
-    }
-}
-
 impl<FE, T> TensorRead for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        match self {
-            Self::Dense(inner) => inner.read_value(coord),
-            Self::Sparse(inner) => inner.read_value(coord),
-        }
+        Box::pin(async move {
+            let base_coord = self.resolve_base_coord(coord)?;
+            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
+
+            let block_id = match self.schema.layout() {
+                Layout::Dense => Some(block_offset),
+                Layout::Sparse { .. } => self.lookup_sparse_block_for_coord(&base_coord, block_offset).await?
+            };
+
+            let Some(id) = block_id else {
+                return Ok(T::default())
+            };
+
+            if let Some(block) = self.read_block(id).await? {
+                    validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
+                    Ok(block[offset_in_block])
+                } else {
+                    Err(Error::DataMismatch("Block is missing".to_string()))
+                }
+        })
     }
 }
 
