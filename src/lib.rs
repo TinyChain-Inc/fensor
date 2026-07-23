@@ -78,9 +78,11 @@ struct DenseStorage<FE> {
     schema: TensorSchema,
 }
 
+type SparseIndex<FE> = TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>;
+
 struct SparseStorage<FE> {
     blocks: DirLock<FE>,
-    index: TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>,
+    index: SparseIndex<FE>,
     schema: TensorSchema,
 }
 
@@ -103,21 +105,83 @@ impl<FE> Storage<FE> {
             Self::Sparse(s) => &s.schema
         }
     }
+
+    pub(crate) fn index(&self) -> Option<&SparseIndex<FE>> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Sparse(s) => Some(&s.index)
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Sparse
+// ---------------------------------------------------------------------------
+
+pub struct SparseHandle<'a, FE, T>(&'a Tensor<FE, T>);
+
+impl<'a, FE, T> SparseHandle<'a, FE, T> 
+where 
+    FE: TensorFileEntry<T>,
+    T: TensorElement {
+    pub async fn compact_sparse(&self) -> Result<()> {
+        let SparseHandle(tensor) = *self;
+        let all_rows = {
+            let guard = tensor.storage.index()
+                .ok_or_else(|| Error::SparseIndex("Sparse index is missing".to_string()))?
+                .read().await;
+            let mut rows = guard.into_rows().await.map_err(Error::from)?;
+            let mut collected: Vec<Vec<u64>> = Vec::new();
+            while let Some(row) = rows.next().await {
+                let row = row.map_err(Error::from)?;
+                collected.push(row.to_vec());
+            }
+            collected
+        };
+
+        let mut to_delete: Vec<(Vec<u64>, u64)> = Vec::new();
+        for row in &all_rows {
+            let key = vec![row[0], row[1]];
+            let block_id = row[2];
+            let all_zero = match self.0.read_block(block_id).await? {
+                Some(block) => block.iter().all(|v| *v == T::default()),
+                None => true,
+            };
+            if all_zero {
+                to_delete.push((key, block_id));
+            }
+        }
+
+        for (key, block_id) in to_delete {
+            tensor.delete_row(key).await?;
+            tensor.delete_block(block_id).await;
+        }
+
+        Ok(())
+    }
+}
+
+enum SparseWriteAction {
+    Write(u64),
+    DeleteRow(u64),
+    NoOp,
 }
 
 // ---------------------------------------------------------------------------
-// DenseTensor
+// Tensor enum
 // ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct DenseTensor<FE, T = f32> {
-    storage: Arc<DenseStorage<FE>>,
+pub struct Tensor<FE, T> {
+    storage: Arc<Storage<FE>>,
     schema: TensorSchema,
     view: TensorView,
-    _dtype: std::marker::PhantomData<T>,
+    _dtype: std::marker::PhantomData<T>
 }
 
-impl<FE, T> DenseTensor<FE, T>
+pub type TensorF32<FE> = Tensor<FE, f32>;
+pub type TensorF64<FE> = Tensor<FE, f64>;
+
+impl<FE, T> Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
@@ -130,7 +194,15 @@ where
 
         let mut dir_guard = dir.try_write()?;
         let blocks_dir = dir_guard.create_dir(BLOCKS.to_string())?;
-        let tensor = Self::new_storage(blocks_dir, schema);
+
+        let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = schema.layout() {
+            let index_dir = dir_guard.create_dir(INDEX.to_string())?;
+            Some(TableLock::create(SparseTableSchema::default(), Collator::default(), index_dir)?)
+        } else {
+            None
+        };
+        
+        let tensor = Self::new_storage(blocks_dir, index, schema);
         tensor.persist_metadata().await?;
         Ok(tensor)
     }
@@ -143,41 +215,30 @@ where
         let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
         let schema = load_metadata_inner(&blocks_dir).await?;
         validate_tensor_dtype::<T>(&schema)?;
-        Ok(Self::new_storage(blocks_dir, schema))
+        let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = schema.layout() {
+            let index_dir = dir_guard.get_dir(INDEX).cloned().ok_or_else(|| {
+                Error::InvalidSchema("sparse tensor missing index directory".to_string())
+            })?;
+            Some(TableLock::load(SparseTableSchema::default(), Collator::default(), index_dir)?)
+        } else {
+            None
+        };
+        
+        Ok(Self::new_storage(blocks_dir, index, schema))
     }
 
-    pub async fn load_with_schema(dir: DirLock<FE>, expected: &TensorSchema) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        validate_tensor_dtype::<T>(expected)?;
-        let tensor = Self::load(dir).await?;
-        if tensor.schema() != expected {
-            return Err(Error::InvalidSchema(format!(
-                "persisted metadata mismatch: expected {:?}, found {:?}",
-                expected,
-                tensor.schema()
-            )));
-        }
-        Ok(tensor)
+    /// Build a lazily-streamed encoder for this tensor's current view
+    /// (identity or transformed, dense or sparse): schema followed by a
+    /// nested sequence of non-default `(coord, value)` pairs and a trailing
+    /// verification record. No full in-memory buffering -- each value is
+    /// read from storage only as the returned value is actually driven by
+    /// a destream encoder (e.g. `tbon::en::encode(tensor.view_encoder())`).
+    pub fn view_encoder(&self) -> stream::TensorViewEncoder<'_, FE, T> {
+        stream::TensorViewEncoder::new(self)
     }
 
-    fn new_storage(blocks: DirLock<FE>, schema: TensorSchema) -> Self {
-        let view = TensorView::identity(&schema);
-        let storage = Arc::new(DenseStorage {
-            blocks,
-            schema: schema.clone(),
-        });
-        Self {
-            storage,
-            schema,
-            view,
-            _dtype: std::marker::PhantomData,
-        }
-    }
-
-    pub(crate) fn block_len(&self) -> usize {
-        self.storage.schema.block_len().max(1)
+    pub fn as_sparse(&self) -> Option<SparseHandle<'_, FE, T>> {
+        matches!(self.storage.as_ref(), Storage::Sparse(_)).then(|| SparseHandle(self))
     }
 
     pub(crate) fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
@@ -189,26 +250,30 @@ where
         let k = k as u64;
         let base_coord: Vec<u64> = self
             .storage
-            .schema
+            .schema()
             .strides()
             .iter()
-            .zip(self.storage.schema.shape().iter())
+            .zip(self.storage.schema().shape().iter())
             .map(|(stride, dim)| (k / *stride as u64) % *dim as u64)
             .collect();
-        self.storage.schema.validate_coord(&base_coord)?;
+        self.storage.schema().validate_coord(&base_coord)?;
         Ok(base_coord)
     }
 
     pub(crate) fn block_position_from_base_coord(&self, base_coord: &[u64]) -> (u64, usize) {
         let offset: u64 = base_coord
             .iter()
-            .zip(self.storage.schema.strides().iter())
+            .zip(self.storage.schema().strides().iter())
             .map(|(coord, stride)| *coord * (*stride as u64))
             .sum();
         let block_len = self.block_len() as u64;
         let block_offset = offset / block_len;
         let offset_in_block = (offset % block_len) as usize;
         (block_offset, offset_in_block)
+    }
+
+    pub(crate) fn block_len(&self) -> usize {
+        self.storage.schema().block_len().max(1)
     }
 
     fn default_block(&self) -> Vec<T> {
@@ -240,143 +305,18 @@ where
     where
         FE: AsType<String> + From<String>,
     {
-        let payload = encode_schema(&self.storage.schema);
+        let payload = encode_schema(&self.storage.schema());
         let _ = decode_schema(&payload)?;
-        write_metadata_file(&self.storage.blocks, METADATA, &payload).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SparseTensor
-// ---------------------------------------------------------------------------
-
-enum SparseWriteAction {
-    Write(u64),
-    DeleteRow(u64),
-    NoOp,
-}
-
-#[derive(Clone)]
-pub struct SparseTensor<FE, T = f32> {
-    storage: Arc<SparseStorage<FE>>,
-    schema: TensorSchema,
-    view: TensorView,
-    _dtype: std::marker::PhantomData<T>,
-}
-
-impl<FE, T> SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    pub async fn create(dir: DirLock<FE>, schema: TensorSchema) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        validate_tensor_dtype::<T>(&schema)?;
-        if !matches!(schema.layout(), Layout::Sparse { .. }) {
-            return Err(Error::InvalidLayout(
-                "SparseTensor requires a sparse schema layout".to_string(),
-            ));
-        }
-
-        let mut dir_guard = dir.try_write()?;
-        let blocks_dir = dir_guard.create_dir(BLOCKS.to_string())?;
-        let index_dir = dir_guard.create_dir(INDEX.to_string())?;
-        let index =
-            TableLock::create(SparseTableSchema::default(), Collator::default(), index_dir)?;
-        let tensor = Self::new_storage(blocks_dir, index, schema);
-        tensor.persist_metadata().await?;
-        Ok(tensor)
+        write_metadata_file(&self.storage.blocks(), METADATA, &payload).await
     }
 
-    pub async fn load(dir: DirLock<FE>) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        let mut dir_guard = dir.try_write()?;
-        let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-        let schema = load_metadata_inner(&blocks_dir).await?;
-        validate_tensor_dtype::<T>(&schema)?;
-        let index_dir = dir_guard.get_dir(INDEX).cloned().ok_or_else(|| {
-            Error::InvalidSchema("sparse tensor missing index directory".to_string())
-        })?;
-        let index = TableLock::load(SparseTableSchema::default(), Collator::default(), index_dir)?;
-        Ok(Self::new_storage(blocks_dir, index, schema))
-    }
-
-    pub async fn load_with_schema(dir: DirLock<FE>, expected: &TensorSchema) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        validate_tensor_dtype::<T>(expected)?;
-        let tensor = Self::load(dir).await?;
-        if tensor.schema() != expected {
-            return Err(Error::InvalidSchema(format!(
-                "persisted metadata mismatch: expected {:?}, found {:?}",
-                expected,
-                tensor.schema()
-            )));
-        }
-        Ok(tensor)
-    }
-
-    fn new_storage(
-        blocks: DirLock<FE>,
-        index: TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>,
-        schema: TensorSchema,
-    ) -> Self {
-        let view = TensorView::identity(&schema);
-        let storage = Arc::new(SparseStorage {
-            blocks,
-            index,
-            schema: schema.clone(),
-        });
-        Self {
-            storage,
-            schema,
-            view,
-            _dtype: std::marker::PhantomData,
-        }
-    }
-
-    pub(crate) fn block_len(&self) -> usize {
-        self.storage.schema.block_len().max(1)
-    }
-
-    pub(crate) fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
-        self.schema.validate_coord(coord)?;
-        let k = self.view.flat_offset(coord)?;
-        if k < 0 {
-            return Err(Error::InvalidCoord("negative linear offset".to_string()));
-        }
-        let k = k as u64;
-        let base_coord: Vec<u64> = self
-            .storage
-            .schema
-            .strides()
-            .iter()
-            .zip(self.storage.schema.shape().iter())
-            .map(|(stride, dim)| (k / *stride as u64) % *dim as u64)
-            .collect();
-        self.storage.schema.validate_coord(&base_coord)?;
-        Ok(base_coord)
-    }
-
-    pub(crate) fn block_position_from_base_coord(&self, base_coord: &[u64]) -> (u64, usize) {
-        let offset: u64 = base_coord
-            .iter()
-            .zip(self.storage.schema.strides().iter())
-            .map(|(coord, stride)| *coord * (*stride as u64))
-            .sum();
-        let block_len = self.block_len() as u64;
-        let block_offset = offset / block_len;
-        let offset_in_block = (offset % block_len) as usize;
-        (block_offset, offset_in_block)
+    async fn delete_block(&self, block_id: u64) {
+        let mut blocks = self.storage.blocks().write().await;
+        blocks.delete(&block_id.to_string()).await;
     }
 
     pub(crate) fn sparse_key(&self, coords: &[u64], block_offset: u64) -> Vec<u64> {
-        let sparse_axis = match self.storage.schema.layout() {
+        let sparse_axis = match self.storage.schema().layout() {
             Layout::Sparse { axis } => axis.unwrap_or(0),
             Layout::Dense => 0,
         };
@@ -391,10 +331,6 @@ where
     ) -> Result<Option<u64>> {
         let key = self.sparse_key(base_coord, block_offset);
         self.lookup_block_id(&key).await
-    }
-
-    fn default_block(&self) -> Vec<T> {
-        vec![T::default(); self.block_len()]
     }
 
     async fn resolve_sparse_block_for_write(
@@ -425,160 +361,33 @@ where
         Ok(SparseWriteAction::Write(block_id))
     }
 
-    async fn write_value_to_block(
-        &self,
-        block_id: u64,
-        offset_in_block: usize,
-        value: T,
-        create_if_missing: bool,
-    ) -> Result<()> {
-        let mut block = match self.read_block(block_id).await? {
-            Some(block) => block,
-            None if create_if_missing => self.default_block(),
+    fn new_storage(
+        blocks: DirLock<FE>,
+        index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
+        schema: TensorSchema,
+    ) -> Self 
+    where
+        FE: {
+        let view = TensorView::identity(&schema);
+
+        let storage = match index {
+            Some(si) => {
+                Storage::Sparse(SparseStorage {
+                    blocks,
+                    index: si,
+                    schema: schema.clone(),
+                })
+            },
             None => {
-                return Err(Error::SparseIndex(
-                    "sparse index points to missing block".to_string(),
-                ));
+                Storage::Dense(DenseStorage { blocks, schema: schema.clone() })
             }
         };
-        validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-        block[offset_in_block] = value;
-        self.write_block(block_id, block).await
-    }
 
-    async fn delete_block(&self, block_id: u64) {
-        let mut blocks = self.storage.blocks.write().await;
-        blocks.delete(&block_id.to_string()).await;
-    }
-
-    async fn persist_metadata(&self) -> Result<()>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        let payload = encode_schema(&self.storage.schema);
-        let _ = decode_schema(&payload)?;
-        write_metadata_file(&self.storage.blocks, METADATA, &payload).await
-    }
-
-    pub async fn compact_sparse(&self) -> Result<()> {
-        let all_rows = {
-            let guard = self.storage.index.read().await;
-            let mut rows = guard.into_rows().await.map_err(Error::from)?;
-            let mut collected: Vec<Vec<u64>> = Vec::new();
-            while let Some(row) = rows.next().await {
-                let row = row.map_err(Error::from)?;
-                collected.push(row.to_vec());
-            }
-            collected
-        };
-
-        let mut to_delete: Vec<(Vec<u64>, u64)> = Vec::new();
-        for row in &all_rows {
-            let key = vec![row[0], row[1]];
-            let block_id = row[2];
-            let all_zero = match self.read_block(block_id).await? {
-                Some(block) => block.iter().all(|v| *v == T::default()),
-                None => true,
-            };
-            if all_zero {
-                to_delete.push((key, block_id));
-            }
-        }
-
-        for (key, block_id) in to_delete {
-            self.delete_row(key).await?;
-            self.delete_block(block_id).await;
-        }
-
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tensor enum
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub enum Tensor<FE, T = f32> {
-    Dense(DenseTensor<FE, T>),
-    Sparse(SparseTensor<FE, T>),
-}
-
-pub type TensorF32<FE> = Tensor<FE, f32>;
-pub type TensorF64<FE> = Tensor<FE, f64>;
-pub type DenseTensorF32<FE> = DenseTensor<FE, f32>;
-pub type DenseTensorF64<FE> = DenseTensor<FE, f64>;
-pub type SparseTensorF32<FE> = SparseTensor<FE, f32>;
-pub type SparseTensorF64<FE> = SparseTensor<FE, f64>;
-
-impl<FE, T> Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    pub async fn create(dir: DirLock<FE>, schema: TensorSchema) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        match schema.layout() {
-            Layout::Dense => DenseTensor::create(dir, schema).await.map(Self::Dense),
-            Layout::Sparse { .. } => SparseTensor::create(dir, schema).await.map(Self::Sparse),
-        }
-    }
-
-    pub async fn load(dir: DirLock<FE>) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        let layout = {
-            let mut dir_guard = dir.try_write()?;
-            let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-            let schema = load_metadata_inner(&blocks_dir).await?;
-            schema.layout().clone()
-        };
-        match layout {
-            Layout::Dense => DenseTensor::load(dir).await.map(Self::Dense),
-            Layout::Sparse { .. } => SparseTensor::load(dir).await.map(Self::Sparse),
-        }
-    }
-
-    pub async fn load_with_schema(dir: DirLock<FE>, expected: &TensorSchema) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        validate_tensor_dtype::<T>(expected)?;
-        let tensor = Self::load(dir).await?;
-        if tensor.schema() != expected {
-            return Err(Error::InvalidSchema(format!(
-                "persisted metadata mismatch: expected {:?}, found {:?}",
-                expected,
-                tensor.schema()
-            )));
-        }
-        Ok(tensor)
-    }
-
-    /// Build a lazily-streamed encoder for this tensor's current view
-    /// (identity or transformed, dense or sparse): schema followed by a
-    /// nested sequence of non-default `(coord, value)` pairs and a trailing
-    /// verification record. No full in-memory buffering -- each value is
-    /// read from storage only as the returned value is actually driven by
-    /// a destream encoder (e.g. `tbon::en::encode(tensor.view_encoder())`).
-    pub fn view_encoder(&self) -> stream::TensorViewEncoder<'_, FE, T> {
-        stream::TensorViewEncoder::new(self)
-    }
-
-    pub fn as_sparse(&self) -> Option<&SparseTensor<FE, T>> {
-        match self {
-            Self::Sparse(inner) => Some(inner),
-            Self::Dense(_) => None,
-        }
-    }
-
-    pub fn into_sparse(self) -> Option<SparseTensor<FE, T>> {
-        match self {
-            Self::Sparse(inner) => Some(inner),
-            Self::Dense(_) => None,
+        Self {
+            storage: Arc::new(storage),
+            schema,
+            view,
+            _dtype: std::marker::PhantomData,
         }
     }
 }
