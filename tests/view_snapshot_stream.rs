@@ -64,7 +64,7 @@ async fn identity_dense_view_round_trips_with_data() {
 
     assert!(decoded.is_base_tensor());
     assert_eq!(decoded.schema().shape(), schema.shape());
-    assert_eq!(decoded.schema().layout(), &Layout::Dense);
+    assert_eq!(decoded.schema().layout(), Layout::Dense);
 
     for (coord, value) in expected {
         let read = decoded.read_value(&coord).await.expect("read");
@@ -102,7 +102,7 @@ async fn identity_sparse_view_round_trips_with_data_and_axis() {
     let decoded = decoded.into_inner();
 
     assert!(decoded.is_base_tensor());
-    assert_eq!(decoded.schema().layout(), &Layout::Sparse { axis: Some(0) });
+    assert_eq!(decoded.schema().layout(), Layout::Sparse { axis: Some(0) });
 
     for coord in iter_coords(schema.shape()) {
         let expected = tensor.read_value(&coord).await.expect("read source");
@@ -211,7 +211,7 @@ async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
     let decoded = decoded.into_inner();
 
     assert!(decoded.is_base_tensor());
-    assert_eq!(decoded.schema().layout(), &Layout::Sparse { axis: None });
+    assert_eq!(decoded.schema().layout(), Layout::Sparse { axis: None });
 
     for (coord, value) in expected {
         let read = decoded.read_value(&coord).await.expect("read");

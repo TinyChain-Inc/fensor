@@ -128,6 +128,7 @@ enum SparseWriteAction {
 // ---------------------------------------------------------------------------
 // Tensor enum
 // ---------------------------------------------------------------------------
+#[derive(Clone)]
 pub struct Tensor<FE, T> {
     storage: Arc<Storage<FE>>,
     schema: TensorSchema,

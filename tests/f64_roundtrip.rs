@@ -1,7 +1,7 @@
 mod common;
 
 use common::{FsEntry, unique_tmp_dir};
-use fensor::{DType, Layout, Tensor, TensorRead, TensorSchema, TensorWrite, contiguous_strides};
+use fensor::{DType, Layout, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite, contiguous_strides};
 use freqfs::Cache;
 use ha_ndarray::{Shape, shape};
 use std::io;
@@ -43,9 +43,10 @@ async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
     assert_eq!(pi, std::f64::consts::PI);
     assert_eq!(e, std::f64::consts::E);
 
-    let loaded = Tensor::<FsEntry, f64>::load_with_schema(dir.clone(), &schema)
+    let loaded = Tensor::<FsEntry, f64>::load(dir.clone())
         .await
         .expect("load tensor");
+    assert_eq!(schema, *loaded.schema());
     let loaded_e = loaded.read_value(&[1, 1]).await.expect("read loaded e");
     assert_eq!(loaded_e, std::f64::consts::E);
 
