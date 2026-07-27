@@ -1,7 +1,9 @@
 mod common;
 
 use common::{FsEntry, unique_tmp_dir};
-use fensor::{DType, Layout, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite, contiguous_strides};
+use fensor::{
+    DType, Layout, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite, contiguous_strides,
+};
 use freqfs::Cache;
 use ha_ndarray::{Shape, shape};
 use std::io;

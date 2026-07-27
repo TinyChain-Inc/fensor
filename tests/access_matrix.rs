@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, Tensor, TensorArray, TensorBlockStore,
-    TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform,
-    TensorViewSemantics, TensorWrite, TensorWriteBulk, contiguous_strides,
+    BoxFuture, DType, Error, Layout, Tensor, TensorArray, TensorBlockStore, TensorRead,
+    TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform, TensorViewSemantics,
+    TensorWrite, TensorWriteBulk, contiguous_strides,
 };
 use ha_ndarray::{Axes, AxisRange, Range, Shape, axes, range, shape};
 
@@ -1652,9 +1652,7 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load(dir2)
-            .await
-            .expect("reload");
+        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
         assert_eq!(schema, *loaded.schema());
         for coord in iter_coords(loaded.shape()) {
             let v = loaded.read_value(&coord).await.expect("read");
@@ -1681,9 +1679,7 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load(dir2, )
-            .await
-            .expect("reload");
+        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
         assert_eq!(schema, *loaded.schema());
         assert_eq!(loaded.read_value(&[0, 0, 0]).await.expect("read"), 1.0);
         assert_eq!(loaded.read_value(&[1, 2, 3]).await.expect("read"), 9.0);
@@ -1785,9 +1781,7 @@ mod section_h_persistence {
         let _ = tokio::fs::remove_file(&target).await;
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load(dir2)
-            .await
-            .expect("reload");
+        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
         assert_eq!(schema, *loaded.schema());
         let err = loaded
             .read_value(&[0, 1, 2])
