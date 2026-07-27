@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::io;
+use std::sync::Arc;
 
 use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
@@ -89,32 +89,31 @@ struct SparseStorage<FE> {
 
 enum Storage<FE> {
     Dense(DenseStorage<FE>),
-    Sparse(SparseStorage<FE>)
+    Sparse(SparseStorage<FE>),
 }
 
 impl<FE> Storage<FE> {
     pub(crate) fn blocks(&self) -> &DirLock<FE> {
         match self {
             Self::Dense(s) => &s.blocks,
-            Self::Sparse(s) => &s.blocks
+            Self::Sparse(s) => &s.blocks,
         }
     }
 
     pub(crate) fn schema(&self) -> &TensorSchema {
         match self {
             Self::Dense(s) => &s.schema,
-            Self::Sparse(s) => &s.schema
+            Self::Sparse(s) => &s.schema,
         }
     }
 
     pub(crate) fn index(&self) -> Option<&SparseIndex<FE>> {
         match self {
             Self::Dense(_) => None,
-            Self::Sparse(s) => Some(&s.index)
+            Self::Sparse(s) => Some(&s.index),
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Sparse
@@ -122,16 +121,20 @@ impl<FE> Storage<FE> {
 
 pub struct SparseHandle<'a, FE, T>(&'a Tensor<FE, T>);
 
-impl<'a, FE, T> SparseHandle<'a, FE, T> 
-where 
+impl<'a, FE, T> SparseHandle<'a, FE, T>
+where
     FE: TensorFileEntry<T>,
-    T: TensorElement {
+    T: TensorElement,
+{
     pub async fn compact_sparse(&self) -> Result<()> {
         let SparseHandle(tensor) = *self;
         let all_rows = {
-            let guard = tensor.storage.index()
+            let guard = tensor
+                .storage
+                .index()
                 .ok_or_else(|| Error::SparseIndex("Sparse index is missing".to_string()))?
-                .read().await;
+                .read()
+                .await;
             let mut rows = guard.into_rows().await.map_err(Error::from)?;
             let mut collected: Vec<Vec<u64>> = Vec::new();
             while let Some(row) = rows.next().await {
@@ -167,7 +170,7 @@ enum SparseWriteAction {
     Write(u64),
     DeleteRow(u64),
     NoOp,
-    CreateBlockAndWrite(u64)
+    CreateBlockAndWrite(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +180,7 @@ pub struct Tensor<FE, T> {
     storage: Arc<Storage<FE>>,
     schema: TensorSchema,
     view: TensorView,
-    _dtype: std::marker::PhantomData<T>
+    _dtype: std::marker::PhantomData<T>,
 }
 
 pub type TensorF32<FE> = Tensor<FE, f32>;
@@ -199,11 +202,15 @@ where
 
         let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = schema.layout() {
             let index_dir = dir_guard.create_dir(INDEX.to_string())?;
-            Some(TableLock::create(SparseTableSchema::default(), Collator::default(), index_dir)?)
+            Some(TableLock::create(
+                SparseTableSchema::default(),
+                Collator::default(),
+                index_dir,
+            )?)
         } else {
             None
         };
-        
+
         let tensor = Self::new_storage(blocks_dir, index, schema);
         tensor.persist_metadata().await?;
         Ok(tensor)
@@ -221,11 +228,15 @@ where
             let index_dir = dir_guard.get_dir(INDEX).cloned().ok_or_else(|| {
                 Error::InvalidSchema("sparse tensor missing index directory".to_string())
             })?;
-            Some(TableLock::load(SparseTableSchema::default(), Collator::default(), index_dir)?)
+            Some(TableLock::load(
+                SparseTableSchema::default(),
+                Collator::default(),
+                index_dir,
+            )?)
         } else {
             None
         };
-        
+
         Ok(Self::new_storage(blocks_dir, index, schema))
     }
 
@@ -293,8 +304,8 @@ where
             None => {
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::NotFound,
-                    "Missing block".to_string()),
-                ));
+                    "Missing block".to_string(),
+                )));
             }
         };
         validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
@@ -362,22 +373,22 @@ where
         blocks: DirLock<FE>,
         index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
         schema: TensorSchema,
-    ) -> Self 
+    ) -> Self
     where
-        FE: {
+        FE:,
+    {
         let view = TensorView::identity(&schema);
 
         let storage = match index {
-            Some(si) => {
-                Storage::Sparse(SparseStorage {
-                    blocks,
-                    index: si,
-                    schema: schema.clone(),
-                })
-            },
-            None => {
-                Storage::Dense(DenseStorage { blocks, schema: schema.clone() })
-            }
+            Some(si) => Storage::Sparse(SparseStorage {
+                blocks,
+                index: si,
+                schema: schema.clone(),
+            }),
+            None => Storage::Dense(DenseStorage {
+                blocks,
+                schema: schema.clone(),
+            }),
         };
 
         Self {
@@ -426,19 +437,22 @@ where
 
             let block_id = match self.schema.layout() {
                 Layout::Dense => Some(block_offset),
-                Layout::Sparse { .. } => self.lookup_sparse_block_for_coord(&base_coord, block_offset).await?
+                Layout::Sparse { .. } => {
+                    self.lookup_sparse_block_for_coord(&base_coord, block_offset)
+                        .await?
+                }
             };
 
             let Some(id) = block_id else {
-                return Ok(T::default())
+                return Ok(T::default());
             };
 
             if let Some(block) = self.read_block(id).await? {
-                    validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-                    Ok(block[offset_in_block])
-                } else {
-                    Err(Error::DataMismatch("Block is missing".to_string()))
-                }
+                validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
+                Ok(block[offset_in_block])
+            } else {
+                Err(Error::DataMismatch("Block is missing".to_string()))
+            }
         })
     }
 }
@@ -469,7 +483,8 @@ where
                 }
                 Layout::Sparse { .. } => {
                     match self
-                        .plan_sparse_write(&base_coord, block_offset, value).await?
+                        .plan_sparse_write(&base_coord, block_offset, value)
+                        .await?
                     {
                         SparseWriteAction::Write(block_id) => {
                             self.write_value_to_block(block_id, offset_in_block, value)
@@ -742,9 +757,12 @@ where
 
     fn delete_row<'a>(&'a self, key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
-            let mut index_lock = self.storage.index()
+            let mut index_lock = self
+                .storage
+                .index()
                 .ok_or_else(|| Error::SparseIndex("Sparse tensor is missing an index".to_string()))?
-                .write().await;
+                .write()
+                .await;
             index_lock.delete_row(&key).await.map_err(Error::from)
         })
     }
