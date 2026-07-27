@@ -438,12 +438,15 @@ where
                 return Ok(T::default());
             };
 
-            if let Some(block) = self.read_block(id).await? {
-                validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-                Ok(block[offset_in_block])
-            } else {
-                Err(Error::DataMismatch("Block is missing".to_string()))
-            }
+            let Some(block) = self.read_block(id).await? else {
+                return match self.schema.layout() {
+                    Layout::Dense => Ok(T::default()),
+                    Layout::Sparse { .. } => Err(Error::DataMismatch("Block is missing".to_string()))
+                }
+            };
+
+            validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
+            Ok(block[offset_in_block])
         })
     }
 }
@@ -468,7 +471,9 @@ where
 
             match self.schema().layout() {
                 Layout::Dense => {
-                    self.write_block(block_offset, self.default_block()).await?;
+                    if self.read_block(block_offset).await?.is_none() {
+                        self.write_block(block_offset, self.default_block()).await?;
+                    }
                     self.write_value_to_block(block_offset, offset_in_block, value)
                         .await
                 }

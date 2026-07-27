@@ -33,18 +33,16 @@ fn sparse_schema_f32(shape: Shape, block_shape: Shape, axis: Option<usize>) -> T
 
 #[tokio::test]
 async fn identity_dense_view_round_trips_with_data() {
-    let root = unique_tmp_dir("view_snapshot_identity_dense");
-    tokio::fs::create_dir(&root).await.expect("mkdir");
     let schema = dense_schema_f32(shape![2, 3], shape![1, 3]);
+    let (root, dir) = common::new_dir("view_snapshot_identity_dense").await;
 
-    let dir = open_dir(&root).expect("open");
     let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
         .await
         .expect("create");
 
     let mut expected = Vec::new();
-    for coord in iter_coords(schema.shape()) {
-        let value = (coord[0] * 10 + coord[1]) as f32 + 1.0;
+    for (idx, coord) in iter_coords(schema.shape()).enumerate() {
+        let value = idx as f32 + 1.0;
         tensor.write_value(&coord, value).await.expect("write");
         expected.push((coord, value));
     }
@@ -66,21 +64,22 @@ async fn identity_dense_view_round_trips_with_data() {
     assert_eq!(decoded.schema().shape(), schema.shape());
     assert_eq!(decoded.schema().layout(), Layout::Dense);
 
-    for (coord, value) in expected {
-        let read = decoded.read_value(&coord).await.expect("read");
-        assert_eq!(read, value);
+    let mut actual = Vec::new();
+    for (coord, _) in expected.iter() {
+        let read = decoded.read_value(coord).await.expect("read");
+        actual.push((coord.clone(), read));
+        // assert_eq!(read, value);
     }
+
+    assert_eq!(&actual, &expected);
 
     cleanup(&root).await;
 }
 
 #[tokio::test]
 async fn identity_sparse_view_round_trips_with_data_and_axis() {
-    let root = unique_tmp_dir("view_snapshot_identity_sparse");
-    tokio::fs::create_dir(&root).await.expect("mkdir");
     let schema = sparse_schema_f32(shape![2, 3], shape![1, 3], Some(0));
-
-    let dir = open_dir(&root).expect("open");
+    let (root, dir) = common::new_dir("view_snapshot_identity_sparse").await;
     let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
         .await
         .expect("create");
