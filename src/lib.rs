@@ -522,124 +522,50 @@ where
 // TensorTransform impls
 // ---------------------------------------------------------------------------
 
-impl<FE, T> TensorTransform for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn reshape(mut self, shape: Shape) -> Result<Self> {
-        let old_shape = self.schema.shape();
-        let old_size: usize = old_shape.iter().product();
-        let new_size: usize = shape.iter().product();
-        if old_size != new_size {
-            return Err(Error::InvalidLayout(
-                "reshape requires an equal number of elements".to_string(),
-            ));
-        }
-        self.view = self.view.reshape(self.schema.shape(), &shape)?;
-        self.schema.set_shape(shape)?;
-        self.schema
-            .set_strides(contiguous_strides(self.schema.shape()))?;
-        Ok(self)
-    }
-
-    fn slice(mut self, range: Range) -> Result<Self> {
-        let current_shape = self.schema.shape();
-        let (view, shape, strides) = self.view.slice(current_shape, &range)?;
-        self.view = view;
-        self.schema.set_shape(shape)?;
-        self.schema.set_strides(strides)?;
-        Ok(self)
-    }
-
-    fn transpose(mut self, permutation: Option<Axes>) -> Result<Self> {
-        let current_shape = self.schema.shape();
-        let current_strides = self.schema.strides().clone();
-        let permutation = default_permutation(current_shape.len(), permutation)?;
-        self.view = self.view.transpose(&permutation)?;
-        let mut shape = Shape::with_capacity(current_shape.len());
-        let mut strides = Vec::with_capacity(current_shape.len());
-        for axis in permutation {
-            shape.push(current_shape[axis]);
-            strides.push(current_strides[axis]);
-        }
-        self.schema.set_shape(shape)?;
-        self.schema.set_strides(strides.into())?;
-        Ok(self)
-    }
-}
-
-impl<FE, T> TensorTransform for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn reshape(mut self, shape: Shape) -> Result<Self> {
-        let old_shape = self.schema.shape();
-        let old_size: usize = old_shape.iter().product();
-        let new_size: usize = shape.iter().product();
-        if old_size != new_size {
-            return Err(Error::InvalidLayout(
-                "reshape requires an equal number of elements".to_string(),
-            ));
-        }
-        self.view = self.view.reshape(self.schema.shape(), &shape)?;
-        self.schema.set_shape(shape)?;
-        self.schema
-            .set_strides(contiguous_strides(self.schema.shape()))?;
-        Ok(self)
-    }
-
-    fn slice(mut self, range: Range) -> Result<Self> {
-        let current_shape = self.schema.shape();
-        let (view, shape, strides) = self.view.slice(current_shape, &range)?;
-        self.view = view;
-        self.schema.set_shape(shape)?;
-        self.schema.set_strides(strides)?;
-        Ok(self)
-    }
-
-    fn transpose(mut self, permutation: Option<Axes>) -> Result<Self> {
-        let current_shape = self.schema.shape();
-        let current_strides = self.schema.strides().clone();
-        let permutation = default_permutation(current_shape.len(), permutation)?;
-        self.view = self.view.transpose(&permutation)?;
-        let mut shape = Shape::with_capacity(current_shape.len());
-        let mut strides = Vec::with_capacity(current_shape.len());
-        for axis in permutation {
-            shape.push(current_shape[axis]);
-            strides.push(current_strides[axis]);
-        }
-        self.schema.set_shape(shape)?;
-        self.schema.set_strides(strides.into())?;
-        Ok(self)
-    }
-}
-
 impl<FE, T> TensorTransform for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        match self {
-            Self::Dense(inner) => inner.reshape(shape).map(Self::Dense),
-            Self::Sparse(inner) => inner.reshape(shape).map(Self::Sparse),
+    fn reshape(mut self, shape: Shape) -> Result<Self> {
+        let old_shape = self.schema.shape();
+        let old_size: usize = old_shape.iter().product();
+        let new_size: usize = shape.iter().product();
+        if old_size != new_size {
+            return Err(Error::InvalidLayout(
+                "reshape requires an equal number of elements".to_string(),
+            ));
         }
+        self.view = self.view.reshape(self.schema.shape(), &shape)?;
+        self.schema.set_shape(shape)?;
+        self.schema
+            .set_strides(contiguous_strides(self.schema.shape()))?;
+        Ok(self)
     }
 
-    fn slice(self, range: Range) -> Result<Self> {
-        match self {
-            Self::Dense(inner) => inner.slice(range).map(Self::Dense),
-            Self::Sparse(inner) => inner.slice(range).map(Self::Sparse),
-        }
+    fn slice(mut self, range: Range) -> Result<Self> {
+        let current_shape = self.schema.shape();
+        let (view, shape, strides) = self.view.slice(current_shape, &range)?;
+        self.view = view;
+        self.schema.set_shape(shape)?;
+        self.schema.set_strides(strides)?;
+        Ok(self)
     }
 
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        match self {
-            Self::Dense(inner) => inner.transpose(permutation).map(Self::Dense),
-            Self::Sparse(inner) => inner.transpose(permutation).map(Self::Sparse),
+    fn transpose(mut self, permutation: Option<Axes>) -> Result<Self> {
+        let current_shape = self.schema.shape();
+        let current_strides = self.schema.strides().clone();
+        let permutation = default_permutation(current_shape.len(), permutation)?;
+        self.view = self.view.transpose(&permutation)?;
+        let mut shape = Shape::with_capacity(current_shape.len());
+        let mut strides = Vec::with_capacity(current_shape.len());
+        for axis in permutation {
+            shape.push(current_shape[axis]);
+            strides.push(current_strides[axis]);
         }
+        self.schema.set_shape(shape)?;
+        self.schema.set_strides(strides.into())?;
+        Ok(self)
     }
 }
 
