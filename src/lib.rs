@@ -398,6 +398,12 @@ where
             _dtype: std::marker::PhantomData,
         }
     }
+
+    fn sparse_index(&self) -> Result<&SparseIndex<FE>> {
+        self.storage
+            .index()
+            .ok_or_else(|| Error::SparseIndex("Operations with index are not available for dense tensor".to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,43 +689,29 @@ where
 // TensorSparseIndex impls
 // ---------------------------------------------------------------------------
 
-impl<FE, T> TensorSparseIndex for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn lookup_block_id<'a>(&'a self, _key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>> {
-        Box::pin(async move { Ok(None) })
-    }
-
-    fn upsert_block_id<'a>(&'a self, _key: Vec<u64>, _block_id: u64) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sparse index is not available for dense layout".to_string(),
-            ))
-        })
-    }
-}
-
-impl<FE, T> TensorSparseIndex for SparseTensor<FE, T>
+impl<FE, T> TensorSparseIndex for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
     fn lookup_block_id<'a>(&'a self, key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>> {
         Box::pin(async move {
-            let index_lock = self.storage.index.read().await;
-            if let Some(row) = index_lock.get_row(key).await? {
-                Ok(row.get(2).copied())
-            } else {
-                Ok(None)
-            }
+            let index = self.sparse_index()?;
+
+            let index_lock = index.read().await;
+            let Some(row) = index_lock.get_row(key).await? else {
+                return Ok(None);
+            };
+
+            Ok(row.get(2).copied())
         })
     }
 
     fn upsert_block_id<'a>(&'a self, key: Vec<u64>, block_id: u64) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let mut index_lock = self.storage.index.write().await;
+            let index = self.sparse_index()?;
+
+            let mut index_lock = index.write().await;
             index_lock
                 .upsert(key, vec![block_id])
                 .await
@@ -730,39 +722,9 @@ where
 
     fn delete_row<'a>(&'a self, key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
-            let mut index_lock = self.storage.index.write().await;
-            index_lock.delete_row(&key).await.map_err(Error::from)
-        })
-    }
-}
+            let index = self.sparse_index()?;
 
-impl<FE, T> TensorSparseIndex for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn lookup_block_id<'a>(&'a self, key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>> {
-        match self {
-            Self::Dense(inner) => inner.lookup_block_id(key),
-            Self::Sparse(inner) => inner.lookup_block_id(key),
-        }
-    }
-
-    fn upsert_block_id<'a>(&'a self, key: Vec<u64>, block_id: u64) -> BoxFuture<'a, Result<()>> {
-        match self {
-            Self::Dense(inner) => inner.upsert_block_id(key, block_id),
-            Self::Sparse(inner) => inner.upsert_block_id(key, block_id),
-        }
-    }
-
-    fn delete_row<'a>(&'a self, key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async move {
-            let mut index_lock = self
-                .storage
-                .index()
-                .ok_or_else(|| Error::SparseIndex("Sparse tensor is missing an index".to_string()))?
-                .write()
-                .await;
+            let mut index_lock = index.write().await;
             index_lock.delete_row(&key).await.map_err(Error::from)
         })
     }

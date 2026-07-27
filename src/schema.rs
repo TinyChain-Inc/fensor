@@ -39,7 +39,7 @@ impl DType {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum Layout {
     Dense,
     Sparse { axis: Option<usize> },
@@ -195,8 +195,8 @@ impl TensorSchema {
         Ok(())
     }
 
-    pub fn layout(&self) -> &Layout {
-        &self.internal.layout
+    pub fn layout(&self) -> Layout {
+        self.internal.layout
     }
 
     pub fn block_shape(&self) -> &Shape {
