@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, SparseTensor, Tensor, TensorArray, TensorBlockStore,
+    BoxFuture, DType, Error, Layout, Tensor, TensorArray, TensorBlockStore,
     TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform,
     TensorViewSemantics, TensorWrite, TensorWriteBulk, contiguous_strides,
 };
@@ -62,10 +62,10 @@ async fn create_sparse(
     shape: Shape,
     block_shape: Shape,
     axis: Option<usize>,
-) -> (PathBuf, SparseTensor<FsEntry, f32>, TensorSchema) {
+) -> (PathBuf, Tensor<FsEntry, f32>, TensorSchema) {
     let (root, dir) = new_dir(name).await;
     let schema = sparse_schema_f32(shape, block_shape, axis);
-    let tensor = SparseTensor::<FsEntry, f32>::create(dir, schema.clone())
+    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
         .await
         .expect("create sparse");
     (root, tensor, schema)
@@ -1652,9 +1652,10 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
+        let loaded = Tensor::<FsEntry, f32>::load(dir2)
             .await
             .expect("reload");
+        assert_eq!(schema, *loaded.schema());
         for coord in iter_coords(loaded.shape()) {
             let v = loaded.read_value(&coord).await.expect("read");
             assert_eq!(v, encode_value(&coord), "post-reload coord {:?}", coord);
@@ -1680,9 +1681,10 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
+        let loaded = Tensor::<FsEntry, f32>::load(dir2, )
             .await
             .expect("reload");
+        assert_eq!(schema, *loaded.schema());
         assert_eq!(loaded.read_value(&[0, 0, 0]).await.expect("read"), 1.0);
         assert_eq!(loaded.read_value(&[1, 2, 3]).await.expect("read"), 9.0);
         assert_eq!(loaded.read_value(&[1, 0, 0]).await.expect("read"), 0.0);
@@ -1783,9 +1785,10 @@ mod section_h_persistence {
         let _ = tokio::fs::remove_file(&target).await;
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
+        let loaded = Tensor::<FsEntry, f32>::load(dir2)
             .await
             .expect("reload");
+        assert_eq!(schema, *loaded.schema());
         let err = loaded
             .read_value(&[0, 1, 2])
             .await

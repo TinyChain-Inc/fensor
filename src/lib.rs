@@ -118,54 +118,6 @@ impl<FE> Storage<FE> {
 // ---------------------------------------------------------------------------
 // Sparse
 // ---------------------------------------------------------------------------
-
-pub struct SparseHandle<'a, FE, T>(&'a Tensor<FE, T>);
-
-impl<'a, FE, T> SparseHandle<'a, FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    pub async fn compact_sparse(&self) -> Result<()> {
-        let SparseHandle(tensor) = *self;
-        let all_rows = {
-            let guard = tensor
-                .storage
-                .index()
-                .ok_or_else(|| Error::SparseIndex("Sparse index is missing".to_string()))?
-                .read()
-                .await;
-            let mut rows = guard.into_rows().await.map_err(Error::from)?;
-            let mut collected: Vec<Vec<u64>> = Vec::new();
-            while let Some(row) = rows.next().await {
-                let row = row.map_err(Error::from)?;
-                collected.push(row.to_vec());
-            }
-            collected
-        };
-
-        let mut to_delete: Vec<(Vec<u64>, u64)> = Vec::new();
-        for row in &all_rows {
-            let key = vec![row[0], row[1]];
-            let block_id = row[2];
-            let all_zero = match tensor.read_block(block_id).await? {
-                Some(block) => block.iter().all(|v| *v == T::default()),
-                None => true,
-            };
-            if all_zero {
-                to_delete.push((key, block_id));
-            }
-        }
-
-        for (key, block_id) in to_delete {
-            tensor.delete_row(key).await?;
-            tensor.delete_block(block_id).await;
-        }
-
-        Ok(())
-    }
-}
-
 enum SparseWriteAction {
     Write(u64),
     DeleteRow(u64),
@@ -250,10 +202,6 @@ where
         stream::TensorViewEncoder::new(self)
     }
 
-    pub fn as_sparse(&self) -> Option<SparseHandle<'_, FE, T>> {
-        matches!(self.storage.as_ref(), Storage::Sparse(_)).then(|| SparseHandle(self))
-    }
-
     pub(crate) fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
         self.schema.validate_coord(coord)?;
         let k = self.view.flat_offset(coord)?;
@@ -287,6 +235,40 @@ where
 
     pub(crate) fn block_len(&self) -> usize {
         self.storage.schema().block_len().max(1)
+    }
+
+    pub async fn compact_sparse(&self) -> Result<()> {
+        let index = self.sparse_index()?;
+        let all_rows = {
+            let guard = index.read().await;
+            let mut rows = guard.into_rows().await.map_err(Error::from)?;
+            let mut collected: Vec<Vec<u64>> = Vec::new();
+            while let Some(row) = rows.next().await {
+                let row = row.map_err(Error::from)?;
+                collected.push(row.to_vec());
+            }
+            collected
+        };
+
+        let mut to_delete: Vec<(Vec<u64>, u64)> = Vec::new();
+        for row in &all_rows {
+            let key = vec![row[0], row[1]];
+            let block_id = row[2];
+            let all_zero = match self.read_block(block_id).await? {
+                Some(block) => block.iter().all(|v| *v == T::default()),
+                None => true,
+            };
+            if all_zero {
+                to_delete.push((key, block_id));
+            }
+        }
+
+        for (key, block_id) in to_delete {
+            self.delete_row(key).await?;
+            self.delete_block(block_id).await;
+        }
+
+        Ok(())
     }
 
     fn default_block(&self) -> Vec<T> {
