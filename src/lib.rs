@@ -317,9 +317,9 @@ where
     where
         FE: AsType<String> + From<String>,
     {
-        let payload = encode_schema(&self.storage.schema());
+        let payload = encode_schema(self.storage.schema());
         let _ = decode_schema(&payload)?;
-        write_metadata_file(&self.storage.blocks(), METADATA, &payload).await
+        write_metadata_file(self.storage.blocks(), METADATA, &payload).await
     }
 
     async fn delete_block(&self, block_id: u64) {
@@ -400,9 +400,11 @@ where
     }
 
     fn sparse_index(&self) -> Result<&SparseIndex<FE>> {
-        self.storage
-            .index()
-            .ok_or_else(|| Error::SparseIndex("Operations with index are not available for dense tensor".to_string()))
+        self.storage.index().ok_or_else(|| {
+            Error::SparseIndex(
+                "Operations with index are not available for dense tensor".to_string(),
+            )
+        })
     }
 }
 
@@ -665,7 +667,7 @@ where
     T: TensorElement,
 {
     fn is_base_tensor(&self) -> bool {
-        self.view.is_identity(&self.storage.schema())
+        self.view.is_identity(self.storage.schema())
     }
 
     fn supports_write_through(&self) -> bool {

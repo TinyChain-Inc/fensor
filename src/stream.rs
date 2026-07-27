@@ -26,7 +26,7 @@ fn encode_tensor_schema_ref(schema: &TensorSchema) -> Result<(DType, Vec<u64>, L
         .map_err(|err| err.to_string())?
         .into_iter()
         .collect::<Vec<u64>>();
-    Ok((schema.dtype(), shape, schema.layout().clone()))
+    Ok((schema.dtype(), shape, schema.layout()))
 }
 
 fn encode_tensor_schema(schema: TensorSchema) -> Result<(DType, Vec<u64>, Layout), String> {
@@ -113,7 +113,7 @@ impl de::FromStream for Layout {
 
 impl<'en> en::ToStream<'en> for Layout {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(encode_layout(self.clone())?, encoder)
+        en::IntoStream::into_stream(encode_layout(*self)?, encoder)
     }
 }
 
