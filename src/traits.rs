@@ -24,7 +24,7 @@ pub trait TensorArray: Send + Sync {
         self.schema().shape()
     }
 
-    fn layout(&self) -> &Layout {
+    fn layout(&self) -> Layout {
         self.schema().layout()
     }
 

@@ -337,7 +337,7 @@ pub(crate) fn snapshot_schema(source: &TensorSchema, is_identity: bool) -> FResu
     let layout = match source.layout() {
         Layout::Dense => Layout::Dense,
         Layout::Sparse { axis } => Layout::Sparse {
-            axis: if is_identity { *axis } else { None },
+            axis: if is_identity { axis } else { None },
         },
     };
     let block_shape = crate::default_block_shape(&shape);
