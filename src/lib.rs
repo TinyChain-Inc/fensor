@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::io;
 
 use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
@@ -166,6 +167,7 @@ enum SparseWriteAction {
     Write(u64),
     DeleteRow(u64),
     NoOp,
+    CreateBlockAndWrite(u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +215,7 @@ where
     {
         let mut dir_guard = dir.try_write()?;
         let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-        let schema = load_metadata_inner(&blocks_dir).await?;
+        let schema = load_metadata_file(&blocks_dir).await?;
         validate_tensor_dtype::<T>(&schema)?;
         let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = schema.layout() {
             let index_dir = dir_guard.get_dir(INDEX).cloned().ok_or_else(|| {
@@ -285,14 +287,13 @@ where
         block_id: u64,
         offset_in_block: usize,
         value: T,
-        create_if_missing: bool,
     ) -> Result<()> {
         let mut block = match self.read_block(block_id).await? {
             Some(block) => block,
-            None if create_if_missing => self.default_block(),
             None => {
-                return Err(Error::SparseIndex(
-                    "sparse index points to missing block".to_string(),
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Missing block".to_string()),
                 ));
             }
         };
@@ -333,14 +334,12 @@ where
         self.lookup_block_id(&key).await
     }
 
-    async fn resolve_sparse_block_for_write(
+    async fn plan_sparse_write(
         &self,
         base_coord: &[u64],
         block_offset: u64,
         value: T,
     ) -> Result<SparseWriteAction> {
-        let key = self.sparse_key(base_coord, block_offset);
-
         if let Some(block_id) = self
             .lookup_sparse_block_for_coord(base_coord, block_offset)
             .await?
@@ -356,9 +355,7 @@ where
         }
 
         let block_id: u64 = rand::random();
-        self.write_block(block_id, self.default_block()).await?;
-        self.upsert_block_id(key, block_id).await?;
-        Ok(SparseWriteAction::Write(block_id))
+        Ok(SparseWriteAction::CreateBlockAndWrite(block_id))
     }
 
     fn new_storage(
@@ -450,59 +447,6 @@ where
 // TensorWrite impls
 // ---------------------------------------------------------------------------
 
-impl<FE, T> TensorWrite for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn write_value<'a>(
-        &'a self,
-        coord: &'a [u64],
-        value: Self::DType,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let base_coord = self.resolve_base_coord(coord)?;
-            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
-            self.write_value_to_block(block_offset, offset_in_block, value, true)
-                .await
-        })
-    }
-}
-
-impl<FE, T> TensorWrite for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn write_value<'a>(
-        &'a self,
-        coord: &'a [u64],
-        value: Self::DType,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let base_coord = self.resolve_base_coord(coord)?;
-            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
-
-            match self
-                .resolve_sparse_block_for_write(&base_coord, block_offset, value)
-                .await?
-            {
-                SparseWriteAction::Write(block_id) => {
-                    self.write_value_to_block(block_id, offset_in_block, value, false)
-                        .await
-                }
-                SparseWriteAction::DeleteRow(block_id) => {
-                    let key = self.sparse_key(&base_coord, block_offset);
-                    self.delete_row(key).await?;
-                    self.delete_block(block_id).await;
-                    Ok(())
-                }
-                SparseWriteAction::NoOp => Ok(()),
-            }
-        })
-    }
-}
-
 impl<FE, T> TensorWrite for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
@@ -513,10 +457,43 @@ where
         coord: &'a [u64],
         value: Self::DType,
     ) -> BoxFuture<'a, Result<()>> {
-        match self {
-            Self::Dense(inner) => inner.write_value(coord, value),
-            Self::Sparse(inner) => inner.write_value(coord, value),
-        }
+        Box::pin(async move {
+            let base_coord = self.resolve_base_coord(coord)?;
+            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
+
+            match self.schema().layout() {
+                Layout::Dense => {
+                    self.write_block(block_offset, self.default_block()).await?;
+                    self.write_value_to_block(block_offset, offset_in_block, value)
+                        .await
+                }
+                Layout::Sparse { .. } => {
+                    match self
+                        .plan_sparse_write(&base_coord, block_offset, value).await?
+                    {
+                        SparseWriteAction::Write(block_id) => {
+                            self.write_value_to_block(block_id, offset_in_block, value)
+                                .await
+                        }
+                        SparseWriteAction::DeleteRow(block_id) => {
+                            let key = self.sparse_key(&base_coord, block_offset);
+                            self.delete_row(key).await?;
+                            self.delete_block(block_id).await;
+                            Ok(())
+                        }
+                        SparseWriteAction::CreateBlockAndWrite(block_id) => {
+                            self.write_block(block_id, self.default_block()).await?;
+                            let key = self.sparse_key(&base_coord, block_offset);
+                            self.upsert_block_id(key, block_id).await?;
+                            self.write_value_to_block(block_id, offset_in_block, value)
+                                .await?;
+                            Ok(())
+                        }
+                        SparseWriteAction::NoOp => Ok(()),
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -649,82 +626,6 @@ where
 // TensorBlockStore impls
 // ---------------------------------------------------------------------------
 
-impl<FE, T> TensorBlockStore for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    type Block = Vec<T>;
-
-    fn read_block<'a>(&'a self, block_id: u64) -> BoxFuture<'a, Result<Option<Self::Block>>> {
-        Box::pin(async move {
-            let blocks = self.storage.blocks.read().await;
-            if let Some(file) = blocks.get_file(&block_id.to_string()) {
-                let guard = file.read::<Vec<T>>().await?;
-                Ok(Some(guard.clone()))
-            } else {
-                Ok(None)
-            }
-        })
-    }
-
-    fn write_block<'a>(&'a self, block_id: u64, block: Self::Block) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let file = {
-                let blocks = self.storage.blocks.read().await;
-                blocks.get_file(&block_id.to_string()).cloned()
-            };
-            if let Some(file) = file {
-                let mut guard = file.write::<Vec<T>>().await?;
-                *guard = block;
-                Ok(())
-            } else {
-                let mut blocks = self.storage.blocks.write().await;
-                blocks.create_file(block_id.to_string(), block, 0)?;
-                Ok(())
-            }
-        })
-    }
-}
-
-impl<FE, T> TensorBlockStore for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    type Block = Vec<T>;
-
-    fn read_block<'a>(&'a self, block_id: u64) -> BoxFuture<'a, Result<Option<Self::Block>>> {
-        Box::pin(async move {
-            let blocks = self.storage.blocks.read().await;
-            if let Some(file) = blocks.get_file(&block_id.to_string()) {
-                let guard = file.read::<Vec<T>>().await?;
-                Ok(Some(guard.clone()))
-            } else {
-                Ok(None)
-            }
-        })
-    }
-
-    fn write_block<'a>(&'a self, block_id: u64, block: Self::Block) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let file = {
-                let blocks = self.storage.blocks.read().await;
-                blocks.get_file(&block_id.to_string()).cloned()
-            };
-            if let Some(file) = file {
-                let mut guard = file.write::<Vec<T>>().await?;
-                *guard = block;
-                Ok(())
-            } else {
-                let mut blocks = self.storage.blocks.write().await;
-                blocks.create_file(block_id.to_string(), block, 0)?;
-                Ok(())
-            }
-        })
-    }
-}
-
 impl<FE, T> TensorBlockStore for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
@@ -733,17 +634,33 @@ where
     type Block = Vec<T>;
 
     fn read_block<'a>(&'a self, block_id: u64) -> BoxFuture<'a, Result<Option<Self::Block>>> {
-        match self {
-            Self::Dense(inner) => inner.read_block(block_id),
-            Self::Sparse(inner) => inner.read_block(block_id),
-        }
+        Box::pin(async move {
+            let blocks = self.storage.blocks().read().await;
+            if let Some(file) = blocks.get_file(&block_id.to_string()) {
+                let guard = file.read::<Vec<T>>().await?;
+                Ok(Some(guard.clone()))
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     fn write_block<'a>(&'a self, block_id: u64, block: Self::Block) -> BoxFuture<'a, Result<()>> {
-        match self {
-            Self::Dense(inner) => inner.write_block(block_id, block),
-            Self::Sparse(inner) => inner.write_block(block_id, block),
-        }
+        Box::pin(async move {
+            let file = {
+                let blocks = self.storage.blocks().read().await;
+                blocks.get_file(&block_id.to_string()).cloned()
+            };
+            if let Some(file) = file {
+                let mut guard = file.write::<Vec<T>>().await?;
+                *guard = block;
+                Ok(())
+            } else {
+                let mut blocks = self.storage.blocks().write().await;
+                blocks.create_file(block_id.to_string(), block, 0)?;
+                Ok(())
+            }
+        })
     }
 }
 
@@ -824,98 +741,36 @@ where
     }
 
     fn delete_row<'a>(&'a self, key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
-        match self {
-            Self::Dense(inner) => inner.delete_row(key),
-            Self::Sparse(inner) => inner.delete_row(key),
-        }
+        Box::pin(async move {
+            let mut index_lock = self.storage.index()
+                .ok_or_else(|| Error::SparseIndex("Sparse tensor is missing an index".to_string()))?
+                .write().await;
+            index_lock.delete_row(&key).await.map_err(Error::from)
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
 // TensorViewSemantics impls
 // ---------------------------------------------------------------------------
-
-impl<FE, T> TensorViewSemantics for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        self.view.is_identity(&self.storage.schema)
-    }
-
-    fn supports_write_through(&self) -> bool {
-        !self.view.has_gather_axes()
-    }
-}
-
-impl<FE, T> TensorViewSemantics for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        self.view.is_identity(&self.storage.schema)
-    }
-
-    fn supports_write_through(&self) -> bool {
-        !self.view.has_gather_axes()
-    }
-}
-
 impl<FE, T> TensorViewSemantics for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
     fn is_base_tensor(&self) -> bool {
-        match self {
-            Self::Dense(inner) => inner.is_base_tensor(),
-            Self::Sparse(inner) => inner.is_base_tensor(),
-        }
+        self.view.is_identity(&self.storage.schema())
     }
 
     fn supports_write_through(&self) -> bool {
-        match self {
-            Self::Dense(inner) => inner.supports_write_through(),
-            Self::Sparse(inner) => inner.supports_write_through(),
-        }
+        !self.view.has_gather_axes()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Unsupported bulk traits (trait-surface wiring only)
 // ---------------------------------------------------------------------------
-
-impl<FE, T> TensorReadBulk for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-}
-
-impl<FE, T> TensorReadBulk for SparseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-}
-
 impl<FE, T> TensorReadBulk for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-}
-
-impl<FE, T> TensorWriteBulk for DenseTensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-}
-
-impl<FE, T> TensorWriteBulk for SparseTensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
@@ -948,7 +803,7 @@ pub fn default_block_shape(shape: &Shape) -> Shape {
     block_shape
 }
 
-async fn load_metadata_inner<FE>(blocks: &DirLock<FE>) -> Result<TensorSchema>
+async fn load_metadata_file<FE>(blocks: &DirLock<FE>) -> Result<TensorSchema>
 where
     FE: AsType<String> + FileLoad + Send + Sync + 'static,
 {
