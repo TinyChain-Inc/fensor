@@ -255,10 +255,7 @@ where
         for row in &all_rows {
             let key = vec![row[0], row[1]];
             let block_id = row[2];
-            let all_zero = match self.read_block(block_id).await? {
-                Some(block) => block.iter().all(|v| *v == T::default()),
-                None => true,
-            };
+            let all_zero = self.is_empty_block(block_id).await?;
             if all_zero {
                 to_delete.push((key, block_id));
             }
@@ -389,6 +386,13 @@ where
             )
         })
     }
+
+    async fn is_empty_block(&self, block_id: u64) -> Result<bool> {
+        match self.read_block(block_id).await? {
+            Some(block) => Ok(block.iter().all(|v| *v == T::default())),
+            None => Ok(true),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +496,10 @@ where
                         SparseWriteAction::DeleteRow(block_id) => {
                             let key = self.sparse_key(&base_coord, block_offset);
                             self.delete_row(key).await?;
-                            self.delete_block(block_id).await;
+                            if self.is_empty_block(block_id).await? {
+                                self.delete_block(block_id).await;
+                            }
+                            
                             Ok(())
                         }
                         SparseWriteAction::CreateBlockAndWrite(block_id) => {
