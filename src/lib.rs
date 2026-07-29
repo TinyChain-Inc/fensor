@@ -1,4 +1,4 @@
-use std::io::{ErrorKind, Error as IoError};
+use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
 
 use b_table::{TableLock, collate::Collator};
@@ -282,10 +282,7 @@ where
         let mut block = match self.read_block(block_id).await? {
             Some(block) => block,
             None => {
-                return Err(IoError::new(
-                    ErrorKind::NotFound,
-                    "Missing block".to_string(),
-                ).into());
+                return Err(IoError::new(ErrorKind::NotFound, "Missing block".to_string()).into());
             }
         };
         validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
@@ -448,7 +445,8 @@ where
                     Layout::Sparse { .. } => Err(IoError::new(
                         ErrorKind::NotFound,
                         "Block is missing".to_string(),
-                    ).into()),
+                    )
+                    .into()),
                 };
             };
 
@@ -499,7 +497,7 @@ where
                             if self.is_empty_block(block_id).await? {
                                 self.delete_block(block_id).await;
                             }
-                            
+
                             Ok(())
                         }
                         SparseWriteAction::CreateBlockAndWrite(block_id) => {
