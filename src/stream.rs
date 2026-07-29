@@ -1,13 +1,10 @@
-use std::fmt;
-
 use destream::{de, en};
 use freqfs::DirLock;
-use safecast::Match;
 
-use crate::wire_tags::{VIEW_SNAPSHOT_VALUES_TAG, VIEW_SNAPSHOT_VALUES_ERROR_TAG, LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
+use crate::wire_tags::{LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
 use crate::{
-    DType, Error, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorRead,
-    TensorSchema, TensorViewSemantics, TensorWrite, contiguous_strides, schema,
+    DType, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
+    TensorViewSemantics, TensorWrite, contiguous_strides, schema,
 };
 
 fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
@@ -286,11 +283,12 @@ where
                             continue;
                         }
 
-                        break Some((Ok((coord, value)), ValuesEncodingState::Walking { tensor, coords }))
-                    },
-                    Err(error) => {
-                        break Some((Err(format!("{error}")), ValuesEncodingState::Done))
+                        break Some((
+                            Ok((coord, value)),
+                            ValuesEncodingState::Walking { tensor, coords },
+                        ));
                     }
+                    Err(error) => break Some((Err(format!("{error}")), ValuesEncodingState::Done)),
                 }
             }
         }));
@@ -368,12 +366,8 @@ where
         // off the wire, with no in-memory buffering.
         match seq.next_element::<TensorDecodedValues<FE, T>>(tensor).await {
             Ok(Some(TensorDecodedValues { tensor })) => Ok(TensorViewDecoder { tensor }),
-            Ok(None) => {
-                Err(de::Error::custom("missing tensor view data"))
-            }
-            Err(err) => {
-                Err(err)
-            }
+            Ok(None) => Err(de::Error::custom("missing tensor view data")),
+            Err(err) => Err(err),
         }
     }
 }
@@ -429,8 +423,8 @@ where
                 .write_value(&coord, value)
                 .await
                 .map_err(de::Error::custom)?;
-        };
-        
+        }
+
         Ok(self.tensor)
     }
 }
