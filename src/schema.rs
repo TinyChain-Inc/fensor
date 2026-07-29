@@ -225,7 +225,7 @@ impl TensorSchema {
     /// Total number of elements described by this schema's shape, computed
     /// with overflow checking so a corrupted/adversarial shape fails closed
     /// instead of silently wrapping.
-    pub fn element_count(&self) -> FResult<usize> {
+    pub fn element_count(&self) -> FResult<u64> {
         checked_product(self.shape.as_slice())
     }
 }
@@ -262,10 +262,10 @@ pub fn contiguous_strides(shape: &[usize]) -> Strides {
     strides.into()
 }
 
-fn checked_product(shape: &[usize]) -> FResult<usize> {
+fn checked_product(shape: &[usize]) -> FResult<u64> {
     shape
         .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .try_fold(1u64, |acc, &dim| acc.checked_mul(dim as u64))
         .ok_or_else(|| Error::InvalidSchema("shape element count overflows usize".to_string()))
 }
 
@@ -274,7 +274,7 @@ fn checked_product(shape: &[usize]) -> FResult<usize> {
 pub(crate) struct RowMajorCoords {
     shape: Vec<usize>,
     coord: Vec<u64>,
-    remaining: usize,
+    remaining: u64,
 }
 
 pub(crate) fn row_major_coords(shape: &[usize]) -> FResult<RowMajorCoords> {
