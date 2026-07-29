@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{ErrorKind, Error as IoError};
 use std::sync::Arc;
 
 use b_table::{TableLock, collate::Collator};
@@ -282,10 +282,10 @@ where
         let mut block = match self.read_block(block_id).await? {
             Some(block) => block,
             None => {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
+                return Err(IoError::new(
+                    ErrorKind::NotFound,
                     "Missing block".to_string(),
-                )));
+                ).into());
             }
         };
         validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
@@ -445,10 +445,10 @@ where
             let Some(block) = self.read_block(id).await? else {
                 return match self.schema.layout() {
                     Layout::Dense => Ok(T::default()),
-                    Layout::Sparse { .. } => Err(Error::Io(io::Error::new(
-                        io::ErrorKind::NotFound,
+                    Layout::Sparse { .. } => Err(IoError::new(
+                        ErrorKind::NotFound,
                         "Block is missing".to_string(),
-                    ))),
+                    ).into()),
                 };
             };
 
