@@ -452,14 +452,9 @@ where
             };
 
             let Some(block) = self.read_block(id).await? else {
-                return match self.schema.layout() {
-                    Layout::Dense => Ok(T::default()),
-                    Layout::Sparse { .. } => Err(IoError::new(
-                        ErrorKind::NotFound,
-                        "Block is missing".to_string(),
-                    )
-                    .into()),
-                };
+                return Err(
+                    IoError::new(ErrorKind::NotFound, "Block is missing".to_string()).into(),
+                );
             };
 
             validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
