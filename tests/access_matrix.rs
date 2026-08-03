@@ -1795,6 +1795,77 @@ mod section_h_persistence {
         cleanup(&root).await;
     }
 
+    // On a freshly created (unwritten) dense tensor, every block position
+    // implied by shape/block_shape must already have a block file on disk —
+    // dense storage is fully materialized at `create`, not populated lazily
+    // on first write.
+    #[tokio::test]
+    async fn dense_create_materializes_all_blocks_on_disk() {
+        let root = common::unique_tmp_dir("h_dense_all_blocks");
+        tokio::fs::create_dir(&root).await.expect("mkdir");
+        let schema = dense_schema_f32(shape![2, 3, 4], shape![1, 1, 4]);
+        let expected_blocks =
+            schema.element_count().expect("element count") / schema.block_len() as u64;
+
+        let dir = open_dir(&root).expect("open");
+        let _tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema)
+            .await
+            .expect("create dense");
+        dir.sync().await.expect("sync");
+
+        let mut block_files = Vec::new();
+        let mut rd = tokio::fs::read_dir(root.join("blocks"))
+            .await
+            .expect("read blocks dir");
+        while let Some(entry) = rd.next_entry().await.expect("next entry") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != "metadata" {
+                block_files.push(name);
+            }
+        }
+
+        assert_eq!(
+            block_files.len() as u64,
+            expected_blocks,
+            "expected {expected_blocks} block files on disk for a freshly created dense tensor, found {:?}",
+            block_files
+        );
+
+        cleanup(&root).await;
+    }
+
+    // A freshly created (unwritten) sparse tensor must not materialize any
+    // block files — only the schema `metadata` file should exist under
+    // `blocks/` until a nonzero write forces a block into existence.
+    #[tokio::test]
+    async fn sparse_create_has_no_blocks_only_metadata_on_disk() {
+        let root = common::unique_tmp_dir("h_sparse_no_blocks");
+        tokio::fs::create_dir(&root).await.expect("mkdir");
+        let schema = sparse_schema_f32(shape![2, 3, 4], shape![1, 1, 4], Some(1));
+
+        let dir = open_dir(&root).expect("open");
+        let _tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema)
+            .await
+            .expect("create sparse");
+        dir.sync().await.expect("sync");
+
+        let mut entries = Vec::new();
+        let mut rd = tokio::fs::read_dir(root.join("blocks"))
+            .await
+            .expect("read blocks dir");
+        while let Some(entry) = rd.next_entry().await.expect("next entry") {
+            entries.push(entry.file_name().to_string_lossy().into_owned());
+        }
+
+        assert_eq!(
+            entries,
+            vec!["metadata".to_string()],
+            "a freshly created sparse tensor must have no block files, only the metadata file"
+        );
+
+        cleanup(&root).await;
+    }
+
     #[tokio::test]
     async fn unknown_metadata_version_rejected_on_reload() {
         let root = common::unique_tmp_dir("h_meta_version");
