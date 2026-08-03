@@ -1758,39 +1758,70 @@ mod section_h_persistence {
 
     #[tokio::test]
     async fn sparse_index_points_to_missing_block_on_read() {
-        let root = common::unique_tmp_dir("h_index_orphan");
-        tokio::fs::create_dir(&root).await.expect("mkdir");
+        let (root, dir) = new_dir("h_index_orphan").await;
         let schema = sparse_schema_f32(shape![2, 3, 4], shape![1, 1, 4], Some(1));
 
-        let block_id = {
-            let dir = open_dir(&root).expect("open");
-            let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
-                .await
-                .expect("create");
-            tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
-            let id = block_id_for_coord(&tensor, &schema, &[0, 1, 2])
-                .await
-                .expect("row must exist");
-            dir.sync().await.expect("sync");
-            id
+        let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
+            .await
+            .expect("create");
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
+        let block_id = block_id_for_coord(&tensor, &schema, &[0, 1, 2])
+            .await
+            .expect("row must exist");
+
+        // Delete the orphan block file via freqfs's own delete+sync, on the
+        // same in-memory `blocks` dir the live tensor already holds.
+        let blocks_dir = {
+            let guard = dir.read().await;
+            guard.get_dir("blocks").cloned().expect("blocks dir")
         };
+        {
+            let mut blocks_guard = blocks_dir.write().await;
+            blocks_guard.delete(&block_id.to_string()).await;
+        }
+        blocks_dir.sync().await.expect("sync deleted block");
 
-        // Delete the orphan block file directly.
-        let blocks_dir = root.join("blocks");
-        let target = blocks_dir.join(block_id.to_string());
-        let _ = tokio::fs::remove_file(&target).await;
-
-        let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
-        assert_eq!(schema, *loaded.schema());
-        let err = loaded
+        let err = tensor
             .read_value(&[0, 1, 2])
             .await
             .expect_err("orphan index row must fail closed");
-        assert!(
-            matches!(err, Error::SparseIndex(_) | Error::Io(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+
+        cleanup(&root).await;
+    }
+
+    // Dense blocks are eagerly materialized at `create` (see
+    // `dense_create_materializes_all_blocks_on_disk`), so a missing block
+    // file for a valid coord is corruption, not a legitimate lazy-block
+    // state — `read_value` must fail closed rather than fall back to
+    // `T::default()`.
+    #[tokio::test]
+    async fn dense_block_missing_on_read_fails_closed() {
+        let (root, dir) = new_dir("h_dense_block_missing").await;
+        let schema = dense_schema_f32(shape![2, 3, 4], shape![1, 1, 4]);
+
+        let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
+            .await
+            .expect("create dense");
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
+
+        // Dense block ids are the block_offset itself (no index indirection).
+        let block_id = common::block_key_for_coord(&schema, &[0, 1, 2])[1];
+        let blocks_dir = {
+            let guard = dir.read().await;
+            guard.get_dir("blocks").cloned().expect("blocks dir")
+        };
+        {
+            let mut blocks_guard = blocks_dir.write().await;
+            blocks_guard.delete(&block_id.to_string()).await;
+        }
+        blocks_dir.sync().await.expect("sync deleted block");
+
+        let err = tensor
+            .read_value(&[0, 1, 2])
+            .await
+            .expect_err("missing dense block must fail closed");
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
 
         cleanup(&root).await;
     }
