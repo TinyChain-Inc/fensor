@@ -165,6 +165,9 @@ where
         };
 
         let tensor = Self::new_storage(blocks_dir, index, schema);
+        if let Layout::Dense = tensor.schema.layout() {
+            tensor.materialize_dense_blocks().await?;
+        }
         tensor.persist_metadata().await?;
         Ok(tensor)
     }
@@ -271,6 +274,15 @@ where
 
     fn default_block(&self) -> Vec<T> {
         vec![T::default(); self.block_len()]
+    }
+
+    async fn materialize_dense_blocks(&self) -> Result<()> {
+        let block_len = self.block_len() as u64;
+        let num_blocks = self.storage.schema().element_count()? / block_len;
+        for block_id in 0..num_blocks {
+            self.write_block(block_id, self.default_block()).await?;
+        }
+        Ok(())
     }
 
     async fn write_value_to_block(
