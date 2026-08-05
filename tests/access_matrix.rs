@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, SparseZeroPolicy, Tensor, TensorArray, TensorBlockStore,
-    TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex, TensorSparseLifecycle,
-    TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk, contiguous_strides,
+    BoxFuture, DType, Error, Layout, Tensor, TensorArray, TensorBlockStore, TensorRead,
+    TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform, TensorViewSemantics,
+    TensorWrite, TensorWriteBulk, contiguous_strides,
 };
 use ha_ndarray::{Axes, AxisRange, Range, Shape, axes, range, shape};
 
@@ -75,7 +75,10 @@ fn encode_value(coord: &[u64]) -> f32 {
     (coord[0] as f32) * 100.0 + (coord[1] as f32) * 10.0 + (coord[2] as f32)
 }
 
-async fn seed_values(tensor: &Tensor<FsEntry, f32>) {
+async fn seed_values<T>(tensor: &T)
+where
+    T: TensorWrite<DType = f32>,
+{
     for coord in iter_coords(tensor.shape()) {
         tensor
             .write_value(&coord, encode_value(&coord))
@@ -1240,30 +1243,6 @@ mod section_e_sparse_lifecycle {
     }
 
     #[tokio::test]
-    #[ignore = "requires Tensor::with_sparse_zero_policy / create_with_policy"]
-    async fn sparse_nonzero_to_zero_retain_zero_policy() {
-        // Intended shape once the policy setter lands:
-        //
-        //   let tensor = Tensor::<FsEntry, f32>::create_with_policy(
-        //       dir, schema, SparseZeroPolicy::RetainZero,
-        //   ).await.expect("create");
-        //   tensor.write_value(&[0, 1, 2], 5.0).await.expect("write nz");
-        //   tensor.write_value(&[0, 1, 2], 0.0).await.expect("write z");
-        //   assert!(tensor.lookup_block_id(&[1, 1]).await.unwrap().is_some());
-        //   assert_eq!(tensor.read_value(&[0, 1, 2]).await.unwrap(), 0.0);
-        panic!("requires Tensor::with_sparse_zero_policy / create_with_policy");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Tensor::with_sparse_zero_policy / create_with_policy"]
-    async fn sparse_nonzero_to_zero_tombstone_policy() {
-        // Same shape as above, but with `SparseZeroPolicy::Tombstone`.
-        // Exact contract (sentinel block_id vs zero-filled block) to be
-        // specified during implementation.
-        panic!("requires Tensor::with_sparse_zero_policy / create_with_policy");
-    }
-
-    #[tokio::test]
     async fn sparse_overwrite_nonzero_preserves_row_id() {
         let (root, tensor, schema) =
             create_sparse("e_overwrite", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
@@ -1308,13 +1287,90 @@ mod section_e_sparse_lifecycle {
     }
 
     #[tokio::test]
-    #[ignore = "requires policy persistence + setter"]
-    async fn sparse_zero_policy_persists_across_reload() {
-        // Once the policy setter lands and is persisted in metadata:
-        //   1. Create tensor with non-default policy
-        //   2. Write values, sync, drop
-        //   3. Reload, assert sparse_zero_policy() matches what was set
-        panic!("requires SparseZeroPolicy persistence");
+    async fn compact_sparse_preserves_nonzero_rows() {
+        let (root, tensor, schema) = create_sparse(
+            "e_compact_preserve",
+            shape![2, 3, 4],
+            shape![1, 1, 4],
+            Some(1),
+        )
+        .await;
+
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write nz");
+
+        tensor.compact_sparse().await.expect("compact");
+
+        assert!(
+            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
+                .await
+                .is_some(),
+            "compact must not remove rows with nonzero values"
+        );
+        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 5.0);
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sparse_write_zero_to_new_coord_is_noop() {
+        let (root, tensor, schema) =
+            create_sparse("e_noop", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+
+        tensor
+            .write_value(&[0, 1, 2], 0.0)
+            .await
+            .expect("write zero");
+
+        assert!(
+            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
+                .await
+                .is_none(),
+            "zero write to new coord must not create a row"
+        );
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn compact_sparse_idempotent() {
+        let (root, tensor, schema) =
+            create_sparse("e_compact_idem", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("nz");
+        tensor.write_value(&[1, 2, 3], 3.0).await.expect("nz2");
+        tensor.write_value(&[0, 1, 2], 0.0).await.expect("zero");
+
+        tensor.compact_sparse().await.expect("first compact");
+
+        assert!(
+            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
+                .await
+                .is_none(),
+            "zero row removed after first compact"
+        );
+        assert!(
+            block_id_for_coord(&tensor, &schema, &[1, 2, 3])
+                .await
+                .is_some(),
+            "nonzero row preserved after first compact"
+        );
+
+        tensor.compact_sparse().await.expect("second compact");
+
+        assert!(
+            block_id_for_coord(&tensor, &schema, &[0, 1, 2])
+                .await
+                .is_none(),
+            "still absent after second compact"
+        );
+        assert!(
+            block_id_for_coord(&tensor, &schema, &[1, 2, 3])
+                .await
+                .is_some(),
+            "nonzero row still present after second compact"
+        );
+
+        cleanup(&root).await;
     }
 }
 
@@ -1596,9 +1652,8 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
-            .await
-            .expect("reload");
+        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
+        assert_eq!(schema, *loaded.schema());
         for coord in iter_coords(loaded.shape()) {
             let v = loaded.read_value(&coord).await.expect("read");
             assert_eq!(v, encode_value(&coord), "post-reload coord {:?}", coord);
@@ -1624,44 +1679,11 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
-            .await
-            .expect("reload");
+        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
+        assert_eq!(schema, *loaded.schema());
         assert_eq!(loaded.read_value(&[0, 0, 0]).await.expect("read"), 1.0);
         assert_eq!(loaded.read_value(&[1, 2, 3]).await.expect("read"), 9.0);
         assert_eq!(loaded.read_value(&[1, 0, 0]).await.expect("read"), 0.0);
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn view_schema_persists_via_with_view_schema() {
-        let root = common::unique_tmp_dir("h_view_persist");
-        tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = dense_schema_f32(shape![2, 3, 4], shape![1, 1, 4]);
-
-        let view_schema = {
-            let dir = open_dir(&root).expect("open");
-            let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
-                .await
-                .expect("create");
-            seed_values(&tensor).await;
-            let transposed = tensor.clone().transpose(Some(axes![2, 0, 1])).expect("tx");
-            let vs = transposed.view_schema().expect("view schema");
-            dir.sync().await.expect("sync");
-            vs
-        };
-
-        let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
-            .await
-            .expect("reload");
-        let rehydrated = loaded
-            .with_view_schema(&view_schema)
-            .expect("rehydrate view");
-        assert_eq!(rehydrated.shape(), &[4, 2, 3]);
-        // sample one coord to verify the view still resolves correctly
-        let _ = rehydrated.read_value(&[0, 0, 0]).await.expect("read");
 
         cleanup(&root).await;
     }
@@ -1736,39 +1758,140 @@ mod section_h_persistence {
 
     #[tokio::test]
     async fn sparse_index_points_to_missing_block_on_read() {
-        let root = common::unique_tmp_dir("h_index_orphan");
-        tokio::fs::create_dir(&root).await.expect("mkdir");
+        let (root, dir) = new_dir("h_index_orphan").await;
         let schema = sparse_schema_f32(shape![2, 3, 4], shape![1, 1, 4], Some(1));
 
-        let block_id = {
-            let dir = open_dir(&root).expect("open");
-            let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
-                .await
-                .expect("create");
-            tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
-            let id = block_id_for_coord(&tensor, &schema, &[0, 1, 2])
-                .await
-                .expect("row must exist");
-            dir.sync().await.expect("sync");
-            id
-        };
-
-        // Delete the orphan block file directly.
-        let blocks_dir = root.join("blocks");
-        let target = blocks_dir.join(block_id.to_string());
-        let _ = tokio::fs::remove_file(&target).await;
-
-        let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load_with_schema(dir2, &schema)
+        let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
             .await
-            .expect("reload");
-        let err = loaded
+            .expect("create");
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
+        let block_id = block_id_for_coord(&tensor, &schema, &[0, 1, 2])
+            .await
+            .expect("row must exist");
+
+        // Delete the orphan block file via freqfs's own delete+sync, on the
+        // same in-memory `blocks` dir the live tensor already holds.
+        let blocks_dir = {
+            let guard = dir.read().await;
+            guard.get_dir("blocks").cloned().expect("blocks dir")
+        };
+        {
+            let mut blocks_guard = blocks_dir.write().await;
+            blocks_guard.delete(&block_id.to_string()).await;
+        }
+        blocks_dir.sync().await.expect("sync deleted block");
+
+        let err = tensor
             .read_value(&[0, 1, 2])
             .await
             .expect_err("orphan index row must fail closed");
-        assert!(
-            matches!(err, Error::SparseIndex(_) | Error::Io(_)),
-            "got {err:?}"
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+
+        cleanup(&root).await;
+    }
+
+    // Dense blocks are eagerly materialized at `create` (see
+    // `dense_create_materializes_all_blocks_on_disk`), so a missing block
+    // file for a valid coord is corruption, not a legitimate lazy-block
+    // state — `read_value` must fail closed rather than fall back to
+    // `T::default()`.
+    #[tokio::test]
+    async fn dense_block_missing_on_read_fails_closed() {
+        let (root, dir) = new_dir("h_dense_block_missing").await;
+        let schema = dense_schema_f32(shape![2, 3, 4], shape![1, 1, 4]);
+
+        let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone())
+            .await
+            .expect("create dense");
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
+
+        // Dense block ids are the block_offset itself (no index indirection).
+        let block_id = common::block_key_for_coord(&schema, &[0, 1, 2])[1];
+        let blocks_dir = {
+            let guard = dir.read().await;
+            guard.get_dir("blocks").cloned().expect("blocks dir")
+        };
+        {
+            let mut blocks_guard = blocks_dir.write().await;
+            blocks_guard.delete(&block_id.to_string()).await;
+        }
+        blocks_dir.sync().await.expect("sync deleted block");
+
+        let err = tensor
+            .read_value(&[0, 1, 2])
+            .await
+            .expect_err("missing dense block must fail closed");
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+
+        cleanup(&root).await;
+    }
+
+    // On a freshly created (unwritten) dense tensor, every block position
+    // implied by shape/block_shape must already have a block file on disk —
+    // dense storage is fully materialized at `create`, not populated lazily
+    // on first write.
+    #[tokio::test]
+    async fn dense_create_materializes_all_blocks_on_disk() {
+        let root = common::unique_tmp_dir("h_dense_all_blocks");
+        tokio::fs::create_dir(&root).await.expect("mkdir");
+        let schema = dense_schema_f32(shape![2, 3, 4], shape![1, 1, 4]);
+        let expected_blocks =
+            schema.element_count().expect("element count") / schema.block_len() as u64;
+
+        let dir = open_dir(&root).expect("open");
+        let _tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema)
+            .await
+            .expect("create dense");
+        dir.sync().await.expect("sync");
+
+        let mut block_files = Vec::new();
+        let mut rd = tokio::fs::read_dir(root.join("blocks"))
+            .await
+            .expect("read blocks dir");
+        while let Some(entry) = rd.next_entry().await.expect("next entry") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != "metadata" {
+                block_files.push(name);
+            }
+        }
+
+        assert_eq!(
+            block_files.len() as u64,
+            expected_blocks,
+            "expected {expected_blocks} block files on disk for a freshly created dense tensor, found {:?}",
+            block_files
+        );
+
+        cleanup(&root).await;
+    }
+
+    // A freshly created (unwritten) sparse tensor must not materialize any
+    // block files — only the schema `metadata` file should exist under
+    // `blocks/` until a nonzero write forces a block into existence.
+    #[tokio::test]
+    async fn sparse_create_has_no_blocks_only_metadata_on_disk() {
+        let root = common::unique_tmp_dir("h_sparse_no_blocks");
+        tokio::fs::create_dir(&root).await.expect("mkdir");
+        let schema = sparse_schema_f32(shape![2, 3, 4], shape![1, 1, 4], Some(1));
+
+        let dir = open_dir(&root).expect("open");
+        let _tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema)
+            .await
+            .expect("create sparse");
+        dir.sync().await.expect("sync");
+
+        let mut entries = Vec::new();
+        let mut rd = tokio::fs::read_dir(root.join("blocks"))
+            .await
+            .expect("read blocks dir");
+        while let Some(entry) = rd.next_entry().await.expect("next entry") {
+            entries.push(entry.file_name().to_string_lossy().into_owned());
+        }
+
+        assert_eq!(
+            entries,
+            vec!["metadata".to_string()],
+            "a freshly created sparse tensor must have no block files, only the metadata file"
         );
 
         cleanup(&root).await;

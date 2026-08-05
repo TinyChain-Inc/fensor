@@ -10,19 +10,6 @@ pub const PORTABLE_INLINE_RANK: usize = 8;
 pub type TensorShape = SmallVec<[u64; PORTABLE_INLINE_RANK]>;
 
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub enum AxisContribSchema {
-    Stride(i64),
-    Gather(SmallVec<[i64; PORTABLE_INLINE_RANK]>),
-}
-
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub struct ViewSchema {
-    pub base_rank: usize,
-    pub base_offset: i64,
-    pub axes: SmallVec<[AxisContribSchema; PORTABLE_INLINE_RANK]>,
-}
-
-#[derive(Clone, Eq, PartialEq, Debug)]
 struct InternalLayoutMetadata {
     layout: Layout,
     block_shape: Shape,
@@ -52,7 +39,7 @@ impl DType {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum Layout {
     Dense,
     Sparse { axis: Option<usize> },
@@ -208,8 +195,8 @@ impl TensorSchema {
         Ok(())
     }
 
-    pub fn layout(&self) -> &Layout {
-        &self.internal.layout
+    pub fn layout(&self) -> Layout {
+        self.internal.layout
     }
 
     pub fn block_shape(&self) -> &Shape {
@@ -233,6 +220,13 @@ impl TensorSchema {
 
     pub fn rank(&self) -> usize {
         self.shape.len()
+    }
+
+    /// Total number of elements described by this schema's shape, computed
+    /// with overflow checking so a corrupted/adversarial shape fails closed
+    /// instead of silently wrapping.
+    pub fn element_count(&self) -> FResult<u64> {
+        checked_product(self.shape.as_slice())
     }
 }
 
@@ -266,6 +260,89 @@ pub fn contiguous_strides(shape: &[usize]) -> Strides {
     }
 
     strides.into()
+}
+
+fn checked_product(shape: &[usize]) -> FResult<u64> {
+    shape
+        .iter()
+        .try_fold(1u64, |acc, &dim| acc.checked_mul(dim as u64))
+        .ok_or_else(|| Error::InvalidSchema("shape element count overflows usize".to_string()))
+}
+
+/// Row-major (C-order) coordinate walk over `shape`, used to materialize or
+/// reconstruct a tensor view's data as a flat sequence for wire transfer.
+pub(crate) struct RowMajorCoords {
+    shape: Vec<usize>,
+    coord: Vec<u64>,
+    remaining: u64,
+}
+
+pub(crate) fn row_major_coords(shape: &[usize]) -> FResult<RowMajorCoords> {
+    let remaining = if shape.is_empty() {
+        0
+    } else {
+        checked_product(shape)?
+    };
+
+    Ok(RowMajorCoords {
+        shape: shape.to_vec(),
+        coord: vec![0u64; shape.len()],
+        remaining,
+    })
+}
+
+impl Iterator for RowMajorCoords {
+    type Item = Vec<u64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let out = self.coord.clone();
+        self.remaining -= 1;
+
+        if self.remaining > 0 {
+            let mut axis = self.shape.len() - 1;
+            loop {
+                self.coord[axis] += 1;
+                if (self.coord[axis] as usize) < self.shape[axis] {
+                    break;
+                }
+                self.coord[axis] = 0;
+                if axis == 0 {
+                    break;
+                }
+                axis -= 1;
+            }
+        }
+
+        Some(out)
+    }
+}
+
+/// Build the destination schema for a materialized view snapshot: same
+/// dtype/shape as `source`, with layout normalized for a fresh, independent
+/// destination tensor and freshly computed `block_shape`/`strides`.
+///
+/// A `Sparse { axis }` hint is preserved only when `source` is currently an
+/// identity/base view (`is_identity`) -- `transpose`/`slice`/`reshape` never
+/// update `layout` when they mutate `shape`/`strides`, so a stale axis hint
+/// surviving a transform could silently denote the wrong logical axis (or,
+/// after a rank-reducing slice, be out of bounds). Resetting it to `None` on
+/// any non-identity view sidesteps that silent-corruption risk; `None` is
+/// always valid and defaults to axis 0 downstream.
+pub(crate) fn snapshot_schema(source: &TensorSchema, is_identity: bool) -> FResult<TensorSchema> {
+    let shape = source.shape().clone();
+    let layout = match source.layout() {
+        Layout::Dense => Layout::Dense,
+        Layout::Sparse { axis } => Layout::Sparse {
+            axis: if is_identity { axis } else { None },
+        },
+    };
+    let block_shape = crate::default_block_shape(&shape);
+    let strides = contiguous_strides(&shape);
+    TensorSchema::new(source.dtype(), shape, layout, block_shape, strides)
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]

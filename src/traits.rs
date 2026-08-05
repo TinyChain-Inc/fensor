@@ -24,7 +24,7 @@ pub trait TensorArray: Send + Sync {
         self.schema().shape()
     }
 
-    fn layout(&self) -> &Layout {
+    fn layout(&self) -> Layout {
         self.schema().layout()
     }
 
@@ -171,6 +171,14 @@ pub trait TensorSparseIndex: Send + Sync {
     fn lookup_block_id<'a>(&'a self, key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>>;
 
     fn upsert_block_id<'a>(&'a self, key: Vec<u64>, block_id: u64) -> BoxFuture<'a, Result<()>>;
+
+    fn delete_row<'a>(&'a self, _key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Err(Error::Unsupported(
+                "delete_row is not implemented for this tensor backend".to_string(),
+            ))
+        })
+    }
 }
 
 /// Base/view capability contract, aligned with v1 writeability semantics.
@@ -181,28 +189,6 @@ pub trait TensorViewSemantics: TensorArray {
 
     fn supports_write_through(&self) -> bool {
         false
-    }
-}
-
-/// Sparse lifecycle policy for zero-write handling and index cleanup.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum SparseZeroPolicy {
-    RemoveRow,
-    Tombstone,
-    RetainZero,
-}
-
-pub trait TensorSparseLifecycle: TensorArray {
-    fn sparse_zero_policy(&self) -> SparseZeroPolicy {
-        SparseZeroPolicy::RemoveRow
-    }
-
-    fn compact_sparse<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sparse compaction is not implemented for this tensor backend".to_string(),
-            ))
-        })
     }
 }
 

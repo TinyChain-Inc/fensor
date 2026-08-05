@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use ha_ndarray::{Axes, AxisRange, Range, Shape, Strides};
 
-use crate::{AxisContribSchema, Error, Result, TensorSchema, ViewSchema, schema};
+use crate::{Error, Result, TensorSchema, schema};
 
 #[derive(Clone)]
 pub struct TensorView {
-    base_rank: usize,
     base_offset: i64,
     axes: Vec<AxisContrib>,
 }
@@ -18,13 +17,8 @@ pub(crate) enum AxisContrib {
 }
 
 impl TensorView {
-    pub fn rank(&self) -> usize {
-        self.axes.len()
-    }
-
     pub fn identity(schema: &TensorSchema) -> Self {
         Self {
-            base_rank: schema.rank(),
             base_offset: 0,
             axes: schema
                 .strides()
@@ -56,7 +50,6 @@ impl TensorView {
         }
 
         Ok(Self {
-            base_rank: self.base_rank,
             base_offset: self.base_offset,
             axes,
         })
@@ -159,49 +152,12 @@ impl TensorView {
 
         Ok((
             Self {
-                base_rank: self.base_rank,
                 base_offset: new_base_offset,
                 axes: new_axes,
             },
             new_shape,
             new_strides,
         ))
-    }
-
-    pub fn to_schema(&self) -> Result<ViewSchema> {
-        Ok(ViewSchema {
-            base_rank: self.base_rank,
-            base_offset: self.base_offset,
-            axes: self
-                .axes
-                .iter()
-                .map(|a| match a {
-                    AxisContrib::Stride(s) => AxisContribSchema::Stride(*s),
-                    AxisContrib::Gather(g) => {
-                        AxisContribSchema::Gather(g.iter().copied().collect())
-                    }
-                })
-                .collect(),
-        })
-    }
-
-    pub fn from_schema(schema: &ViewSchema) -> Result<Self> {
-        let axes = schema
-            .axes
-            .iter()
-            .map(|a| match a {
-                AxisContribSchema::Stride(s) => Ok(AxisContrib::Stride(*s)),
-                AxisContribSchema::Gather(g) => Ok(AxisContrib::Gather(
-                    g.iter().copied().collect::<Vec<_>>().into(),
-                )),
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            base_rank: schema.base_rank,
-            base_offset: schema.base_offset,
-            axes,
-        })
     }
 
     pub fn reshape(&self, current_shape: &[usize], new_shape: &[usize]) -> Result<Self> {
@@ -213,7 +169,6 @@ impl TensorView {
             ));
         }
         Ok(Self {
-            base_rank: self.base_rank,
             base_offset: self.base_offset,
             axes: schema::contiguous_strides(new_shape)
                 .iter()
@@ -244,6 +199,16 @@ impl TensorView {
         }
 
         Ok(k)
+    }
+
+    pub fn is_identity(&self, base_schema: &TensorSchema) -> bool {
+        self.base_offset == 0 && self.is_c_contiguous(base_schema.shape())
+    }
+
+    pub fn has_gather_axes(&self) -> bool {
+        self.axes
+            .iter()
+            .any(|a| matches!(a, AxisContrib::Gather(_)))
     }
 
     fn is_c_contiguous(&self, shape: &[usize]) -> bool {
@@ -376,32 +341,6 @@ mod tests {
         let (sliced, new_shape, _) = transposed.slice(&shape, &range).expect("slice");
         assert_eq!(new_shape.as_slice(), &[2, 2]);
         assert_eq!(sliced.flat_offset(&[1, 1]).expect("offset"), 53);
-    }
-
-    // -- schema roundtrip ---------------------------------------------------------
-
-    #[test]
-    fn view_schema_roundtrip() {
-        // [5,4,3], strides [12,3,1], perm [2,0,1] → axes [Stride(1),Stride(12),Stride(3)]
-        // flat_offset([1,2,3]) = 1*1 + 2*12 + 3*3 = 34
-        let schema = schema(&[5, 4, 3]);
-        let identity = TensorView::identity(&schema);
-        let transposed = identity.transpose(&[2, 0, 1]).expect("transpose");
-        let view_schema = transposed.to_schema().expect("schema");
-        let restored = TensorView::from_schema(&view_schema).expect("restore");
-        assert_eq!(restored.flat_offset(&[1, 2, 3]).expect("coord"), 34);
-    }
-
-    #[test]
-    fn view_schema_roundtrip_with_reshape() {
-        // ViewSchema carries only base_rank, base_offset, axes — no shape/strides duplication
-        // [6,4]→[2,3,4]: axes [Stride(12),Stride(4),Stride(1)], coord [1,0,2] → k=14
-        let schema = schema(&[6, 4]);
-        let view = TensorView::identity(&schema);
-        let reshaped = view.reshape(schema.shape(), &[2, 3, 4]).expect("reshape");
-        let view_schema = reshaped.to_schema().expect("to_schema");
-        let restored = TensorView::from_schema(&view_schema).expect("from_schema");
-        assert_eq!(restored.flat_offset(&[1, 0, 2]).expect("offset"), 14);
     }
 
     // -- invalid reshape chain guards ---------------------------------------------
