@@ -1,6 +1,24 @@
 use crate::{Error, Result};
 use ha_ndarray::Shape;
 
+pub(crate) fn validate_coord(shape: &[usize], coord: &[u64]) -> Result<()> {
+    if coord.len() != shape.len() {
+        return Err(Error::InvalidCoord(
+            "incorrect number of coordinates".to_string(),
+        ));
+    }
+    for (i, (c, dim)) in coord.iter().zip(shape.iter()).enumerate() {
+        let c = usize::try_from(*c)
+            .map_err(|_| Error::InvalidCoord(format!("coordinate at axis {i} overflows usize")))?;
+        if c >= *dim {
+            return Err(Error::InvalidCoord(format!(
+                "coordinate at axis {i} is out of bounds"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_offset_in_bounds(offset: usize, block_len: usize) -> Result<()> {
     if offset < block_len {
         Ok(())
