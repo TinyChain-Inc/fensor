@@ -2,12 +2,15 @@ use std::sync::Arc;
 
 use ha_ndarray::{Axes, AxisRange, Range, Shape, Strides};
 
-use crate::{Error, Result, TensorSchema, schema};
+use crate::schema::contiguous_strides;
+use crate::{Error, Result};
 
 #[derive(Clone)]
 pub struct TensorView {
     base_offset: i64,
     axes: Vec<AxisContrib>,
+    shape: Shape,
+    strides: Strides,
 }
 
 #[derive(Clone)]
@@ -17,15 +20,24 @@ pub(crate) enum AxisContrib {
 }
 
 impl TensorView {
-    pub fn identity(schema: &TensorSchema) -> Self {
+    pub fn identity(shape: Shape, strides: Strides) -> Self {
         Self {
             base_offset: 0,
-            axes: schema
-                .strides()
+            axes: strides
                 .iter()
                 .map(|&s| AxisContrib::Stride(s as i64))
                 .collect(),
+            shape,
+            strides,
         }
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn strides(&self) -> &[usize] {
+        &self.strides
     }
 
     pub fn transpose(&self, permutation: &[usize]) -> Result<Self> {
@@ -37,6 +49,8 @@ impl TensorView {
 
         let mut seen = vec![false; self.axes.len()];
         let mut axes = Vec::with_capacity(self.axes.len());
+        let mut shape = Shape::with_capacity(self.axes.len());
+        let mut strides = Strides::with_capacity(self.axes.len());
 
         for permuted_axis in permutation {
             if *permuted_axis >= self.axes.len() || seen[*permuted_axis] {
@@ -47,16 +61,20 @@ impl TensorView {
 
             seen[*permuted_axis] = true;
             axes.push(self.axes[*permuted_axis].clone());
+            shape.push(self.shape[*permuted_axis]);
+            strides.push(self.strides[*permuted_axis]);
         }
 
         Ok(Self {
             base_offset: self.base_offset,
             axes,
+            shape,
+            strides,
         })
     }
 
-    pub fn slice(&self, shape: &[usize], range: &Range) -> Result<(Self, Shape, Strides)> {
-        if range.len() != shape.len() {
+    pub fn slice(&self, range: &Range) -> Result<Self> {
+        if range.len() != self.shape.len() {
             return Err(Error::InvalidLayout(
                 "slice range rank must match tensor rank".to_string(),
             ));
@@ -67,7 +85,7 @@ impl TensorView {
         let mut new_shape = Shape::with_capacity(self.axes.len());
         let mut new_strides = Strides::with_capacity(self.axes.len());
 
-        for (axis_index, (bound, dim)) in range.iter().zip(shape.iter()).enumerate() {
+        for (axis_index, (bound, dim)) in range.iter().zip(self.shape.iter()).enumerate() {
             let current = &self.axes[axis_index];
 
             match bound {
@@ -150,30 +168,31 @@ impl TensorView {
             }
         }
 
-        Ok((
-            Self {
-                base_offset: new_base_offset,
-                axes: new_axes,
-            },
-            new_shape,
-            new_strides,
-        ))
+        Ok(Self {
+            base_offset: new_base_offset,
+            axes: new_axes,
+            shape: new_shape,
+            strides: new_strides,
+        })
     }
 
-    pub fn reshape(&self, current_shape: &[usize], new_shape: &[usize]) -> Result<Self> {
-        if !self.is_c_contiguous(current_shape) {
+    pub fn reshape(&self, new_shape: &[usize]) -> Result<Self> {
+        if !self.is_c_contiguous() {
             return Err(Error::Unsupported(
                 "reshape requires a C-contiguous view; copy the tensor before reshaping \
                 a transposed, flip, step-strided, or gather-sliced view"
                     .to_string(),
             ));
         }
+        let strides = contiguous_strides(new_shape)?;
         Ok(Self {
             base_offset: self.base_offset,
-            axes: schema::contiguous_strides(new_shape)
+            axes: strides
                 .iter()
                 .map(|&s| AxisContrib::Stride(s as i64))
                 .collect(),
+            shape: new_shape.into(),
+            strides,
         })
     }
 
@@ -201,8 +220,8 @@ impl TensorView {
         Ok(k)
     }
 
-    pub fn is_identity(&self, base_schema: &TensorSchema) -> bool {
-        self.base_offset == 0 && self.is_c_contiguous(base_schema.shape())
+    pub fn is_identity(&self, base_shape: &[usize]) -> bool {
+        self.base_offset == 0 && self.shape.as_slice() == base_shape && self.is_c_contiguous()
     }
 
     pub fn has_gather_axes(&self) -> bool {
@@ -211,11 +230,13 @@ impl TensorView {
             .any(|a| matches!(a, AxisContrib::Gather(_)))
     }
 
-    fn is_c_contiguous(&self, shape: &[usize]) -> bool {
-        if self.axes.len() != shape.len() {
+    fn is_c_contiguous(&self) -> bool {
+        if self.axes.len() != self.shape.len() {
             return false;
         }
-        let expected = schema::contiguous_strides(shape);
+        let Ok(expected) = contiguous_strides(&self.shape) else {
+            return false;
+        };
         self.axes
             .iter()
             .zip(expected.iter())
@@ -243,14 +264,12 @@ pub fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::contiguous_strides;
     use ha_ndarray::{range, shape};
 
-    fn schema(shape: &[usize]) -> TensorSchema {
-        TensorSchema::dense(
-            shape.iter().copied().collect(),
-            shape.iter().copied().collect(),
-        )
-        .expect("schema")
+    fn view_for(shape: &[usize]) -> TensorView {
+        let strides = contiguous_strides(shape).expect("strides");
+        TensorView::identity(shape.into(), strides)
     }
 
     // -- flat_offset correctness ---------------------------------------------------
@@ -258,35 +277,31 @@ mod tests {
     #[test]
     fn flat_offset_identity() {
         // [4,5,6], strides [30,6,1], coord [2,1,3] → k = 2*30 + 1*6 + 3*1 = 69
-        let schema = schema(&[4, 5, 6]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[4, 5, 6]);
         assert_eq!(view.flat_offset(&[2, 1, 3]).expect("offset"), 69);
     }
 
     #[test]
     fn flat_offset_reshape_rank_reducing() {
         // [2,3,4]→[6,4]: new strides [4,1], coord [3,2] → k = 3*4 + 2*1 = 14
-        let schema = schema(&[2, 3, 4]);
-        let view = TensorView::identity(&schema);
-        let reshaped = view.reshape(schema.shape(), &[6, 4]).expect("reshape");
+        let view = view_for(&[2, 3, 4]);
+        let reshaped = view.reshape(&[6, 4]).expect("reshape");
         assert_eq!(reshaped.flat_offset(&[3, 2]).expect("offset"), 14);
     }
 
     #[test]
     fn flat_offset_reshape_rank_increasing() {
         // [6,4]→[2,3,4]: new strides [12,4,1], coord [1,0,2] → k = 1*12 + 0*4 + 2*1 = 14
-        let schema = schema(&[6, 4]);
-        let view = TensorView::identity(&schema);
-        let reshaped = view.reshape(schema.shape(), &[2, 3, 4]).expect("reshape");
+        let view = view_for(&[6, 4]);
+        let reshaped = view.reshape(&[2, 3, 4]).expect("reshape");
         assert_eq!(reshaped.flat_offset(&[1, 0, 2]).expect("offset"), 14);
     }
 
     #[test]
     fn flat_offset_reshape_same_rank() {
         // [6,4]→[4,6]: new strides [6,1], coord [2,3] → k = 2*6 + 3*1 = 15
-        let schema = schema(&[6, 4]);
-        let view = TensorView::identity(&schema);
-        let reshaped = view.reshape(schema.shape(), &[4, 6]).expect("reshape");
+        let view = view_for(&[6, 4]);
+        let reshaped = view.reshape(&[4, 6]).expect("reshape");
         assert_eq!(reshaped.flat_offset(&[2, 3]).expect("offset"), 15);
     }
 
@@ -299,15 +314,14 @@ mod tests {
         // In(1,5,2): base_offset += 1*6 = 6, axis → Stride(12), extent 2
         // Of([0,3,4]): Gather([0,3,4]), extent 3
         // flat_offset([1,2]) = 66 + 1*12 + Gather[2]=4 = 82
-        let schema = schema(&[4, 5, 6]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[4, 5, 6]);
         let range = range![
             AxisRange::At(2),
             AxisRange::In(1, 5, 2),
             AxisRange::Of(shape![0, 3, 4])
         ];
-        let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        assert_eq!(new_shape.as_slice(), &[2, 3]);
+        let sliced = view.slice(&range).expect("slice");
+        assert_eq!(sliced.shape(), &[2, 3]);
         assert_eq!(sliced.flat_offset(&[1, 2]).expect("offset"), 82);
     }
 
@@ -315,8 +329,7 @@ mod tests {
     fn transpose_arbitrary_permutation() {
         // [3,4,5], strides [20,5,1], perm [2,0,1] → axes [Stride(1),Stride(20),Stride(5)]
         // flat_offset([1,2,3]) = 1*1 + 2*20 + 3*5 = 56
-        let schema = schema(&[3, 4, 5]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[3, 4, 5]);
         let transposed = view.transpose(&[2, 0, 1]).expect("transpose");
         assert_eq!(transposed.flat_offset(&[1, 2, 3]).expect("offset"), 56);
     }
@@ -329,17 +342,15 @@ mod tests {
         // In(0,4,2) on axis 2 (Stride(5)): base_offset+=0, Stride(10), extent 2
         // base_offset=41, axes=[Stride(2),Stride(10)], shape=[2,2]
         // flat_offset([1,1]) = 41 + 2 + 10 = 53
-        let schema = schema(&[3, 4, 5]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[3, 4, 5]);
         let transposed = view.transpose(&[2, 0, 1]).expect("transpose");
-        let shape: Shape = shape![5, 3, 4];
         let range: Range = range![
             AxisRange::In(1, 5, 2),
             AxisRange::At(2),
             AxisRange::In(0, 4, 2)
         ];
-        let (sliced, new_shape, _) = transposed.slice(&shape, &range).expect("slice");
-        assert_eq!(new_shape.as_slice(), &[2, 2]);
+        let sliced = transposed.slice(&range).expect("slice");
+        assert_eq!(sliced.shape(), &[2, 2]);
         assert_eq!(sliced.flat_offset(&[1, 1]).expect("offset"), 53);
     }
 
@@ -348,11 +359,10 @@ mod tests {
     #[test]
     fn transpose_then_reshape_rejected() {
         // transposed [3,4]: axes=[Stride(1),Stride(4)]; contiguous_strides([4,3])=[3,1]; 1≠3
-        let schema = schema(&[3, 4]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[3, 4]);
         let transposed = view.transpose(&[1, 0]).expect("transpose");
         assert!(matches!(
-            transposed.reshape(&[4, 3], &[12]),
+            transposed.reshape(&[12]),
             Err(Error::Unsupported(_))
         ));
     }
@@ -360,40 +370,28 @@ mod tests {
     #[test]
     fn strided_slice_then_reshape_rejected() {
         // In(0,6,2) on axis 0 of [6,4]: axes=[Stride(8),Stride(1)]; contiguous_strides([3,4])=[4,1]; 8≠4
-        let schema = schema(&[6, 4]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[6, 4]);
         let range = range![AxisRange::In(0, 6, 2), AxisRange::In(0, 4, 1)];
-        let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        assert!(matches!(
-            sliced.reshape(&new_shape, &[12]),
-            Err(Error::Unsupported(_))
-        ));
+        let sliced = view.slice(&range).expect("slice");
+        assert!(matches!(sliced.reshape(&[12]), Err(Error::Unsupported(_))));
     }
 
     #[test]
     fn gather_slice_then_reshape_rejected() {
         // Of([0,2,4]) on axis 0: Gather axis present → rejected
-        let schema = schema(&[6, 4]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[6, 4]);
         let range = range![AxisRange::Of(shape![0, 2, 4]), AxisRange::In(0, 4, 1)];
-        let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        assert!(matches!(
-            sliced.reshape(&new_shape, &[12]),
-            Err(Error::Unsupported(_))
-        ));
+        let sliced = view.slice(&range).expect("slice");
+        assert!(matches!(sliced.reshape(&[12]), Err(Error::Unsupported(_))));
     }
 
     #[test]
     fn at_slice_non_first_axis_then_reshape_rejected() {
         // At(0) on axis 1 of [3,4]: axes=[Stride(4)]; contiguous_strides([3])=[1]; 4≠1
-        let schema = schema(&[3, 4]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[3, 4]);
         let range = range![AxisRange::In(0, 3, 1), AxisRange::At(0)];
-        let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        assert!(matches!(
-            sliced.reshape(&new_shape, &[3]),
-            Err(Error::Unsupported(_))
-        ));
+        let sliced = view.slice(&range).expect("slice");
+        assert!(matches!(sliced.reshape(&[3]), Err(Error::Unsupported(_))));
     }
 
     // -- valid reshape chains -----------------------------------------------------
@@ -403,13 +401,10 @@ mod tests {
         // In(1,4,1) on axis 0 of [6,4]: strides unchanged [4,1], contiguous for [3,4] ✓
         // base_offset=4; reshape [3,4]→[12]: axes=[Stride(1)]
         // flat_offset([5]) = 4 + 5*1 = 9
-        let schema = schema(&[6, 4]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[6, 4]);
         let range = range![AxisRange::In(1, 4, 1), AxisRange::In(0, 4, 1)];
-        let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        let reshaped = sliced
-            .reshape(&new_shape, &[12])
-            .expect("reshape must succeed");
+        let sliced = view.slice(&range).expect("slice");
+        let reshaped = sliced.reshape(&[12]).expect("reshape must succeed");
         assert_eq!(reshaped.flat_offset(&[5]).expect("offset"), 9);
     }
 
@@ -418,13 +413,10 @@ mod tests {
         // At(1) on axis 0 of [3,4]: base_offset=4, axes=[Stride(1)], contiguous for [4] ✓
         // reshape [4]→[2,2]: axes=[Stride(2),Stride(1)]
         // flat_offset([1,1]) = 4 + 1*2 + 1*1 = 7
-        let schema = schema(&[3, 4]);
-        let view = TensorView::identity(&schema);
+        let view = view_for(&[3, 4]);
         let range = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
-        let (sliced, new_shape, _) = view.slice(schema.shape(), &range).expect("slice");
-        let reshaped = sliced
-            .reshape(&new_shape, &[2, 2])
-            .expect("reshape must succeed");
+        let sliced = view.slice(&range).expect("slice");
+        let reshaped = sliced.reshape(&[2, 2]).expect("reshape must succeed");
         assert_eq!(reshaped.flat_offset(&[1, 1]).expect("offset"), 7);
     }
 
@@ -433,19 +425,15 @@ mod tests {
         // reshape [6,4]→[2,3,4]: axes=[Stride(12),Stride(4),Stride(1)]
         // slice In(0,2,1) / In(0,2,1) / In(0,4,1); shape=[2,2,4]
         // flat_offset([1,1,2]) = 0 + 1*12 + 1*4 + 2*1 = 18
-        let schema = schema(&[6, 4]);
-        let view = TensorView::identity(&schema);
-        let reshaped_shape = [2usize, 3, 4];
-        let reshaped = view
-            .reshape(schema.shape(), &reshaped_shape)
-            .expect("reshape");
+        let view = view_for(&[6, 4]);
+        let reshaped = view.reshape(&[2, 3, 4]).expect("reshape");
         let range = range![
             AxisRange::In(0, 2, 1),
             AxisRange::In(0, 2, 1),
             AxisRange::In(0, 4, 1)
         ];
-        let (sliced, new_shape, _) = reshaped.slice(&reshaped_shape, &range).expect("slice");
-        assert_eq!(new_shape.as_slice(), &[2, 2, 4]);
+        let sliced = reshaped.slice(&range).expect("slice");
+        assert_eq!(sliced.shape(), &[2, 2, 4]);
         assert_eq!(sliced.flat_offset(&[1, 1, 2]).expect("offset"), 18);
     }
 }

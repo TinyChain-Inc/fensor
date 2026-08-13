@@ -4,7 +4,7 @@ use freqfs::DirLock;
 use crate::wire_tags::{LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
 use crate::{
     DType, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
-    TensorViewSemantics, TensorWrite, contiguous_strides, schema,
+    TensorViewSemantics, TensorWrite, schema,
 };
 
 fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
@@ -17,43 +17,6 @@ fn encode_layout<E: en::Error>(layout: Layout) -> Result<(u8, Option<u64>), E> {
         Layout::Dense => Ok((LAYOUT_TAG_DENSE, None)),
         Layout::Sparse { axis } => Ok((LAYOUT_TAG_SPARSE, encode_sparse_axis(axis)?)),
     }
-}
-
-fn encode_tensor_schema_ref(schema: &TensorSchema) -> Result<(DType, Vec<u64>, Layout), String> {
-    let shape = schema
-        .shape_u64()
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .collect::<Vec<u64>>();
-    Ok((schema.dtype(), shape, schema.layout()))
-}
-
-fn encode_tensor_schema(schema: TensorSchema) -> Result<(DType, Vec<u64>, Layout), String> {
-    encode_tensor_schema_ref(&schema)
-}
-
-fn encode_tensor_ref<FE, T>(tensor: &Tensor<FE, T>) -> Result<TensorSchema, String>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    if !tensor.is_base_tensor() {
-        return Err(
-            "cannot serialize a tensor with a non-identity view; views are metadata-only and \
-            are never persisted"
-                .to_string(),
-        );
-    }
-
-    Ok(tensor.schema().clone())
-}
-
-fn encode_tensor<FE, T>(tensor: Tensor<FE, T>) -> Result<TensorSchema, String>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    encode_tensor_ref(&tensor)
 }
 
 impl de::FromStream for DType {
@@ -122,75 +85,6 @@ impl<'en> en::IntoStream<'en> for Layout {
     }
 }
 
-impl de::FromStream for TensorSchema {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (dtype, shape, layout): (DType, Vec<u64>, Layout) =
-            <(DType, Vec<u64>, Layout)>::from_stream((), decoder).await?;
-        let shape = TensorSchema::shape_usize_from_u64(&shape).map_err(de::Error::custom)?;
-        let block_shape = super::default_block_shape(&shape);
-        let strides = contiguous_strides(&shape);
-
-        TensorSchema::new(dtype, shape, layout, block_shape, strides).map_err(de::Error::custom)
-    }
-}
-
-impl<'en> en::ToStream<'en> for TensorSchema {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(
-            encode_tensor_schema_ref(self).map_err(en::Error::custom)?,
-            encoder,
-        )
-    }
-}
-
-impl<'en> en::IntoStream<'en> for TensorSchema {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(
-            encode_tensor_schema(self).map_err(en::Error::custom)?,
-            encoder,
-        )
-    }
-}
-
-impl<FE, T> de::FromStream for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T> + safecast::AsType<String> + From<String>,
-    T: TensorElement,
-{
-    type Context = freqfs::DirLock<FE>;
-
-    async fn from_stream<D: de::Decoder>(
-        dir: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        let schema = TensorSchema::from_stream((), decoder).await?;
-
-        Tensor::create(dir, schema).await.map_err(de::Error::custom)
-    }
-}
-
-impl<'en, FE, T> en::ToStream<'en> for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(encode_tensor_ref(self).map_err(en::Error::custom)?, encoder)
-    }
-}
-
-impl<'en, FE, T> en::IntoStream<'en> for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        en::IntoStream::into_stream(encode_tensor(self).map_err(en::Error::custom)?, encoder)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tensor view streaming: lazy encode + streaming decode
 // ---------------------------------------------------------------------------
@@ -211,12 +105,31 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
+    // Encode schema info needed to reconstruct the tensor: (dtype, shape, layout, block_shape)
+    let dtype = tensor.schema().dtype();
+    let shape: Vec<u64> = tensor.schema().shape().iter().map(|&d| d as u64).collect();
+    // A `Sparse { axis }` hint is preserved only when the tensor is currently an
+    // identity/base view -- `transpose`/`slice`/`reshape` never update layout when
+    // they mutate the view's shape/strides, so a stale axis hint surviving a
+    // transform could silently denote the wrong logical axis (or, after a
+    // rank-reducing slice, be out of bounds). Resetting it to `None` on any
+    // non-identity view sidesteps that silent-corruption risk; `None` is always
+    // valid and defaults to axis 0 downstream.
     let is_identity = tensor.is_base_tensor();
-    let schema_snapshot =
-        schema::snapshot_schema(tensor.schema(), is_identity).map_err(en::Error::custom)?;
-    let shape: Vec<usize> = tensor.schema().shape().iter().copied().collect();
-    let view_values = ViewSnapshotValues { tensor, shape };
-    en::IntoStream::into_stream((schema_snapshot, view_values), encoder)
+    let layout = match tensor.layout() {
+        Layout::Dense => Layout::Dense,
+        Layout::Sparse { axis } => Layout::Sparse {
+            axis: if is_identity { axis } else { None },
+        },
+    };
+    let block_shape: Vec<usize> = tensor.block_shape().to_vec();
+    let view_shape: Vec<usize> = tensor.view.shape().to_vec();
+    let schema_info = (dtype, shape, layout, block_shape);
+    let view_values = ViewSnapshotValues {
+        tensor,
+        shape: view_shape,
+    };
+    en::IntoStream::into_stream((schema_info, view_values), encoder)
 }
 
 impl<'en, FE, T> en::ToStream<'en> for TensorViewEncoder<'_, FE, T>
@@ -343,20 +256,29 @@ where
     }
 
     async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let schema: TensorSchema = seq
+        let (dtype, shape_u64, layout, block_shape): (DType, Vec<u64>, Layout, Vec<usize>) = seq
             .next_element(())
             .await?
-            .ok_or_else(|| de::Error::custom("missing tensor view schema"))?;
+            .ok_or_else(|| de::Error::custom("missing tensor view schema info"))?;
 
-        if schema.dtype() != T::DTYPE {
+        if dtype != T::DTYPE {
             return Err(de::Error::custom(format!(
                 "tensor dtype mismatch: schema {:?} != tensor {:?}",
-                schema.dtype(),
+                dtype,
                 T::DTYPE,
             )));
         }
 
-        let tensor = Tensor::<FE, T>::create(self.dir.clone(), schema)
+        // Convert shape from u64 to usize
+        let shape: Vec<usize> = shape_u64
+            .iter()
+            .map(|&d| usize::try_from(d).map_err(|_| de::Error::custom("shape dimension overflow")))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let schema = TensorSchema::new(dtype, shape.clone().into()).map_err(de::Error::custom)?;
+        // Use max_capacity inferred from block_shape
+        let max_capacity = block_shape.iter().product::<usize>();
+        let tensor = Tensor::<FE, T>::create(self.dir.clone(), schema, layout, max_capacity)
             .await
             .map_err(de::Error::custom)?;
 
@@ -444,6 +366,5 @@ mod tests {
     fn schema_types_have_destream_impls() {
         assert_stream::<DType>();
         assert_stream::<Layout>();
-        assert_stream::<TensorSchema>();
     }
 }

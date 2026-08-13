@@ -11,6 +11,7 @@ use safecast::AsType;
 mod error;
 mod schema;
 mod stream;
+pub mod tensor;
 mod traits;
 mod validate;
 mod view;
@@ -18,10 +19,10 @@ mod wire_tags;
 
 pub use error::{Error, Result};
 pub use schema::{
-    DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape,
-    contiguous_strides,
+    DType, Layout, SparseIndexSchema, SparseTableSchema, TensorShape, contiguous_strides,
 };
 pub use stream::{TensorViewDecoder, TensorViewEncoder};
+pub use tensor::TensorSchema;
 pub use traits::{
     BoxFuture, TensorArray, TensorBlockStore, TensorMatMul, TensorMath, TensorMathScalar,
     TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll, TensorReduceBoolean,
@@ -76,7 +77,7 @@ where
 
 struct DenseStorage<FE> {
     blocks: DirLock<FE>,
-    schema: TensorSchema,
+    storage_schema: tensor::StorageSchema,
 }
 
 type SparseIndex<FE> = TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>;
@@ -84,7 +85,7 @@ type SparseIndex<FE> = TableLock<SparseTableSchema, SparseIndexSchema, Collator<
 struct SparseStorage<FE> {
     blocks: DirLock<FE>,
     index: SparseIndex<FE>,
-    schema: TensorSchema,
+    storage_schema: tensor::StorageSchema,
 }
 
 enum Storage<FE> {
@@ -100,10 +101,10 @@ impl<FE> Storage<FE> {
         }
     }
 
-    pub(crate) fn schema(&self) -> &TensorSchema {
+    pub(crate) fn storage_schema(&self) -> &tensor::StorageSchema {
         match self {
-            Self::Dense(s) => &s.schema,
-            Self::Sparse(s) => &s.schema,
+            Self::Dense(s) => &s.storage_schema,
+            Self::Sparse(s) => &s.storage_schema,
         }
     }
 
@@ -144,16 +145,31 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    pub async fn create(dir: DirLock<FE>, schema: TensorSchema) -> Result<Self>
+    pub async fn create(
+        dir: DirLock<FE>,
+        schema: TensorSchema,
+        layout: Layout,
+        max_capacity: usize,
+    ) -> Result<Self>
     where
         FE: AsType<String> + From<String>,
     {
-        validate_tensor_dtype::<T>(&schema)?;
+        if max_capacity == 0 || max_capacity > tensor::MAX_BLOCK_CAPACITY {
+            return Err(Error::InvalidSchema(format!(
+                "max block capacity must be non-zero and at most {}, got {max_capacity}",
+                tensor::MAX_BLOCK_CAPACITY
+            )));
+        }
+
+        validate_tensor_dtype::<T>(schema.dtype())?;
+
+        let storage_schema =
+            tensor::StorageSchema::new(schema.shape().as_slice(), layout, max_capacity)?;
 
         let mut dir_guard = dir.try_write()?;
         let blocks_dir = dir_guard.create_dir(BLOCKS.to_string())?;
 
-        let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = schema.layout() {
+        let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = layout {
             let index_dir = dir_guard.create_dir(INDEX.to_string())?;
             Some(TableLock::create(
                 SparseTableSchema::default(),
@@ -164,12 +180,7 @@ where
             None
         };
 
-        let tensor = Self::new_storage(blocks_dir, index, schema);
-        if let Layout::Dense = tensor.schema.layout() {
-            tensor.materialize_dense_blocks().await?;
-        }
-        tensor.persist_metadata().await?;
-        Ok(tensor)
+        Self::new_storage(blocks_dir, index, schema, storage_schema).await
     }
 
     pub async fn load(dir: DirLock<FE>) -> Result<Self>
@@ -178,9 +189,9 @@ where
     {
         let mut dir_guard = dir.try_write()?;
         let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-        let schema = load_metadata_file(&blocks_dir).await?;
-        validate_tensor_dtype::<T>(&schema)?;
-        let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = schema.layout() {
+        let (schema, storage_schema) = load_metadata_file(&blocks_dir).await?;
+        validate_tensor_dtype::<T>(schema.dtype())?;
+        let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = storage_schema.layout {
             let index_dir = dir_guard.get_dir(INDEX).cloned().ok_or_else(|| {
                 Error::InvalidSchema("sparse tensor missing index directory".to_string())
             })?;
@@ -193,7 +204,7 @@ where
             None
         };
 
-        Ok(Self::new_storage(blocks_dir, index, schema))
+        Self::new_storage(blocks_dir, index, schema, storage_schema).await
     }
 
     /// Build a lazily-streamed encoder for this tensor's current view
@@ -207,38 +218,66 @@ where
     }
 
     pub(crate) fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
-        self.schema.validate_coord(coord)?;
+        validate::validate_coord(self.view.shape(), coord)?;
         let k = self.view.flat_offset(coord)?;
         if k < 0 {
             return Err(Error::InvalidCoord("negative linear offset".to_string()));
         }
         let k = k as u64;
         let base_coord: Vec<u64> = self
-            .storage
-            .schema()
+            .schema
             .strides()
             .iter()
-            .zip(self.storage.schema().shape().iter())
+            .zip(self.schema.shape().iter())
             .map(|(stride, dim)| (k / *stride as u64) % *dim as u64)
             .collect();
-        self.storage.schema().validate_coord(&base_coord)?;
+        validate::validate_coord(self.schema.shape(), &base_coord)?;
         Ok(base_coord)
     }
 
-    pub(crate) fn block_position_from_base_coord(&self, base_coord: &[u64]) -> (u64, usize) {
-        let offset: u64 = base_coord
+    pub(crate) fn block_position_from_base_coord(
+        &self,
+        base_coord: &[u64],
+    ) -> tensor::BlockPosition {
+        let block_shape = self.block_shape();
+        let block_strides = self.block_strides();
+        let grid_strides = self.grid_strides();
+
+        let mut block_id: u64 = 0;
+        let mut offset_in_block: usize = 0;
+        for (i, coord) in base_coord.iter().enumerate() {
+            let block_dim = block_shape[i] as u64;
+            block_id += (coord / block_dim) * grid_strides[i] as u64;
+            offset_in_block += ((coord % block_dim) as usize) * block_strides[i];
+        }
+        tensor::BlockPosition {
+            block_id,
+            offset_in_block,
+        }
+    }
+
+    pub(crate) fn block_shape(&self) -> &[usize] {
+        &self.storage.storage_schema().block_schema.shape
+    }
+
+    pub(crate) fn block_strides(&self) -> &[usize] {
+        &self.storage.storage_schema().block_schema.strides
+    }
+
+    pub(crate) fn grid_strides(&self) -> &[usize] {
+        &self.storage.storage_schema().strides
+    }
+
+    pub(crate) fn num_blocks(&self) -> u64 {
+        self.storage
+            .storage_schema()
+            .shape
             .iter()
-            .zip(self.storage.schema().strides().iter())
-            .map(|(coord, stride)| *coord * (*stride as u64))
-            .sum();
-        let block_len = self.block_len() as u64;
-        let block_offset = offset / block_len;
-        let offset_in_block = (offset % block_len) as usize;
-        (block_offset, offset_in_block)
+            .product::<usize>() as u64
     }
 
     pub(crate) fn block_len(&self) -> usize {
-        self.storage.schema().block_len().max(1)
+        self.block_shape().iter().product::<usize>().max(1)
     }
 
     pub async fn compact_sparse(&self) -> Result<()> {
@@ -276,9 +315,12 @@ where
         vec![T::default(); self.block_len()]
     }
 
-    async fn materialize_dense_blocks(&self) -> Result<()> {
-        let block_len = self.block_len() as u64;
-        let num_blocks = self.storage.schema().element_count()? / block_len;
+    async fn materialize(&self) -> Result<()> {
+        if let Layout::Sparse { .. } = self.layout() {
+            return Ok(());
+        }
+
+        let num_blocks = self.num_blocks();
         for block_id in 0..num_blocks {
             self.write_block(block_id, self.default_block()).await?;
         }
@@ -306,7 +348,7 @@ where
     where
         FE: AsType<String> + From<String>,
     {
-        let payload = encode_schema(self.storage.schema());
+        let payload = encode_schema(&self.schema, self.storage.storage_schema());
         let _ = decode_schema(&payload)?;
         write_metadata_file(self.storage.blocks(), METADATA, &payload).await
     }
@@ -317,11 +359,7 @@ where
     }
 
     pub(crate) fn sparse_key(&self, coords: &[u64], block_offset: u64) -> Vec<u64> {
-        let sparse_axis = match self.storage.schema().layout() {
-            Layout::Sparse { axis } => axis.unwrap_or(0),
-            Layout::Dense => 0,
-        };
-        let axis = sparse_axis.min(coords.len().saturating_sub(1));
+        let axis = sparse_axis_for_layout(self.layout(), coords.len());
         vec![coords[axis], block_offset]
     }
 
@@ -358,34 +396,40 @@ where
         Ok(SparseWriteAction::CreateBlockAndWrite(block_id))
     }
 
-    fn new_storage(
+    async fn new_storage(
         blocks: DirLock<FE>,
         index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
         schema: TensorSchema,
-    ) -> Self
+        storage_schema: tensor::StorageSchema,
+    ) -> Result<Self>
     where
-        FE:,
+        FE: AsType<String> + From<String>,
     {
-        let view = TensorView::identity(&schema);
+        let view = TensorView::identity(schema.shape().clone(), schema.strides().clone());
 
         let storage = match index {
             Some(si) => Storage::Sparse(SparseStorage {
                 blocks,
                 index: si,
-                schema: schema.clone(),
+                storage_schema,
             }),
             None => Storage::Dense(DenseStorage {
                 blocks,
-                schema: schema.clone(),
+                storage_schema,
             }),
         };
 
-        Self {
+        let tensor = Self {
             storage: Arc::new(storage),
             schema,
             view,
             _dtype: std::marker::PhantomData,
-        }
+        };
+
+        tensor.materialize().await?;
+        tensor.persist_metadata().await?;
+
+        Ok(tensor)
     }
 
     fn sparse_index(&self) -> Result<&SparseIndex<FE>> {
@@ -422,8 +466,16 @@ where
         T::default()
     }
 
-    fn schema_dtype(&self) -> DType {
-        self.schema.dtype()
+    fn layout(&self) -> Layout {
+        self.storage.storage_schema().layout
+    }
+
+    fn shape(&self) -> &[usize] {
+        self.view.shape()
+    }
+
+    fn strides(&self) -> &[usize] {
+        self.view.strides()
     }
 }
 // ---------------------------------------------------------------------------
@@ -437,12 +489,15 @@ where
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
             let base_coord = self.resolve_base_coord(coord)?;
-            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
+            let tensor::BlockPosition {
+                block_id: block_grid_id,
+                offset_in_block,
+            } = self.block_position_from_base_coord(&base_coord);
 
-            let block_id = match self.schema.layout() {
-                Layout::Dense => Some(block_offset),
+            let block_id = match self.layout() {
+                Layout::Dense => Some(block_grid_id),
                 Layout::Sparse { .. } => {
-                    self.lookup_sparse_block_for_coord(&base_coord, block_offset)
+                    self.lookup_sparse_block_for_coord(&base_coord, block_grid_id)
                         .await?
                 }
             };
@@ -479,19 +534,23 @@ where
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let base_coord = self.resolve_base_coord(coord)?;
-            let (block_offset, offset_in_block) = self.block_position_from_base_coord(&base_coord);
+            let tensor::BlockPosition {
+                block_id: block_grid_id,
+                offset_in_block,
+            } = self.block_position_from_base_coord(&base_coord);
 
-            match self.schema().layout() {
+            match self.layout() {
                 Layout::Dense => {
-                    if self.read_block(block_offset).await?.is_none() {
-                        self.write_block(block_offset, self.default_block()).await?;
+                    if self.read_block(block_grid_id).await?.is_none() {
+                        self.write_block(block_grid_id, self.default_block())
+                            .await?;
                     }
-                    self.write_value_to_block(block_offset, offset_in_block, value)
+                    self.write_value_to_block(block_grid_id, offset_in_block, value)
                         .await
                 }
                 Layout::Sparse { .. } => {
                     match self
-                        .plan_sparse_write(&base_coord, block_offset, value)
+                        .plan_sparse_write(&base_coord, block_grid_id, value)
                         .await?
                     {
                         SparseWriteAction::Write(block_id) => {
@@ -499,7 +558,7 @@ where
                                 .await
                         }
                         SparseWriteAction::DeleteRow(block_id) => {
-                            let key = self.sparse_key(&base_coord, block_offset);
+                            let key = self.sparse_key(&base_coord, block_grid_id);
                             self.delete_row(key).await?;
                             if self.is_empty_block(block_id).await? {
                                 self.delete_block(block_id).await;
@@ -509,7 +568,7 @@ where
                         }
                         SparseWriteAction::CreateBlockAndWrite(block_id) => {
                             self.write_block(block_id, self.default_block()).await?;
-                            let key = self.sparse_key(&base_coord, block_offset);
+                            let key = self.sparse_key(&base_coord, block_grid_id);
                             self.upsert_block_id(key, block_id).await?;
                             self.write_value_to_block(block_id, offset_in_block, value)
                                 .await?;
@@ -533,43 +592,25 @@ where
     T: TensorElement,
 {
     fn reshape(mut self, shape: Shape) -> Result<Self> {
-        let old_shape = self.schema.shape();
-        let old_size: usize = old_shape.iter().product();
+        let old_size: usize = self.view.shape().iter().product();
         let new_size: usize = shape.iter().product();
         if old_size != new_size {
             return Err(Error::InvalidLayout(
                 "reshape requires an equal number of elements".to_string(),
             ));
         }
-        self.view = self.view.reshape(self.schema.shape(), &shape)?;
-        self.schema.set_shape(shape)?;
-        self.schema
-            .set_strides(contiguous_strides(self.schema.shape()))?;
+        self.view = self.view.reshape(&shape)?;
         Ok(self)
     }
 
     fn slice(mut self, range: Range) -> Result<Self> {
-        let current_shape = self.schema.shape();
-        let (view, shape, strides) = self.view.slice(current_shape, &range)?;
-        self.view = view;
-        self.schema.set_shape(shape)?;
-        self.schema.set_strides(strides)?;
+        self.view = self.view.slice(&range)?;
         Ok(self)
     }
 
     fn transpose(mut self, permutation: Option<Axes>) -> Result<Self> {
-        let current_shape = self.schema.shape();
-        let current_strides = self.schema.strides().clone();
-        let permutation = default_permutation(current_shape.len(), permutation)?;
+        let permutation = default_permutation(self.view.shape().len(), permutation)?;
         self.view = self.view.transpose(&permutation)?;
-        let mut shape = Shape::with_capacity(current_shape.len());
-        let mut strides = Vec::with_capacity(current_shape.len());
-        for axis in permutation {
-            shape.push(current_shape[axis]);
-            strides.push(current_strides[axis]);
-        }
-        self.schema.set_shape(shape)?;
-        self.schema.set_strides(strides.into())?;
         Ok(self)
     }
 }
@@ -670,7 +711,7 @@ where
     T: TensorElement,
 {
     fn is_base_tensor(&self) -> bool {
-        self.view.is_identity(self.storage.schema())
+        self.view.is_identity(self.schema.shape())
     }
 
     fn supports_write_through(&self) -> bool {
@@ -699,22 +740,9 @@ where
 // Free functions
 // ---------------------------------------------------------------------------
 
-pub fn default_block_shape(shape: &Shape) -> Shape {
-    if shape.is_empty() {
-        return Shape::new();
-    }
-    let mut block_shape = Shape::with_capacity(shape.len());
-    for (i, dim) in shape.iter().enumerate() {
-        if i + 1 == shape.len() {
-            block_shape.push((*dim).min(4096));
-        } else {
-            block_shape.push(1);
-        }
-    }
-    block_shape
-}
-
-async fn load_metadata_file<FE>(blocks: &DirLock<FE>) -> Result<TensorSchema>
+async fn load_metadata_file<FE>(
+    blocks: &DirLock<FE>,
+) -> Result<(TensorSchema, tensor::StorageSchema)>
 where
     FE: AsType<String> + FileLoad + Send + Sync + 'static,
 {
@@ -749,9 +777,9 @@ where
     Ok(())
 }
 
-fn encode_schema(schema: &TensorSchema) -> String {
+fn encode_schema(schema: &TensorSchema, storage_schema: &tensor::StorageSchema) -> String {
     let dtype = schema.dtype().as_str();
-    let layout = match schema.layout() {
+    let layout = match storage_schema.layout {
         Layout::Dense => "dense".to_string(),
         Layout::Sparse { axis } => format!(
             "sparse:{}",
@@ -765,8 +793,9 @@ fn encode_schema(schema: &TensorSchema) -> String {
         .map(|dim| dim.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let block_shape = schema
-        .block_shape()
+    let block_shape = storage_schema
+        .block_schema
+        .shape
         .iter()
         .map(|dim| dim.to_string())
         .collect::<Vec<_>>()
@@ -783,7 +812,7 @@ fn encode_schema(schema: &TensorSchema) -> String {
     s
 }
 
-fn decode_schema(payload: &str) -> Result<TensorSchema> {
+fn decode_schema(payload: &str) -> Result<(TensorSchema, tensor::StorageSchema)> {
     let mut fields = std::collections::HashMap::<String, String>::new();
     for line in payload.lines().filter(|line| !line.is_empty()) {
         let (key, value) = line
@@ -827,21 +856,17 @@ fn decode_schema(payload: &str) -> Result<TensorSchema> {
             .get("block_shape")
             .ok_or_else(|| Error::InvalidSchema("missing block_shape in metadata".to_string()))?,
     )?;
-    let strides = parse_usize_vec(
+    let _strides = parse_usize_vec(
         fields
             .get("strides")
             .ok_or_else(|| Error::InvalidSchema("missing strides in metadata".to_string()))?,
     )?;
 
-    let schema = TensorSchema::new(
-        dtype,
-        shape.into(),
-        layout,
-        block_shape.into(),
-        strides.into(),
-    )?;
+    let tensor_schema = TensorSchema::new(dtype, shape.clone().into())?;
+    let storage_schema =
+        tensor::StorageSchema::from_block_shape(&shape, layout, block_shape.into())?;
 
-    Ok(schema)
+    Ok((tensor_schema, storage_schema))
 }
 
 fn parse_layout(layout: &str) -> Result<Layout> {
@@ -876,11 +901,19 @@ fn parse_usize_vec(value: &str) -> Result<Vec<usize>> {
         .collect()
 }
 
-fn validate_tensor_dtype<T: TensorElement>(schema: &TensorSchema) -> Result<()> {
-    if schema.dtype() != T::DTYPE {
+pub(crate) fn sparse_axis_for_layout(layout: Layout, ndim: usize) -> usize {
+    let axis = match layout {
+        Layout::Sparse { axis } => axis.unwrap_or(0),
+        Layout::Dense => 0,
+    };
+    axis.min(ndim.saturating_sub(1))
+}
+
+fn validate_tensor_dtype<T: TensorElement>(dtype: DType) -> Result<()> {
+    if dtype != T::DTYPE {
         return Err(Error::InvalidSchema(format!(
             "tensor dtype mismatch: schema {:?} != tensor {:?}",
-            schema.dtype(),
+            dtype,
             T::DTYPE,
         )));
     }
@@ -898,36 +931,31 @@ mod metadata_tests {
 
     #[test]
     fn schema_metadata_roundtrip() {
-        let schema = TensorSchema::new(
-            DType::F32,
-            shape![3, 4, 5],
+        let schema = TensorSchema::new(DType::F32, shape![3, 4, 5]).expect("schema");
+        let storage_schema = tensor::StorageSchema::from_block_shape(
+            &[3, 4, 5],
             Layout::Sparse { axis: Some(1) },
             shape![1, 2, 5],
-            vec![20, 5, 1].into(),
         )
-        .expect("schema");
+        .expect("storage schema");
 
-        let encoded = encode_schema(&schema);
-        let decoded = decode_schema(&encoded).expect("decode");
-        assert_eq!(decoded, schema);
+        let encoded = encode_schema(&schema, &storage_schema);
+        let (decoded_schema, _decoded_storage) = decode_schema(&encoded).expect("decode");
+        assert_eq!(decoded_schema, schema);
     }
 
     #[test]
     fn schema_metadata_roundtrip_f64() {
-        let schema = TensorSchema::new(
-            DType::F64,
-            shape![2, 2],
-            Layout::Dense,
-            shape![1, 2],
-            vec![2, 1].into(),
-        )
-        .expect("schema");
+        let schema = TensorSchema::new(DType::F64, shape![2, 2]).expect("schema");
+        let storage_schema =
+            tensor::StorageSchema::from_block_shape(&[2, 2], Layout::Dense, shape![1, 2])
+                .expect("storage schema");
 
-        let encoded = encode_schema(&schema);
+        let encoded = encode_schema(&schema, &storage_schema);
         assert!(encoded.contains("dtype=f64"));
 
-        let decoded = decode_schema(&encoded).expect("decode");
-        assert_eq!(decoded, schema);
+        let (decoded_schema, _) = decode_schema(&encoded).expect("decode");
+        assert_eq!(decoded_schema, schema);
     }
 
     #[test]
@@ -955,16 +983,302 @@ mod metadata_tests {
 
     #[test]
     fn typed_tensor_rejects_schema_dtype_mismatch() {
-        let schema = TensorSchema::new(
-            DType::F64,
-            shape![2, 2],
-            Layout::Dense,
-            shape![1, 2],
-            vec![2, 1].into(),
-        )
-        .expect("schema");
-
-        let err = validate_tensor_dtype::<f32>(&schema).expect_err("expected mismatch");
+        let err = validate_tensor_dtype::<f32>(DType::F64).expect_err("expected mismatch");
         assert!(matches!(err, Error::InvalidSchema(_)));
+    }
+}
+
+#[cfg(test)]
+mod sparse_axis_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_axis_none_defaults_to_zero() {
+        assert_eq!(sparse_axis_for_layout(Layout::Sparse { axis: None }, 3), 0);
+    }
+
+    #[test]
+    fn sparse_axis_some_selects_given_axis() {
+        assert_eq!(
+            sparse_axis_for_layout(Layout::Sparse { axis: Some(1) }, 3),
+            1
+        );
+        assert_eq!(
+            sparse_axis_for_layout(Layout::Sparse { axis: Some(2) }, 3),
+            2
+        );
+    }
+
+    #[test]
+    fn sparse_axis_none_and_some_zero_are_equivalent() {
+        assert_eq!(
+            sparse_axis_for_layout(Layout::Sparse { axis: None }, 3),
+            sparse_axis_for_layout(Layout::Sparse { axis: Some(0) }, 3),
+        );
+    }
+
+    #[test]
+    fn sparse_axis_dense_is_always_zero() {
+        assert_eq!(sparse_axis_for_layout(Layout::Dense, 3), 0);
+    }
+
+    #[test]
+    fn sparse_axis_clamps_to_last_axis_when_out_of_range() {
+        // `sparse_key` receives `coords.len()` as `ndim`, which is always the
+        // tensor's own rank -- axis selection must never index past it.
+        assert_eq!(
+            sparse_axis_for_layout(Layout::Sparse { axis: Some(5) }, 3),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod sparse_lifecycle_tests {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use b_table::Node;
+    use destream::{de, en};
+    use freqfs::Cache;
+    use ha_ndarray::shape;
+    use safecast::as_type;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum TestFE {
+        Node(Node<u64>),
+        F32(Vec<f32>),
+        Text(String),
+    }
+
+    impl<'en> en::ToStream<'en> for TestFE {
+        fn to_stream<E: en::Encoder<'en>>(
+            &'en self,
+            encoder: E,
+        ) -> std::result::Result<E::Ok, E::Error> {
+            match self {
+                Self::Node(node) => node.to_stream(encoder),
+                Self::F32(values) => values.to_stream(encoder),
+                Self::Text(text) => text.to_stream(encoder),
+            }
+        }
+    }
+
+    // Only ever read via a concrete `AsType` target (mirrors `tests/common.rs::FsEntry`).
+    impl de::FromStream for TestFE {
+        type Context = ();
+
+        async fn from_stream<D: de::Decoder>(
+            _: (),
+            _decoder: &mut D,
+        ) -> std::result::Result<Self, D::Error> {
+            Err(de::Error::custom(
+                "TestFE does not support generic decoding; read via a concrete AsType target",
+            ))
+        }
+    }
+
+    as_type!(TestFE, Node, Node<u64>);
+    as_type!(TestFE, F32, Vec<f32>);
+    as_type!(TestFE, Text, String);
+
+    fn unique_tmp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        path.push(format!("fensor_sparse_lifecycle_{name}_{unique}"));
+        path
+    }
+
+    fn open_dir(root: &Path) -> io::Result<DirLock<TestFE>> {
+        let cache = Cache::<TestFE>::new(1_000_000, None);
+        cache.load(root.to_path_buf())
+    }
+
+    async fn new_dir(name: &str) -> (PathBuf, DirLock<TestFE>) {
+        let root = unique_tmp_dir(name);
+        tokio::fs::create_dir(&root).await.expect("create tmp dir");
+        let dir = open_dir(&root).expect("load tmp dir");
+        (root, dir)
+    }
+
+    async fn cleanup(root: &Path) {
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    async fn create_sparse(
+        name: &str,
+        shape: Shape,
+        max_capacity: usize,
+        axis: Option<usize>,
+    ) -> (PathBuf, Tensor<TestFE, f32>) {
+        let (root, dir) = new_dir(name).await;
+        let schema = TensorSchema::new(DType::F32, shape).expect("schema");
+        let tensor =
+            Tensor::<TestFE, f32>::create(dir, schema, Layout::Sparse { axis }, max_capacity)
+                .await
+                .expect("create sparse");
+        (root, tensor)
+    }
+
+    async fn block_id_for_coord(tensor: &Tensor<TestFE, f32>, coord: &[u64]) -> Option<u64> {
+        let base_coord = tensor.resolve_base_coord(coord).expect("base coord");
+        let tensor::BlockPosition { block_id, .. } =
+            tensor.block_position_from_base_coord(&base_coord);
+        tensor
+            .lookup_sparse_block_for_coord(&base_coord, block_id)
+            .await
+            .expect("lookup")
+    }
+
+    #[tokio::test]
+    async fn sparse_zero_to_nonzero_creates_row_and_block() {
+        let (root, tensor) = create_sparse("zero_to_nonzero", shape![2, 3, 4], 4, Some(1)).await;
+
+        assert!(
+            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
+            "no row before write"
+        );
+
+        tensor.write_value(&[0, 1, 2], 1.0).await.expect("write");
+        let block_id = block_id_for_coord(&tensor, &[0, 1, 2])
+            .await
+            .expect("row must exist");
+        assert!(
+            tensor.read_block(block_id).await.expect("block").is_some(),
+            "block must be materialized after first nonzero write"
+        );
+        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 1.0);
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sparse_nonzero_to_zero_remove_row_policy() {
+        let (root, tensor) = create_sparse("remove_row", shape![2, 3, 4], 4, Some(1)).await;
+
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write nz");
+        assert!(block_id_for_coord(&tensor, &[0, 1, 2]).await.is_some());
+
+        tensor.write_value(&[0, 1, 2], 0.0).await.expect("write z");
+
+        assert!(
+            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
+            "RemoveRow policy must drop the row when value becomes default"
+        );
+        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 0.0);
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sparse_overwrite_nonzero_preserves_row_id() {
+        let (root, tensor) = create_sparse("overwrite", shape![2, 3, 4], 4, Some(1)).await;
+
+        tensor.write_value(&[0, 1, 2], 1.0).await.expect("write 1");
+        let id_a = block_id_for_coord(&tensor, &[0, 1, 2])
+            .await
+            .expect("must exist");
+
+        tensor.write_value(&[0, 1, 2], 2.0).await.expect("write 2");
+        let id_b = block_id_for_coord(&tensor, &[0, 1, 2])
+            .await
+            .expect("must exist");
+
+        assert_eq!(id_a, id_b, "block_id must be stable across nonzero updates");
+        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 2.0);
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn compact_sparse_removes_all_zero_rows() {
+        let (root, tensor) = create_sparse("compact", shape![2, 3, 4], 4, Some(1)).await;
+
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("nz");
+        tensor.write_value(&[0, 1, 2], 0.0).await.expect("zero");
+
+        tensor
+            .compact_sparse()
+            .await
+            .expect("compact must be supported");
+
+        assert!(
+            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
+            "compaction must drop all-zero rows"
+        );
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn compact_sparse_preserves_nonzero_rows() {
+        let (root, tensor) = create_sparse("compact_preserve", shape![2, 3, 4], 4, Some(1)).await;
+
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write nz");
+
+        tensor.compact_sparse().await.expect("compact");
+
+        assert!(
+            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_some(),
+            "compact must not remove rows with nonzero values"
+        );
+        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 5.0);
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sparse_write_zero_to_new_coord_is_noop() {
+        let (root, tensor) = create_sparse("noop", shape![2, 3, 4], 4, Some(1)).await;
+
+        tensor
+            .write_value(&[0, 1, 2], 0.0)
+            .await
+            .expect("write zero");
+
+        assert!(
+            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
+            "zero write to new coord must not create a row"
+        );
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn compact_sparse_idempotent() {
+        let (root, tensor) = create_sparse("compact_idem", shape![2, 3, 4], 4, Some(1)).await;
+
+        tensor.write_value(&[0, 1, 2], 5.0).await.expect("nz");
+        tensor.write_value(&[1, 2, 3], 3.0).await.expect("nz2");
+        tensor.write_value(&[0, 1, 2], 0.0).await.expect("zero");
+
+        tensor.compact_sparse().await.expect("first compact");
+
+        assert!(
+            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
+            "zero row removed after first compact"
+        );
+        assert!(
+            block_id_for_coord(&tensor, &[1, 2, 3]).await.is_some(),
+            "nonzero row preserved after first compact"
+        );
+
+        tensor.compact_sparse().await.expect("second compact");
+
+        assert!(
+            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
+            "still absent after second compact"
+        );
+        assert!(
+            block_id_for_coord(&tensor, &[1, 2, 3]).await.is_some(),
+            "nonzero row still present after second compact"
+        );
+
+        cleanup(&root).await;
     }
 }

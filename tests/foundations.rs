@@ -9,6 +9,8 @@ use fensor::{
 };
 use ha_ndarray::{Axes, AxisRange, Range, Shape, Strides, axes, range, shape};
 
+mod common;
+
 fn block_on<F: Future>(future: F) -> F::Output {
     fn noop_raw_waker() -> RawWaker {
         fn clone(_: *const ()) -> RawWaker {
@@ -39,6 +41,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
 #[derive(Clone)]
 struct TestTensor {
     schema: TensorSchema,
+    layout: Layout,
+    shape: Shape,
+    strides: Strides,
     values: Vec<f32>,
     base_offset: usize,
 }
@@ -46,24 +51,39 @@ struct TestTensor {
 impl TestTensor {
     fn new(layout: Layout) -> Self {
         let shape: Shape = shape![2, 3, 4];
-        let strides = contiguous_strides(&shape);
-        let block_shape: Shape = shape![1, 1, 4];
-        let schema = TensorSchema::new(DType::F32, shape, layout, block_shape, strides)
-            .expect("valid schema");
-        let schema_shape = schema.shape().clone();
+        let schema = TensorSchema::new(DType::F32, shape.clone()).expect("valid schema");
+        let strides = schema.strides().clone();
+        let values = vec![0.0; shape.iter().product()];
 
         Self {
-            values: vec![0.0; schema_shape.iter().product()],
             schema,
+            layout,
+            shape,
+            strides,
+            values,
             base_offset: 0,
         }
+    }
+
+    fn validate_coord(&self, coord: &[u64]) -> fensor::Result<()> {
+        if coord.len() != self.shape.len() {
+            return Err(Error::InvalidCoord(
+                "incorrect number of coordinates".to_string(),
+            ));
+        }
+        for (c, dim) in coord.iter().zip(self.shape.iter()) {
+            if (*c as usize) >= *dim {
+                return Err(Error::InvalidCoord("coordinate out of bounds".to_string()));
+            }
+        }
+        Ok(())
     }
 
     fn linear_offset(&self, coord: &[u64]) -> usize {
         self.base_offset
             + coord
                 .iter()
-                .zip(self.schema.strides().iter())
+                .zip(self.strides.iter())
                 .map(|(c, s)| (*c as usize) * *s)
                 .sum::<usize>()
     }
@@ -79,12 +99,24 @@ impl TensorArray for TestTensor {
     fn dtype(&self) -> Self::DType {
         0.0
     }
+
+    fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn strides(&self) -> &[usize] {
+        &self.strides
+    }
 }
 
 impl TensorRead for TestTensor {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, fensor::Result<Self::DType>> {
         Box::pin(async move {
-            self.schema.validate_coord(coord)?;
+            self.validate_coord(coord)?;
             Ok(self.values[self.linear_offset(coord)])
         })
     }
@@ -97,7 +129,7 @@ impl TensorWrite for TestTensor {
         value: Self::DType,
     ) -> BoxFuture<'a, fensor::Result<()>> {
         Box::pin(async move {
-            self.schema.validate_coord(coord)?;
+            self.validate_coord(coord)?;
             let offset = self.linear_offset(coord);
 
             // Interior mutability is not needed for these tests; clone/write/forget keeps test code minimal.
@@ -116,7 +148,7 @@ impl TensorWrite for TestTensor {
 
 impl TensorTransform for TestTensor {
     fn reshape(mut self, shape: Shape) -> fensor::Result<Self> {
-        let old_size: usize = self.schema.shape().iter().product();
+        let old_size: usize = self.shape.iter().product();
         let new_size: usize = shape.iter().product();
 
         if old_size != new_size {
@@ -125,15 +157,14 @@ impl TensorTransform for TestTensor {
             ));
         }
 
-        self.schema.set_shape(shape)?;
-        self.schema
-            .set_strides(contiguous_strides(self.schema.shape()))?;
+        self.strides = contiguous_strides(&shape)?;
+        self.shape = shape;
         self.base_offset = 0;
         Ok(self)
     }
 
     fn slice(mut self, range: Range) -> fensor::Result<Self> {
-        if range.len() != self.schema.shape().len() {
+        if range.len() != self.shape.len() {
             return Err(Error::InvalidLayout(
                 "slice range rank must match tensor rank".to_string(),
             ));
@@ -141,8 +172,8 @@ impl TensorTransform for TestTensor {
 
         let mut next_shape = Shape::with_capacity(range.len());
         let mut next_strides = Strides::with_capacity(range.len());
-        let shape = self.schema.shape().clone();
-        let strides = self.schema.strides().clone();
+        let shape = self.shape.clone();
+        let strides = self.strides.clone();
 
         for (axis, (bound, dim)) in range.iter().zip(shape.iter()).enumerate() {
             match bound {
@@ -166,14 +197,14 @@ impl TensorTransform for TestTensor {
             }
         }
 
-        self.schema.set_shape(next_shape)?;
-        self.schema.set_strides(next_strides)?;
+        self.shape = next_shape;
+        self.strides = next_strides;
         Ok(self)
     }
 
     fn transpose(mut self, permutation: Option<Axes>) -> fensor::Result<Self> {
-        let shape = self.schema.shape().clone();
-        let base_strides = self.schema.strides().clone();
+        let shape = self.shape.clone();
+        let base_strides = self.strides.clone();
         let ndim = shape.len();
         let axes = permutation.unwrap_or_else(|| (0..ndim).collect());
 
@@ -196,12 +227,12 @@ impl TensorTransform for TestTensor {
         let mut shape = Shape::with_capacity(ndim);
         let mut strides = Strides::with_capacity(ndim);
         for axis in axes {
-            shape.push(self.schema.shape()[axis]);
+            shape.push(self.shape[axis]);
             strides.push(base_strides[axis]);
         }
 
-        self.schema.set_shape(shape)?;
-        self.schema.set_strides(strides)?;
+        self.shape = shape;
+        self.strides = strides;
         Ok(self)
     }
 }
@@ -403,22 +434,30 @@ fn dense_sparse_parity_for_supported_operations() {
     }
 }
 
-#[test]
-fn public_schema_constructor_rejects_invalid_sparse_axis_hint() {
-    let schema = TensorSchema::new(
-        DType::F32,
-        shape![2, 3],
-        Layout::Sparse { axis: Some(2) },
-        shape![1, 1],
-        contiguous_strides(&[2, 3]),
+#[tokio::test]
+async fn public_create_rejects_invalid_sparse_axis_hint() {
+    let (root, dir) = common::new_dir("invalid_sparse_axis").await;
+    let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
+    let result = fensor::Tensor::<common::FsEntry, f32>::create(
+        dir,
+        schema,
+        Layout::Sparse { axis: Some(99) },
+        1000,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InvalidSchema(_))),
+        "out-of-bounds sparse axis must be rejected"
     );
-
-    assert!(matches!(schema, Err(Error::InvalidSchema(_))));
+    common::cleanup(&root).await;
 }
 
 #[test]
 fn public_schema_contiguous_strides_match_expected() {
-    assert_eq!(contiguous_strides(&[2, 3, 4]).as_slice(), &[12, 4, 1]);
+    assert_eq!(
+        contiguous_strides(&[2, 3, 4]).expect("strides").as_slice(),
+        &[12, 4, 1]
+    );
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use b_table::Node;
 use destream::{de, en};
-use fensor::{Layout, TensorSchema, TensorSparseIndex};
+use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
 use freqfs::{Cache, DirLock};
 use safecast::as_type;
 
@@ -83,48 +83,6 @@ pub fn iter_coords(shape: &[usize]) -> CoordIter {
     CoordIter::new(shape)
 }
 
-/// Test helper: derive the sparse-index key `[coord[sparse_axis], block_offset]`
-/// from a coord, using only the public `TensorSchema` surface. Mirrors the
-/// arithmetic in `Tensor::block_position_from_base_coord` + `Tensor::sparse_key`.
-/// Pass the **base** schema (the one used at `create`), not a view-transformed
-/// one — views can change strides relative to the on-disk layout.
-pub fn block_key_for_coord(schema: &TensorSchema, coord: &[u64]) -> Vec<u64> {
-    assert_eq!(
-        coord.len(),
-        schema.shape().len(),
-        "coord rank must match schema rank"
-    );
-
-    let strides = schema.strides();
-    let block_len = schema.block_len().max(1) as u64;
-    let offset: u64 = coord
-        .iter()
-        .zip(strides.iter())
-        .map(|(c, s)| c * (*s as u64))
-        .sum();
-    let block_offset = offset / block_len;
-
-    let sparse_axis = match schema.layout() {
-        Layout::Sparse { axis } => axis.unwrap_or(0),
-        Layout::Dense => 0,
-    };
-    let axis = sparse_axis.min(coord.len().saturating_sub(1));
-
-    vec![coord[axis], block_offset]
-}
-
-/// Test helper: probe the sparse index for the block backing `coord`.
-/// Wraps `block_key_for_coord` + `TensorSparseIndex::lookup_block_id` so test
-/// bodies can talk in coord-space instead of hand-spelling block keys.
-pub async fn block_id_for_coord<T: TensorSparseIndex>(
-    tensor: &T,
-    schema: &TensorSchema,
-    coord: &[u64],
-) -> Option<u64> {
-    let key = block_key_for_coord(schema, coord);
-    tensor.lookup_block_id(&key).await.expect("lookup_block_id")
-}
-
 pub struct CoordIter {
     shape: Vec<usize>,
     coord: Vec<u64>,
@@ -169,4 +127,31 @@ impl Iterator for CoordIter {
         }
         Some(out)
     }
+}
+
+pub async fn create_dense_tensor<T>(
+    dir: DirLock<FsEntry>,
+    schema: TensorSchema,
+) -> Tensor<FsEntry, T>
+where
+    T: TensorElement,
+    FsEntry: TensorFileEntry<T>,
+{
+    Tensor::<FsEntry, T>::create(dir, schema, Layout::Dense, 1000)
+        .await
+        .expect("created")
+}
+
+pub async fn create_sparse_tensor<T>(
+    dir: DirLock<FsEntry>,
+    schema: TensorSchema,
+    axis: Option<usize>,
+) -> Tensor<FsEntry, T>
+where
+    T: TensorElement,
+    FsEntry: TensorFileEntry<T>,
+{
+    Tensor::<FsEntry, T>::create(dir, schema, Layout::Sparse { axis }, 1000)
+        .await
+        .expect("created")
 }

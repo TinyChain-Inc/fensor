@@ -3,8 +3,9 @@ use std::pin::Pin;
 
 use ha_ndarray::{Axes, Range, Shape};
 
-use crate::schema::{DType, Layout, TensorSchema};
-use crate::{Error, Result};
+use crate::schema::{DType, Layout};
+use crate::validate;
+use crate::{Error, Result, TensorSchema};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -16,20 +17,14 @@ pub trait TensorArray: Send + Sync {
 
     fn dtype(&self) -> Self::DType;
 
+    fn layout(&self) -> Layout;
+
+    fn shape(&self) -> &[usize];
+
+    fn strides(&self) -> &[usize];
+
     fn schema_dtype(&self) -> DType {
         self.schema().dtype()
-    }
-
-    fn shape(&self) -> &[usize] {
-        self.schema().shape()
-    }
-
-    fn layout(&self) -> Layout {
-        self.schema().layout()
-    }
-
-    fn strides(&self) -> &[usize] {
-        self.schema().strides()
     }
 
     fn ndim(&self) -> usize {
@@ -429,7 +424,7 @@ pub trait TensorReduceBoolean: TensorArray {
 /// Matrix/tensor contraction operations.
 pub trait TensorMatMul: TensorArray + Sized {
     fn matmul_output_shape(&self, rhs: &Self) -> Result<Shape> {
-        crate::validate::matmul_output_shape(self.shape(), rhs.shape())
+        validate::matmul_output_shape(self.shape(), rhs.shape())
     }
 
     fn matmul<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {

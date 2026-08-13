@@ -9,13 +9,6 @@ use crate::{Error, Result as FResult};
 pub const PORTABLE_INLINE_RANK: usize = 8;
 pub type TensorShape = SmallVec<[u64; PORTABLE_INLINE_RANK]>;
 
-#[derive(Clone, Eq, PartialEq, Debug)]
-struct InternalLayoutMetadata {
-    layout: Layout,
-    block_shape: Shape,
-    strides: Strides,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum DType {
     F32,
@@ -45,192 +38,7 @@ pub enum Layout {
     Sparse { axis: Option<usize> },
 }
 
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub struct TensorSchema {
-    dtype: DType,
-    shape: Shape,
-    internal: InternalLayoutMetadata,
-}
-
-impl TensorSchema {
-    pub(crate) fn shape_u64(&self) -> FResult<TensorShape> {
-        Self::shape_u64_from_shape(&self.shape)
-    }
-
-    pub(crate) fn shape_usize_from_u64(shape: &[u64]) -> FResult<Shape> {
-        validate_shape_dims(shape)?;
-
-        shape
-            .iter()
-            .map(|dim| {
-                usize::try_from(*dim)
-                    .map_err(|_| Error::InvalidSchema("shape dimension overflow".to_string()))
-            })
-            .collect::<FResult<Vec<usize>>>()
-            .map(Into::into)
-    }
-
-    fn shape_u64_from_shape(shape: &Shape) -> FResult<TensorShape> {
-        validate_shape_dims(shape.as_slice())?;
-
-        shape
-            .iter()
-            .map(|dim| {
-                u64::try_from(*dim)
-                    .map_err(|_| Error::InvalidSchema("shape dimension overflow".to_string()))
-            })
-            .collect::<FResult<TensorShape>>()
-    }
-
-    pub fn new(
-        dtype: DType,
-        shape: Shape,
-        layout: Layout,
-        block_shape: Shape,
-        strides: Strides,
-    ) -> FResult<Self> {
-        validate_shape_dims(shape.as_slice())?;
-
-        if block_shape.len() != shape.len() || block_shape.contains(&0) {
-            return Err(Error::InvalidSchema(
-                "block_shape must be non-zero and match tensor rank".to_string(),
-            ));
-        }
-
-        if strides.len() != shape.len() {
-            return Err(Error::InvalidSchema(
-                "strides rank must match tensor shape rank".to_string(),
-            ));
-        }
-
-        if let Layout::Sparse { axis: Some(axis) } = layout
-            && axis >= shape.len()
-        {
-            return Err(Error::InvalidSchema(
-                "sparse axis hint out of bounds".to_string(),
-            ));
-        }
-
-        // Validate that shape dimensions are representable in the portable u64 form.
-        let _ = Self::shape_u64_from_shape(&shape)?;
-
-        let internal = InternalLayoutMetadata {
-            layout,
-            block_shape,
-            strides,
-        };
-
-        Ok(Self {
-            dtype,
-            shape,
-            internal,
-        })
-    }
-
-    pub fn dense_with_dtype(dtype: DType, shape: Shape, block_shape: Shape) -> FResult<Self> {
-        let strides = contiguous_strides(&shape);
-        Self::new(dtype, shape, Layout::Dense, block_shape, strides)
-    }
-
-    pub fn sparse_with_dtype(
-        dtype: DType,
-        shape: Shape,
-        block_shape: Shape,
-        axis: Option<usize>,
-    ) -> FResult<Self> {
-        let strides = contiguous_strides(&shape);
-        Self::new(dtype, shape, Layout::Sparse { axis }, block_shape, strides)
-    }
-
-    pub fn dense(shape: Shape, block_shape: Shape) -> FResult<Self> {
-        Self::dense_with_dtype(DType::F32, shape, block_shape)
-    }
-
-    pub fn sparse(shape: Shape, block_shape: Shape, axis: Option<usize>) -> FResult<Self> {
-        Self::sparse_with_dtype(DType::F32, shape, block_shape, axis)
-    }
-
-    pub fn block_len(&self) -> usize {
-        self.internal.block_shape.iter().product()
-    }
-
-    pub fn validate_coord(&self, coord: &[u64]) -> FResult<()> {
-        let shape = self.shape();
-
-        if coord.len() != shape.len() {
-            return Err(Error::InvalidCoord(
-                "incorrect number of coordinates".to_string(),
-            ));
-        }
-
-        for (i, (c, dim)) in coord.iter().zip(shape.iter()).enumerate() {
-            let coord = usize::try_from(*c).map_err(|_| {
-                Error::InvalidCoord(format!("coordinate at axis {i} overflows usize"))
-            })?;
-
-            if coord >= *dim {
-                return Err(Error::InvalidCoord(format!(
-                    "coordinate at axis {i} is out of bounds"
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn dtype(&self) -> DType {
-        self.dtype
-    }
-
-    pub fn shape(&self) -> &Shape {
-        &self.shape
-    }
-
-    pub fn set_shape(&mut self, shape: Shape) -> FResult<()> {
-        validate_shape_dims(shape.as_slice())?;
-
-        // Preserve portability invariant by ensuring we can encode this shape as u64.
-        let _ = Self::shape_u64_from_shape(&shape)?;
-        self.shape = shape;
-        Ok(())
-    }
-
-    pub fn layout(&self) -> Layout {
-        self.internal.layout
-    }
-
-    pub fn block_shape(&self) -> &Shape {
-        &self.internal.block_shape
-    }
-
-    pub fn strides(&self) -> &Strides {
-        &self.internal.strides
-    }
-
-    pub fn set_strides(&mut self, strides: Strides) -> FResult<()> {
-        if strides.len() != self.rank() {
-            return Err(Error::InvalidSchema(
-                "strides rank must match tensor shape rank".to_string(),
-            ));
-        }
-
-        self.internal.strides = strides;
-        Ok(())
-    }
-
-    pub fn rank(&self) -> usize {
-        self.shape.len()
-    }
-
-    /// Total number of elements described by this schema's shape, computed
-    /// with overflow checking so a corrupted/adversarial shape fails closed
-    /// instead of silently wrapping.
-    pub fn element_count(&self) -> FResult<u64> {
-        checked_product(self.shape.as_slice())
-    }
-}
-
-fn validate_shape_dims<T>(shape: &[T]) -> FResult<()>
+pub(crate) fn validate_shape_dims<T>(shape: &[T]) -> FResult<()>
 where
     T: Copy + PartialEq + From<u8>,
 {
@@ -249,17 +57,43 @@ where
     Ok(())
 }
 
-pub fn contiguous_strides(shape: &[usize]) -> Strides {
+pub fn contiguous_strides(shape: &[usize]) -> FResult<Strides> {
+    validate_shape_dims(shape)?;
+
     let ndim = shape.len();
     let mut strides = vec![1usize; ndim];
 
     for i in (0..ndim).rev() {
         if i + 1 < ndim {
-            strides[i] = strides[i + 1] * shape[i + 1];
+            strides[i] = strides[i + 1]
+                .checked_mul(shape[i + 1])
+                .ok_or_else(|| Error::InvalidSchema("Dimension overflows stride".to_string()))?;
         }
     }
 
-    strides.into()
+    Ok(strides.into())
+}
+
+pub fn greedy_block_shape(shape: &[usize], max_capacity: usize) -> FResult<Shape> {
+    validate_shape_dims(shape)?;
+
+    if max_capacity == 0 {
+        return Err(Error::InvalidSchema(
+            "max block capacity must be non-zero".to_string(),
+        ));
+    }
+
+    let ndim = shape.len();
+    let mut block_shape = vec![1usize; ndim];
+    let mut remaining = max_capacity;
+
+    for i in (0..ndim).rev() {
+        let take = shape[i].min(remaining);
+        block_shape[i] = take;
+        remaining /= take;
+    }
+
+    Ok(block_shape.into())
 }
 
 fn checked_product(shape: &[usize]) -> FResult<u64> {
@@ -319,30 +153,6 @@ impl Iterator for RowMajorCoords {
 
         Some(out)
     }
-}
-
-/// Build the destination schema for a materialized view snapshot: same
-/// dtype/shape as `source`, with layout normalized for a fresh, independent
-/// destination tensor and freshly computed `block_shape`/`strides`.
-///
-/// A `Sparse { axis }` hint is preserved only when `source` is currently an
-/// identity/base view (`is_identity`) -- `transpose`/`slice`/`reshape` never
-/// update `layout` when they mutate `shape`/`strides`, so a stale axis hint
-/// surviving a transform could silently denote the wrong logical axis (or,
-/// after a rank-reducing slice, be out of bounds). Resetting it to `None` on
-/// any non-identity view sidesteps that silent-corruption risk; `None` is
-/// always valid and defaults to axis 0 downstream.
-pub(crate) fn snapshot_schema(source: &TensorSchema, is_identity: bool) -> FResult<TensorSchema> {
-    let shape = source.shape().clone();
-    let layout = match source.layout() {
-        Layout::Dense => Layout::Dense,
-        Layout::Sparse { axis } => Layout::Sparse {
-            axis: if is_identity { axis } else { None },
-        },
-    };
-    let block_shape = crate::default_block_shape(&shape);
-    let strides = contiguous_strides(&shape);
-    TensorSchema::new(source.dtype(), shape, layout, block_shape, strides)
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -466,5 +276,165 @@ impl Schema for SparseTableSchema {
                 "invalid sparse table value length",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_strides_rank_three() {
+        // [4,5,6]: strides[2]=1, strides[1]=1*6=6, strides[0]=6*5=30
+        assert_eq!(
+            contiguous_strides(&[4, 5, 6]).expect("strides"),
+            Strides::from_vec(vec![30, 6, 1])
+        );
+    }
+
+    #[test]
+    fn contiguous_strides_rank_two() {
+        // [2,3]: strides[1]=1, strides[0]=1*3=3
+        assert_eq!(
+            contiguous_strides(&[2, 3]).expect("strides"),
+            Strides::from_vec(vec![3, 1])
+        );
+    }
+
+    #[test]
+    fn contiguous_strides_single_dim() {
+        assert_eq!(
+            contiguous_strides(&[7]).expect("strides"),
+            Strides::from_vec(vec![1])
+        );
+    }
+
+    #[test]
+    fn contiguous_strides_all_ones() {
+        // [1,1,1]: every stride collapses to 1
+        assert_eq!(
+            contiguous_strides(&[1, 1, 1]).expect("strides"),
+            Strides::from_vec(vec![1, 1, 1])
+        );
+    }
+
+    #[test]
+    fn contiguous_strides_leading_one() {
+        // [1,5,6]: a leading 1 dim doesn't perturb trailing strides
+        assert_eq!(
+            contiguous_strides(&[1, 5, 6]).expect("strides"),
+            Strides::from_vec(vec![30, 6, 1])
+        );
+    }
+
+    #[test]
+    fn contiguous_strides_trailing_one() {
+        // [4,5,1]: a trailing 1 dim collapses the last two strides to 1
+        assert_eq!(
+            contiguous_strides(&[4, 5, 1]).expect("strides"),
+            Strides::from_vec(vec![5, 1, 1])
+        );
+    }
+
+    #[test]
+    fn contiguous_strides_empty_shape() {
+        // validate_shape_dims rejects an empty shape before any stride math runs
+        let err = contiguous_strides(&[]).expect_err("empty shape should be rejected");
+        assert!(matches!(err, Error::InvalidSchema(_)));
+    }
+
+    #[test]
+    fn contiguous_strides_zero_dim() {
+        // validate_shape_dims rejects any zero-sized dimension, so the old
+        // "0 propagates as a stride" behavior is no longer reachable
+        let err = contiguous_strides(&[3, 0, 4]).expect_err("zero dimension should be rejected");
+        assert!(matches!(err, Error::InvalidSchema(_)));
+    }
+
+    #[test]
+    fn contiguous_strides_overflow() {
+        // strides[1] = shape[2] = usize::MAX (no overflow: 1 * MAX);
+        // strides[0] = strides[1] * shape[1] = MAX * 2 -> overflows usize
+        let err = contiguous_strides(&[3, 2, usize::MAX]).expect_err("overflow should be rejected");
+        assert!(matches!(err, Error::InvalidSchema(_)));
+    }
+
+    #[test]
+    fn greedy_block_shape_capacity_covers_whole_tensor() {
+        // cap=1000 exceeds 4*5*6=120, so the whole tensor fits in one block
+        assert_eq!(
+            greedy_block_shape(&[4, 5, 6], 1000).expect("block shape"),
+            Shape::from_vec(vec![4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn greedy_block_shape_capacity_equals_total() {
+        // cap=6 exactly equals 2*3, so the whole tensor still fits
+        assert_eq!(
+            greedy_block_shape(&[2, 3], 6).expect("block shape"),
+            Shape::from_vec(vec![2, 3])
+        );
+    }
+
+    #[test]
+    fn greedy_block_shape_partial_fit_limits_outer_axis() {
+        // axis 2: take=min(6,50)=6, remaining=50/6=8
+        // axis 1: take=min(5,8)=5, remaining=8/5=1
+        // axis 0: take=min(4,1)=1
+        assert_eq!(
+            greedy_block_shape(&[4, 5, 6], 50).expect("block shape"),
+            Shape::from_vec(vec![1, 5, 6])
+        );
+    }
+
+    #[test]
+    fn greedy_block_shape_rank_two_partial() {
+        // axis 1: take=min(7,5)=5, remaining=5/5=1
+        // axis 0: take=min(3,1)=1
+        assert_eq!(
+            greedy_block_shape(&[3, 7], 5).expect("block shape"),
+            Shape::from_vec(vec![1, 5])
+        );
+    }
+
+    #[test]
+    fn greedy_block_shape_single_dim() {
+        // cap needn't evenly divide the axis: take=min(10,3)=3
+        assert_eq!(
+            greedy_block_shape(&[10], 3).expect("block shape"),
+            Shape::from_vec(vec![3])
+        );
+    }
+
+    #[test]
+    fn greedy_block_shape_capacity_one() {
+        // the smallest feasible capacity forces every axis down to 1
+        assert_eq!(
+            greedy_block_shape(&[4, 5, 6], 1).expect("block shape"),
+            Shape::from_vec(vec![1, 1, 1])
+        );
+    }
+
+    #[test]
+    fn greedy_block_shape_zero_capacity() {
+        // no block can hold 0 elements; block_shape entries must be non-zero
+        let err = greedy_block_shape(&[4, 5, 6], 0).expect_err("zero capacity should be rejected");
+        assert!(matches!(err, Error::InvalidSchema(_)));
+    }
+
+    #[test]
+    fn greedy_block_shape_empty_shape() {
+        // validate_shape_dims rejects an empty shape, same as contiguous_strides
+        let err = greedy_block_shape(&[], 10).expect_err("empty shape should be rejected");
+        assert!(matches!(err, Error::InvalidSchema(_)));
+    }
+
+    #[test]
+    fn greedy_block_shape_zero_dim() {
+        // validate_shape_dims rejects any zero-sized dimension, same as contiguous_strides
+        let err =
+            greedy_block_shape(&[3, 0, 4], 10).expect_err("zero dimension should be rejected");
+        assert!(matches!(err, Error::InvalidSchema(_)));
     }
 }
