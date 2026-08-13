@@ -1,34 +1,24 @@
 mod common;
 
-use common::{FsEntry, unique_tmp_dir};
-use fensor::{
-    DType, Layout, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite, contiguous_strides,
-};
+use common::{FsEntry, new_dir};
+use fensor::{DType, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite};
 use freqfs::Cache;
 use ha_ndarray::{Shape, shape};
 use std::io;
 
+use crate::common::create_dense_tensor;
+
 #[tokio::test]
 async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
-    let root = unique_tmp_dir("f64_roundtrip");
-    tokio::fs::create_dir(&root).await?;
+    let (root, dir) = new_dir("f64_roundtrip").await;
 
     let cache = Cache::<FsEntry>::new(1_000_000, None);
     let dir = cache.load(root.clone())?;
 
     let shape: Shape = shape![2, 2];
-    let schema = TensorSchema::new(
-        DType::F64,
-        shape.clone(),
-        Layout::Dense,
-        shape![1, 2],
-        contiguous_strides(&shape),
-    )
-    .expect("valid schema");
+    let schema = TensorSchema::new(DType::F64, shape.clone()).expect("valid schema");
 
-    let tensor = Tensor::<FsEntry, f64>::create(dir.clone(), schema.clone())
-        .await
-        .expect("create tensor");
+    let tensor = create_dense_tensor::<f64>(dir.clone(), schema.clone()).await;
 
     tensor
         .write_value(&[0, 0], std::f64::consts::PI)

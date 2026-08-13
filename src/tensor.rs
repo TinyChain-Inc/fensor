@@ -1,7 +1,7 @@
 use ha_ndarray::{Shape, Strides};
 
 use crate::schema::{contiguous_strides, greedy_block_shape, validate_shape_dims};
-use crate::{DType, Layout, Result as FResult};
+use crate::{DType, Error, Layout, Result as FResult};
 
 pub type TensorShape = Shape;
 pub type TensorStrides = Strides;
@@ -107,6 +107,14 @@ impl StorageSchema {
         layout: Layout,
         block_schema: BlockSchema,
     ) -> FResult<Self> {
+        if let Layout::Sparse { axis: Some(axis) } = layout
+            && axis >= tensor_shape.len()
+        {
+            return Err(Error::InvalidSchema(
+                "sparse axis hint out of bounds".to_string(),
+            ));
+        }
+
         let shape: StorageShape = tensor_shape
             .iter()
             .zip(block_schema.shape.iter())

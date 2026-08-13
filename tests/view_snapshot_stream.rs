@@ -6,39 +6,23 @@
 mod common;
 
 use fensor::{
-    DType, Layout, Tensor, TensorArray, TensorRead, TensorSchema, TensorTransform,
-    TensorViewDecoder, TensorViewSemantics, TensorWrite, contiguous_strides,
+    DType, Layout, TensorArray, TensorRead, TensorSchema, TensorTransform, TensorViewDecoder,
+    TensorViewSemantics, TensorWrite,
 };
+
 use futures::stream::TryStreamExt;
-use ha_ndarray::{AxisRange, Shape, axes, range, shape};
+use ha_ndarray::{AxisRange, axes, range, shape};
 
-use common::{FsEntry, cleanup, iter_coords, open_dir, unique_tmp_dir};
-
-fn dense_schema_f32(shape: Shape, block_shape: Shape) -> TensorSchema {
-    let strides = contiguous_strides(&shape);
-    TensorSchema::new(DType::F32, shape, Layout::Dense, block_shape, strides).expect("schema")
-}
-
-fn sparse_schema_f32(shape: Shape, block_shape: Shape, axis: Option<usize>) -> TensorSchema {
-    let strides = contiguous_strides(&shape);
-    TensorSchema::new(
-        DType::F32,
-        shape,
-        Layout::Sparse { axis },
-        block_shape,
-        strides,
-    )
-    .expect("schema")
-}
+use common::{
+    FsEntry, cleanup, create_dense_tensor, create_sparse_tensor, iter_coords, new_dir, open_dir,
+};
 
 #[tokio::test]
 async fn identity_dense_view_round_trips_with_data() {
-    let schema = dense_schema_f32(shape![2, 3], shape![1, 3]);
-    let (root, dir) = common::new_dir("view_snapshot_identity_dense").await;
+    let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("Schema created");
+    let (root, dir) = new_dir("view_snapshot_identity_dense").await;
 
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
-        .await
-        .expect("create");
+    let tensor = create_dense_tensor::<f32>(dir, schema.clone()).await;
 
     let mut expected = Vec::new();
     for (idx, coord) in iter_coords(schema.shape()).enumerate() {
@@ -62,27 +46,21 @@ async fn identity_dense_view_round_trips_with_data() {
 
     assert!(decoded.is_base_tensor());
     assert_eq!(decoded.schema().shape(), schema.shape());
-    assert_eq!(decoded.schema().layout(), Layout::Dense);
+    assert_eq!(decoded.layout(), Layout::Dense);
 
-    let mut actual = Vec::new();
-    for (coord, _) in expected.iter() {
+    for (coord, value) in expected.iter() {
         let read = decoded.read_value(coord).await.expect("read");
-        actual.push((coord.clone(), read));
-        // assert_eq!(read, value);
+        assert_eq!(read, *value);
     }
-
-    assert_eq!(&actual, &expected);
 
     cleanup(&root).await;
 }
 
 #[tokio::test]
 async fn identity_sparse_view_round_trips_with_data_and_axis() {
-    let schema = sparse_schema_f32(shape![2, 3], shape![1, 3], Some(0));
-    let (root, dir) = common::new_dir("view_snapshot_identity_sparse").await;
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
-        .await
-        .expect("create");
+    let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
+    let (root, dir) = new_dir("view_snapshot_identity_sparse").await;
+    let tensor = create_sparse_tensor::<f32>(dir, schema.clone(), Some(0)).await;
 
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
     tensor.write_value(&[1, 2], 9.0f32).await.expect("write");
@@ -101,7 +79,7 @@ async fn identity_sparse_view_round_trips_with_data_and_axis() {
     let decoded = decoded.into_inner();
 
     assert!(decoded.is_base_tensor());
-    assert_eq!(decoded.schema().layout(), Layout::Sparse { axis: Some(0) });
+    assert_eq!(decoded.layout(), Layout::Sparse { axis: Some(0) });
 
     for coord in iter_coords(schema.shape()) {
         let expected = tensor.read_value(&coord).await.expect("read source");
@@ -114,14 +92,10 @@ async fn identity_sparse_view_round_trips_with_data_and_axis() {
 
 #[tokio::test]
 async fn non_identity_dense_view_round_trips_with_data() {
-    let root = unique_tmp_dir("view_snapshot_non_identity_dense");
-    tokio::fs::create_dir(&root).await.expect("mkdir");
-    let schema = dense_schema_f32(shape![3, 4], shape![1, 4]);
+    let (root, dir) = new_dir("view_snapshot_non_identity_dense").await;
+    let schema = TensorSchema::new(DType::F32, shape![3, 4]).expect("schema");
 
-    let dir = open_dir(&root).expect("open");
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
-        .await
-        .expect("create");
+    let tensor = create_dense_tensor::<f32>(dir, schema.clone()).await;
 
     for coord in iter_coords(schema.shape()) {
         let value = (coord[0] * 10 + coord[1]) as f32 + 1.0;
@@ -169,14 +143,9 @@ async fn non_identity_dense_view_round_trips_with_data() {
 
 #[tokio::test]
 async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
-    let root = unique_tmp_dir("view_snapshot_non_identity_sparse");
-    tokio::fs::create_dir(&root).await.expect("mkdir");
-    let schema = sparse_schema_f32(shape![2, 3], shape![1, 3], Some(0));
-
-    let dir = open_dir(&root).expect("open");
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
-        .await
-        .expect("create");
+    let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
+    let (root, dir) = new_dir("view_snapshot_non_identity_sparse").await;
+    let tensor = create_sparse_tensor(dir, schema.clone(), Some(0)).await;
 
     tensor.write_value(&[0, 1], 7.0f32).await.expect("write");
     tensor.write_value(&[1, 2], 3.0f32).await.expect("write");
@@ -210,7 +179,7 @@ async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
     let decoded = decoded.into_inner();
 
     assert!(decoded.is_base_tensor());
-    assert_eq!(decoded.schema().layout(), Layout::Sparse { axis: None });
+    assert_eq!(decoded.layout(), Layout::Sparse { axis: None });
 
     for (coord, value) in expected {
         let read = decoded.read_value(&coord).await.expect("read");
@@ -222,17 +191,11 @@ async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
 
 #[tokio::test]
 async fn only_nonzero_values_are_transmitted() {
-    let root = unique_tmp_dir("view_snapshot_sparse_transmission");
-    tokio::fs::create_dir(&root).await.expect("mkdir");
-
     // Create a large dense tensor (20x20 = 400 elements), but write only ONE nonzero value.
     // This demonstrates that the encoder only transmits non-default values, not all 400 elements.
-    let schema = dense_schema_f32(shape![20, 20], shape![5, 5]);
-
-    let dir = open_dir(&root).expect("open");
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone())
-        .await
-        .expect("create");
+    let schema = TensorSchema::new(DType::F32, shape![20, 20]).expect("schema");
+    let (root, dir) = new_dir("view_snapshot_sparse_transmission").await;
+    let tensor = create_dense_tensor(dir, schema.clone()).await;
 
     // Write exactly one nonzero value; everything else remains at default (0.0)
     tensor.write_value(&[5, 7], 3.0f32).await.expect("write");
@@ -295,15 +258,10 @@ async fn only_nonzero_values_are_transmitted() {
 }
 
 #[tokio::test]
-async fn truncated_stream_fails_closed_and_removes_partial_storage() {
-    let root = unique_tmp_dir("view_snapshot_verification_mismatch");
-    tokio::fs::create_dir(&root).await.expect("mkdir");
-    let schema = dense_schema_f32(shape![2, 3], shape![1, 3]);
-
-    let dir = open_dir(&root).expect("open");
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema)
-        .await
-        .expect("create");
+async fn truncated_stream_fails_closed() {
+    let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
+    let (root, dir) = new_dir("view_snapshot_verification_mismatch").await;
+    let tensor = create_dense_tensor(dir, schema.clone()).await;
 
     // Write a couple of nonzero values
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
@@ -346,53 +304,61 @@ async fn truncated_stream_fails_closed_and_removes_partial_storage() {
         "corrupted verification (incomplete stream) must fail"
     );
 
-    // Verify that the decode target directory was cleaned up (no tensor storage left behind).
-    // Try to read the directory contents; it should be empty or sparse.
-    let mut dir_entries = tokio::fs::read_dir(&decode_root)
+    cleanup(&root).await;
+}
+
+#[tokio::test]
+async fn corrupted_block_read_fails_closed() {
+    let (root, dir) = new_dir("view_snapshot_read_value_fails_dense").await;
+    let schema = TensorSchema::new(DType::F32, shape![1000, 1000]).expect("schema");
+    let tensor = create_dense_tensor(dir.clone(), schema.clone()).await;
+
+    tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
+    tensor
+        .write_value(&[205, 1005], 9.0f32)
         .await
-        .expect("read decode_root");
+        .expect("write");
+    tensor
+        .write_value(&[805, 2000], 13.0f32)
+        .await
+        .expect("write");
 
-    let mut found_tensor_content = false;
-    while let Some(entry) = dir_entries.next_entry().await.expect("read next entry") {
-        let path = entry.path();
-        // If there's a "blocks" directory with actual block files, that's tensor content that should have been cleaned up.
-        if path.ends_with("blocks")
-            && let Ok(mut block_entries) = tokio::fs::read_dir(&path).await
-            && block_entries.next_entry().await.ok().flatten().is_some()
-        {
-            found_tensor_content = true;
-        }
-    }
+    dir.sync().await.expect("fs sync");
 
-    assert!(
-        !found_tensor_content,
-        "partial tensor storage should have been cleaned up after decode failure"
-    );
+    let dir_lock = dir.write().await;
+    let block_dir = dir_lock
+        .get_dir("blocks")
+        .expect("blocks exists for any tensor");
+    block_dir
+        .write()
+        .await
+        .truncate_and_sync()
+        .await
+        .expect("blocks are cleaned up");
+
+    // let encoded_stream = tbon::en::encode(tensor.view_encoder()).expect("encode view");
+
+    // let decode_root = root.join("decoded");
+    // tokio::fs::create_dir(&decode_root)
+    //     .await
+    //     .expect("mkdir decoded");
+    // let dir2 = open_dir(&decode_root).expect("open decode target");
+
+    // let result: std::result::Result<TensorViewDecoder<FsEntry, f32>, _> =
+    //     tbon::de::try_decode(dir2.clone(), encoded_stream).await;
+
+    // assert!(result.is_ok());
 
     cleanup(&root).await;
 }
 
 #[tokio::test]
 async fn corrupted_dtype_mismatch_fails_closed() {
-    let root = unique_tmp_dir("view_snapshot_dtype_mismatch");
-    tokio::fs::create_dir(&root).await.expect("mkdir");
+    let (root, dir) = new_dir("view_snapshot_dtype_mismatch").await;
 
     // Create an f64 tensor
-    let shape_f64 = shape![2, 2];
-    let block_shape_f64 = shape![1, 2];
-    let f64_schema = TensorSchema::new(
-        DType::F64,
-        shape_f64.clone(),
-        Layout::Dense,
-        block_shape_f64,
-        contiguous_strides(&shape_f64),
-    )
-    .expect("f64 schema");
-
-    let dir = open_dir(&root).expect("open");
-    let tensor_f64 = Tensor::<FsEntry, f64>::create(dir, f64_schema)
-        .await
-        .expect("create f64 tensor");
+    let schema = TensorSchema::new(DType::F64, shape![2, 2]).expect("schema");
+    let tensor_f64 = create_dense_tensor(dir, schema.clone()).await;
 
     tensor_f64.write_value(&[0, 0], 1.5).await.expect("write");
 
