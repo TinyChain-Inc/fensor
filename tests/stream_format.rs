@@ -22,7 +22,8 @@ async fn base_tensor_round_trips_through_tbon() {
         .await
         .expect("create");
 
-    let encoded = tbon::en::encode(tensor.view_encoder()).expect("encode base tensor");
+    let view = tensor.view();
+    let encoded = tbon::en::encode(view.view_encoder()).expect("encode base tensor");
 
     let decode_root = root.join("decoded");
     tokio::fs::create_dir(&decode_root)

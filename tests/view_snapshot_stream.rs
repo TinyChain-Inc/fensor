@@ -6,8 +6,8 @@
 mod common;
 
 use fensor::{
-    DType, Layout, TensorArray, TensorRead, TensorSchema, TensorTransform, TensorViewDecoder,
-    TensorViewSemantics, TensorWrite,
+    DType, Layout, TensorArray, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
+    TensorViewDecoder, TensorViewSemantics, TensorWrite,
 };
 
 use futures::stream::TryStreamExt;
@@ -31,7 +31,8 @@ async fn identity_dense_view_round_trips_with_data() {
         expected.push((coord, value));
     }
 
-    let encoded = tbon::en::encode(tensor.view_encoder()).expect("encode view");
+    let view = tensor.view();
+    let encoded = tbon::en::encode(view.view_encoder()).expect("encode view");
 
     let decode_root = root.join("decoded");
     tokio::fs::create_dir(&decode_root)
@@ -44,7 +45,7 @@ async fn identity_dense_view_round_trips_with_data() {
 
     let decoded = decoded.into_inner();
 
-    assert!(decoded.is_base_tensor());
+    assert!(decoded.view().is_base_tensor());
     assert_eq!(decoded.schema().shape(), schema.shape());
     assert_eq!(decoded.layout(), Layout::Dense);
 
@@ -65,7 +66,8 @@ async fn identity_sparse_view_round_trips_with_data_and_axis() {
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
     tensor.write_value(&[1, 2], 9.0f32).await.expect("write");
 
-    let encoded = tbon::en::encode(tensor.view_encoder()).expect("encode view");
+    let view = tensor.view();
+    let encoded = tbon::en::encode(view.view_encoder()).expect("encode view");
 
     let decode_root = root.join("decoded");
     tokio::fs::create_dir(&decode_root)
@@ -78,7 +80,7 @@ async fn identity_sparse_view_round_trips_with_data_and_axis() {
 
     let decoded = decoded.into_inner();
 
-    assert!(decoded.is_base_tensor());
+    assert!(decoded.view().is_base_tensor());
     assert_eq!(decoded.layout(), Layout::Sparse { axis: Some(0) });
 
     for coord in iter_coords(schema.shape()) {
@@ -103,7 +105,7 @@ async fn non_identity_dense_view_round_trips_with_data() {
     }
 
     let sliced = tensor
-        .clone()
+        .view()
         .slice(range![AxisRange::In(1, 3, 1), AxisRange::In(0, 4, 2)])
         .expect("slice")
         .transpose(Some(axes![1, 0]))
@@ -112,7 +114,7 @@ async fn non_identity_dense_view_round_trips_with_data() {
     assert!(!sliced.is_base_tensor());
 
     let mut expected = Vec::new();
-    for coord in iter_coords(sliced.schema().shape()) {
+    for coord in iter_coords(sliced.shape()) {
         let value = sliced.read_value(&coord).await.expect("read source view");
         expected.push((coord, value));
     }
@@ -130,8 +132,8 @@ async fn non_identity_dense_view_round_trips_with_data() {
 
     let decoded = decoded.into_inner();
 
-    assert!(decoded.is_base_tensor());
-    assert_eq!(decoded.schema().shape(), sliced.schema().shape());
+    assert!(decoded.view().is_base_tensor());
+    assert_eq!(decoded.shape(), sliced.shape());
 
     for (coord, value) in expected {
         let read = decoded.read_value(&coord).await.expect("read");
@@ -151,13 +153,13 @@ async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
     tensor.write_value(&[1, 2], 3.0f32).await.expect("write");
 
     let transposed = tensor
-        .clone()
+        .view()
         .transpose(Some(axes![1, 0]))
         .expect("transpose");
     assert!(!transposed.is_base_tensor());
 
     let mut expected = Vec::new();
-    for coord in iter_coords(transposed.schema().shape()) {
+    for coord in iter_coords(transposed.shape()) {
         let value = transposed
             .read_value(&coord)
             .await
@@ -178,7 +180,7 @@ async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
 
     let decoded = decoded.into_inner();
 
-    assert!(decoded.is_base_tensor());
+    assert!(decoded.view().is_base_tensor());
     assert_eq!(decoded.layout(), Layout::Sparse { axis: None });
 
     for (coord, value) in expected {
@@ -200,7 +202,8 @@ async fn only_nonzero_values_are_transmitted() {
     // Write exactly one nonzero value; everything else remains at default (0.0)
     tensor.write_value(&[5, 7], 3.0f32).await.expect("write");
 
-    let encoded_stream = tbon::en::encode(tensor.view_encoder()).expect("encode view");
+    let view = tensor.view();
+    let encoded_stream = tbon::en::encode(view.view_encoder()).expect("encode view");
     // Collect the stream to measure size and prepare for decoding
     let encoded_parts = encoded_stream
         .try_collect::<Vec<_>>()
@@ -237,7 +240,7 @@ async fn only_nonzero_values_are_transmitted() {
 
     let decoded = decoded.into_inner();
 
-    assert!(decoded.is_base_tensor());
+    assert!(decoded.view().is_base_tensor());
     assert_eq!(decoded.schema().shape(), schema.shape());
 
     // Verify the single written value is present
@@ -267,7 +270,8 @@ async fn truncated_stream_fails_closed() {
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
     tensor.write_value(&[1, 2], 9.0f32).await.expect("write");
 
-    let encoded_stream = tbon::en::encode(tensor.view_encoder()).expect("encode view");
+    let view = tensor.view();
+    let encoded_stream = tbon::en::encode(view.view_encoder()).expect("encode view");
     // Collect the stream so we can create a truncated version
     let encoded_parts = encoded_stream
         .try_collect::<Vec<_>>()
@@ -336,7 +340,7 @@ async fn corrupted_block_read_fails_closed() {
         .await
         .expect("blocks are cleaned up");
 
-    // let encoded_stream = tbon::en::encode(tensor.view_encoder()).expect("encode view");
+    // let encoded_stream = tbon::en::encode(tensor.view().view_encoder()).expect("encode view");
 
     // let decode_root = root.join("decoded");
     // tokio::fs::create_dir(&decode_root)
@@ -362,7 +366,8 @@ async fn corrupted_dtype_mismatch_fails_closed() {
 
     tensor_f64.write_value(&[0, 0], 1.5).await.expect("write");
 
-    let encoded = tbon::en::encode(tensor_f64.view_encoder()).expect("encode f64 view");
+    let view = tensor_f64.view();
+    let encoded = tbon::en::encode(view.view_encoder()).expect("encode f64 view");
 
     let decode_root = root.join("decoded");
     tokio::fs::create_dir(&decode_root)

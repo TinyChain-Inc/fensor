@@ -10,7 +10,7 @@ use crate::common::create_dense_tensor;
 
 #[tokio::test]
 async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
-    let (root, dir) = new_dir("f64_roundtrip").await;
+    let (root, _) = new_dir("f64_roundtrip").await;
 
     let cache = Cache::<FsEntry>::new(1_000_000, None);
     let dir = cache.load(root.clone())?;

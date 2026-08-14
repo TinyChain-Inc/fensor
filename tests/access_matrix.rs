@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, Tensor, TensorArray, TensorBlockStore, TensorRead,
-    TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform, TensorViewSemantics,
-    TensorWrite, TensorWriteBulk, contiguous_strides,
+    BoxFuture, DType, Error, Layout, Tensor, TensorArray, TensorBlockStore, TensorGeometry,
+    TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform,
+    TensorViewSemantics, TensorWrite, TensorWriteBulk, contiguous_strides,
 };
 use ha_ndarray::{Axes, AxisRange, Range, Shape, axes, range, shape};
 
@@ -344,7 +344,7 @@ mod section_b_transforms {
             AxisRange::In(1, 3, 1),
             AxisRange::In(0, 4, 2)
         ];
-        let sliced = tensor.clone().slice(r).expect("slice");
+        let sliced = tensor.view().slice(r).expect("slice");
         assert_eq!(sliced.shape(), &[2, 2, 2]);
 
         for s_coord in iter_coords(sliced.shape()) {
@@ -363,7 +363,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let perm = axes![2, 0, 1];
-        let transposed = tensor.clone().transpose(Some(perm.clone())).expect("tx");
+        let transposed = tensor.view().transpose(Some(perm.clone())).expect("tx");
         assert_eq!(transposed.shape(), &[4, 2, 3]);
 
         let mut inverse = vec![0usize; perm.len()];
@@ -389,7 +389,7 @@ mod section_b_transforms {
         let (root, tensor, _) = create_dense("b_reshape", shape![2, 3, 4], shape![1, 1, 4]).await;
         seed_values(&tensor).await;
 
-        let reshaped = tensor.clone().reshape(shape![6, 4]).expect("reshape");
+        let reshaped = tensor.view().reshape(shape![6, 4]).expect("reshape");
         assert_eq!(reshaped.shape(), &[6, 4]);
 
         let from_reshape = reshaped.read_value(&[0, 0]).await.expect("reshape read");
@@ -419,7 +419,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let perm = axes![1, 2, 0];
-        let transposed = tensor.clone().transpose(Some(perm.clone())).expect("tx");
+        let transposed = tensor.view().transpose(Some(perm.clone())).expect("tx");
         assert_eq!(transposed.shape(), &[3, 4, 2]);
 
         let mut inverse = vec![0usize; perm.len()];
@@ -451,7 +451,7 @@ mod section_b_transforms {
             AxisRange::In(0, 3, 2),
             AxisRange::In(1, 4, 1)
         ];
-        let sliced = tensor.clone().slice(r).expect("slice");
+        let sliced = tensor.view().slice(r).expect("slice");
 
         for s_coord in iter_coords(sliced.shape()) {
             let src = vec![s_coord[0], s_coord[1] * 2, s_coord[2] + 1];
@@ -477,7 +477,7 @@ mod section_b_transforms {
         ];
 
         let left = tensor
-            .clone()
+            .view()
             .slice(r.clone())
             .expect("slice")
             .transpose(Some(perm.clone()))
@@ -485,7 +485,7 @@ mod section_b_transforms {
 
         let remapped = transpose_range(&r, &perm);
         let right = tensor
-            .clone()
+            .view()
             .transpose(Some(perm))
             .expect("tx")
             .slice(remapped)
@@ -515,7 +515,7 @@ mod section_b_transforms {
         ];
 
         let left = tensor
-            .clone()
+            .view()
             .slice(r.clone())
             .expect("slice")
             .transpose(Some(perm.clone()))
@@ -523,7 +523,7 @@ mod section_b_transforms {
 
         let remapped = transpose_range(&r, &perm);
         let right = tensor
-            .clone()
+            .view()
             .transpose(Some(perm))
             .expect("tx")
             .slice(remapped)
@@ -558,7 +558,7 @@ mod section_b_transforms {
         ];
 
         let chained = tensor
-            .clone()
+            .view()
             .slice(s1)
             .expect("s1")
             .transpose(Some(perm))
@@ -583,7 +583,7 @@ mod section_b_transforms {
             create_dense("b_reshape_view", shape![2, 3, 4], shape![1, 1, 4]).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::In(0, 2, 1),
                 AxisRange::In(0, 2, 1),
@@ -603,7 +603,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::At(1),
                 AxisRange::In(0, 4, 1),
@@ -625,7 +625,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::At(1),
                 AxisRange::In(0, 4, 1),
@@ -650,7 +650,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::In(0, 4, 2),
                 AxisRange::In(0, 6, 2),
@@ -672,7 +672,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::In(0, 4, 2),
                 AxisRange::In(0, 6, 2),
@@ -702,7 +702,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
                 AxisRange::In(0, 5, 1),
@@ -727,7 +727,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
                 AxisRange::In(0, 5, 1),
@@ -755,7 +755,7 @@ mod section_b_transforms {
 
         // In(2, 2, 1) produces extent = 0 on axis 0. The schema rejects zero-dim
         // shapes, so slice must return an error rather than panic.
-        let result = tensor.clone().slice(range![
+        let result = tensor.view().slice(range![
             AxisRange::In(2, 2, 1),
             AxisRange::In(0, 5, 1),
             AxisRange::In(0, 6, 1)
@@ -771,7 +771,7 @@ mod section_b_transforms {
         seed_values(&tensor).await;
 
         let transposed = tensor
-            .clone()
+            .view()
             .transpose(Some(axes![0, 1, 2]))
             .expect("identity tx");
         assert_eq!(transposed.shape(), tensor.shape());
@@ -780,6 +780,50 @@ mod section_b_transforms {
             let expected = tensor.read_value(&coord).await.expect("orig");
             let actual = transposed.read_value(&coord).await.expect("identity tx");
             assert_eq!(actual, expected, "identity perm coord {:?}", coord);
+        }
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn two_simultaneous_views_from_same_tensor() {
+        let (root, tensor, _) = create_dense("b_two_views", shape![2, 3, 4], shape![1, 1, 4]).await;
+        seed_values(&tensor).await;
+
+        let r: Range = range![
+            AxisRange::In(0, 2, 1),
+            AxisRange::In(1, 3, 1),
+            AxisRange::In(0, 4, 2)
+        ];
+        let perm = axes![2, 0, 1];
+
+        // Two independent borrows of `tensor` held live at the same time.
+        let left = tensor.view().slice(r).expect("slice");
+        let right = tensor.view().transpose(Some(perm.clone())).expect("tx");
+
+        assert_eq!(left.shape(), &[2, 2, 2]);
+        assert_eq!(right.shape(), &[4, 2, 3]);
+
+        let mut inverse = vec![0usize; perm.len()];
+        for (i, axis) in perm.iter().enumerate() {
+            inverse[*axis] = i;
+        }
+
+        for s_coord in iter_coords(left.shape()) {
+            let src = vec![s_coord[0], s_coord[1] + 1, s_coord[2] * 2];
+            let expected = tensor.read_value(&src).await.expect("read original");
+            let actual = left.read_value(&s_coord).await.expect("read sliced");
+            assert_eq!(actual, expected, "left coord {:?}", s_coord);
+        }
+
+        for t_coord in iter_coords(right.shape()) {
+            let mut src = vec![0u64; t_coord.len()];
+            for old_axis in 0..t_coord.len() {
+                src[old_axis] = t_coord[inverse[old_axis]];
+            }
+            let expected = tensor.read_value(&src).await.expect("read original");
+            let actual = right.read_value(&t_coord).await.expect("read transposed");
+            assert_eq!(actual, expected, "right coord {:?}", t_coord);
         }
 
         cleanup(&root).await;
@@ -808,7 +852,7 @@ mod section_c_new_transforms {
         }
 
         let broadcasted = tensor
-            .clone()
+            .view()
             .broadcast(shape![2, 3, 4])
             .expect("broadcast must be supported");
 
@@ -833,7 +877,7 @@ mod section_c_new_transforms {
         let (root, tensor, _) = create_dense("c_flip", shape![2, 3, 4], shape![1, 1, 4]).await;
         seed_values(&tensor).await;
 
-        let flipped = tensor.clone().flip(2).expect("flip must be supported");
+        let flipped = tensor.view().flip(2).expect("flip must be supported");
 
         for coord in iter_coords(flipped.shape()) {
             let src = vec![coord[0], coord[1], 3 - coord[2]];
@@ -859,7 +903,7 @@ mod section_c_new_transforms {
         }
 
         let squeezed = tensor
-            .clone()
+            .view()
             .squeeze(axes![0, 2])
             .expect("squeeze must be supported");
         assert_eq!(squeezed.shape(), &[3, 4]);
@@ -887,7 +931,7 @@ mod section_c_new_transforms {
         }
 
         let unsqueezed = tensor
-            .clone()
+            .view()
             .unsqueeze(axes![0, 2])
             .expect("unsqueeze must be supported");
         assert_eq!(unsqueezed.shape(), &[1, 3, 1, 4]);
@@ -910,7 +954,7 @@ mod section_c_new_transforms {
         let (root, tensor, _) =
             create_dense("c_squeeze_bad", shape![2, 3, 4], shape![1, 1, 4]).await;
         let err = tensor
-            .clone()
+            .view()
             .squeeze(axes![1])
             .err()
             .expect("must reject squeeze on size>1 axis");
@@ -1081,10 +1125,10 @@ mod section_f_view_semantics {
     async fn is_base_tensor_true_only_for_identity_view() {
         let (root, tensor, _) = create_dense("f_is_base", shape![2, 3, 4], shape![1, 1, 4]).await;
 
-        assert!(tensor.is_base_tensor(), "fresh tensor is the base");
+        assert!(tensor.view().is_base_tensor(), "fresh tensor is the base");
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::In(0, 2, 1),
                 AxisRange::In(0, 2, 1),
@@ -1093,7 +1137,7 @@ mod section_f_view_semantics {
             .expect("slice");
         assert!(!sliced.is_base_tensor(), "sliced view is not the base");
 
-        let transposed = tensor.clone().transpose(Some(axes![2, 0, 1])).expect("tx");
+        let transposed = tensor.view().transpose(Some(axes![2, 0, 1])).expect("tx");
         assert!(
             !transposed.is_base_tensor(),
             "transposed view is not the base"
@@ -1108,7 +1152,7 @@ mod section_f_view_semantics {
             create_dense("f_writethrough", shape![2, 3, 4], shape![1, 1, 4]).await;
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::In(0, 2, 1),
                 AxisRange::In(1, 3, 1),
@@ -1132,7 +1176,7 @@ mod section_f_view_semantics {
     #[tokio::test]
     async fn write_through_rejected_for_broadcast() {
         let (root, tensor, _) = create_dense("f_no_wt", shape![1, 3, 4], shape![1, 1, 4]).await;
-        let broadcasted = match tensor.clone().broadcast(shape![2, 3, 4]) {
+        let broadcasted = match tensor.view().broadcast(shape![2, 3, 4]) {
             Ok(b) => b,
             Err(_) => {
                 // Broadcast not yet implemented — skip the rest of the test;
@@ -1162,12 +1206,12 @@ mod section_f_view_semantics {
             create_dense("f_reshape_view", shape![2, 3, 4], shape![1, 1, 4]).await;
 
         // Reshape over identity is fine.
-        let reshaped = tensor.clone().reshape(shape![6, 4]).expect("reshape ok");
+        let reshaped = tensor.view().reshape(shape![6, 4]).expect("reshape ok");
         assert!(reshaped.supports_write_through());
 
         // Reshape over a transformed view is rejected (current contract).
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::In(0, 2, 1),
                 AxisRange::In(0, 2, 1),
@@ -1285,7 +1329,7 @@ mod section_g_sparse_iteration {
         tensor.write_value(&[2, 0, 0], 3.0).await.expect("w");
 
         let sliced = tensor
-            .clone()
+            .view()
             .slice(range![
                 AxisRange::In(1, 3, 1),
                 AxisRange::In(0, 3, 1),

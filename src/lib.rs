@@ -5,7 +5,6 @@ use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
 use futures::StreamExt as _;
-use ha_ndarray::{Axes, Range, Shape};
 use safecast::AsType;
 
 mod error;
@@ -24,13 +23,11 @@ pub use schema::{
 pub use stream::{TensorViewDecoder, TensorViewEncoder};
 pub use tensor::TensorSchema;
 pub use traits::{
-    BoxFuture, TensorArray, TensorBlockStore, TensorMatMul, TensorMath, TensorMathScalar,
-    TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll, TensorReduceBoolean,
-    TensorSparseIndex, TensorTransform, TensorUnary, TensorViewSemantics, TensorWrite,
-    TensorWriteBulk,
+    BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorMatMul, TensorMath,
+    TensorMathScalar, TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll,
+    TensorReduceBoolean, TensorSparseIndex, TensorTransform, TensorUnary, TensorViewSemantics,
+    TensorWrite, TensorWriteBulk,
 };
-
-use view::{TensorView, default_permutation};
 
 const BLOCKS: &str = "blocks";
 const INDEX: &str = "index";
@@ -133,7 +130,6 @@ enum SparseWriteAction {
 pub struct Tensor<FE, T> {
     storage: Arc<Storage<FE>>,
     schema: TensorSchema,
-    view: TensorView,
     _dtype: std::marker::PhantomData<T>,
 }
 
@@ -207,32 +203,8 @@ where
         Self::new_storage(blocks_dir, index, schema, storage_schema).await
     }
 
-    /// Build a lazily-streamed encoder for this tensor's current view
-    /// (identity or transformed, dense or sparse): schema followed by a
-    /// nested sequence of non-default `(coord, value)` pairs and a trailing
-    /// verification record. No full in-memory buffering -- each value is
-    /// read from storage only as the returned value is actually driven by
-    /// a destream encoder (e.g. `tbon::en::encode(tensor.view_encoder())`).
-    pub fn view_encoder(&self) -> stream::TensorViewEncoder<'_, FE, T> {
-        stream::TensorViewEncoder::new(self)
-    }
-
-    pub(crate) fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
-        validate::validate_coord(self.view.shape(), coord)?;
-        let k = self.view.flat_offset(coord)?;
-        if k < 0 {
-            return Err(Error::InvalidCoord("negative linear offset".to_string()));
-        }
-        let k = k as u64;
-        let base_coord: Vec<u64> = self
-            .schema
-            .strides()
-            .iter()
-            .zip(self.schema.shape().iter())
-            .map(|(stride, dim)| (k / *stride as u64) % *dim as u64)
-            .collect();
-        validate::validate_coord(self.schema.shape(), &base_coord)?;
-        Ok(base_coord)
+    pub fn view(&self) -> view::TensorView<'_, FE, T> {
+        view::TensorView::new_identity(self)
     }
 
     pub(crate) fn block_position_from_base_coord(
@@ -405,8 +377,6 @@ where
     where
         FE: AsType<String> + From<String>,
     {
-        let view = TensorView::identity(schema.shape().clone(), schema.strides().clone());
-
         let storage = match index {
             Some(si) => Storage::Sparse(SparseStorage {
                 blocks,
@@ -422,7 +392,6 @@ where
         let tensor = Self {
             storage: Arc::new(storage),
             schema,
-            view,
             _dtype: std::marker::PhantomData,
         };
 
@@ -449,18 +418,14 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// TensorArray impls
+// TensorGeometry and TensorArray impls
 // ---------------------------------------------------------------------------
-impl<FE, T> TensorArray for Tensor<FE, T>
+impl<FE, T> TensorGeometry for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
     type DType = T;
-
-    fn schema(&self) -> &TensorSchema {
-        &self.schema
-    }
 
     fn dtype(&self) -> Self::DType {
         T::default()
@@ -471,11 +436,21 @@ where
     }
 
     fn shape(&self) -> &[usize] {
-        self.view.shape()
+        self.schema.shape()
+    }
+}
+
+impl<FE, T> TensorArray for Tensor<FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
+    fn schema(&self) -> &TensorSchema {
+        &self.schema
     }
 
     fn strides(&self) -> &[usize] {
-        self.view.strides()
+        self.schema.strides()
     }
 }
 // ---------------------------------------------------------------------------
@@ -488,16 +463,17 @@ where
 {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            let base_coord = self.resolve_base_coord(coord)?;
+            validate::validate_coord(self.schema.shape(), coord)?;
+
             let tensor::BlockPosition {
                 block_id: block_grid_id,
                 offset_in_block,
-            } = self.block_position_from_base_coord(&base_coord);
+            } = self.block_position_from_base_coord(coord);
 
             let block_id = match self.layout() {
                 Layout::Dense => Some(block_grid_id),
                 Layout::Sparse { .. } => {
-                    self.lookup_sparse_block_for_coord(&base_coord, block_grid_id)
+                    self.lookup_sparse_block_for_coord(coord, block_grid_id)
                         .await?
                 }
             };
@@ -533,11 +509,11 @@ where
         value: Self::DType,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let base_coord = self.resolve_base_coord(coord)?;
+            validate::validate_coord(self.schema.shape(), coord)?;
             let tensor::BlockPosition {
                 block_id: block_grid_id,
                 offset_in_block,
-            } = self.block_position_from_base_coord(&base_coord);
+            } = self.block_position_from_base_coord(coord);
 
             match self.layout() {
                 Layout::Dense => {
@@ -549,16 +525,13 @@ where
                         .await
                 }
                 Layout::Sparse { .. } => {
-                    match self
-                        .plan_sparse_write(&base_coord, block_grid_id, value)
-                        .await?
-                    {
+                    match self.plan_sparse_write(coord, block_grid_id, value).await? {
                         SparseWriteAction::Write(block_id) => {
                             self.write_value_to_block(block_id, offset_in_block, value)
                                 .await
                         }
                         SparseWriteAction::DeleteRow(block_id) => {
-                            let key = self.sparse_key(&base_coord, block_grid_id);
+                            let key = self.sparse_key(coord, block_grid_id);
                             self.delete_row(key).await?;
                             if self.is_empty_block(block_id).await? {
                                 self.delete_block(block_id).await;
@@ -568,7 +541,7 @@ where
                         }
                         SparseWriteAction::CreateBlockAndWrite(block_id) => {
                             self.write_block(block_id, self.default_block()).await?;
-                            let key = self.sparse_key(&base_coord, block_grid_id);
+                            let key = self.sparse_key(coord, block_grid_id);
                             self.upsert_block_id(key, block_id).await?;
                             self.write_value_to_block(block_id, offset_in_block, value)
                                 .await?;
@@ -579,39 +552,6 @@ where
                 }
             }
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TensorTransform impls
-// ---------------------------------------------------------------------------
-
-impl<FE, T> TensorTransform for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn reshape(mut self, shape: Shape) -> Result<Self> {
-        let old_size: usize = self.view.shape().iter().product();
-        let new_size: usize = shape.iter().product();
-        if old_size != new_size {
-            return Err(Error::InvalidLayout(
-                "reshape requires an equal number of elements".to_string(),
-            ));
-        }
-        self.view = self.view.reshape(&shape)?;
-        Ok(self)
-    }
-
-    fn slice(mut self, range: Range) -> Result<Self> {
-        self.view = self.view.slice(&range)?;
-        Ok(self)
-    }
-
-    fn transpose(mut self, permutation: Option<Axes>) -> Result<Self> {
-        let permutation = default_permutation(self.view.shape().len(), permutation)?;
-        self.view = self.view.transpose(&permutation)?;
-        Ok(self)
     }
 }
 
@@ -699,23 +639,6 @@ where
             let mut index_lock = index.write().await;
             index_lock.delete_row(&key).await.map_err(Error::from)
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TensorViewSemantics impls
-// ---------------------------------------------------------------------------
-impl<FE, T> TensorViewSemantics for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        self.view.is_identity(self.schema.shape())
-    }
-
-    fn supports_write_through(&self) -> bool {
-        !self.view.has_gather_axes()
     }
 }
 
@@ -1041,7 +964,7 @@ mod sparse_lifecycle_tests {
     use b_table::Node;
     use destream::{de, en};
     use freqfs::Cache;
-    use ha_ndarray::shape;
+    use ha_ndarray::{Shape, shape};
     use safecast::as_type;
 
     use super::*;
@@ -1126,11 +1049,9 @@ mod sparse_lifecycle_tests {
     }
 
     async fn block_id_for_coord(tensor: &Tensor<TestFE, f32>, coord: &[u64]) -> Option<u64> {
-        let base_coord = tensor.resolve_base_coord(coord).expect("base coord");
-        let tensor::BlockPosition { block_id, .. } =
-            tensor.block_position_from_base_coord(&base_coord);
+        let tensor::BlockPosition { block_id, .. } = tensor.block_position_from_base_coord(coord);
         tensor
-            .lookup_sparse_block_for_coord(&base_coord, block_id)
+            .lookup_sparse_block_for_coord(coord, block_id)
             .await
             .expect("lookup")
     }
