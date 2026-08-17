@@ -9,27 +9,7 @@ use crate::{
 };
 use crate::{stream, validate};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TensorViewShape(Shape);
-
-impl TensorViewShape {
-    pub fn as_slice(&self) -> &[usize] {
-        &self.0
-    }
-}
-
-impl From<Shape> for TensorViewShape {
-    fn from(s: Shape) -> Self {
-        Self(s)
-    }
-}
-
-impl std::ops::Deref for TensorViewShape {
-    type Target = [usize];
-    fn deref(&self) -> &[usize] {
-        &self.0
-    }
-}
+pub type TensorViewShape = Shape;
 
 #[derive(Clone)]
 pub struct TensorView<'t, FE, T> {
@@ -213,7 +193,7 @@ where
                 .iter()
                 .map(|&s| AxisContrib::Stride(s as i64))
                 .collect(),
-            shape: shape.into(),
+            shape,
         })
     }
 
@@ -312,7 +292,7 @@ where
             tensor: self.tensor,
             base_offset: new_base_offset,
             axes: new_axes,
-            shape: new_shape.into(),
+            shape: new_shape,
         })
     }
 
@@ -345,7 +325,7 @@ where
             tensor: self.tensor,
             base_offset: self.base_offset,
             axes,
-            shape: shape.into(),
+            shape,
         })
     }
 }
