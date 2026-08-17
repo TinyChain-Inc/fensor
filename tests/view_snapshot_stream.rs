@@ -319,11 +319,11 @@ async fn corrupted_block_read_fails_closed() {
 
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
     tensor
-        .write_value(&[205, 1005], 9.0f32)
+        .write_value(&[205, 503], 9.0f32)
         .await
         .expect("write");
     tensor
-        .write_value(&[805, 2000], 13.0f32)
+        .write_value(&[805, 999], 13.0f32)
         .await
         .expect("write");
 
@@ -339,19 +339,19 @@ async fn corrupted_block_read_fails_closed() {
         .truncate_and_sync()
         .await
         .expect("blocks are cleaned up");
+    let identity_view = tensor.view();
+    let encoded_stream = tbon::en::encode(identity_view.view_encoder()).expect("encode view");
 
-    // let encoded_stream = tbon::en::encode(tensor.view().view_encoder()).expect("encode view");
+    let decode_root = root.join("decoded");
+    tokio::fs::create_dir(&decode_root)
+        .await
+        .expect("mkdir decoded");
+    let dir2 = open_dir(&decode_root).expect("open decode target");
 
-    // let decode_root = root.join("decoded");
-    // tokio::fs::create_dir(&decode_root)
-    //     .await
-    //     .expect("mkdir decoded");
-    // let dir2 = open_dir(&decode_root).expect("open decode target");
+    let result: std::result::Result<TensorViewDecoder<FsEntry, f32>, _> =
+        tbon::de::try_decode(dir2.clone(), encoded_stream).await;
 
-    // let result: std::result::Result<TensorViewDecoder<FsEntry, f32>, _> =
-    //     tbon::de::try_decode(dir2.clone(), encoded_stream).await;
-
-    // assert!(result.is_ok());
+    assert!(result.is_err());
 
     cleanup(&root).await;
 }
