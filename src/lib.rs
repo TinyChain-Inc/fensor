@@ -294,9 +294,16 @@ where
 
         let num_blocks = self.num_blocks();
         for block_id in 0..num_blocks {
-            self.write_block(block_id, self.default_block()).await?;
+            if !self.block_exists(block_id).await {
+                self.write_block(block_id, self.default_block()).await?;
+            }
         }
         Ok(())
+    }
+
+    async fn block_exists(&self, block_id: u64) -> bool {
+        let blocks = self.storage.blocks().read().await;
+        blocks.get_file(&block_id.to_string()).is_some()
     }
 
     async fn write_value_to_block(
