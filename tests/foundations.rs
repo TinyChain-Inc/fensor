@@ -4,8 +4,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, TensorArray, TensorRead, TensorSchema, TensorTransform,
-    TensorWrite, contiguous_strides,
+    BoxFuture, DType, Error, Layout, TensorArray, TensorGeometry, TensorRead, TensorSchema,
+    TensorTransform, TensorWrite, contiguous_strides,
 };
 use ha_ndarray::{Axes, AxisRange, Range, Shape, Strides, axes, range, shape};
 
@@ -89,12 +89,8 @@ impl TestTensor {
     }
 }
 
-impl TensorArray for TestTensor {
+impl TensorGeometry for TestTensor {
     type DType = f32;
-
-    fn schema(&self) -> &TensorSchema {
-        &self.schema
-    }
 
     fn dtype(&self) -> Self::DType {
         0.0
@@ -106,6 +102,12 @@ impl TensorArray for TestTensor {
 
     fn shape(&self) -> &[usize] {
         &self.shape
+    }
+}
+
+impl TensorArray for TestTensor {
+    fn schema(&self) -> &TensorSchema {
+        &self.schema
     }
 
     fn strides(&self) -> &[usize] {

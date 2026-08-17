@@ -2,8 +2,7 @@ mod common;
 
 use common::{FsEntry, new_dir};
 use fensor::{DType, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite};
-use freqfs::Cache;
-use ha_ndarray::{Shape, shape};
+use ha_ndarray::{shape};
 use std::io;
 
 use crate::common::create_dense_tensor;
@@ -12,11 +11,7 @@ use crate::common::create_dense_tensor;
 async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
     let (root, dir) = new_dir("f64_roundtrip").await;
 
-    let cache = Cache::<FsEntry>::new(1_000_000, None);
-    let dir = cache.load(root.clone())?;
-
-    let shape: Shape = shape![2, 2];
-    let schema = TensorSchema::new(DType::F64, shape.clone()).expect("valid schema");
+    let schema = TensorSchema::new(DType::F64, shape![2, 2]).expect("valid schema");
 
     let tensor = create_dense_tensor::<f64>(dir.clone(), schema.clone()).await;
 
@@ -28,6 +23,8 @@ async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
         .write_value(&[1, 1], std::f64::consts::E)
         .await
         .expect("write e");
+
+    dir.sync().await?;
 
     let pi = tensor.read_value(&[0, 0]).await.expect("read pi");
     let e = tensor.read_value(&[1, 1]).await.expect("read e");

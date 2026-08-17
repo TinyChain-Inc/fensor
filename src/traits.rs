@@ -9,23 +9,15 @@ use crate::{Error, Result, TensorSchema};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A minimal ndarray-like semantic surface for filesystem-backed tensors.
-pub trait TensorArray: Send + Sync {
+/// Minimal shape/dtype surface shared by base tensors AND their views.
+pub trait TensorGeometry: Send + Sync {
     type DType: Copy + Send + Sync + 'static;
-
-    fn schema(&self) -> &TensorSchema;
 
     fn dtype(&self) -> Self::DType;
 
     fn layout(&self) -> Layout;
 
     fn shape(&self) -> &[usize];
-
-    fn strides(&self) -> &[usize];
-
-    fn schema_dtype(&self) -> DType {
-        self.schema().dtype()
-    }
 
     fn ndim(&self) -> usize {
         self.shape().len()
@@ -36,10 +28,21 @@ pub trait TensorArray: Send + Sync {
     }
 }
 
+/// Adds the persistent, storage-backed schema -- implemented ONLY by base tensors.
+pub trait TensorArray: TensorGeometry {
+    fn schema(&self) -> &TensorSchema;
+
+    fn strides(&self) -> &[usize];
+
+    fn schema_dtype(&self) -> DType {
+        self.schema().dtype()
+    }
+}
+
 type OrderedSparseElements<ET> = Vec<(Vec<u64>, ET)>;
 
 /// Async value reads aligned with ndarray coordinate semantics.
-pub trait TensorRead: TensorArray {
+pub trait TensorRead: TensorGeometry {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>>;
 
     fn read_sparse_elements_in_order<'a>(
@@ -80,7 +83,7 @@ pub trait TensorReadBulk: TensorRead {
 }
 
 /// Async value writes aligned with ndarray coordinate semantics.
-pub trait TensorWrite: TensorArray {
+pub trait TensorWrite: TensorGeometry {
     fn write_value<'a>(&'a self, coord: &'a [u64], value: Self::DType)
     -> BoxFuture<'a, Result<()>>;
 }
@@ -120,7 +123,7 @@ pub trait TensorWriteBulk: TensorWrite {
 }
 
 /// Transform-style ndarray operations (metadata/view level).
-pub trait TensorTransform: TensorArray + Sized {
+pub trait TensorTransform: TensorGeometry + Sized {
     fn reshape(self, shape: Shape) -> Result<Self>;
 
     fn broadcast(self, _shape: Shape) -> Result<Self> {
@@ -177,7 +180,7 @@ pub trait TensorSparseIndex: Send + Sync {
 }
 
 /// Base/view capability contract, aligned with v1 writeability semantics.
-pub trait TensorViewSemantics: TensorArray {
+pub trait TensorViewSemantics: TensorGeometry {
     fn is_base_tensor(&self) -> bool {
         true
     }
