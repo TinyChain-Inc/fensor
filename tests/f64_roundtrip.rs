@@ -2,7 +2,7 @@ mod common;
 
 use common::{FsEntry, new_dir};
 use fensor::{DType, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite};
-use ha_ndarray::{shape};
+use ha_ndarray::shape;
 use std::io;
 
 use crate::common::create_dense_tensor;

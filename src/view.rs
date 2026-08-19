@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use ha_ndarray::{Axes, AxisRange, Range, Shape};
 
-use crate::schema::contiguous_strides;
-use crate::{
-    BoxFuture, Error, Layout, Result, Tensor, TensorArray, TensorElement, TensorFileEntry,
-    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, TensorWrite,
+use crate::error::{Error, Result};
+use crate::schema::{self, Layout, TensorViewShape};
+use crate::tensor::{Tensor, TensorElement, TensorFileEntry};
+use crate::traits::{
+    BoxFuture, TensorArray, TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics,
+    TensorWrite,
 };
-use crate::{stream, validate};
 
-pub type TensorViewShape = Shape;
+use crate::{stream, validate};
 
 #[derive(Clone)]
 pub struct TensorView<'t, FE, T> {
@@ -73,7 +74,7 @@ where
         if self.axes.len() != self.shape.len() {
             return false;
         }
-        let Ok(expected) = contiguous_strides(&self.shape) else {
+        let Ok(expected) = schema::contiguous_strides(&self.shape) else {
             return false;
         };
         self.axes
@@ -185,7 +186,7 @@ where
                     .to_string(),
             ));
         }
-        let strides = contiguous_strides(&shape)?;
+        let strides = schema::contiguous_strides(&shape)?;
         Ok(Self {
             tensor: self.tensor,
             base_offset: self.base_offset,

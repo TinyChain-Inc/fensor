@@ -1,12 +1,11 @@
 use destream::{de, en};
 use freqfs::DirLock;
 
+use crate::schema::{self, DType, Layout, RowMajorCoords, TensorSchema};
+use crate::tensor::{Tensor, TensorElement, TensorFileEntry};
+use crate::traits::{TensorArray, TensorGeometry, TensorRead, TensorViewSemantics, TensorWrite};
 use crate::view;
 use crate::wire_tags::{LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
-use crate::{
-    DType, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
-    TensorSchema, TensorViewSemantics, TensorWrite, schema,
-};
 
 fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
     axis.map(|axis| u64::try_from(axis).map_err(|_| E::custom("sparse axis overflow")))
@@ -169,7 +168,7 @@ struct ViewSnapshotValues<'en, 't, FE, T> {
 enum ValuesEncodingState<'en, 't, FE, T> {
     Walking {
         view: &'en view::TensorView<'t, FE, T>,
-        coords: schema::RowMajorCoords,
+        coords: RowMajorCoords,
     },
     Done,
 }
