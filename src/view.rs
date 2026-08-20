@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{iter, sync::Arc};
 
 use ha_ndarray::{Axes, AxisRange, Range, Shape};
 
@@ -24,6 +24,7 @@ pub struct TensorView<'t, FE, T> {
 pub(crate) enum AxisContrib {
     Stride(i64),
     Gather(Arc<[i64]>),
+    Broadcast(i64),
 }
 
 impl<'t, FE, T> TensorView<'t, FE, T>
@@ -57,6 +58,7 @@ where
         for (c, axis) in coord.iter().zip(self.axes.iter()) {
             k += match axis {
                 AxisContrib::Stride(s) => (*c as i64) * s,
+                AxisContrib::Broadcast(constant) => *constant,
                 AxisContrib::Gather(offsets) => {
                     let i = usize::try_from(*c)
                         .map_err(|_| Error::InvalidCoord("coord overflows usize".to_string()))?;
@@ -162,7 +164,7 @@ where
         !self
             .axes
             .iter()
-            .any(|a| matches!(a, AxisContrib::Gather(_)))
+            .any(|a| matches!(a, AxisContrib::Gather(_) | AxisContrib::Broadcast(_)))
     }
 }
 
@@ -198,6 +200,50 @@ where
         })
     }
 
+    fn broadcast(self, shape: TensorViewShape) -> Result<Self> {
+        if shape.len() < self.shape.len() {
+            return Err(Error::InvalidLayout(format!(
+                "cannot broadcast shape {:?} to a lower rank shape {:?}",
+                self.shape, shape
+            )));
+        }
+
+        let rank_diff = shape.len() - self.shape.len();
+        let mut axes = Vec::with_capacity(shape.len());
+        axes.extend(iter::repeat_n(AxisContrib::Broadcast(0), rank_diff));
+
+        for (axis_index, (&old_dim, &new_dim)) in
+            self.shape.iter().zip(shape[rank_diff..].iter()).enumerate()
+        {
+            if old_dim != 1 && old_dim != new_dim {
+                return Err(Error::InvalidLayout(format!(
+                    "cannot broadcast axis {axis_index} from dimension {old_dim} to {new_dim}"
+                )));
+            }
+
+            let axis_contrib = if old_dim == 1usize {
+                AxisContrib::Broadcast(match &self.axes[axis_index] {
+                    AxisContrib::Stride(_) => 0i64,
+                    AxisContrib::Broadcast(c) => *c,
+                    AxisContrib::Gather(g) => *g.first().ok_or_else(|| {
+                        Error::InvalidLayout(format!("axis {axis_index} has an empty gather table"))
+                    })?,
+                })
+            } else {
+                self.axes[axis_index].clone()
+            };
+
+            axes.push(axis_contrib);
+        }
+
+        Ok(Self {
+            tensor: self.tensor,
+            base_offset: self.base_offset,
+            axes,
+            shape,
+        })
+    }
+
     fn slice(self, range: Range) -> Result<Self> {
         if range.len() != self.shape.len() {
             return Err(Error::InvalidLayout(
@@ -221,6 +267,7 @@ where
                     }
                     new_base_offset += match current {
                         AxisContrib::Stride(s) => (*i as i64) * s,
+                        AxisContrib::Broadcast(c) => *c,
                         AxisContrib::Gather(g) => *g.get(*i).ok_or_else(|| {
                             Error::InvalidLayout(format!(
                                 "slice bound at axis {axis_index} out of bounds for gather"
@@ -247,6 +294,9 @@ where
                             let new_s = s * (*step as i64);
                             new_axes.push(AxisContrib::Stride(new_s));
                         }
+                        AxisContrib::Broadcast(c) => {
+                            new_axes.push(AxisContrib::Broadcast(*c));
+                        }
                         AxisContrib::Gather(g) => {
                             let offsets = (0..extent)
                                 .map(|c| {
@@ -269,21 +319,26 @@ where
                         )));
                     }
 
-                    let offsets = indices
-                        .iter()
-                        .map(|idx| {
-                            Ok(match current {
-                                AxisContrib::Stride(s) => (*idx as i64) * s,
-                                AxisContrib::Gather(g) => *g.get(*idx).ok_or_else(|| {
-                                    Error::InvalidLayout(format!(
-                                        "slice bound at axis {axis_index} out of bounds for gather"
-                                    ))
-                                })?,
+                    if let AxisContrib::Broadcast(c) = current {
+                        new_axes.push(AxisContrib::Broadcast(*c));
+                    } else {
+                        let offsets = indices
+                            .iter()
+                            .map(|idx| {
+                                Ok(match current {
+                                    AxisContrib::Stride(s) => (*idx as i64) * s,
+                                    AxisContrib::Gather(g) => *g.get(*idx).ok_or_else(|| {
+                                        Error::InvalidLayout(format!(
+                                            "slice bound at axis {axis_index} out of bounds for gather"
+                                        ))
+                                    })?,
+                                    AxisContrib::Broadcast(_) => unreachable!("handled above"),
+                                })
                             })
-                        })
-                        .collect::<Result<Vec<i64>>>()?;
+                            .collect::<Result<Vec<i64>>>()?;
 
-                    new_axes.push(AxisContrib::Gather(offsets.into()));
+                        new_axes.push(AxisContrib::Gather(offsets.into()));
+                    }
                     new_shape.push(indices.len());
                 }
             }
@@ -355,6 +410,11 @@ where
         value: Self::DType,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            if !self.supports_write_through() {
+                return Err(Error::Unsupported(
+                    "this view does not support write-through to the base tensor".to_string(),
+                ));
+            }
             let base_coord = self.resolve_base_coord(coord)?;
             self.tensor.write_value(&base_coord, value).await
         })
@@ -668,6 +728,276 @@ mod tests {
         let sliced = reshaped.slice(r).expect("slice");
         assert_eq!(sliced.shape(), &[2, 2, 4]);
         assert_eq!(sliced.flat_offset(&[1, 1, 2]).expect("offset"), 18);
+        cleanup(&root).await;
+    }
+
+    // -- broadcast flat_offset correctness -----------------------------------------
+
+    #[tokio::test]
+    async fn flat_offset_broadcast_rank_preserving() {
+        // [1,3,4], strides [12,4,1] -> identity axes [Stride(12),Stride(4),Stride(1)]
+        // broadcast to [2,3,4]: axis 0 (dim 1->2) becomes Broadcast(0), axes 1,2 unchanged
+        // flat_offset([a,2,3]) = 0*a + 4*2 + 1*3 = 11, for any a
+        let (root, tensor) = create_dense(
+            "flat_offset_broadcast_rank_preserving",
+            shape![1, 3, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![2, 3, 4])
+            .expect("broadcast must be supported");
+        assert_eq!(broadcasted.flat_offset(&[0, 2, 3]).expect("offset"), 11);
+        assert_eq!(broadcasted.flat_offset(&[1, 2, 3]).expect("offset"), 11);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn flat_offset_broadcast_rank_expanding() {
+        // [3,4], strides [4,1] -> axes [Stride(4),Stride(1)]
+        // broadcast to [2,3,4]: rank_diff=1, prepend Broadcast(0); remaining axes unchanged (3==3,4==4)
+        // flat_offset([a,2,3]) = 4*2 + 1*3 = 11, for any a
+        let (root, tensor) =
+            create_dense("flat_offset_broadcast_rank_expanding", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![2, 3, 4])
+            .expect("broadcast must be supported");
+        assert_eq!(broadcasted.flat_offset(&[0, 2, 3]).expect("offset"), 11);
+        assert_eq!(broadcasted.flat_offset(&[1, 2, 3]).expect("offset"), 11);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
+        // [4,5,6], strides [30,6,1]. Of([3]) on axis 0 -> Gather([90]) (3*30=90), shape [1,5,6]
+        // broadcast axis 0 to 7 -> Broadcast(90) (NOT Broadcast(0))
+        // flat_offset([k,2,4]) = 90 + 6*2 + 4 = 106, for any k in 0..7
+        let (root, tensor) = create_dense(
+            "broadcast_preserves_offset_of_gathered_size_one_axis",
+            shape![4, 5, 6],
+            1000,
+        )
+        .await;
+        tensor.write_value(&[3, 2, 4], 77.0).await.expect("seed");
+        let view = tensor.view();
+        let r = range![
+            AxisRange::Of(shape![3]),
+            AxisRange::In(0, 5, 1),
+            AxisRange::In(0, 6, 1)
+        ];
+        let sliced = view.slice(r).expect("slice");
+        assert_eq!(sliced.shape(), &[1, 5, 6]);
+        let broadcasted = sliced
+            .broadcast(shape![7, 5, 6])
+            .expect("broadcast must be supported");
+        assert_eq!(broadcasted.flat_offset(&[0, 2, 4]).expect("offset"), 106);
+        assert_eq!(broadcasted.flat_offset(&[6, 2, 4]).expect("offset"), 106);
+        for k in 0..7u64 {
+            let v = broadcasted
+                .read_value(&[k, 2, 4])
+                .await
+                .expect("broadcast read");
+            assert_eq!(v, 77.0, "k={k}");
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_rejects_lower_rank_target() {
+        let (root, tensor) =
+            create_dense("broadcast_rejects_lower_rank_target", shape![2, 3], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.broadcast(shape![3]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_rejects_incompatible_dim() {
+        let (root, tensor) =
+            create_dense("broadcast_rejects_incompatible_dim", shape![2, 3], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.broadcast(shape![2, 5]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_noop_same_shape_preserves_write_through() {
+        // broadcasting to the current shape is a no-op: axes unchanged, still fully write-through
+        let (root, tensor) = create_dense(
+            "broadcast_noop_same_shape_preserves_write_through",
+            shape![2, 3],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![2, 3])
+            .expect("no-op broadcast must be supported");
+        assert!(broadcasted.supports_write_through());
+        broadcasted
+            .write_value(&[1, 2], 5.0)
+            .await
+            .expect("write through no-op broadcast");
+        assert_eq!(tensor.read_value(&[1, 2]).await.expect("base read"), 5.0);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_then_reshape_rejected() {
+        // [1,4] broadcast to [3,4]: axis 0 becomes Broadcast(0) -> view is no longer c-contiguous
+        let (root, tensor) =
+            create_dense("broadcast_then_reshape_rejected", shape![1, 4], 1000).await;
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![3, 4])
+            .expect("broadcast must be supported");
+        assert!(matches!(
+            broadcasted.reshape(shape![12]),
+            Err(Error::Unsupported(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_expands_middle_or_trailing_axis_with_rank_increase() {
+        // [3,1,4], strides [4,4,1] -> axes [Stride(4),Stride(4),Stride(1)]
+        // broadcast to [2,3,5,4]: rank_diff=1 prepends Broadcast(0); axis (dim 3->3) clones Stride(4);
+        // middle axis (dim 1->5) becomes Broadcast(0); trailing axis (dim 4->4) clones Stride(1)
+        // flat_offset([i,j,k,l]) = 4*j + l, independent of i and k
+        let (root, tensor) = create_dense(
+            "broadcast_expands_middle_or_trailing_axis_with_rank_increase",
+            shape![3, 1, 4],
+            1000,
+        )
+        .await;
+        tensor.write_value(&[2, 0, 2], 55.0).await.expect("seed");
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![2, 3, 5, 4])
+            .expect("broadcast must be supported");
+        assert_eq!(broadcasted.shape(), &[2, 3, 5, 4]);
+        assert_eq!(broadcasted.flat_offset(&[1, 2, 3, 2]).expect("offset"), 10);
+        assert_eq!(broadcasted.flat_offset(&[0, 2, 0, 2]).expect("offset"), 10);
+        for i in 0..2u64 {
+            for k in 0..5u64 {
+                let v = broadcasted.read_value(&[i, 2, k, 2]).await.expect("read");
+                assert_eq!(v, 55.0, "i={i} k={k}");
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_twice_passes_through_existing_broadcast_axis() {
+        // [4,4], strides [4,1]. Of([3]) on axis 0 -> Gather([12]) (3*4=12), shape [1,4]
+        // first broadcast to [5,4]: axis 0 (dim 1->5) becomes Broadcast(12) (not 0)
+        // second broadcast to [2,5,4]: prepends Broadcast(0); the existing Broadcast(12) axis
+        // (dim 5->5, unchanged) must clone through as Broadcast(12), not reset to 0
+        // flat_offset([i,j,k]) = 12 + k, independent of i and j
+        let (root, tensor) = create_dense(
+            "broadcast_twice_passes_through_existing_broadcast_axis",
+            shape![4, 4],
+            1000,
+        )
+        .await;
+        for k in 0..4u64 {
+            tensor
+                .write_value(&[3, k], k as f32 * 1.5)
+                .await
+                .expect("seed");
+        }
+        let view = tensor.view();
+        let r = range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)];
+        let sliced = view.slice(r).expect("slice");
+        let once = sliced
+            .broadcast(shape![5, 4])
+            .expect("first broadcast must be supported");
+        let twice = once
+            .broadcast(shape![2, 5, 4])
+            .expect("second broadcast must be supported");
+        assert_eq!(twice.shape(), &[2, 5, 4]);
+        for i in 0..2u64 {
+            for j in 0..5u64 {
+                for k in 0..4u64 {
+                    assert_eq!(
+                        twice.flat_offset(&[i, j, k]).expect("offset"),
+                        12 + k as i64,
+                        "i={i} j={j} k={k}"
+                    );
+                    let v = twice.read_value(&[i, j, k]).await.expect("read");
+                    assert_eq!(v, k as f32 * 1.5, "i={i} j={j} k={k}");
+                }
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_then_transpose_preserves_constant() {
+        // [4,4], Of([3]) -> Gather([12]); broadcast to [5,4] -> axes [Broadcast(12), Stride(1)]
+        // transpose([1,0]) -> axes [Stride(1), Broadcast(12)], shape [4,5]
+        // flat_offset([k,j]) = k + 12, independent of j
+        let (root, tensor) = create_dense(
+            "broadcast_then_transpose_preserves_constant",
+            shape![4, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let r = range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)];
+        let sliced = view.slice(r).expect("slice");
+        let broadcasted = sliced
+            .broadcast(shape![5, 4])
+            .expect("broadcast must be supported");
+        let transposed = broadcasted.transpose(Some(axes![1, 0])).expect("transpose");
+        assert_eq!(transposed.shape(), &[4, 5]);
+        for k in 0..4u64 {
+            for j in 0..5u64 {
+                assert_eq!(
+                    transposed.flat_offset(&[k, j]).expect("offset"),
+                    12 + k as i64,
+                    "k={k} j={j}"
+                );
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn slice_of_after_broadcast_preserves_constant() {
+        // [1,4] -> broadcast to [3,4]: axis 0 becomes Broadcast(0)
+        // Of([0,2]) slice on that Broadcast axis must stay Broadcast(0), not become a Gather
+        // flat_offset([x,y]) = y, independent of x
+        let (root, tensor) = create_dense(
+            "slice_of_after_broadcast_preserves_constant",
+            shape![1, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![3, 4])
+            .expect("broadcast must be supported");
+        let r = range![AxisRange::Of(shape![0, 2]), AxisRange::In(0, 4, 1)];
+        let sliced = broadcasted.slice(r).expect("slice");
+        assert_eq!(sliced.shape(), &[2, 4]);
+        for x in 0..2u64 {
+            for y in 0..4u64 {
+                assert_eq!(
+                    sliced.flat_offset(&[x, y]).expect("offset"),
+                    y as i64,
+                    "x={x} y={y}"
+                );
+            }
+        }
         cleanup(&root).await;
     }
 }

@@ -1201,6 +1201,33 @@ mod section_f_view_semantics {
     }
 
     #[tokio::test]
+    async fn write_through_rejected_for_gather_slice() {
+        let (root, tensor, _) =
+            create_dense("f_no_wt_gather", shape![4, 3, 4], shape![1, 1, 4]).await;
+        let gathered = tensor
+            .view()
+            .slice(range![
+                AxisRange::Of(shape![0, 2]),
+                AxisRange::In(0, 3, 1),
+                AxisRange::In(0, 4, 1)
+            ])
+            .expect("slice");
+
+        assert!(
+            !gathered.supports_write_through(),
+            "gather-sliced view must NOT be write-through"
+        );
+
+        let err = gathered
+            .write_value(&[0, 0, 0], 1.0)
+            .await
+            .expect_err("write must be rejected on gather-sliced view");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
     async fn reshape_view_writeability_documented() {
         let (root, tensor, _) =
             create_dense("f_reshape_view", shape![2, 3, 4], shape![1, 1, 4]).await;
