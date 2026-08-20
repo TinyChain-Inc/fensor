@@ -129,6 +129,100 @@ pub fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Vec
     Ok(axes)
 }
 
+fn slice_bound_at(
+    current: &AxisContrib,
+    dim: usize,
+    index: usize,
+    axis_index: usize,
+) -> Result<i64> {
+    if index >= dim {
+        return Err(Error::InvalidLayout(format!(
+            "slice bound at axis {axis_index} is out of bounds"
+        )));
+    }
+    match current {
+        AxisContrib::Stride(s) => Ok((index as i64) * s),
+        AxisContrib::Broadcast(c) => Ok(*c),
+        AxisContrib::Gather(g) => g.get(index).copied().ok_or_else(|| {
+            Error::InvalidLayout(format!(
+                "slice bound at axis {axis_index} out of bounds for gather"
+            ))
+        }),
+    }
+}
+
+fn slice_bound_in(
+    current: &AxisContrib,
+    dim: usize,
+    start: usize,
+    stop: usize,
+    step: usize,
+    axis_index: usize,
+) -> Result<(i64, AxisContrib, usize)> {
+    if step == 0 || start > stop || stop > dim {
+        return Err(Error::InvalidLayout(format!(
+            "slice bound at axis {axis_index} is out of bounds"
+        )));
+    }
+    let extent = if start == stop {
+        0
+    } else {
+        (stop - start).div_ceil(step)
+    };
+
+    let (offset_delta, axis) = match current {
+        AxisContrib::Stride(s) => ((start as i64) * s, AxisContrib::Stride(s * (step as i64))),
+        AxisContrib::Broadcast(c) => (0, AxisContrib::Broadcast(*c)),
+        AxisContrib::Gather(g) => {
+            let offsets = (0..extent)
+                .map(|c| {
+                    g.get(start + c * step).copied().ok_or_else(|| {
+                        Error::InvalidLayout(format!(
+                            "slice bound at axis {axis_index} out of bounds for gather"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i64>>>()?;
+            (0, AxisContrib::Gather(offsets.into()))
+        }
+    };
+
+    Ok((offset_delta, axis, extent))
+}
+
+fn slice_bound_of(
+    current: &AxisContrib,
+    dim: usize,
+    indices: &[usize],
+    axis_index: usize,
+) -> Result<AxisContrib> {
+    if indices.iter().any(|index| *index >= dim) {
+        return Err(Error::InvalidLayout(format!(
+            "slice bound at axis {axis_index} is out of bounds"
+        )));
+    }
+    match current {
+        AxisContrib::Broadcast(c) => Ok(AxisContrib::Broadcast(*c)),
+        AxisContrib::Stride(s) => {
+            let offsets: Vec<i64> = indices.iter().map(|idx| (*idx as i64) * s).collect();
+            Ok(AxisContrib::Gather(offsets.into()))
+        }
+        AxisContrib::Gather(g) => {
+            let offsets = indices
+                .iter()
+                .map(|idx| {
+                    g.get(*idx).copied().ok_or_else(|| {
+                        Error::InvalidLayout(format!(
+                            "slice bound at axis {axis_index} out of bounds for gather"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i64>>>()?;
+            Ok(AxisContrib::Gather(offsets.into()))
+        }
+    }
+}
+
 impl<'t, FE, T> TensorGeometry for TensorView<'t, FE, T>
 where
     FE: TensorFileEntry<T>,
@@ -255,90 +349,22 @@ where
         let mut new_base_offset = self.base_offset;
         let mut new_shape = Shape::with_capacity(self.axes.len());
 
-        for (axis_index, (bound, dim)) in range.iter().zip(self.shape.iter()).enumerate() {
+        for (axis_index, (bound, &dim)) in range.iter().zip(self.shape.iter()).enumerate() {
             let current = &self.axes[axis_index];
 
             match bound {
                 AxisRange::At(i) => {
-                    if *i >= *dim {
-                        return Err(Error::InvalidLayout(format!(
-                            "slice bound at axis {axis_index} is out of bounds"
-                        )));
-                    }
-                    new_base_offset += match current {
-                        AxisContrib::Stride(s) => (*i as i64) * s,
-                        AxisContrib::Broadcast(c) => *c,
-                        AxisContrib::Gather(g) => *g.get(*i).ok_or_else(|| {
-                            Error::InvalidLayout(format!(
-                                "slice bound at axis {axis_index} out of bounds for gather"
-                            ))
-                        })?,
-                    };
+                    new_base_offset += slice_bound_at(current, dim, *i, axis_index)?;
                 }
                 AxisRange::In(start, stop, step) => {
-                    if *step == 0 || *start > *stop || *stop > *dim {
-                        return Err(Error::InvalidLayout(format!(
-                            "slice bound at axis {axis_index} is out of bounds"
-                        )));
-                    }
-
-                    let extent = if start == stop {
-                        0
-                    } else {
-                        (stop - start).div_ceil(*step)
-                    };
-
-                    match current {
-                        AxisContrib::Stride(s) => {
-                            new_base_offset += (*start as i64) * s;
-                            let new_s = s * (*step as i64);
-                            new_axes.push(AxisContrib::Stride(new_s));
-                        }
-                        AxisContrib::Broadcast(c) => {
-                            new_axes.push(AxisContrib::Broadcast(*c));
-                        }
-                        AxisContrib::Gather(g) => {
-                            let offsets = (0..extent)
-                                .map(|c| {
-                                    g.get(start + c * step).copied().ok_or_else(|| {
-                                        Error::InvalidLayout(format!(
-                                            "slice bound at axis {axis_index} out of bounds for gather"
-                                        ))
-                                    })
-                                })
-                                .collect::<Result<Vec<i64>>>()?;
-                            new_axes.push(AxisContrib::Gather(offsets.into()));
-                        }
-                    }
+                    let (offset_delta, axis, extent) =
+                        slice_bound_in(current, dim, *start, *stop, *step, axis_index)?;
+                    new_base_offset += offset_delta;
+                    new_axes.push(axis);
                     new_shape.push(extent);
                 }
                 AxisRange::Of(indices) => {
-                    if indices.iter().any(|index| *index >= *dim) {
-                        return Err(Error::InvalidLayout(format!(
-                            "slice bound at axis {axis_index} is out of bounds"
-                        )));
-                    }
-
-                    if let AxisContrib::Broadcast(c) = current {
-                        new_axes.push(AxisContrib::Broadcast(*c));
-                    } else {
-                        let offsets = indices
-                            .iter()
-                            .map(|idx| {
-                                Ok(match current {
-                                    AxisContrib::Stride(s) => (*idx as i64) * s,
-                                    AxisContrib::Gather(g) => *g.get(*idx).ok_or_else(|| {
-                                        Error::InvalidLayout(format!(
-                                            "slice bound at axis {axis_index} out of bounds for gather"
-                                        ))
-                                    })?,
-                                    AxisContrib::Broadcast(_) => unreachable!("handled above"),
-                                })
-                            })
-                            .collect::<Result<Vec<i64>>>()?;
-
-                        new_axes.push(AxisContrib::Gather(offsets.into()));
-                    }
+                    new_axes.push(slice_bound_of(current, dim, indices, axis_index)?);
                     new_shape.push(indices.len());
                 }
             }
@@ -998,6 +1024,238 @@ mod tests {
                 );
             }
         }
+        cleanup(&root).await;
+    }
+
+    // -- slice() baseline coverage: AxisContrib chaining gaps ----------------------
+
+    #[tokio::test]
+    async fn at_slice_on_broadcast_axis() {
+        // [1,4] -> broadcast to [3,4]: axis 0 becomes Broadcast(0)
+        // At(1) on that Broadcast axis contributes 0 regardless of index, and the axis is dropped
+        // flat_offset([y]) = y
+        let (root, tensor) = create_dense("at_slice_on_broadcast_axis", shape![1, 4], 1000).await;
+        for c in 0..4u64 {
+            tensor
+                .write_value(&[0, c], c as f32 * 2.0)
+                .await
+                .expect("seed");
+        }
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![3, 4])
+            .expect("broadcast must be supported");
+        let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
+        let sliced = broadcasted.slice(r).expect("slice");
+        assert_eq!(sliced.shape(), &[4]);
+        for y in 0..4u64 {
+            assert_eq!(sliced.flat_offset(&[y]).expect("offset"), y as i64);
+            let v = sliced.read_value(&[y]).await.expect("read");
+            assert_eq!(v, y as f32 * 2.0, "y={y}");
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn in_slice_on_broadcast_axis() {
+        // [1,4] -> broadcast to [5,4]: axis 0 becomes Broadcast(0)
+        // In(1,4,1) on that Broadcast axis stays Broadcast(0) with extent 3, still independent of index
+        let (root, tensor) = create_dense("in_slice_on_broadcast_axis", shape![1, 4], 1000).await;
+        for c in 0..4u64 {
+            tensor
+                .write_value(&[0, c], c as f32 * 2.0)
+                .await
+                .expect("seed");
+        }
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![5, 4])
+            .expect("broadcast must be supported");
+        let r = range![AxisRange::In(1, 4, 1), AxisRange::In(0, 4, 1)];
+        let sliced = broadcasted.slice(r).expect("slice");
+        assert_eq!(sliced.shape(), &[3, 4]);
+        for a in 0..3u64 {
+            for y in 0..4u64 {
+                assert_eq!(
+                    sliced.flat_offset(&[a, y]).expect("offset"),
+                    y as i64,
+                    "a={a} y={y}"
+                );
+                let v = sliced.read_value(&[a, y]).await.expect("read");
+                assert_eq!(v, y as f32 * 2.0, "a={a} y={y}");
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn at_slice_on_gather_axis() {
+        // [4,4], strides [4,1]. Of([1,3]) on axis 0 -> Gather([4,12]) (1*4=4, 3*4=12), shape [2,4]
+        // At(1) on that Gather axis selects g[1]=12 (base row 3) and drops the axis
+        // flat_offset([y]) = 12 + y
+        let (root, tensor) = create_dense("at_slice_on_gather_axis", shape![4, 4], 1000).await;
+        for y in 0..4u64 {
+            tensor
+                .write_value(&[3, y], y as f32 * 3.0)
+                .await
+                .expect("seed");
+        }
+        let view = tensor.view();
+        let gathered = view
+            .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+            .expect("slice Of");
+        assert_eq!(gathered.shape(), &[2, 4]);
+        let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
+        let sliced = gathered.slice(r).expect("slice At on gather axis");
+        assert_eq!(sliced.shape(), &[4]);
+        for y in 0..4u64 {
+            assert_eq!(
+                sliced.flat_offset(&[y]).expect("offset"),
+                12 + y as i64,
+                "y={y}"
+            );
+            let v = sliced.read_value(&[y]).await.expect("read");
+            assert_eq!(v, y as f32 * 3.0, "y={y}");
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn in_slice_on_gather_axis() {
+        // [4,4], strides [4,1]. Of([1,3]) on axis 0 -> Gather([4,12]), shape [2,4]
+        // In(1,2,1) on that Gather axis selects g[1]=12 (base row 3) via a sub-range, extent 1
+        // flat_offset([0,y]) = 12 + y
+        let (root, tensor) = create_dense("in_slice_on_gather_axis", shape![4, 4], 1000).await;
+        for y in 0..4u64 {
+            tensor
+                .write_value(&[3, y], y as f32 * 3.0)
+                .await
+                .expect("seed");
+        }
+        let view = tensor.view();
+        let gathered = view
+            .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+            .expect("slice Of");
+        let r = range![AxisRange::In(1, 2, 1), AxisRange::In(0, 4, 1)];
+        let sliced = gathered.slice(r).expect("slice In on gather axis");
+        assert_eq!(sliced.shape(), &[1, 4]);
+        for y in 0..4u64 {
+            assert_eq!(
+                sliced.flat_offset(&[0, y]).expect("offset"),
+                12 + y as i64,
+                "y={y}"
+            );
+            let v = sliced.read_value(&[0, y]).await.expect("read");
+            assert_eq!(v, y as f32 * 3.0, "y={y}");
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn of_slice_on_gather_axis() {
+        // [4,4], strides [4,1]. Of([1,3]) on axis 0 -> Gather([4,12]), shape [2,4]
+        // Of([1,0]) on that Gather axis reorders: new Gather([12,4]) (picks g[1] then g[0])
+        // flat_offset([0,y]) = 12+y (base row 3), flat_offset([1,y]) = 4+y (base row 1)
+        let (root, tensor) = create_dense("of_slice_on_gather_axis", shape![4, 4], 1000).await;
+        for y in 0..4u64 {
+            tensor
+                .write_value(&[1, y], y as f32 * 5.0)
+                .await
+                .expect("seed row1");
+            tensor
+                .write_value(&[3, y], y as f32 * 3.0)
+                .await
+                .expect("seed row3");
+        }
+        let view = tensor.view();
+        let gathered = view
+            .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+            .expect("slice Of");
+        let r = range![AxisRange::Of(shape![1, 0]), AxisRange::In(0, 4, 1)];
+        let sliced = gathered.slice(r).expect("slice Of on gather axis");
+        assert_eq!(sliced.shape(), &[2, 4]);
+        for y in 0..4u64 {
+            assert_eq!(
+                sliced.flat_offset(&[0, y]).expect("offset"),
+                12 + y as i64,
+                "y={y}"
+            );
+            assert_eq!(
+                sliced.flat_offset(&[1, y]).expect("offset"),
+                4 + y as i64,
+                "y={y}"
+            );
+            assert_eq!(
+                sliced.read_value(&[0, y]).await.expect("read"),
+                y as f32 * 3.0,
+                "y={y}"
+            );
+            assert_eq!(
+                sliced.read_value(&[1, y]).await.expect("read"),
+                y as f32 * 5.0,
+                "y={y}"
+            );
+        }
+        cleanup(&root).await;
+    }
+
+    // -- slice() baseline coverage: validation error paths --------------------------
+
+    #[tokio::test]
+    async fn slice_rank_mismatch_rejected() {
+        let (root, tensor) = create_dense("slice_rank_mismatch_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let r = range![AxisRange::In(0, 3, 1)];
+        assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn at_slice_out_of_bounds_rejected() {
+        let (root, tensor) =
+            create_dense("at_slice_out_of_bounds_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let r = range![AxisRange::At(3), AxisRange::In(0, 4, 1)];
+        assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn in_slice_step_zero_rejected() {
+        let (root, tensor) = create_dense("in_slice_step_zero_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let r = range![AxisRange::In(0, 3, 0), AxisRange::In(0, 4, 1)];
+        assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn in_slice_start_after_stop_rejected() {
+        let (root, tensor) =
+            create_dense("in_slice_start_after_stop_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let r = range![AxisRange::In(2, 1, 1), AxisRange::In(0, 4, 1)];
+        assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn in_slice_stop_exceeds_dim_rejected() {
+        let (root, tensor) =
+            create_dense("in_slice_stop_exceeds_dim_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let r = range![AxisRange::In(0, 5, 1), AxisRange::In(0, 4, 1)];
+        assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn of_slice_out_of_bounds_rejected() {
+        let (root, tensor) =
+            create_dense("of_slice_out_of_bounds_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let r = range![AxisRange::Of(shape![0, 5]), AxisRange::In(0, 4, 1)];
+        assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
         cleanup(&root).await;
     }
 }
