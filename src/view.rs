@@ -440,6 +440,122 @@ where
             shape: self.shape,
         })
     }
+
+    fn squeeze(self, axes: Axes) -> Result<Self> {
+        let ndim = self.shape.len();
+
+        if axes.is_empty() {
+            return Err(Error::InvalidLayout(
+                "squeeze requires a non-empty list of axes".to_string(),
+            ));
+        }
+        if axes.len() == ndim {
+            return Err(Error::InvalidLayout(
+                "squeeze cannot remove every axis; rank-0 tensors are not supported".to_string(),
+            ));
+        }
+
+        let mut remove = vec![false; ndim];
+        for &axis in axes.iter() {
+            if axis >= ndim {
+                return Err(Error::InvalidLayout(format!(
+                    "squeeze axis {axis} is out of bounds for rank {ndim}"
+                )));
+            }
+            if remove[axis] {
+                return Err(Error::InvalidLayout(format!(
+                    "squeeze axis {axis} specified more than once"
+                )));
+            }
+            if self.shape[axis] != 1 {
+                return Err(Error::InvalidLayout(format!(
+                    "cannot squeeze axis {axis} with dimension {}",
+                    self.shape[axis]
+                )));
+            }
+            remove[axis] = true;
+        }
+
+        let mut base_offset = self.base_offset;
+        let mut axes_out = Vec::with_capacity(ndim - axes.len());
+        let mut shape_out = Shape::with_capacity(ndim - axes.len());
+
+        for i in 0..ndim {
+            if remove[i] {
+                base_offset += slice_bound_at(&self.axes[i], 1, 0, i)?;
+            } else {
+                axes_out.push(self.axes[i].clone());
+                shape_out.push(self.shape[i]);
+            }
+        }
+
+        Ok(Self {
+            tensor: self.tensor,
+            base_offset,
+            axes: axes_out,
+            shape: shape_out,
+        })
+    }
+
+    fn unsqueeze(self, axes: Axes) -> Result<Self> {
+        let old_ndim = self.shape.len();
+
+        if axes.is_empty() {
+            return Err(Error::InvalidLayout(
+                "unsqueeze requires a non-empty list of axes".to_string(),
+            ));
+        }
+
+        let mut insert_before = vec![false; old_ndim];
+        for &axis in axes.iter() {
+            if axis >= old_ndim {
+                return Err(Error::InvalidLayout(format!(
+                    "unsqueeze axis {axis} is out of bounds for rank {old_ndim}"
+                )));
+            }
+            if insert_before[axis] {
+                return Err(Error::InvalidLayout(format!(
+                    "unsqueeze axis {axis} specified more than once"
+                )));
+            }
+            insert_before[axis] = true;
+        }
+
+        let new_ndim = old_ndim + axes.len();
+        let mut layout = Vec::with_capacity(new_ndim);
+        for i in 0..old_ndim {
+            if insert_before[i] {
+                layout.push(None);
+            }
+            layout.push(Some(i));
+        }
+
+        let shape_out: Shape = layout
+            .iter()
+            .map(|slot| match slot {
+                None => 1,
+                Some(i) => self.shape[*i],
+            })
+            .collect();
+
+        let contiguous = schema::contiguous_strides(&shape_out)?;
+
+        let axes_out: Vec<AxisContrib> = layout
+            .iter()
+            .enumerate()
+            .map(|(pos, slot)| match slot {
+                None => AxisContrib::Stride(contiguous[pos] as i64),
+                Some(i) => self.axes[*i].clone(),
+            })
+            .collect();
+
+        Ok(Self {
+            tensor: self.tensor,
+            base_offset: self.base_offset,
+            axes: axes_out,
+            shape: shape_out,
+        })
+    }
 }
 
 impl<'t, FE, T> TensorRead for TensorView<'t, FE, T>
@@ -1404,6 +1520,410 @@ mod tests {
         let view = tensor.view();
         let r = range![AxisRange::Of(shape![0, 5]), AxisRange::In(0, 4, 1)];
         assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+        cleanup(&root).await;
+    }
+
+    // -- squeeze/unsqueeze --
+
+    #[tokio::test]
+    async fn squeeze_stride_axis_folds_zero_offset() {
+        // shape [3,1,4], strides [4,4,1] (from schema::contiguous_strides)
+        // squeeze axis 1 (dim=1) -> shape [3,4]
+        // flat_offset([x,z]) should equal flat_offset([x,0,z]) on original
+        let (root, tensor) = create_dense(
+            "squeeze_stride_axis_folds_zero_offset",
+            shape![3, 1, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let squeezed = view
+            .clone()
+            .squeeze(axes![1])
+            .expect("squeeze must be supported");
+        assert_eq!(squeezed.shape(), &[3, 4]);
+
+        // For a stride axis with dim=1, index 0 contributes 0 to the offset
+        // so flat_offset on squeezed [x,z] should match original [x,0,z]
+        for x in 0..3u64 {
+            for z in 0..4u64 {
+                let orig_offset = view.flat_offset(&[x, 0, z]).expect("orig offset");
+                let squeeze_offset = squeezed.flat_offset(&[x, z]).expect("squeeze offset");
+                assert_eq!(orig_offset, squeeze_offset, "x={}, z={}", x, z);
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_gather_singleton_folds_offset() {
+        // [4,4], strides [4,1]. Of([3]) on axis 0 -> Gather([12]), shape [1,4]
+        // squeeze axis 0 -> shape [4]
+        // flat_offset([y]) = 12 + y
+        let (root, tensor) =
+            create_dense("squeeze_gather_singleton_folds_offset", shape![4, 4], 1000).await;
+        for y in 0..4u64 {
+            tensor
+                .write_value(&[3, y], y as f32 * 2.0)
+                .await
+                .expect("seed");
+        }
+        let view = tensor.view();
+        let gathered = view
+            .slice(range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)])
+            .expect("slice Of");
+        assert_eq!(gathered.shape(), &[1, 4]);
+        let squeezed = gathered
+            .squeeze(axes![0])
+            .expect("squeeze must be supported");
+        assert_eq!(squeezed.shape(), &[4]);
+
+        for y in 0..4u64 {
+            assert_eq!(
+                squeezed.flat_offset(&[y]).expect("offset"),
+                12 + y as i64,
+                "y={}",
+                y
+            );
+            let v = squeezed.read_value(&[y]).await.expect("read");
+            assert_eq!(v, y as f32 * 2.0, "y={}", y);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_broadcast_axis_folds_constant() {
+        // [4,5,6], strides [30,6,1]. Of([3]) on axis 0 -> Gather([90]), shape [1,5,6].
+        // Broadcasting axis 0 to its OWN size (1 -> 1) still converts it to
+        // AxisContrib::Broadcast(90) (broadcast() always wraps an old_dim==1
+        // axis in Broadcast, regardless of the target size), so this is how a
+        // dim==1 axis ends up typed as Broadcast rather than Gather/Stride.
+        // squeeze(axes![0]) must fold that constant 90 into base_offset.
+        let (root, tensor) = create_dense(
+            "squeeze_broadcast_axis_folds_constant",
+            shape![4, 5, 6],
+            1000,
+        )
+        .await;
+        tensor.write_value(&[3, 2, 4], 77.0).await.expect("seed");
+        let view = tensor.view();
+        let gathered = view
+            .slice(range![
+                AxisRange::Of(shape![3]),
+                AxisRange::In(0, 5, 1),
+                AxisRange::In(0, 6, 1)
+            ])
+            .expect("slice Of");
+        assert_eq!(gathered.shape(), &[1, 5, 6]);
+
+        let broadcasted = gathered
+            .broadcast(shape![1, 5, 6])
+            .expect("same-size broadcast must be supported");
+
+        let squeezed = broadcasted
+            .squeeze(axes![0])
+            .expect("squeeze must be supported");
+        assert_eq!(squeezed.shape(), &[5, 6]);
+
+        for y in 0..5u64 {
+            for z in 0..6u64 {
+                assert_eq!(
+                    squeezed.flat_offset(&[y, z]).expect("offset"),
+                    90 + 6 * y as i64 + z as i64,
+                    "y={y} z={z}"
+                );
+            }
+        }
+        let v = squeezed.read_value(&[2, 4]).await.expect("read");
+        assert_eq!(v, 77.0);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_empty_axes_rejected() {
+        let (root, tensor) =
+            create_dense("squeeze_empty_axes_rejected", shape![3, 1, 4], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.squeeze(axes![]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_all_axes_rejected() {
+        let (root, tensor) = create_dense("squeeze_all_axes_rejected", shape![1, 1], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.squeeze(axes![0, 1]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_duplicate_axis_rejected() {
+        let (root, tensor) =
+            create_dense("squeeze_duplicate_axis_rejected", shape![1, 3, 1, 4], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.squeeze(axes![0, 0]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_axis_out_of_bounds_rejected() {
+        let (root, tensor) =
+            create_dense("squeeze_axis_out_of_bounds_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.squeeze(axes![5]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_removes_gather_axis_restores_write_through() {
+        // [4,4], strides [4,1]. Of([3]) on axis 0 -> Gather([12]), shape [1,4]
+        // Before squeeze: supports_write_through() is false (has Gather)
+        // After squeeze: supports_write_through() should be true, and write_value should work
+        let (root, tensor) = create_dense(
+            "squeeze_removes_gather_axis_restores_write_through",
+            shape![4, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let gathered = view
+            .slice(range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)])
+            .expect("slice Of");
+        assert!(
+            !gathered.supports_write_through(),
+            "gathered should have Gather axis"
+        );
+
+        let squeezed = gathered
+            .squeeze(axes![0])
+            .expect("squeeze must be supported");
+        assert!(
+            squeezed.supports_write_through(),
+            "squeezed should support write_through"
+        );
+
+        squeezed.write_value(&[2], 9.0).await.expect("write");
+        let v = tensor.read_value(&[3, 2]).await.expect("read from base");
+        assert_eq!(v, 9.0);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_uses_contiguous_stride_at_insertion_point() {
+        // shape [3,4], .unsqueeze(axes![0,1]) -> shape [1,3,1,4]
+        // strides should be [12,4,4,1] (from contiguous_strides([1,3,1,4]))
+        // flat_offset([0,1,0,2]) = 0*12 + 1*4 + 0*4 + 2*1 = 6
+        let (root, tensor) = create_dense(
+            "unsqueeze_uses_contiguous_stride_at_insertion_point",
+            shape![3, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let unsqueezed = view
+            .unsqueeze(axes![0, 1])
+            .expect("unsqueeze must be supported");
+        assert_eq!(unsqueezed.shape(), &[1, 3, 1, 4]);
+
+        // Verify expected strides via flat_offset calculations
+        // flat_offset([0,1,0,2]) should be 1*4 + 2*1 = 6
+        assert_eq!(
+            unsqueezed.flat_offset(&[0, 1, 0, 2]).expect("offset"),
+            6,
+            "flat_offset([0,1,0,2])"
+        );
+        assert_eq!(
+            unsqueezed.flat_offset(&[0, 2, 0, 3]).expect("offset"),
+            2 * 4 + 3,
+            "flat_offset([0,2,0,3])"
+        );
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_then_reshape_preserves_contiguity() {
+        // shape [3,4], .unsqueeze(axes![0]) -> shape [1,3,4]
+        // then .reshape(shape![12]) should succeed (contiguity is preserved)
+        let (root, tensor) = create_dense(
+            "unsqueeze_then_reshape_preserves_contiguity",
+            shape![3, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+        let unsqueezed = view
+            .unsqueeze(axes![0])
+            .expect("unsqueeze must be supported");
+        assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
+
+        // This should succeed, proving contiguity is preserved
+        let reshaped = unsqueezed
+            .reshape(shape![12])
+            .expect("reshape after unsqueeze must succeed");
+        assert_eq!(reshaped.shape(), &[12]);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_before_first_middle_and_last_original_axis() {
+        // shape [2,3,4], test unsqueeze at positions 0, 1, 2
+        let (root, tensor) = create_dense(
+            "unsqueeze_before_first_middle_and_last_original_axis",
+            shape![2, 3, 4],
+            1000,
+        )
+        .await;
+        let view = tensor.view();
+
+        let unsqueeze_first = view.clone().unsqueeze(axes![0]).expect("unsqueeze at 0");
+        assert_eq!(unsqueeze_first.shape(), &[1, 2, 3, 4]);
+
+        let unsqueeze_middle = view.clone().unsqueeze(axes![1]).expect("unsqueeze at 1");
+        assert_eq!(unsqueeze_middle.shape(), &[2, 1, 3, 4]);
+
+        let unsqueeze_last = view.clone().unsqueeze(axes![2]).expect("unsqueeze at 2");
+        assert_eq!(unsqueeze_last.shape(), &[2, 3, 1, 4]);
+
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_empty_axes_rejected() {
+        let (root, tensor) =
+            create_dense("unsqueeze_empty_axes_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.unsqueeze(axes![]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_duplicate_axis_rejected() {
+        let (root, tensor) =
+            create_dense("unsqueeze_duplicate_axis_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(
+            view.unsqueeze(axes![0, 0]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_axis_out_of_bounds_rejected() {
+        let (root, tensor) =
+            create_dense("unsqueeze_axis_out_of_bounds_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        // shape is rank 2, so valid axes are 0,1 only
+        assert!(matches!(
+            view.clone().unsqueeze(axes![2]),
+            Err(Error::InvalidLayout(_))
+        ));
+        assert!(matches!(
+            view.unsqueeze(axes![3]),
+            Err(Error::InvalidLayout(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_write_through_roundtrip() {
+        // shape [3,4], .unsqueeze(axes![0]) -> shape [1,3,4]
+        // write_value at [0,1,2] should write to [1,2] on base tensor
+        let (root, tensor) =
+            create_dense("unsqueeze_write_through_roundtrip", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let unsqueezed = view
+            .unsqueeze(axes![0])
+            .expect("unsqueeze must be supported");
+        assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
+
+        unsqueezed
+            .write_value(&[0, 1, 2], 9.0)
+            .await
+            .expect("write");
+        let v = tensor.read_value(&[1, 2]).await.expect("read from base");
+        assert_eq!(v, 9.0);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_then_unsqueeze_round_trip() {
+        // shape [3,1,4], squeeze axis 1 -> [3,4]
+        // then unsqueeze axes![1] -> [3,1,4]
+        // assert flat_offset for all coordinates matches original
+        let shape = shape![3, 1, 4];
+        let (root, tensor) =
+            create_dense("squeeze_then_unsqueeze_round_trip", shape.clone(), 1000).await;
+        let view = tensor.view();
+        let squeezed = view
+            .clone()
+            .squeeze(axes![1])
+            .expect("squeeze must be supported");
+        assert_eq!(squeezed.shape(), &[3, 4]);
+
+        let restored = squeezed
+            .unsqueeze(axes![1])
+            .expect("unsqueeze must be supported");
+        assert_eq!(restored.shape(), &[3, 1, 4]);
+
+        // Verify flat_offset matches for all coordinates
+        let coords = row_major_coords(&shape).expect("coords");
+        for c in coords {
+            assert_eq!(
+                restored.flat_offset(&c).expect("restored offset"),
+                view.flat_offset(&c).expect("original offset"),
+                "{:?}",
+                c
+            );
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_then_squeeze_round_trip() {
+        // shape [3,4], unsqueeze axes![0] -> [1,3,4]
+        // then squeeze axes![0] -> [3,4]
+        // assert flat_offset for all coordinates matches original
+        let shape = shape![3, 4];
+        let (root, tensor) =
+            create_dense("unsqueeze_then_squeeze_round_trip", shape.clone(), 1000).await;
+        let view = tensor.view();
+        let unsqueezed = view
+            .clone()
+            .unsqueeze(axes![0])
+            .expect("unsqueeze must be supported");
+        assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
+
+        let restored = unsqueezed
+            .squeeze(axes![0])
+            .expect("squeeze must be supported");
+        assert_eq!(restored.shape(), &[3, 4]);
+
+        // Verify flat_offset matches for all coordinates
+        let coords = row_major_coords(&shape).expect("coords");
+        for c in coords {
+            assert_eq!(
+                restored.flat_offset(&c).expect("restored offset"),
+                view.flat_offset(&c).expect("original offset"),
+                "{:?}",
+                c
+            );
+        }
         cleanup(&root).await;
     }
 }

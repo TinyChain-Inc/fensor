@@ -932,7 +932,7 @@ mod section_c_new_transforms {
 
         let unsqueezed = tensor
             .view()
-            .unsqueeze(axes![0, 2])
+            .unsqueeze(axes![0, 1])
             .expect("unsqueeze must be supported");
         assert_eq!(unsqueezed.shape(), &[1, 3, 1, 4]);
 
@@ -962,6 +962,358 @@ mod section_c_new_transforms {
             matches!(err, Error::InvalidLayout(_) | Error::Unsupported(_)),
             "got {err:?}"
         );
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_removes_size_one_axes_sparse() {
+        let (root, tensor, _) = create_sparse(
+            "c_squeeze_sparse",
+            shape![1, 3, 1, 4],
+            shape![1, 1, 1],
+            Some(0),
+        )
+        .await;
+        seed_values(&tensor).await;
+
+        let squeezed = tensor
+            .view()
+            .squeeze(axes![0, 2])
+            .expect("squeeze must be supported");
+        assert_eq!(squeezed.shape(), &[3, 4]);
+
+        for b in 0..3u64 {
+            for c in 0..4u64 {
+                let v = squeezed.read_value(&[b, c]).await.expect("squeezed read");
+                assert_eq!(v, encode_value(&[0, b, 0, c]), "coord [{},{c}]", b);
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_inserts_size_one_axes_sparse() {
+        let (root, tensor, _) = create_sparse(
+            "c_unsqueeze_sparse",
+            shape![2, 3, 4],
+            shape![1, 1, 4],
+            Some(0),
+        )
+        .await;
+        seed_values(&tensor).await;
+
+        let unsqueezed = tensor
+            .view()
+            .unsqueeze(axes![0, 2])
+            .expect("unsqueeze must be supported");
+        assert_eq!(unsqueezed.shape(), &[1, 2, 3, 1, 4]);
+
+        for a in 0..2u64 {
+            for b in 0..3u64 {
+                for c in 0..4u64 {
+                    let v = unsqueezed
+                        .read_value(&[0, a, b, 0, c])
+                        .await
+                        .expect("unsqueezed read");
+                    assert_eq!(v, encode_value(&[a, b, c]), "coord [0,{},{},0,{}]", a, b, c);
+                }
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_duplicate_axis_rejected() {
+        let (root, tensor, _) =
+            create_dense("c_squeeze_dup", shape![2, 3, 4], shape![1, 1, 1]).await;
+        let err = tensor
+            .view()
+            .squeeze(axes![1, 1])
+            .err()
+            .expect("must reject duplicate axis");
+        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_axis_out_of_bounds_rejected() {
+        let (root, tensor, _) =
+            create_dense("c_squeeze_oob", shape![2, 3, 4], shape![1, 1, 1]).await;
+        let err = tensor
+            .view()
+            .squeeze(axes![5])
+            .err()
+            .expect("must reject out of bounds");
+        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_duplicate_axis_rejected() {
+        let (root, tensor, _) = create_dense("c_unsqueeze_dup", shape![3, 4], shape![1, 1]).await;
+        let err = tensor
+            .view()
+            .unsqueeze(axes![0, 0])
+            .err()
+            .expect("must reject duplicate axis");
+        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_axis_out_of_bounds_rejected() {
+        let (root, tensor, _) = create_dense("c_unsqueeze_oob", shape![3, 4], shape![1, 1]).await;
+        // For rank-2 tensor, valid axes are 0,1 only
+        let err2 = tensor
+            .view()
+            .unsqueeze(axes![2])
+            .err()
+            .expect("must reject axis 2");
+        assert!(matches!(err2, Error::InvalidLayout(_)), "got {err2:?}");
+
+        let err3 = tensor
+            .view()
+            .unsqueeze(axes![3])
+            .err()
+            .expect("must reject axis 3");
+        assert!(matches!(err3, Error::InvalidLayout(_)), "got {err3:?}");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_empty_axes_rejected() {
+        let (root, tensor, _) =
+            create_dense("c_squeeze_empty", shape![3, 1, 4], shape![1, 1, 1]).await;
+        let err = tensor
+            .view()
+            .squeeze(axes![])
+            .err()
+            .expect("must reject empty axes");
+        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn unsqueeze_empty_axes_rejected() {
+        let (root, tensor, _) = create_dense("c_unsqueeze_empty", shape![3, 4], shape![1, 1]).await;
+        let err = tensor
+            .view()
+            .unsqueeze(axes![])
+            .err()
+            .expect("must reject empty axes");
+        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_all_axes_rejected() {
+        let (root, tensor, _) = create_dense("c_squeeze_all", shape![1, 1], shape![1, 1]).await;
+        let err = tensor
+            .view()
+            .squeeze(axes![0, 1])
+            .err()
+            .expect("must reject squeezing all axes");
+        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        cleanup(&root).await;
+    }
+}
+
+// ====================================================================
+// Section C2 — Squeeze/Unsqueeze chaining with other transforms
+// ====================================================================
+
+mod section_c2_squeeze_unsqueeze_chains {
+    use super::*;
+
+    #[tokio::test]
+    async fn chained_slice_then_squeeze_vs_squeeze_then_slice() {
+        // shape [2,1,3,4] (size-1 axis at original position 1)
+        let (root, tensor, _) =
+            create_dense("c2_slice_squeeze", shape![2, 1, 3, 4], shape![1, 1, 1]).await;
+        seed_values(&tensor).await;
+
+        // Path (a): slice then squeeze
+        let sliced_a = tensor
+            .view()
+            .slice(range![
+                AxisRange::In(0, 2, 1),
+                AxisRange::In(0, 1, 1),
+                AxisRange::In(0, 3, 1),
+                AxisRange::In(0, 4, 1)
+            ])
+            .expect("slice");
+        let squeezed_a = sliced_a.squeeze(axes![1]).expect("squeeze");
+
+        // Path (b): squeeze then slice
+        let squeezed_b = tensor.view().squeeze(axes![1]).expect("squeeze");
+        let sliced_b = squeezed_b
+            .slice(range![
+                AxisRange::In(0, 2, 1),
+                AxisRange::In(0, 3, 1),
+                AxisRange::In(0, 4, 1)
+            ])
+            .expect("slice");
+
+        assert_eq!(squeezed_a.shape(), sliced_b.shape());
+        for coord in iter_coords(squeezed_a.shape()) {
+            let v_a = squeezed_a.read_value(&coord).await.expect("read a");
+            let v_b = sliced_b.read_value(&coord).await.expect("read b");
+            assert_eq!(v_a, v_b, "coord {:?}", coord);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn chained_unsqueeze_then_transpose_dense() {
+        // shape [2,3,4], .unsqueeze(axes![1]) -> [2,1,3,4]
+        // then .transpose(Some(axes![0,3,1,2])) -> [2,4,1,3]
+        let (root, tensor, _) =
+            create_dense("c2_unsqueeze_transpose", shape![2, 3, 4], shape![1, 1, 4]).await;
+        seed_values(&tensor).await;
+
+        let unsqueezed = tensor.view().unsqueeze(axes![1]).expect("unsqueeze");
+        assert_eq!(unsqueezed.shape(), &[2, 1, 3, 4]);
+
+        let transposed = unsqueezed
+            .transpose(Some(axes![0, 3, 1, 2]))
+            .expect("transpose");
+        assert_eq!(transposed.shape(), &[2, 4, 1, 3]);
+
+        // Verify reads: transposed[a,c,0,b] should equal original [a,b,c]
+        for a in 0..2u64 {
+            for b in 0..3u64 {
+                for c in 0..4u64 {
+                    let v = transposed.read_value(&[a, c, 0, b]).await.expect("read");
+                    let expected = encode_value(&[a, b, c]);
+                    assert_eq!(v, expected, "coord [{},{},0,{}]", a, c, b);
+                }
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn chained_unsqueeze_then_flip_is_noop_on_new_axis() {
+        // shape [2,3,4], .unsqueeze(axes![1]) -> [2,1,3,4]
+        // then .flip(1) (flip the new size-1 axis, which is a no-op)
+        let (root, tensor, _) =
+            create_dense("c2_unsqueeze_flip", shape![2, 3, 4], shape![1, 1, 4]).await;
+        seed_values(&tensor).await;
+
+        let unsqueezed = tensor.view().unsqueeze(axes![1]).expect("unsqueeze");
+        let flipped = unsqueezed.clone().flip(1).expect("flip");
+
+        // Flipping a dim-1 axis is a no-op, so reads should be identical
+        for coord in iter_coords(unsqueezed.shape()) {
+            let v_unflipped = unsqueezed.read_value(&coord).await.expect("read unflipped");
+            let v_flipped = flipped.read_value(&coord).await.expect("read flipped");
+            assert_eq!(v_flipped, v_unflipped, "coord {:?}", coord);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn chained_unsqueeze_then_broadcast() {
+        // shape [2,3,4], .unsqueeze(axes![0]) -> [1,2,3,4]
+        // then .broadcast([5,2,3,4]) (broadcast new axis from 1 to 5)
+        let (root, tensor, _) =
+            create_dense("c2_unsqueeze_broadcast", shape![2, 3, 4], shape![1, 1, 4]).await;
+        seed_values(&tensor).await;
+
+        let unsqueezed = tensor.view().unsqueeze(axes![0]).expect("unsqueeze");
+        let broadcasted = unsqueezed.broadcast(shape![5, 2, 3, 4]).expect("broadcast");
+        assert_eq!(broadcasted.shape(), &[5, 2, 3, 4]);
+
+        // Each k in 0..5 should read the same value as the original tensor at [a,b,c]
+        for k in 0..5u64 {
+            for a in 0..2u64 {
+                for b in 0..3u64 {
+                    for c in 0..4u64 {
+                        let v = broadcasted.read_value(&[k, a, b, c]).await.expect("read");
+                        let expected = encode_value(&[a, b, c]);
+                        assert_eq!(v, expected, "coord [{},{},{},{}]", k, a, b, c);
+                    }
+                }
+            }
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn chained_squeeze_then_reshape_dense() {
+        // shape [1,3,4], .squeeze(axes![0]) -> [3,4]
+        // then .reshape([12])
+        let (root, tensor, _) =
+            create_dense("c2_squeeze_reshape", shape![1, 3, 4], shape![1, 1]).await;
+        seed_values(&tensor).await;
+
+        let squeezed = tensor.view().squeeze(axes![0]).expect("squeeze");
+        assert_eq!(squeezed.shape(), &[3, 4]);
+
+        let reshaped = squeezed.reshape(shape![12]).expect("reshape");
+        assert_eq!(reshaped.shape(), &[12]);
+
+        // Verify values match row-major order
+        for idx in 0..12u64 {
+            let b = idx / 4;
+            let c = idx % 4;
+            let v = reshaped.read_value(&[idx]).await.expect("read");
+            let expected = encode_value(&[0, b, c]);
+            assert_eq!(v, expected, "idx={}", idx);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn chained_unsqueeze_then_reshape_dense() {
+        // shape [2,3,4], .unsqueeze(axes![0]) -> [1,2,3,4]
+        // then .reshape([24])
+        let (root, tensor, _) =
+            create_dense("c2_unsqueeze_reshape", shape![2, 3, 4], shape![1, 1, 4]).await;
+        seed_values(&tensor).await;
+
+        let unsqueezed = tensor.view().unsqueeze(axes![0]).expect("unsqueeze");
+        assert_eq!(unsqueezed.shape(), &[1, 2, 3, 4]);
+
+        let reshaped = unsqueezed.reshape(shape![24]).expect("reshape");
+        assert_eq!(reshaped.shape(), &[24]);
+
+        // Verify values match row-major order
+        for idx in 0..24u64 {
+            let a = (idx / 12) % 2;
+            let b = (idx / 4) % 3;
+            let c = idx % 4;
+            let v = reshaped.read_value(&[idx]).await.expect("read");
+            let expected = encode_value(&[a, b, c]);
+            assert_eq!(v, expected, "idx={}", idx);
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn squeeze_then_unsqueeze_round_trip_sparse() {
+        // sparse shape [3,1,4], squeeze axis 1 then unsqueeze back
+        let (root, tensor, _) = create_sparse(
+            "c2_squeeze_unsqueeze_sparse",
+            shape![3, 1, 4],
+            shape![1, 1],
+            Some(0),
+        )
+        .await;
+        seed_values(&tensor).await;
+
+        let squeezed = tensor.view().squeeze(axes![1]).expect("squeeze");
+        assert_eq!(squeezed.shape(), &[3, 4]);
+
+        let restored = squeezed.unsqueeze(axes![1]).expect("unsqueeze");
+        assert_eq!(restored.shape(), &[3, 1, 4]);
+
+        // Verify every coordinate reads the original tensor's value
+        for coord in iter_coords(tensor.shape()) {
+            let v_orig = tensor.read_value(&coord).await.expect("read orig");
+            let v_restored = restored.read_value(&coord).await.expect("read restored");
+            assert_eq!(v_restored, v_orig, "coord {:?}", coord);
+        }
         cleanup(&root).await;
     }
 }
