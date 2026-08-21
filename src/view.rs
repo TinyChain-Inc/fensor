@@ -378,6 +378,12 @@ where
             }
         }
 
+        if new_shape.iter().any(|&dim| dim == 0) {
+            return Err(Error::InvalidLayout(
+                "slice produced a zero-extent axis".to_string(),
+            ));
+        }
+
         Ok(Self {
             tensor: self.tensor,
             base_offset: new_base_offset,
