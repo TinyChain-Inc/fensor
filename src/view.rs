@@ -223,6 +223,14 @@ fn slice_bound_of(
     }
 }
 
+fn flip_axis_contrib(current: &AxisContrib, dim: usize) -> (i64, AxisContrib) {
+    match current {
+        AxisContrib::Stride(s) => (((dim as i64) - 1) * s, AxisContrib::Stride(-s)),
+        AxisContrib::Broadcast(c) => (0, AxisContrib::Broadcast(*c)),
+        AxisContrib::Gather(g) => (0, AxisContrib::Gather(g.iter().rev().copied().collect())),
+    }
+}
+
 impl<'t, FE, T> TensorGeometry for TensorView<'t, FE, T>
 where
     FE: TensorFileEntry<T>,
@@ -410,6 +418,28 @@ where
             shape,
         })
     }
+
+    fn flip(self, axis: usize) -> Result<Self> {
+        if axis >= self.shape.len() {
+            return Err(Error::InvalidLayout(format!(
+                "flip axis {axis} is out of bounds for rank {}",
+                self.shape.len()
+            )));
+        }
+
+        let dim = self.shape[axis];
+        let (offset_delta, new_axis) = flip_axis_contrib(&self.axes[axis], dim);
+
+        let mut axes = self.axes;
+        axes[axis] = new_axis;
+
+        Ok(Self {
+            tensor: self.tensor,
+            base_offset: self.base_offset + offset_delta,
+            axes,
+            shape: self.shape,
+        })
+    }
 }
 
 impl<'t, FE, T> TensorRead for TensorView<'t, FE, T>
@@ -458,7 +488,8 @@ mod tests {
     use ha_ndarray::{AxisRange, axes, range, shape};
     use safecast::as_type;
 
-    use crate::{DType, Error, Layout, Tensor, TensorSchema};
+    use crate::schema::row_major_coords;
+use crate::{DType, Error, Layout, Tensor, TensorSchema};
 
     use super::*;
 
@@ -1024,6 +1055,120 @@ mod tests {
                 );
             }
         }
+        cleanup(&root).await;
+    }
+
+    // -- flip --------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn flip_stride_axis_reverses_offset() {
+        // [4,5,6], strides [30,6,1]; flip axis 2 (dim 6, stride 1) -> offset_delta=5, Stride(-1)
+        // flat_offset([0,0,0]) = 5 + 0*(-1) = 5; flat_offset([0,0,5]) = 5 + 5*(-1) = 0
+        let (root, tensor) =
+            create_dense("flip_stride_axis_reverses_offset", shape![4, 5, 6], 1000).await;
+        let view = tensor.view();
+        let flipped = view.flip(2).expect("flip");
+        assert_eq!(flipped.flat_offset(&[0, 0, 0]).expect("offset"), 5);
+        assert_eq!(flipped.flat_offset(&[0, 0, 5]).expect("offset"), 0);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn flip_then_flip_is_identity() {
+        // flipping the same axis twice restores the original Stride and base_offset
+        let shape = shape![4, 5, 6];
+        let (root, tensor) = create_dense("flip_then_flip_is_identity", shape.clone(), 1000).await;
+        let view = tensor.view();
+        let flipped_twice = view
+            .clone()
+            .flip(2)
+            .expect("flip")
+            .flip(2)
+            .expect("flip again");
+        let coords = row_major_coords(&shape).expect("coords for shape");
+
+        for c in coords {
+            assert_eq!(
+                flipped_twice.flat_offset(&c).expect("offset"),
+                view.flat_offset(&c).expect("offset"),
+                "{c:?}"
+            );
+        }
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn flip_on_broadcast_axis_is_noop() {
+        // [1,4] broadcast to [3,4]: axis 0 becomes Broadcast(0); flip axis 0 leaves it unchanged
+        let (root, tensor) = create_dense("flip_on_broadcast_axis_is_noop", shape![1, 4], 1000).await;
+        let view = tensor.view();
+        let broadcasted = view
+            .broadcast(shape![3, 4])
+            .expect("broadcast must be supported");
+        let before: Vec<i64> = (0..3u64)
+            .map(|x| broadcasted.flat_offset(&[x, 2]).expect("offset"))
+            .collect();
+        let flipped = broadcasted.flip(0).expect("flip");
+        let after: Vec<i64> = (0..3u64)
+            .map(|x| flipped.flat_offset(&[x, 2]).expect("offset"))
+            .collect();
+        assert_eq!(before, after);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn flip_on_gather_axis_reverses_table() {
+        // [4,4], strides [4,1]. Of([1,3]) on axis 0 -> Gather([4,12]), shape [2,4]
+        // flip axis 0 reverses the table -> Gather([12,4])
+        let (root, tensor) = create_dense("flip_on_gather_axis_reverses_table", shape![4, 4], 1000).await;
+        let view = tensor.view();
+        let gathered = view
+            .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+            .expect("slice Of");
+        let before: Vec<i64> = (0..2u64)
+            .map(|a| gathered.flat_offset(&[a, 0]).expect("offset"))
+            .collect();
+        let flipped = gathered.flip(0).expect("flip");
+        let after: Vec<i64> = (0..2u64)
+            .map(|a| flipped.flat_offset(&[a, 0]).expect("offset"))
+            .collect();
+        let expected: Vec<i64> = before.into_iter().rev().collect();
+        assert_eq!(after, expected);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn flip_invalid_axis_out_of_bounds() {
+        let (root, tensor) = create_dense("flip_invalid_axis_out_of_bounds", shape![3, 4, 5], 1000).await;
+        let view = tensor.view();
+        assert!(matches!(view.flip(3), Err(Error::InvalidLayout(_))));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn flip_then_reshape_rejected() {
+        // flip axis 1 of [3,4]: axes=[Stride(4),Stride(-1)]; negative stride is never c-contiguous
+        let (root, tensor) = create_dense("flip_then_reshape_rejected", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let flipped = view.flip(1).expect("flip");
+        assert!(matches!(
+            flipped.reshape(shape![12]),
+            Err(Error::Unsupported(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn flip_write_through_roundtrip() {
+        // flip axis 1 (dim 4) of [3,4]; write through flipped[1,1] must land on tensor[1,2]
+        let (root, tensor) = create_dense("flip_write_through_roundtrip", shape![3, 4], 1000).await;
+        let view = tensor.view();
+        let flipped = view.flip(1).expect("flip");
+        flipped
+            .write_value(&[1, 1], 9.0)
+            .await
+            .expect("write through flipped");
+        assert_eq!(tensor.read_value(&[1, 2]).await.expect("base read"), 9.0);
         cleanup(&root).await;
     }
 
