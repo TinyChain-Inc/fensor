@@ -489,7 +489,7 @@ mod tests {
     use safecast::as_type;
 
     use crate::schema::row_major_coords;
-use crate::{DType, Error, Layout, Tensor, TensorSchema};
+    use crate::{DType, Error, Layout, Tensor, TensorSchema};
 
     use super::*;
 
@@ -1100,7 +1100,8 @@ use crate::{DType, Error, Layout, Tensor, TensorSchema};
     #[tokio::test]
     async fn flip_on_broadcast_axis_is_noop() {
         // [1,4] broadcast to [3,4]: axis 0 becomes Broadcast(0); flip axis 0 leaves it unchanged
-        let (root, tensor) = create_dense("flip_on_broadcast_axis_is_noop", shape![1, 4], 1000).await;
+        let (root, tensor) =
+            create_dense("flip_on_broadcast_axis_is_noop", shape![1, 4], 1000).await;
         let view = tensor.view();
         let broadcasted = view
             .broadcast(shape![3, 4])
@@ -1120,7 +1121,8 @@ use crate::{DType, Error, Layout, Tensor, TensorSchema};
     async fn flip_on_gather_axis_reverses_table() {
         // [4,4], strides [4,1]. Of([1,3]) on axis 0 -> Gather([4,12]), shape [2,4]
         // flip axis 0 reverses the table -> Gather([12,4])
-        let (root, tensor) = create_dense("flip_on_gather_axis_reverses_table", shape![4, 4], 1000).await;
+        let (root, tensor) =
+            create_dense("flip_on_gather_axis_reverses_table", shape![4, 4], 1000).await;
         let view = tensor.view();
         let gathered = view
             .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
@@ -1139,7 +1141,8 @@ use crate::{DType, Error, Layout, Tensor, TensorSchema};
 
     #[tokio::test]
     async fn flip_invalid_axis_out_of_bounds() {
-        let (root, tensor) = create_dense("flip_invalid_axis_out_of_bounds", shape![3, 4, 5], 1000).await;
+        let (root, tensor) =
+            create_dense("flip_invalid_axis_out_of_bounds", shape![3, 4, 5], 1000).await;
         let view = tensor.view();
         assert!(matches!(view.flip(3), Err(Error::InvalidLayout(_))));
         cleanup(&root).await;
