@@ -5,6 +5,7 @@ use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
 use futures::StreamExt as _;
+use ha_ndarray::Range;
 use safecast::AsType;
 
 use crate::error::{Error, Result};
@@ -627,13 +628,26 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Unsupported bulk traits (trait-surface wiring only)
+// TensorReadBulk / TensorWriteBulk impls
 // ---------------------------------------------------------------------------
 impl<FE, T> TensorReadBulk for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
+    fn read_values<'a>(&'a self, range: Range) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
+        Box::pin(async move {
+            let mut values = Vec::new();
+            for coord in validate::iter_range_coords(self.shape(), &range)? {
+                values.push(self.read_value(&coord).await?);
+            }
+            Ok(values)
+        })
+    }
+
+    fn read_all<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
+        Box::pin(async move { self.read_values(validate::full_range(self.shape())).await })
+    }
 }
 
 impl<FE, T> TensorWriteBulk for Tensor<FE, T>
@@ -641,6 +655,60 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
+    fn write_values<'a>(
+        &'a self,
+        range: Range,
+        values: Vec<Self::DType>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let coords: Vec<Vec<u64>> =
+                validate::iter_range_coords(self.shape(), &range)?.collect();
+            if coords.len() != values.len() {
+                return Err(Error::DataMismatch(format!(
+                    "expected {} values for range but got {}",
+                    coords.len(),
+                    values.len()
+                )));
+            }
+            for (coord, value) in coords.into_iter().zip(values) {
+                self.write_value(&coord, value).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn write_tensor<'a, Src>(&'a self, other: &'a Src) -> BoxFuture<'a, Result<()>>
+    where
+        Src: TensorRead<DType = Self::DType> + Sync + ?Sized,
+    {
+        Box::pin(async move {
+            if self.shape() != other.shape() {
+                return Err(Error::InvalidLayout(format!(
+                    "cannot write tensor of shape {:?} into tensor of shape {:?}",
+                    other.shape(),
+                    self.shape()
+                )));
+            }
+            for coord in
+                validate::iter_range_coords(self.shape(), &validate::full_range(self.shape()))?
+            {
+                let value = other.read_value(&coord).await?;
+                self.write_value(&coord, value).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn fill<'a>(&'a self, value: Self::DType) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            for coord in
+                validate::iter_range_coords(self.shape(), &validate::full_range(self.shape()))?
+            {
+                self.write_value(&coord, value).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
