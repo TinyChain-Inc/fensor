@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use futures::Stream;
 use ha_ndarray::{Axes, Range, Shape};
 
 use crate::schema::{DType, Layout};
@@ -39,7 +40,9 @@ pub trait TensorArray: TensorGeometry {
     }
 }
 
-type OrderedSparseElements<ET> = Vec<(Vec<u64>, ET)>;
+/// A lazily-produced, row-major-ordered stream of populated sparse elements.
+pub type SparseElementStream<'a, ET> =
+    Pin<Box<dyn Stream<Item = Result<(Vec<u64>, ET)>> + Send + 'a>>;
 
 /// Async value reads aligned with ndarray coordinate semantics.
 pub trait TensorRead: TensorGeometry {
@@ -49,7 +52,7 @@ pub trait TensorRead: TensorGeometry {
         &'a self,
         _range: Range,
         requested_order: Axes,
-    ) -> BoxFuture<'a, Result<OrderedSparseElements<Self::DType>>> {
+    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
         let base_order = (0..self.ndim()).collect::<Vec<_>>();
         let requested_order = requested_order.into_iter().collect::<Vec<_>>();
 

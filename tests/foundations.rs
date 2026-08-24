@@ -11,33 +11,6 @@ use ha_ndarray::{Axes, AxisRange, Range, Shape, Strides, axes, range, shape};
 
 mod common;
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    fn noop_raw_waker() -> RawWaker {
-        fn clone(_: *const ()) -> RawWaker {
-            noop_raw_waker()
-        }
-        fn wake(_: *const ()) {}
-        fn wake_by_ref(_: *const ()) {}
-        fn drop(_: *const ()) {}
-
-        RawWaker::new(
-            std::ptr::null(),
-            &RawWakerVTable::new(clone, wake, wake_by_ref, drop),
-        )
-    }
-
-    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
-    let mut cx = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-
-    loop {
-        match Future::poll(Pin::as_mut(&mut future), &mut cx) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
-}
-
 #[derive(Clone)]
 struct TestTensor {
     schema: TensorSchema,
@@ -258,10 +231,10 @@ fn iter_coords(shape: &[usize]) -> Vec<Vec<u64>> {
     out
 }
 
-fn seed_values(tensor: &TestTensor) {
+async fn seed_values(tensor: &TestTensor) {
     for coord in iter_coords(tensor.schema.shape()) {
         let value = (coord[0] * 100 + coord[1] * 10 + coord[2]) as f32;
-        block_on(tensor.write_value(&coord, value)).expect("write value");
+        tensor.write_value(&coord, value).await.expect("write value");
     }
 }
 
@@ -274,28 +247,28 @@ fn transpose_range(range: &Range, permutation: &[usize]) -> Range {
     remapped.into()
 }
 
-#[test]
-fn accessor_coordinate_offset_and_read_write_dense() {
+#[tokio::test]
+async fn accessor_coordinate_offset_and_read_write_dense() {
     let tensor = TestTensor::new(Layout::Dense);
 
     assert_eq!(tensor.linear_offset(&[1, 2, 3]), 23);
 
-    block_on(tensor.write_value(&[1, 2, 3], 7.5)).expect("write");
-    block_on(tensor.write_value(&[0, 0, 0], 1.25)).expect("write");
+    tensor.write_value(&[1, 2, 3], 7.5).await.expect("write");
+    tensor.write_value(&[0, 0, 0], 1.25).await.expect("write");
 
-    let v_a = block_on(tensor.read_value(&[1, 2, 3])).expect("read");
-    let v_b = block_on(tensor.read_value(&[0, 0, 0])).expect("read");
-    let v_c = block_on(tensor.read_value(&[1, 1, 1])).expect("read");
+    let v_a = tensor.read_value(&[1, 2, 3]).await.expect("read");
+    let v_b = tensor.read_value(&[0, 0, 0]).await.expect("read");
+    let v_c = tensor.read_value(&[1, 1, 1]).await.expect("read");
 
     assert_eq!(v_a, 7.5);
     assert_eq!(v_b, 1.25);
     assert_eq!(v_c, 0.0);
 }
 
-#[test]
-fn standalone_transpose_arbitrary_permutation() {
+#[tokio::test]
+async fn standalone_transpose_arbitrary_permutation() {
     let tensor = TestTensor::new(Layout::Dense);
-    seed_values(&tensor);
+    seed_values(&tensor).await;
 
     let perm = axes![2, 0, 1];
     let transposed = tensor
@@ -316,16 +289,16 @@ fn standalone_transpose_arbitrary_permutation() {
             src[old_axis] = t_coord[inverse[old_axis]];
         }
 
-        let expected = block_on(tensor.read_value(&src)).expect("read original");
-        let actual = block_on(transposed.read_value(&t_coord)).expect("read transposed");
+        let expected = tensor.read_value(&src).await.expect("read original");
+        let actual = transposed.read_value(&t_coord).await.expect("read transposed");
         assert_eq!(actual, expected, "coord {:?}", t_coord);
     }
 }
 
-#[test]
-fn standalone_slice_range_selection() {
+#[tokio::test]
+async fn standalone_slice_range_selection() {
     let tensor = TestTensor::new(Layout::Dense);
-    seed_values(&tensor);
+    seed_values(&tensor).await;
 
     let r: Range = range![
         AxisRange::In(0, 2, 1),
@@ -338,16 +311,16 @@ fn standalone_slice_range_selection() {
 
     for s_coord in iter_coords(sliced.shape()) {
         let src = vec![s_coord[0], s_coord[1] + 1, s_coord[2] * 2];
-        let expected = block_on(tensor.read_value(&src)).expect("read original");
-        let actual = block_on(sliced.read_value(&s_coord)).expect("read slice");
+        let expected = tensor.read_value(&src).await.expect("read original");
+        let actual = sliced.read_value(&s_coord).await.expect("read slice");
         assert_eq!(actual, expected, "coord {:?}", s_coord);
     }
 }
 
-#[test]
-fn composition_transpose_slice_and_slice_transpose_consistency() {
+#[tokio::test]
+async fn composition_transpose_slice_and_slice_transpose_consistency() {
     let tensor = TestTensor::new(Layout::Dense);
-    seed_values(&tensor);
+    seed_values(&tensor).await;
 
     let perm = axes![2, 0, 1];
     let r: Range = range![
@@ -374,14 +347,14 @@ fn composition_transpose_slice_and_slice_transpose_consistency() {
     assert_eq!(left.shape(), right.shape());
 
     for coord in iter_coords(left.shape()) {
-        let left_v = block_on(left.read_value(&coord)).expect("left read");
-        let right_v = block_on(right.read_value(&coord)).expect("right read");
+        let left_v = left.read_value(&coord).await.expect("left read");
+        let right_v = right.read_value(&coord).await.expect("right read");
         assert_eq!(left_v, right_v, "coord {:?}", coord);
     }
 }
 
-#[test]
-fn dense_sparse_parity_for_supported_operations() {
+#[tokio::test]
+async fn dense_sparse_parity_for_supported_operations() {
     let dense = TestTensor::new(Layout::Dense);
     let sparse = TestTensor::new(Layout::Sparse { axis: Some(1) });
 
@@ -395,13 +368,13 @@ fn dense_sparse_parity_for_supported_operations() {
     .collect();
 
     for (coord, value) in &writes {
-        block_on(dense.write_value(coord, *value)).expect("dense write");
-        block_on(sparse.write_value(coord, *value)).expect("sparse write");
+        dense.write_value(coord, *value).await.expect("dense write");
+        sparse.write_value(coord, *value).await.expect("sparse write");
     }
 
     for coord in iter_coords(dense.shape()) {
-        let d = block_on(dense.read_value(&coord)).expect("dense read");
-        let s = block_on(sparse.read_value(&coord)).expect("sparse read");
+        let d = dense.read_value(&coord).await.expect("dense read");
+        let s = sparse.read_value(&coord).await.expect("sparse read");
         assert_eq!(d, s, "base coord {:?}", coord);
     }
 
@@ -415,8 +388,8 @@ fn dense_sparse_parity_for_supported_operations() {
         .expect("transpose");
 
     for coord in iter_coords(permuted_dense.shape()) {
-        let d = block_on(permuted_dense.read_value(&coord)).expect("dense read");
-        let s = block_on(permuted_sparse.read_value(&coord)).expect("sparse read");
+        let d = permuted_dense.read_value(&coord).await.expect("dense read");
+        let s = permuted_sparse.read_value(&coord).await.expect("sparse read");
         assert_eq!(d, s, "transposed coord {:?}", coord);
     }
 
@@ -430,8 +403,8 @@ fn dense_sparse_parity_for_supported_operations() {
     let sliced_sparse = sparse.clone().slice(r).expect("slice");
 
     for coord in iter_coords(sliced_dense.shape()) {
-        let d = block_on(sliced_dense.read_value(&coord)).expect("dense read");
-        let s = block_on(sliced_sparse.read_value(&coord)).expect("sparse read");
+        let d = sliced_dense.read_value(&coord).await.expect("dense read");
+        let s = sliced_sparse.read_value(&coord).await.expect("sparse read");
         assert_eq!(d, s, "sliced coord {:?}", coord);
     }
 }
@@ -462,19 +435,21 @@ fn public_schema_contiguous_strides_match_expected() {
     );
 }
 
-#[test]
-fn sparse_incompatible_order_error_is_structured() {
+#[tokio::test]
+async fn sparse_incompatible_order_error_is_structured() {
     let tensor = TestTensor::new(Layout::Sparse { axis: None });
 
-    let err = block_on(tensor.read_sparse_elements_in_order(
+    let err = match tensor.read_sparse_elements_in_order(
         range![
             AxisRange::In(0, 2, 1),
             AxisRange::In(0, 3, 1),
             AxisRange::In(0, 4, 1)
         ],
         axes![2, 0, 1],
-    ))
-    .expect_err("expected unsupported sparse order");
+    ).await {
+        Ok(_) => panic!("expected unsupported sparse order"),
+        Err(err) => err
+    };
 
     match err {
         Error::UnsupportedSparseIterationOrder {

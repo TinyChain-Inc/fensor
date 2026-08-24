@@ -378,7 +378,7 @@ where
             }
         }
 
-        if new_shape.iter().any(|&dim| dim == 0) {
+        if new_shape.contains(&0) {
             return Err(Error::InvalidLayout(
                 "slice produced a zero-extent axis".to_string(),
             ));
@@ -486,8 +486,8 @@ where
         let mut axes_out = Vec::with_capacity(ndim - axes.len());
         let mut shape_out = Shape::with_capacity(ndim - axes.len());
 
-        for i in 0..ndim {
-            if remove[i] {
+        for (i, &removed) in remove.iter().enumerate().take(ndim) {
+            if removed {
                 base_offset += slice_bound_at(&self.axes[i], 1, 0, i)?;
             } else {
                 axes_out.push(self.axes[i].clone());
@@ -529,8 +529,8 @@ where
 
         let new_ndim = old_ndim + axes.len();
         let mut layout = Vec::with_capacity(new_ndim);
-        for i in 0..old_ndim {
-            if insert_before[i] {
+        for (i, &inserted) in insert_before.iter().enumerate().take(old_ndim) {
+            if inserted {
                 layout.push(None);
             }
             layout.push(Some(i));

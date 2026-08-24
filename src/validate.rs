@@ -159,3 +159,30 @@ impl Iterator for RangeCoords {
         Some(out)
     }
 }
+
+pub(crate) fn range_contains_coord(range: &Range, coord: &[u64]) -> Result<bool> {
+    if range.len() != coord.len() {
+        return Err(Error::InvalidCoord(
+            "incorrect number of coordinates".to_string(),
+        ));
+    }
+
+    for (axis_range, &c) in range.iter().zip(coord) {
+        let contained = match axis_range {
+            AxisRange::At(i) => c == *i as u64,
+            AxisRange::In(start, stop, step) => {
+                *step != 0
+                    && c >= *start as u64
+                    && c < *stop as u64
+                    && (c - *start as u64).is_multiple_of(*step as u64)
+            }
+            AxisRange::Of(indices) => indices.iter().any(|&i| i as u64 == c),
+        };
+
+        if !contained {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}

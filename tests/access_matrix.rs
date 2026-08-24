@@ -21,6 +21,7 @@ use fensor::{
     TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform,
     TensorViewSemantics, TensorWrite, TensorWriteBulk, contiguous_strides,
 };
+use futures::TryStreamExt;
 use ha_ndarray::{Axes, AxisRange, Range, Shape, axes, range, shape};
 
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
@@ -1620,7 +1621,7 @@ mod section_g_sparse_iteration {
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
         tensor.write_value(&[1, 0, 1], 4.0).await.expect("w");
 
-        let rows = tensor
+        let rows: Vec<(Vec<u64>, f32)> = tensor
             .read_sparse_elements_in_order(
                 range![
                     AxisRange::In(0, 2, 1),
@@ -1630,7 +1631,10 @@ mod section_g_sparse_iteration {
                 axes![0, 1, 2],
             )
             .await
-            .expect("compatible order must succeed");
+            .expect("compatible order must succeed")
+            .try_collect()
+            .await
+            .expect("stream must not error");
 
         assert_eq!(rows.len(), 3, "should yield exactly the written coords");
         // First coordinate in axis-0 order: [0,0,0]
@@ -1648,7 +1652,7 @@ mod section_g_sparse_iteration {
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
 
-        let rows = tensor
+        let rows: Vec<(Vec<u64>, f32)> = tensor
             .read_sparse_elements_in_order(
                 range![
                     AxisRange::In(1, 2, 1),
@@ -1658,7 +1662,10 @@ mod section_g_sparse_iteration {
                 axes![0, 1, 2],
             )
             .await
-            .expect("partial range supported");
+            .expect("partial range supported")
+            .try_collect()
+            .await
+            .expect("stream must not error");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, vec![1u64, 2, 3]);
@@ -1671,7 +1678,7 @@ mod section_g_sparse_iteration {
         let (root, tensor, _) =
             create_sparse("g_bad_order", shape![2, 3, 4], shape![1, 1, 4], Some(0)).await;
 
-        let err = tensor
+        let err = match tensor
             .read_sparse_elements_in_order(
                 range![
                     AxisRange::In(0, 2, 1),
@@ -1681,7 +1688,10 @@ mod section_g_sparse_iteration {
                 axes![2, 0, 1],
             )
             .await
-            .expect_err("incompatible order must fail");
+        {
+            Ok(_) => panic!("incompatible order must fail"),
+            Err(e) => e,
+        };
 
         match err {
             Error::UnsupportedSparseIterationOrder {
@@ -1727,10 +1737,10 @@ mod section_g_sparse_iteration {
             )
             .await;
 
-        // v1 may choose either: support this case OR return a structured
-        // `UnsupportedSparseIterationOrder` with a clear hint.
         match result {
-            Ok(rows) => {
+            Ok(stream) => {
+                let rows: Vec<(Vec<u64>, f32)> =
+                    stream.try_collect().await.expect("stream must not error");
                 assert_eq!(rows.len(), 2);
             }
             Err(Error::UnsupportedSparseIterationOrder { hint, .. }) => {

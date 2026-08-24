@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
 
@@ -5,7 +6,8 @@ use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
 use futures::StreamExt as _;
-use ha_ndarray::Range;
+use futures::stream;
+use ha_ndarray::{Axes, Range};
 use safecast::AsType;
 
 use crate::error::{Error, Result};
@@ -14,10 +16,10 @@ use crate::schema::{
     StorageSchema, TensorSchema,
 };
 use crate::traits::{
-    BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorRead, TensorReadBulk,
-    TensorSparseIndex, TensorWrite, TensorWriteBulk,
+    BoxFuture, SparseElementStream, TensorArray, TensorBlockStore, TensorGeometry, TensorRead,
+    TensorReadBulk, TensorSparseIndex, TensorWrite, TensorWriteBulk,
 };
-use crate::validate;
+use crate::validate::{self, validate_coord};
 use crate::view::TensorView;
 
 const BLOCKS: &str = "blocks";
@@ -109,6 +111,12 @@ enum SparseWriteAction {
     DeleteRow(u64),
     NoOp,
     CreateBlockAndWrite(u64),
+}
+
+struct SparseIterState<T> {
+    pending_blocks: VecDeque<(u64, u64)>,
+    buffered: VecDeque<(Vec<u64>, T)>,
+    range: Range,
 }
 
 #[derive(Clone)]
@@ -216,6 +224,42 @@ where
 
     pub(crate) fn grid_strides(&self) -> &[usize] {
         &self.storage.storage_schema().strides
+    }
+
+    pub(crate) fn grid_shape(&self) -> &[usize] {
+        &self.storage.storage_schema().shape
+    }
+
+    pub(crate) fn block_origin_from_grid_id(&self, block_grid_id: u64) -> Vec<u64> {
+        let block_shape = self.block_shape();
+        let grid_shape = self.grid_shape();
+        let grid_strides = self.grid_strides();
+
+        (0..block_shape.len())
+            .map(|axis| {
+                let grid_coord =
+                    (block_grid_id / grid_strides[axis] as u64) as usize % grid_shape[axis];
+                (grid_coord * block_shape[axis]) as u64
+            })
+            .collect()
+    }
+
+    pub(crate) fn base_coord_from_block_offset(
+        &self,
+        origin: &[u64],
+        offset_in_block: usize,
+    ) -> Vec<u64> {
+        let block_shape = self.block_shape();
+        let block_strides = self.block_strides();
+
+        origin
+            .iter()
+            .enumerate()
+            .map(|(axis, &start)| {
+                let local = (offset_in_block / block_strides[axis]) % block_shape[axis];
+                start + local as u64
+            })
+            .collect()
     }
 
     pub(crate) fn num_blocks(&self) -> u64 {
@@ -475,6 +519,94 @@ where
 
             validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
             Ok(block[offset_in_block])
+        })
+    }
+
+    fn read_sparse_elements_in_order<'a>(
+        &'a self,
+        range: Range,
+        requested_order: Axes,
+    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
+        Box::pin(async move {
+            let base_order: Vec<usize> = (0..self.ndim()).collect();
+            let requested_order: Vec<usize> = requested_order.into_iter().collect();
+
+            if requested_order != base_order {
+                return Err(Error::UnsupportedSparseIterationOrder {
+                    requested_order,
+                    base_order,
+                    hint: "materialize or perform external sort for incompatible order".to_string(),
+                });
+            }
+
+            if range.len() != self.ndim() {
+                return Err(Error::InvalidLayout(format!(
+                    "range has {} axes but tensor has {} dimensions",
+                    range.len(),
+                    self.ndim()
+                )));
+            }
+
+            let index = self.sparse_index()?;
+
+            let mut block_refs: Vec<(u64, u64)> = {
+                let guard = index.read().await;
+                let mut rows = guard.into_rows().await.map_err(Error::from)?;
+                let mut refs = Vec::new();
+                while let Some(row) = rows.next().await {
+                    let row = row.map_err(Error::from)?;
+                    refs.push((row[1], row[2]));
+                }
+                refs
+            };
+            block_refs.sort_by_key(|&(block_grid_id, _)| block_grid_id);
+
+            let state = SparseIterState {
+                pending_blocks: block_refs.into(),
+                buffered: VecDeque::new(),
+                range,
+            };
+
+            let elements = stream::unfold(state, move |mut state| async move {
+                loop {
+                    if let Some(item) = state.buffered.pop_front() {
+                        return Some((Ok(item), state));
+                    }
+
+                    let (block_grid_id, block_id) = state.pending_blocks.pop_front()?;
+
+                    let block = match self.read_block(block_id).await {
+                        Ok(Some(block)) => block,
+                        Ok(None) => {
+                            let err: Error =
+                                IoError::new(ErrorKind::NotFound, "Block is missing".to_string())
+                                    .into();
+                            return Some((Err(err), state));
+                        }
+                        Err(e) => return Some((Err(e), state)),
+                    };
+
+                    let origin = self.block_origin_from_grid_id(block_grid_id);
+                    for (offset_in_block, &value) in block.iter().enumerate() {
+                        if value == T::default() {
+                            continue;
+                        }
+
+                        let coord = self.base_coord_from_block_offset(&origin, offset_in_block);
+                        if let Err(err) = validate_coord(self.shape(), &coord) {
+                            return Some((Err(err), state));
+                        };
+
+                        match validate::range_contains_coord(&state.range, &coord) {
+                            Ok(true) => state.buffered.push_back((coord, value)),
+                            Ok(false) => {}
+                            Err(e) => return Some((Err(e), state)),
+                        }
+                    }
+                }
+            });
+
+            Ok(elements.boxed())
         })
     }
 }

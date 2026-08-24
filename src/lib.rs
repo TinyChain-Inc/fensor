@@ -14,8 +14,8 @@ pub use schema::{
 };
 pub use stream::{TensorViewDecoder, TensorViewEncoder};
 pub use traits::{
-    BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorMatMul, TensorMath,
-    TensorMathScalar, TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll,
+    BoxFuture, SparseElementStream, TensorArray, TensorBlockStore, TensorGeometry, TensorMatMul,
+    TensorMath, TensorMathScalar, TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll,
     TensorReduceBoolean, TensorSparseIndex, TensorTransform, TensorUnary, TensorViewSemantics,
     TensorWrite, TensorWriteBulk,
 };
