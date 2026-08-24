@@ -79,7 +79,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Gate: positive and negative tests cover arbitrary permutation + slicing combinations.
 
 2. **Sparse zero-write lifecycle contract.**
-   - Specify behavior for writing zero into sparse coordinates: row removal, tombstoning, or retained zero rows.
+   - Specify behavior for writing zero into sparse coordinates as row removal.
    - Ensure behavior is deterministic and documented; no silent policy drift.
    - Gate: tests assert index/block state transitions for nonzero->zero and zero->nonzero updates.
 
@@ -87,6 +87,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Validate metadata and block persistence across real `freqfs` reload boundaries.
    - Corruption and malformed metadata must fail closed with structured errors.
    - Gate: integration tests cover create->write->reload->read and corruption->error flows.
+   - Implemented: `Tensor::view_encoder()` and `TensorViewDecoder` provide a genuinely streaming serialization for a tensor's current view (identity or transformed, dense or sparse), with no full in-memory buffering on either side. The encoder lazily reads values from filesystem storage and emits only non-default payloads to the wire; the decoder writes arriving values directly to fresh independent base tensor storage. There is no trailer or checksum: success is natural exhaustion of the pairs sequence, and end-to-end transfer completeness/integrity is a transport/caller concern rather than something this wire format re-verifies itself. A sender-side read failure propagates as a bounded error-code sentinel (a closed classification of the failure shape, with no free-text/sender-internal detail such as filesystem paths); that sentinel, a malformed/truncated stream, or any other decode-time error triggers fail-closed behaviour with clear error propagation. Reconstruction always produces a fresh, independent identity base tensor with no link back to the source storage. This is a distinct, additive wire surface alongside the existing schema-only `Tensor: ToStream/FromStream` contract, not a replacement for it; it does not by itself satisfy the "Phase 5: Conversion and materialization" `Dense <-> Sparse` conversion exit criteria below, since it always preserves the source's layout category.
 
 4. **Base/view write-through semantics.**
    - Define which transformed tensors are writable and which are read-only.
@@ -155,6 +156,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 - **Adaptive block sizing.** Evaluate configurable or data-driven block sizing after baseline persistence semantics are stable.
 - **Typed tensor families.** Expand beyond `f32` once core lifecycle and sparse-index behavior are validated.
 - **Cross-host sharding hooks.** Keep routing/sharding orchestration in client libraries while exposing reusable shard-local primitives in `fensor`.
+- **Encode-side enumeration optimization.** Encode-side view streaming currently walks every logical coordinate and filters defaults at the codec layer. A future optimization could use sparse-index row enumeration and filesystem directory listing to skip known-empty storage regions entirely, reducing I/O cost for extremely sparse large tensors — but this requires solving how to invert arbitrary view transforms (some non-closed-form) back to base storage coordinates, which is out of scope for now.
 
 ## ha-ndarray execution dependency acknowledgement
 

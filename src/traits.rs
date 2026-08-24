@@ -1,36 +1,24 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use futures::Stream;
 use ha_ndarray::{Axes, Range, Shape};
 
-use crate::schema::{DType, Layout, TensorSchema};
-use crate::{Error, Result};
+use crate::schema::{DType, Layout};
+use crate::validate;
+use crate::{Error, Result, TensorSchema};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A minimal ndarray-like semantic surface for filesystem-backed tensors.
-pub trait TensorArray: Send + Sync {
+/// Minimal shape/dtype surface shared by base tensors AND their views.
+pub trait TensorGeometry: Send + Sync {
     type DType: Copy + Send + Sync + 'static;
-
-    fn schema(&self) -> &TensorSchema;
 
     fn dtype(&self) -> Self::DType;
 
-    fn schema_dtype(&self) -> DType {
-        self.schema().dtype()
-    }
+    fn layout(&self) -> Layout;
 
-    fn shape(&self) -> &[usize] {
-        self.schema().shape()
-    }
-
-    fn layout(&self) -> &Layout {
-        self.schema().layout()
-    }
-
-    fn strides(&self) -> &[usize] {
-        self.schema().strides()
-    }
+    fn shape(&self) -> &[usize];
 
     fn ndim(&self) -> usize {
         self.shape().len()
@@ -41,15 +29,30 @@ pub trait TensorArray: Send + Sync {
     }
 }
 
+/// Adds the persistent, storage-backed schema -- implemented ONLY by base tensors.
+pub trait TensorArray: TensorGeometry {
+    fn schema(&self) -> &TensorSchema;
+
+    fn strides(&self) -> &[usize];
+
+    fn schema_dtype(&self) -> DType {
+        self.schema().dtype()
+    }
+}
+
+/// A lazily-produced, row-major-ordered stream of populated sparse elements.
+pub type SparseElementStream<'a, ET> =
+    Pin<Box<dyn Stream<Item = Result<(Vec<u64>, ET)>> + Send + 'a>>;
+
 /// Async value reads aligned with ndarray coordinate semantics.
-pub trait TensorRead: TensorArray {
+pub trait TensorRead: TensorGeometry {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>>;
 
     fn read_sparse_elements_in_order<'a>(
         &'a self,
         _range: Range,
         requested_order: Axes,
-    ) -> BoxFuture<'a, Result<Vec<(Vec<u64>, Self::DType)>>> {
+    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
         let base_order = (0..self.ndim()).collect::<Vec<_>>();
         let requested_order = requested_order.into_iter().collect::<Vec<_>>();
 
@@ -83,7 +86,7 @@ pub trait TensorReadBulk: TensorRead {
 }
 
 /// Async value writes aligned with ndarray coordinate semantics.
-pub trait TensorWrite: TensorArray {
+pub trait TensorWrite: TensorGeometry {
     fn write_value<'a>(&'a self, coord: &'a [u64], value: Self::DType)
     -> BoxFuture<'a, Result<()>>;
 }
@@ -123,7 +126,7 @@ pub trait TensorWriteBulk: TensorWrite {
 }
 
 /// Transform-style ndarray operations (metadata/view level).
-pub trait TensorTransform: TensorArray + Sized {
+pub trait TensorTransform: TensorGeometry + Sized {
     fn reshape(self, shape: Shape) -> Result<Self>;
 
     fn broadcast(self, _shape: Shape) -> Result<Self> {
@@ -169,38 +172,24 @@ pub trait TensorSparseIndex: Send + Sync {
     fn lookup_block_id<'a>(&'a self, key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>>;
 
     fn upsert_block_id<'a>(&'a self, key: Vec<u64>, block_id: u64) -> BoxFuture<'a, Result<()>>;
+
+    fn delete_row<'a>(&'a self, _key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Err(Error::Unsupported(
+                "delete_row is not implemented for this tensor backend".to_string(),
+            ))
+        })
+    }
 }
 
 /// Base/view capability contract, aligned with v1 writeability semantics.
-pub trait TensorViewSemantics: TensorArray {
+pub trait TensorViewSemantics: TensorGeometry {
     fn is_base_tensor(&self) -> bool {
         true
     }
 
     fn supports_write_through(&self) -> bool {
         false
-    }
-}
-
-/// Sparse lifecycle policy for zero-write handling and index cleanup.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum SparseZeroPolicy {
-    RemoveRow,
-    Tombstone,
-    RetainZero,
-}
-
-pub trait TensorSparseLifecycle: TensorArray {
-    fn sparse_zero_policy(&self) -> SparseZeroPolicy {
-        SparseZeroPolicy::RemoveRow
-    }
-
-    fn compact_sparse<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sparse compaction is not implemented for this tensor backend".to_string(),
-            ))
-        })
     }
 }
 
@@ -441,7 +430,7 @@ pub trait TensorReduceBoolean: TensorArray {
 /// Matrix/tensor contraction operations.
 pub trait TensorMatMul: TensorArray + Sized {
     fn matmul_output_shape(&self, rhs: &Self) -> Result<Shape> {
-        crate::validate::matmul_output_shape(self.shape(), rhs.shape())
+        validate::matmul_output_shape(self.shape(), rhs.shape())
     }
 
     fn matmul<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
