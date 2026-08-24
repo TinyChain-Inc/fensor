@@ -234,7 +234,10 @@ fn iter_coords(shape: &[usize]) -> Vec<Vec<u64>> {
 async fn seed_values(tensor: &TestTensor) {
     for coord in iter_coords(tensor.schema.shape()) {
         let value = (coord[0] * 100 + coord[1] * 10 + coord[2]) as f32;
-        tensor.write_value(&coord, value).await.expect("write value");
+        tensor
+            .write_value(&coord, value)
+            .await
+            .expect("write value");
     }
 }
 
@@ -290,7 +293,10 @@ async fn standalone_transpose_arbitrary_permutation() {
         }
 
         let expected = tensor.read_value(&src).await.expect("read original");
-        let actual = transposed.read_value(&t_coord).await.expect("read transposed");
+        let actual = transposed
+            .read_value(&t_coord)
+            .await
+            .expect("read transposed");
         assert_eq!(actual, expected, "coord {:?}", t_coord);
     }
 }
@@ -369,7 +375,10 @@ async fn dense_sparse_parity_for_supported_operations() {
 
     for (coord, value) in &writes {
         dense.write_value(coord, *value).await.expect("dense write");
-        sparse.write_value(coord, *value).await.expect("sparse write");
+        sparse
+            .write_value(coord, *value)
+            .await
+            .expect("sparse write");
     }
 
     for coord in iter_coords(dense.shape()) {
@@ -389,7 +398,10 @@ async fn dense_sparse_parity_for_supported_operations() {
 
     for coord in iter_coords(permuted_dense.shape()) {
         let d = permuted_dense.read_value(&coord).await.expect("dense read");
-        let s = permuted_sparse.read_value(&coord).await.expect("sparse read");
+        let s = permuted_sparse
+            .read_value(&coord)
+            .await
+            .expect("sparse read");
         assert_eq!(d, s, "transposed coord {:?}", coord);
     }
 
@@ -439,16 +451,19 @@ fn public_schema_contiguous_strides_match_expected() {
 async fn sparse_incompatible_order_error_is_structured() {
     let tensor = TestTensor::new(Layout::Sparse { axis: None });
 
-    let err = match tensor.read_sparse_elements_in_order(
-        range![
-            AxisRange::In(0, 2, 1),
-            AxisRange::In(0, 3, 1),
-            AxisRange::In(0, 4, 1)
-        ],
-        axes![2, 0, 1],
-    ).await {
+    let err = match tensor
+        .read_sparse_elements_in_order(
+            range![
+                AxisRange::In(0, 2, 1),
+                AxisRange::In(0, 3, 1),
+                AxisRange::In(0, 4, 1)
+            ],
+            axes![2, 0, 1],
+        )
+        .await
+    {
         Ok(_) => panic!("expected unsupported sparse order"),
-        Err(err) => err
+        Err(err) => err,
     };
 
     match err {
