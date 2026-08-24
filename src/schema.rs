@@ -4,9 +4,8 @@ use b_table::{IndexSchema, Schema};
 use ha_ndarray::{Shape, Strides};
 use smallvec::SmallVec;
 
-use crate::{Error, Result as FResult};
+use crate::{Error, PORTABLE_INLINE_RANK, Result as FResult};
 
-pub const PORTABLE_INLINE_RANK: usize = 8;
 pub type TensorShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
 pub type TensorStrides = Strides;
 
@@ -328,6 +327,10 @@ impl b_table::BTreeSchema for SparseIndexSchema {
                 "invalid sparse index key length",
             ))
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        false
     }
 }
 

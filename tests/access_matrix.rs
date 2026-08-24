@@ -1,28 +1,14 @@
-//! Test matrix for the `fensor` access layer per Requirements_1.md.
-//!
-//! Status: **many tests in this file are EXPECTED TO FAIL today.** They pin
-//! down behavior that is not yet implemented (sparse zero-write lifecycle,
-//! bulk I/O, view writeability, in-order sparse iteration, corruption
-//! fail-closed). They serve as a living specification for the access-layer
-//! rollout, not as gating CI checks.
-//!
-//! Tests that require API which does not yet exist (e.g. a `SparseZeroPolicy`
-//! setter) are marked `#[ignore]` and document the needed surface in the body.
-
-#![allow(unused_imports, dead_code, clippy::needless_range_loop)]
-
 mod common;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, Tensor, TensorArray, TensorBlockStore, TensorGeometry,
-    TensorRead, TensorReadBulk, TensorSchema, TensorSparseIndex, TensorTransform,
-    TensorViewSemantics, TensorWrite, TensorWriteBulk, contiguous_strides,
+    DType, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorReadBulk,
+    TensorSchema, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
 };
 use futures::TryStreamExt;
-use ha_ndarray::{Axes, AxisRange, Range, Shape, axes, range, shape};
+use ha_ndarray::{AxisRange, Range, Shape, axes, range, shape};
 
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 

@@ -1,7 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use fensor::{
     BoxFuture, DType, Error, Layout, TensorArray, TensorGeometry, TensorRead, TensorSchema,

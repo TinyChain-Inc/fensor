@@ -24,3 +24,5 @@ pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 
 pub type TensorF32<FE> = Tensor<FE, f32>;
 pub type TensorF64<FE> = Tensor<FE, f64>;
+
+pub(crate) const PORTABLE_INLINE_RANK: usize = 8;
