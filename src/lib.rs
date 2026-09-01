@@ -1,3 +1,4 @@
+mod compute;
 mod error;
 mod schema;
 mod stream;

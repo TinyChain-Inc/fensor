@@ -231,15 +231,16 @@ where
     FE: TensorFileEntry<T> + safecast::AsType<String> + From<String>,
     T: TensorElement,
 {
-    type Context = DirLock<FE>;
+    type Context = (DirLock<FE>, DirLock<FE>);
 
     async fn from_stream<D: de::Decoder>(
-        dir: Self::Context,
+        (dir, workspace): Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
         decoder
             .decode_seq(TensorViewVisitor {
                 dir,
+                workspace,
                 _marker: std::marker::PhantomData,
             })
             .await
@@ -248,6 +249,7 @@ where
 
 struct TensorViewVisitor<FE, T> {
     dir: DirLock<FE>,
+    workspace: DirLock<FE>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -285,9 +287,15 @@ where
         let schema = TensorSchema::new(dtype, shape.clone().into()).map_err(de::Error::custom)?;
         // Use max_capacity inferred from block_shape
         let max_capacity = block_shape.iter().product::<usize>();
-        let tensor = Tensor::<FE, T>::create(self.dir.clone(), schema, layout, max_capacity)
-            .await
-            .map_err(de::Error::custom)?;
+        let tensor = Tensor::<FE, T>::create(
+            self.dir.clone(),
+            self.workspace.clone(),
+            schema,
+            layout,
+            max_capacity,
+        )
+        .await
+        .map_err(de::Error::custom)?;
 
         // Decode the nested pairs sequence, moving `tensor` in by value
         // (Context) and getting it back out as the decoded Value on success
