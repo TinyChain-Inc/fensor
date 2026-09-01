@@ -18,9 +18,10 @@ async fn base_tensor_round_trips_through_tbon() {
     let schema = dense_schema_f32(shape![2, 3]);
 
     let dir = open_dir(&root).expect("open");
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone(), Layout::Dense, 1000)
-        .await
-        .expect("create");
+    let tensor =
+        Tensor::<FsEntry, f32>::create(dir.clone(), dir, schema.clone(), Layout::Dense, 1000)
+            .await
+            .expect("create");
 
     let view = tensor.view();
     let encoded = tbon::en::encode(view.view_encoder()).expect("encode base tensor");
@@ -30,9 +31,10 @@ async fn base_tensor_round_trips_through_tbon() {
         .await
         .expect("mkdir decoded");
     let dir2 = open_dir(&decode_root).expect("open decode target");
-    let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(dir2, encoded)
-        .await
-        .expect("decode base tensor");
+    let decoded: TensorViewDecoder<FsEntry, f32> =
+        tbon::de::try_decode((dir2.clone(), dir2), encoded)
+            .await
+            .expect("decode base tensor");
     let decoded = decoded.into_inner();
 
     assert_eq!(decoded.schema(), &schema);

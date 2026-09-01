@@ -83,9 +83,10 @@ async fn create_dense(
 ) -> (PathBuf, Tensor<TestFE, f32>) {
     let (root, dir) = new_dir(name).await;
     let schema = TensorSchema::new(DType::F32, shape).expect("schema");
-    let tensor = Tensor::<TestFE, f32>::create(dir, schema, Layout::Dense, max_capacity)
-        .await
-        .expect("create dense");
+    let tensor =
+        Tensor::<TestFE, f32>::create(dir.clone(), dir, schema, Layout::Dense, max_capacity)
+            .await
+            .expect("create dense");
     (root, tensor)
 }
 

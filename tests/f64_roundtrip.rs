@@ -13,7 +13,7 @@ async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
 
     let schema = TensorSchema::new(DType::F64, shape![2, 2]).expect("valid schema");
 
-    let tensor = create_dense_tensor::<f64>(dir.clone(), schema.clone()).await;
+    let tensor = create_dense_tensor::<f64>(dir.clone(), dir.clone(), schema.clone()).await;
 
     tensor
         .write_value(&[0, 0], std::f64::consts::PI)
@@ -32,7 +32,7 @@ async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
     assert_eq!(pi, std::f64::consts::PI);
     assert_eq!(e, std::f64::consts::E);
 
-    let loaded = Tensor::<FsEntry, f64>::load(dir.clone())
+    let loaded = Tensor::<FsEntry, f64>::load(dir.clone(), dir.clone())
         .await
         .expect("load tensor");
     assert_eq!(schema, *loaded.schema());

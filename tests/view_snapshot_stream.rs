@@ -22,7 +22,7 @@ async fn identity_dense_view_round_trips_with_data() {
     let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("Schema created");
     let (root, dir) = new_dir("view_snapshot_identity_dense").await;
 
-    let tensor = create_dense_tensor::<f32>(dir, schema.clone()).await;
+    let tensor = create_dense_tensor::<f32>(dir.clone(), dir, schema.clone()).await;
 
     let mut expected = Vec::new();
     for (idx, coord) in iter_coords(schema.shape()).enumerate() {
@@ -39,9 +39,10 @@ async fn identity_dense_view_round_trips_with_data() {
         .await
         .expect("mkdir decoded");
     let dir2 = open_dir(&decode_root).expect("open decode target");
-    let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(dir2, encoded)
-        .await
-        .expect("decode view");
+    let decoded: TensorViewDecoder<FsEntry, f32> =
+        tbon::de::try_decode((dir2.clone(), dir2), encoded)
+            .await
+            .expect("decode view");
 
     let decoded = decoded.into_inner();
 
@@ -61,7 +62,7 @@ async fn identity_dense_view_round_trips_with_data() {
 async fn identity_sparse_view_round_trips_with_data_and_axis() {
     let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
     let (root, dir) = new_dir("view_snapshot_identity_sparse").await;
-    let tensor = create_sparse_tensor::<f32>(dir, schema.clone(), Some(0)).await;
+    let tensor = create_sparse_tensor::<f32>(dir.clone(), dir, schema.clone(), Some(0)).await;
 
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
     tensor.write_value(&[1, 2], 9.0f32).await.expect("write");
@@ -74,9 +75,10 @@ async fn identity_sparse_view_round_trips_with_data_and_axis() {
         .await
         .expect("mkdir decoded");
     let dir2 = open_dir(&decode_root).expect("open decode target");
-    let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(dir2, encoded)
-        .await
-        .expect("decode view");
+    let decoded: TensorViewDecoder<FsEntry, f32> =
+        tbon::de::try_decode((dir2.clone(), dir2), encoded)
+            .await
+            .expect("decode view");
 
     let decoded = decoded.into_inner();
 
@@ -97,7 +99,7 @@ async fn non_identity_dense_view_round_trips_with_data() {
     let (root, dir) = new_dir("view_snapshot_non_identity_dense").await;
     let schema = TensorSchema::new(DType::F32, shape![3, 4]).expect("schema");
 
-    let tensor = create_dense_tensor::<f32>(dir, schema.clone()).await;
+    let tensor = create_dense_tensor::<f32>(dir.clone(), dir, schema.clone()).await;
 
     for coord in iter_coords(schema.shape()) {
         let value = (coord[0] * 10 + coord[1]) as f32 + 1.0;
@@ -126,9 +128,10 @@ async fn non_identity_dense_view_round_trips_with_data() {
         .await
         .expect("mkdir decoded");
     let dir2 = open_dir(&decode_root).expect("open decode target");
-    let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(dir2, encoded)
-        .await
-        .expect("decode view");
+    let decoded: TensorViewDecoder<FsEntry, f32> =
+        tbon::de::try_decode((dir2.clone(), dir2), encoded)
+            .await
+            .expect("decode view");
 
     let decoded = decoded.into_inner();
 
@@ -147,7 +150,7 @@ async fn non_identity_dense_view_round_trips_with_data() {
 async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
     let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
     let (root, dir) = new_dir("view_snapshot_non_identity_sparse").await;
-    let tensor = create_sparse_tensor(dir, schema.clone(), Some(0)).await;
+    let tensor = create_sparse_tensor(dir.clone(), dir, schema.clone(), Some(0)).await;
 
     tensor.write_value(&[0, 1], 7.0f32).await.expect("write");
     tensor.write_value(&[1, 2], 3.0f32).await.expect("write");
@@ -174,9 +177,10 @@ async fn non_identity_sparse_view_round_trips_with_data_resets_axis() {
         .await
         .expect("mkdir decoded");
     let dir2 = open_dir(&decode_root).expect("open decode target");
-    let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(dir2, encoded)
-        .await
-        .expect("decode view");
+    let decoded: TensorViewDecoder<FsEntry, f32> =
+        tbon::de::try_decode((dir2.clone(), dir2), encoded)
+            .await
+            .expect("decode view");
 
     let decoded = decoded.into_inner();
 
@@ -197,7 +201,7 @@ async fn only_nonzero_values_are_transmitted() {
     // This demonstrates that the encoder only transmits non-default values, not all 400 elements.
     let schema = TensorSchema::new(DType::F32, shape![20, 20]).expect("schema");
     let (root, dir) = new_dir("view_snapshot_sparse_transmission").await;
-    let tensor = create_dense_tensor(dir, schema.clone()).await;
+    let tensor = create_dense_tensor(dir.clone(), dir, schema.clone()).await;
 
     // Write exactly one nonzero value; everything else remains at default (0.0)
     tensor.write_value(&[5, 7], 3.0f32).await.expect("write");
@@ -234,7 +238,7 @@ async fn only_nonzero_values_are_transmitted() {
     let encoded_stream_for_decode =
         futures::stream::iter(encoded_parts.into_iter().map(Ok::<_, tbon::de::Error>));
     let decoded: TensorViewDecoder<FsEntry, f32> =
-        tbon::de::try_decode(dir2, encoded_stream_for_decode)
+        tbon::de::try_decode((dir2.clone(), dir2), encoded_stream_for_decode)
             .await
             .expect("decode view");
 
@@ -264,7 +268,7 @@ async fn only_nonzero_values_are_transmitted() {
 async fn truncated_stream_fails_closed() {
     let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
     let (root, dir) = new_dir("view_snapshot_verification_mismatch").await;
-    let tensor = create_dense_tensor(dir, schema.clone()).await;
+    let tensor = create_dense_tensor(dir.clone(), dir, schema.clone()).await;
 
     // Write a couple of nonzero values
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
@@ -301,7 +305,7 @@ async fn truncated_stream_fails_closed() {
 
     // Attempt to decode with incomplete stream; should fail due to the truncated pairs sequence
     let result: std::result::Result<TensorViewDecoder<FsEntry, f32>, _> =
-        tbon::de::try_decode(dir2.clone(), encoded_stream_corrupted).await;
+        tbon::de::try_decode((dir2.clone(), dir2.clone()), encoded_stream_corrupted).await;
 
     assert!(
         result.is_err(),
@@ -315,7 +319,7 @@ async fn truncated_stream_fails_closed() {
 async fn corrupted_block_read_fails_closed() {
     let (root, dir) = new_dir("view_snapshot_read_value_fails_dense").await;
     let schema = TensorSchema::new(DType::F32, shape![1000, 1000]).expect("schema");
-    let tensor = create_dense_tensor(dir.clone(), schema.clone()).await;
+    let tensor = create_dense_tensor(dir.clone(), dir.clone(), schema.clone()).await;
 
     tensor.write_value(&[0, 1], 5.0f32).await.expect("write");
     tensor
@@ -349,7 +353,7 @@ async fn corrupted_block_read_fails_closed() {
     let dir2 = open_dir(&decode_root).expect("open decode target");
 
     let result: std::result::Result<TensorViewDecoder<FsEntry, f32>, _> =
-        tbon::de::try_decode(dir2.clone(), encoded_stream).await;
+        tbon::de::try_decode((dir2.clone(), dir2.clone()), encoded_stream).await;
 
     assert!(result.is_err());
 
@@ -362,7 +366,7 @@ async fn corrupted_dtype_mismatch_fails_closed() {
 
     // Create an f64 tensor
     let schema = TensorSchema::new(DType::F64, shape![2, 2]).expect("schema");
-    let tensor_f64 = create_dense_tensor(dir, schema.clone()).await;
+    let tensor_f64 = create_dense_tensor(dir.clone(), dir, schema.clone()).await;
 
     tensor_f64.write_value(&[0, 0], 1.5).await.expect("write");
 
@@ -377,7 +381,7 @@ async fn corrupted_dtype_mismatch_fails_closed() {
 
     // Try to decode f64-encoded data as f32; should fail with dtype mismatch
     let result: std::result::Result<TensorViewDecoder<FsEntry, f32>, _> =
-        tbon::de::try_decode(dir2.clone(), encoded).await;
+        tbon::de::try_decode((dir2.clone(), dir2.clone()), encoded).await;
 
     assert!(result.is_err(), "dtype mismatch must fail closed");
 

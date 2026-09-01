@@ -28,9 +28,15 @@ async fn create_dense(
     let (root, dir) = new_dir(name).await;
     let schema = dense_schema_f32(shape);
     let max_capacity = block_shape.iter().product::<usize>().max(1);
-    let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone(), Layout::Dense, max_capacity)
-        .await
-        .expect("create dense");
+    let tensor = Tensor::<FsEntry, f32>::create(
+        dir.clone(),
+        dir,
+        schema.clone(),
+        Layout::Dense,
+        max_capacity,
+    )
+    .await
+    .expect("create dense");
     (root, tensor, schema)
 }
 
@@ -43,10 +49,15 @@ async fn create_sparse(
     let (root, dir) = new_dir(name).await;
     let schema = sparse_schema_f32(shape);
     let max_capacity = block_shape.iter().product::<usize>().max(1);
-    let tensor =
-        Tensor::<FsEntry, f32>::create(dir, schema.clone(), Layout::Sparse { axis }, max_capacity)
-            .await
-            .expect("create sparse");
+    let tensor = Tensor::<FsEntry, f32>::create(
+        dir.clone(),
+        dir,
+        schema.clone(),
+        Layout::Sparse { axis },
+        max_capacity,
+    )
+    .await
+    .expect("create sparse");
     (root, tensor, schema)
 }
 
@@ -1754,10 +1765,15 @@ mod section_h_persistence {
 
         {
             let dir = open_dir(&root).expect("open");
-            let tensor =
-                Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
-                    .await
-                    .expect("create");
+            let tensor = Tensor::<FsEntry, f32>::create(
+                dir.clone(),
+                dir.clone(),
+                schema.clone(),
+                Layout::Dense,
+                4,
+            )
+            .await
+            .expect("create");
             for coord in iter_coords(tensor.shape()) {
                 tensor
                     .write_value(&coord, encode_value(&coord))
@@ -1768,7 +1784,9 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
+        let loaded = Tensor::<FsEntry, f32>::load(dir2.clone(), dir2)
+            .await
+            .expect("reload");
         assert_eq!(schema, *loaded.schema());
         for coord in iter_coords(loaded.shape()) {
             let v = loaded.read_value(&coord).await.expect("read");
@@ -1788,6 +1806,7 @@ mod section_h_persistence {
             let dir = open_dir(&root).expect("open");
             let tensor = Tensor::<FsEntry, f32>::create(
                 dir.clone(),
+                dir.clone(),
                 schema.clone(),
                 Layout::Sparse { axis: Some(1) },
                 4,
@@ -1800,7 +1819,9 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
+        let loaded = Tensor::<FsEntry, f32>::load(dir2.clone(), dir2)
+            .await
+            .expect("reload");
         assert_eq!(schema, *loaded.schema());
         assert_eq!(loaded.read_value(&[0, 0, 0]).await.expect("read"), 1.0);
         assert_eq!(loaded.read_value(&[1, 2, 3]).await.expect("read"), 9.0);
@@ -1817,9 +1838,15 @@ mod section_h_persistence {
 
         {
             let dir = open_dir(&root).expect("open");
-            let _ = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
-                .await
-                .expect("create");
+            let _ = Tensor::<FsEntry, f32>::create(
+                dir.clone(),
+                dir.clone(),
+                schema.clone(),
+                Layout::Dense,
+                4,
+            )
+            .await
+            .expect("create");
             dir.sync().await.expect("sync");
         }
 
@@ -1833,7 +1860,7 @@ mod section_h_persistence {
         }
 
         let dir2 = open_dir(&root).expect("reopen");
-        let err = Tensor::<FsEntry, f32>::load(dir2)
+        let err = Tensor::<FsEntry, f32>::load(dir2.clone(), dir2)
             .await
             .err()
             .expect("missing metadata must fail closed");
@@ -1853,9 +1880,15 @@ mod section_h_persistence {
 
         {
             let dir = open_dir(&root).expect("open");
-            let _ = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
-                .await
-                .expect("create");
+            let _ = Tensor::<FsEntry, f32>::create(
+                dir.clone(),
+                dir.clone(),
+                schema.clone(),
+                Layout::Dense,
+                4,
+            )
+            .await
+            .expect("create");
             dir.sync().await.expect("sync");
         }
 
@@ -1865,7 +1898,7 @@ mod section_h_persistence {
         let _ = tokio::fs::write(&meta, b"not a tensor metadata file").await;
 
         let dir2 = open_dir(&root).expect("reopen");
-        let err = Tensor::<FsEntry, f32>::load(dir2)
+        let err = Tensor::<FsEntry, f32>::load(dir2.clone(), dir2)
             .await
             .err()
             .expect("tampered metadata must fail closed");
@@ -1883,6 +1916,7 @@ mod section_h_persistence {
         let schema = sparse_schema_f32(shape![2, 3, 4]);
 
         let tensor = Tensor::<FsEntry, f32>::create(
+            dir.clone(),
             dir.clone(),
             schema.clone(),
             Layout::Sparse { axis: Some(1) },
@@ -1929,9 +1963,15 @@ mod section_h_persistence {
         let (root, dir) = new_dir("h_dense_block_missing").await;
         let schema = dense_schema_f32(shape![2, 3, 4]);
 
-        let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
-            .await
-            .expect("create dense");
+        let tensor = Tensor::<FsEntry, f32>::create(
+            dir.clone(),
+            dir.clone(),
+            schema.clone(),
+            Layout::Dense,
+            4,
+        )
+        .await
+        .expect("create dense");
         tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
 
         let blocks_dir = {
@@ -1981,10 +2021,15 @@ mod section_h_persistence {
         let expected_blocks = (shape.iter().product::<usize>() as u64) / (max_capacity as u64);
 
         let dir = open_dir(&root).expect("open");
-        let _tensor =
-            Tensor::<FsEntry, f32>::create(dir.clone(), schema, Layout::Dense, max_capacity)
-                .await
-                .expect("create dense");
+        let _tensor = Tensor::<FsEntry, f32>::create(
+            dir.clone(),
+            dir.clone(),
+            schema,
+            Layout::Dense,
+            max_capacity,
+        )
+        .await
+        .expect("create dense");
         dir.sync().await.expect("sync");
 
         let mut block_files = Vec::new();
@@ -2020,6 +2065,7 @@ mod section_h_persistence {
         let dir = open_dir(&root).expect("open");
         let _tensor = Tensor::<FsEntry, f32>::create(
             dir.clone(),
+            dir.clone(),
             schema,
             Layout::Sparse { axis: Some(1) },
             4,
@@ -2053,9 +2099,15 @@ mod section_h_persistence {
 
         {
             let dir = open_dir(&root).expect("open");
-            let _ = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
-                .await
-                .expect("create");
+            let _ = Tensor::<FsEntry, f32>::create(
+                dir.clone(),
+                dir.clone(),
+                schema.clone(),
+                Layout::Dense,
+                4,
+            )
+            .await
+            .expect("create");
             dir.sync().await.expect("sync");
         }
 
@@ -2065,7 +2117,7 @@ mod section_h_persistence {
         let _ = tokio::fs::write(&meta, bad).await;
 
         let dir2 = open_dir(&root).expect("reopen");
-        let err = Tensor::<FsEntry, f32>::load(dir2)
+        let err = Tensor::<FsEntry, f32>::load(dir2.clone(), dir2)
             .await
             .err()
             .expect("unknown version must fail closed");

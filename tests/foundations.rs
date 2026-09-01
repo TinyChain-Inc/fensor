@@ -423,6 +423,7 @@ async fn public_create_rejects_invalid_sparse_axis_hint() {
     let (root, dir) = common::new_dir("invalid_sparse_axis").await;
     let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
     let result = fensor::Tensor::<common::FsEntry, f32>::create(
+        dir.clone(),
         dir,
         schema,
         Layout::Sparse { axis: Some(99) },
