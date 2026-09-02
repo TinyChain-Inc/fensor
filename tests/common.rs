@@ -131,21 +131,19 @@ impl Iterator for CoordIter {
 
 pub async fn create_dense_tensor<T>(
     dir: DirLock<FsEntry>,
-    workspace: DirLock<FsEntry>,
     schema: TensorSchema,
 ) -> Tensor<FsEntry, T>
 where
     T: TensorElement,
     FsEntry: TensorFileEntry<T>,
 {
-    Tensor::<FsEntry, T>::create(dir, workspace, schema, Layout::Dense, 1000)
+    Tensor::<FsEntry, T>::create(dir, schema, Layout::Dense, 1000)
         .await
         .expect("created")
 }
 
 pub async fn create_sparse_tensor<T>(
     dir: DirLock<FsEntry>,
-    workspace: DirLock<FsEntry>,
     schema: TensorSchema,
     axis: Option<usize>,
 ) -> Tensor<FsEntry, T>
@@ -153,7 +151,7 @@ where
     T: TensorElement,
     FsEntry: TensorFileEntry<T>,
 {
-    Tensor::<FsEntry, T>::create(dir, workspace, schema, Layout::Sparse { axis }, 1000)
+    Tensor::<FsEntry, T>::create(dir, schema, Layout::Sparse { axis }, 1000)
         .await
         .expect("created")
 }
