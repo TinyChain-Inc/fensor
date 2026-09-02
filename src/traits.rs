@@ -194,7 +194,7 @@ pub trait TensorViewSemantics: TensorGeometry {
 }
 
 /// Unary tensor math operations.
-pub trait TensorUnary: TensorArray + Sized {
+pub trait TensorUnary: TensorGeometry + Sized {
     fn exp<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
         Box::pin(async move {
             Err(Error::Unsupported(

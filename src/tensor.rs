@@ -10,7 +10,6 @@ use futures::stream;
 use ha_ndarray::{Axes, Range};
 use safecast::AsType;
 
-use crate::compute::{self, UnaryOp};
 use crate::error::{Error, Result};
 use crate::schema::{
     BlockPosition, DType, Layout, MAX_BLOCK_CAPACITY, SparseIndexSchema, SparseTableSchema,
@@ -18,7 +17,7 @@ use crate::schema::{
 };
 use crate::traits::{
     BoxFuture, SparseElementStream, TensorArray, TensorBlockStore, TensorGeometry, TensorRead,
-    TensorReadBulk, TensorSparseIndex, TensorUnary, TensorWrite, TensorWriteBulk,
+    TensorReadBulk, TensorSparseIndex, TensorWrite, TensorWriteBulk,
 };
 use crate::validate::{self, validate_coord};
 use crate::view::TensorView;
@@ -124,7 +123,6 @@ struct SparseIterState<T> {
 pub struct Tensor<FE, T> {
     storage: Arc<Storage<FE>>,
     schema: TensorSchema,
-    workspace: DirLock<FE>,
     _dtype: std::marker::PhantomData<T>,
 }
 
@@ -135,7 +133,6 @@ where
 {
     pub async fn create(
         dir: DirLock<FE>,
-        workspace: DirLock<FE>,
         schema: TensorSchema,
         layout: Layout,
         max_capacity: usize,
@@ -168,10 +165,10 @@ where
             None
         };
 
-        Self::new_storage(workspace, blocks_dir, index, schema, storage_schema).await
+        Self::new_storage(blocks_dir, index, schema, storage_schema).await
     }
 
-    pub async fn load(dir: DirLock<FE>, workspace: DirLock<FE>) -> Result<Self>
+    pub async fn load(dir: DirLock<FE>) -> Result<Self>
     where
         FE: AsType<String> + From<String>,
     {
@@ -192,32 +189,7 @@ where
             None
         };
 
-        Self::new_storage(workspace, blocks_dir, index, schema, storage_schema).await
-    }
-
-    /// Create an independent sibling tensor as a flat, depth-1 child of this
-    /// tensor's `workspace` directory (never nested inside `self`'s own root,
-    /// and never nested inside the previous sibling either -- the same
-    /// `workspace` handle propagates unchanged to the sibling, so chains of
-    /// any length stay flat). Used by the math-op streaming pipelines
-    /// (`src/compute.rs`) to produce an output `Tensor` from `&self` alone,
-    /// without requiring a caller-supplied directory.
-    pub(crate) async fn create_sibling(
-        &self,
-        shape: crate::schema::TensorShape,
-        layout: Layout,
-        max_capacity: usize,
-    ) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        let dtype = self.schema.dtype();
-        let schema = TensorSchema::new(dtype, shape)?;
-        let (_uuid, dir) = {
-            let mut workspace_guard = self.workspace.try_write()?;
-            workspace_guard.create_dir_unique()?
-        };
-        Self::create(dir, self.workspace.clone(), schema, layout, max_capacity).await
+        Self::new_storage(blocks_dir, index, schema, storage_schema).await
     }
 
     pub fn view(&self) -> TensorView<'_, FE, T> {
@@ -426,7 +398,6 @@ where
     }
 
     async fn new_storage(
-        workspace: DirLock<FE>,
         blocks: DirLock<FE>,
         index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
         schema: TensorSchema,
@@ -450,7 +421,6 @@ where
         let tensor = Self {
             storage: Arc::new(storage),
             schema,
-            workspace,
             _dtype: std::marker::PhantomData,
         };
 
@@ -874,27 +844,6 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// TensorUnary impl
-// ---------------------------------------------------------------------------
-impl<FE, T> TensorUnary for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T> + AsType<String> + From<String>,
-    T: TensorElement + ha_ndarray::Float + ha_ndarray::Real,
-{
-    fn exp<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move { compute::run_unary(self, UnaryOp::Exp).await })
-    }
-
-    fn ln<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move { compute::run_unary(self, UnaryOp::Ln).await })
-    }
-
-    fn round<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move { compute::run_unary(self, UnaryOp::Round).await })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
 async fn load_metadata_file<FE>(blocks: &DirLock<FE>) -> Result<(TensorSchema, StorageSchema)>
@@ -1270,15 +1219,10 @@ mod sparse_lifecycle_tests {
     ) -> (PathBuf, Tensor<TestFE, f32>) {
         let (root, dir) = new_dir(name).await;
         let schema = TensorSchema::new(DType::F32, shape).expect("schema");
-        let tensor = Tensor::<TestFE, f32>::create(
-            dir.clone(),
-            dir,
-            schema,
-            Layout::Sparse { axis },
-            max_capacity,
-        )
-        .await
-        .expect("create sparse");
+        let tensor =
+            Tensor::<TestFE, f32>::create(dir, schema, Layout::Sparse { axis }, max_capacity)
+                .await
+                .expect("create sparse");
         (root, tensor)
     }
 
@@ -1435,154 +1379,5 @@ mod sparse_lifecycle_tests {
         );
 
         cleanup(&root).await;
-    }
-}
-
-#[cfg(test)]
-mod create_sibling_tests {
-    use std::io;
-    use std::path::{Path, PathBuf};
-
-    use b_table::Node;
-    use destream::{de, en};
-    use freqfs::Cache;
-    use ha_ndarray::shape;
-    use safecast::as_type;
-
-    use super::*;
-
-    #[derive(Clone, Debug)]
-    enum TestFE {
-        Node(Node<u64>),
-        F32(Vec<f32>),
-        Text(String),
-    }
-
-    impl<'en> en::ToStream<'en> for TestFE {
-        fn to_stream<E: en::Encoder<'en>>(
-            &'en self,
-            encoder: E,
-        ) -> std::result::Result<E::Ok, E::Error> {
-            match self {
-                Self::Node(node) => node.to_stream(encoder),
-                Self::F32(values) => values.to_stream(encoder),
-                Self::Text(text) => text.to_stream(encoder),
-            }
-        }
-    }
-
-    // Only ever read via a concrete `AsType` target (mirrors `tests/common.rs::FsEntry`).
-    impl de::FromStream for TestFE {
-        type Context = ();
-
-        async fn from_stream<D: de::Decoder>(
-            _: (),
-            _decoder: &mut D,
-        ) -> std::result::Result<Self, D::Error> {
-            Err(de::Error::custom(
-                "TestFE does not support generic decoding; read via a concrete AsType target",
-            ))
-        }
-    }
-
-    as_type!(TestFE, Node, Node<u64>);
-    as_type!(TestFE, F32, Vec<f32>);
-    as_type!(TestFE, Text, String);
-
-    fn unique_tmp_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        path.push(format!("fensor_create_sibling_{name}_{unique}"));
-        path
-    }
-
-    fn open_dir(root: &Path) -> io::Result<DirLock<TestFE>> {
-        let cache = Cache::<TestFE>::new(1_000_000, None);
-        cache.load(root.to_path_buf())
-    }
-
-    async fn new_dir(name: &str) -> (PathBuf, DirLock<TestFE>) {
-        let root = unique_tmp_dir(name);
-        tokio::fs::create_dir(&root).await.expect("create tmp dir");
-        let dir = open_dir(&root).expect("load tmp dir");
-        (root, dir)
-    }
-
-    async fn cleanup(root: &Path) {
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
-    async fn create_sibling_is_independent_and_functional() {
-        let (root, dir) = new_dir("basic_root").await;
-        let (workspace_root, workspace) = new_dir("basic_workspace").await;
-        let schema = TensorSchema::new(DType::F32, shape![2, 2]).expect("schema");
-        let tensor = Tensor::<TestFE, f32>::create(
-            dir,
-            workspace.clone(),
-            schema.clone(),
-            Layout::Dense,
-            1000,
-        )
-        .await
-        .expect("create base tensor");
-
-        tensor.write_value(&[0, 0], 1.0).await.expect("write base");
-
-        let sibling = tensor
-            .create_sibling(schema.shape().clone(), Layout::Dense, 1000)
-            .await
-            .expect("create_sibling should succeed");
-
-        // (b) the sibling is a fully independent, functional tensor.
-        sibling
-            .write_value(&[1, 1], 42.0)
-            .await
-            .expect("write sibling");
-        assert_eq!(
-            sibling.read_value(&[1, 1]).await.expect("read sibling"),
-            42.0
-        );
-
-        // (c) writing to the sibling does not affect reads on the original
-        // tensor at the same coordinate -- proves independence, not aliasing.
-        assert_eq!(
-            tensor.read_value(&[1, 1]).await.expect("read base"),
-            0.0,
-            "sibling write must not alias the original tensor's storage"
-        );
-        assert_eq!(
-            tensor.read_value(&[0, 0]).await.expect("read base 0,0"),
-            1.0,
-            "original tensor's own data must be untouched by sibling creation"
-        );
-
-        // (d) the concrete proof of the fix: physically delete the original
-        // tensor's own root directory from disk. The sibling -- which lives
-        // as a flat child of `workspace`, not nested under `root` -- must
-        // remain fully readable and writable afterward.
-        tokio::fs::remove_dir_all(&root)
-            .await
-            .expect("delete original tensor's root directory");
-
-        sibling
-            .write_value(&[0, 1], 7.0)
-            .await
-            .expect("write sibling after original root deleted");
-        assert_eq!(
-            sibling.read_value(&[0, 1]).await.expect("read sibling"),
-            7.0,
-            "sibling must remain fully functional after its origin's root is deleted"
-        );
-        assert_eq!(
-            sibling.read_value(&[1, 1]).await.expect("read sibling"),
-            42.0,
-            "sibling's earlier writes must survive deletion of the original tensor's root"
-        );
-
-        cleanup(&workspace_root).await;
     }
 }
