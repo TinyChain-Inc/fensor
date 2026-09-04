@@ -19,7 +19,6 @@ use crate::traits::{
 
 use crate::{PORTABLE_INLINE_RANK, stream, validate};
 
-const BLOCK_CONCURRENCY: usize = 8;
 const STACK_STORED_CHAIN_SIZE: usize = 4;
 
 type PendingOp<T> = Arc<dyn Fn(Vec<T>, Shape) -> Result<Vec<T>> + Send + Sync>;
@@ -739,7 +738,7 @@ where
                     output.write_block(block_id, block).await
                 }
             })
-            .buffer_unordered(BLOCK_CONCURRENCY)
+            .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<()>>()
             .await?;
 
@@ -764,7 +763,7 @@ where
                 }
                 Ok::<(), Error>(())
             })
-            .buffer_unordered(BLOCK_CONCURRENCY)
+            .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<()>>()
             .await?;
 
