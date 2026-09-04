@@ -3,18 +3,25 @@ mod tests;
 
 use std::{iter, sync::Arc};
 
-use ha_ndarray::{Axes, AxisRange, Range, Shape};
+use freqfs::DirLock;
+use futures::{StreamExt, TryStreamExt};
+use ha_ndarray::{Array, Axes, AxisRange, Buffer, NDArrayRead, NDArrayUnary, Range, Shape};
+use safecast::AsType;
 use smallvec::SmallVec;
 
 use crate::error::{Error, Result};
-use crate::schema::{self, Layout, TensorViewShape};
+use crate::schema::{self, Layout, TensorSchema, TensorViewShape};
 use crate::tensor::{Tensor, TensorElement, TensorFileEntry};
 use crate::traits::{
-    BoxFuture, TensorArray, TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics,
-    TensorWrite,
+    BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorRead, TensorTransform,
+    TensorUnary, TensorViewSemantics, TensorWrite,
 };
 
 use crate::{PORTABLE_INLINE_RANK, stream, validate};
+
+const STACK_STORED_CHAIN_SIZE: usize = 4;
+
+type PendingOp<T> = Arc<dyn Fn(Vec<T>, Shape) -> Result<Vec<T>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TensorView<'t, FE, T> {
@@ -22,6 +29,7 @@ pub struct TensorView<'t, FE, T> {
     base_offset: i64,
     axes: SmallVec<[AxisContrib; PORTABLE_INLINE_RANK]>,
     shape: TensorViewShape,
+    pending: Arc<SmallVec<[PendingOp<T>; STACK_STORED_CHAIN_SIZE]>>,
 }
 
 #[derive(Clone)]
@@ -48,6 +56,20 @@ where
                 .map(|&s| AxisContrib::Stride(s as i64))
                 .collect(),
             shape: TensorViewShape::from(shape),
+            pending: Arc::new(SmallVec::new()),
+        }
+    }
+
+    fn push_pending(&self, op: PendingOp<T>) -> Self {
+        let mut pending: SmallVec<[PendingOp<T>; STACK_STORED_CHAIN_SIZE]> =
+            (*self.pending).clone();
+        pending.push(op);
+        Self {
+            tensor: self.tensor,
+            base_offset: self.base_offset,
+            axes: self.axes.clone(),
+            shape: self.shape.clone(),
+            pending: Arc::new(pending),
         }
     }
 
@@ -303,6 +325,7 @@ where
                 .map(|&s| AxisContrib::Stride(s as i64))
                 .collect(),
             shape,
+            pending: self.pending.clone(),
         })
     }
 
@@ -347,6 +370,7 @@ where
             base_offset: self.base_offset,
             axes,
             shape,
+            pending: self.pending.clone(),
         })
     }
 
@@ -393,6 +417,7 @@ where
             base_offset: new_base_offset,
             axes: new_axes,
             shape: new_shape,
+            pending: self.pending.clone(),
         })
     }
 
@@ -426,6 +451,7 @@ where
             base_offset: self.base_offset,
             axes,
             shape,
+            pending: self.pending.clone(),
         })
     }
 
@@ -448,6 +474,7 @@ where
             base_offset: self.base_offset + offset_delta,
             axes,
             shape: self.shape,
+            pending: self.pending.clone(),
         })
     }
 
@@ -504,6 +531,7 @@ where
             base_offset,
             axes: axes_out,
             shape: shape_out,
+            pending: self.pending.clone(),
         })
     }
 
@@ -565,6 +593,7 @@ where
             base_offset: self.base_offset,
             axes: axes_out,
             shape: shape_out,
+            pending: self.pending.clone(),
         })
     }
 }
@@ -601,5 +630,158 @@ where
             let base_coord = self.resolve_base_coord(coord)?;
             self.tensor.write_value(&base_coord, value).await
         })
+    }
+}
+
+impl<'t, FE, T> TensorUnary for TensorView<'t, FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement + ha_ndarray::Float + ha_ndarray::Real,
+{
+    fn exp<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
+        Box::pin(async move {
+            Ok(self.push_pending(Arc::new(|values, shape| {
+                let array = Array::new(Buffer::from(values), shape)?;
+                Ok(array.exp()?.buffer()?.to_slice()?.into_vec())
+            })))
+        })
+    }
+
+    fn ln<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
+        Box::pin(async move {
+            Ok(self.push_pending(Arc::new(|values, shape| {
+                let array = Array::new(Buffer::from(values), shape)?;
+                Ok(array.ln()?.buffer()?.to_slice()?.into_vec())
+            })))
+        })
+    }
+
+    fn round<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
+        Box::pin(async move {
+            Ok(self.push_pending(Arc::new(|values, shape| {
+                let array = Array::new(Buffer::from(values), shape)?;
+                Ok(array.round()?.buffer()?.to_slice()?.into_vec())
+            })))
+        })
+    }
+}
+
+fn apply_pending<T>(values: Vec<T>, shape: Shape, pending: &[PendingOp<T>]) -> Result<Vec<T>> {
+    let mut values = values;
+    for op in pending {
+        values = op(values, shape.clone())?;
+    }
+    Ok(values)
+}
+
+fn clipped_block_range(origin: &[u64], block_shape: &[usize], view_shape: &[usize]) -> Range {
+    origin
+        .iter()
+        .zip(block_shape.iter())
+        .zip(view_shape.iter())
+        .map(|((&o, &b), &v)| {
+            let start = o as usize;
+            AxisRange::In(start, (start + b).min(v), 1)
+        })
+        .collect()
+}
+
+impl<'t, FE, T> TensorView<'t, FE, T>
+where
+    FE: TensorFileEntry<T> + AsType<String> + From<String>,
+    T: TensorElement,
+{
+    pub async fn materialize(
+        &self,
+        dir: DirLock<FE>,
+        max_capacity: usize,
+    ) -> Result<Tensor<FE, T>> {
+        let schema = TensorSchema::new(T::DTYPE, self.shape().to_vec().into())?;
+        match (self.layout(), self.is_base_tensor()) {
+            (Layout::Dense, true) => {
+                let output =
+                    Tensor::create(dir, schema, Layout::Dense, self.tensor().block_len()).await?;
+                self.materialize_dense_blocks(&output).await?;
+                Ok(output)
+            }
+            (Layout::Dense, false) => {
+                let output = Tensor::create(dir, schema, Layout::Dense, max_capacity).await?;
+                self.materialize_dense_ranges(&output).await?;
+                Ok(output)
+            }
+            (Layout::Sparse { .. }, true) => {
+                let output = Tensor::create(dir, schema, self.layout(), max_capacity).await?;
+                self.materialize_sparse_elements(&output).await?;
+                Ok(output)
+            }
+            (Layout::Sparse { .. }, false) => Err(Error::Unsupported(
+                "transformed Sparse view with pending ops".to_string(),
+            )),
+        }
+    }
+
+    async fn materialize_dense_blocks(&self, output: &Tensor<FE, T>) -> Result<()> {
+        let source = self.tensor();
+        let pending = self.pending.clone();
+        let block_shape: Shape = source.block_shape().to_vec().into();
+
+        futures::stream::iter(0..source.num_blocks())
+            .map(|block_id| {
+                let pending = pending.clone();
+                let block_shape = block_shape.clone();
+                async move {
+                    let block = source
+                        .read_block(block_id)
+                        .await?
+                        .ok_or_else(|| Error::InvalidLayout("dense block missing".to_string()))?;
+                    let block = apply_pending(block, block_shape, &pending)?;
+                    output.write_block(block_id, block).await
+                }
+            })
+            .buffer_unordered(num_cpus::get())
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        Ok(())
+    }
+
+    async fn materialize_dense_ranges(&self, output: &Tensor<FE, T>) -> Result<()> {
+        futures::stream::iter(0..output.num_blocks())
+            .map(|block_id| async move {
+                let origin = output.block_origin_from_grid_id(block_id);
+                let range = clipped_block_range(&origin, output.block_shape(), self.shape());
+                let coords: Vec<Vec<u64>> =
+                    validate::iter_range_coords(self.shape(), &range)?.collect();
+                let mut values = Vec::with_capacity(coords.len());
+                for coord in &coords {
+                    values.push(self.read_value(coord).await?);
+                }
+                let shape: Shape = std::iter::once(coords.len()).collect();
+                let values = apply_pending(values, shape, &self.pending)?;
+                for (coord, value) in coords.into_iter().zip(values) {
+                    output.write_value(&coord, value).await?;
+                }
+                Ok::<(), Error>(())
+            })
+            .buffer_unordered(num_cpus::get())
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        Ok(())
+    }
+
+    async fn materialize_sparse_elements(&self, output: &Tensor<FE, T>) -> Result<()> {
+        let order: Axes = (0..self.ndim()).collect();
+        let mut elements = self
+            .tensor()
+            .read_sparse_elements_in_order(validate::full_range(self.shape()), order)
+            .await?;
+        let one: Shape = std::iter::once(1usize).collect();
+        while let Some(item) = elements.next().await {
+            let (coord, value) = item?;
+            let value = apply_pending(vec![value], one.clone(), &self.pending)?[0];
+            output.write_value(&coord, value).await?;
+        }
+        Ok(())
     }
 }
