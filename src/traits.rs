@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use futures::Stream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use ha_ndarray::{Axes, Range, Shape};
 
 use crate::schema::{DType, Layout};
@@ -44,24 +44,74 @@ pub trait TensorArray: TensorGeometry {
 pub type SparseElementStream<'a, ET> =
     Pin<Box<dyn Stream<Item = Result<(Vec<u64>, ET)>> + Send + 'a>>;
 
+/// Bounded batches of values in logical row-major order, independent of storage tiling.
+pub type ValueBlockStream<'a, T> = Pin<Box<dyn Stream<Item = Result<Vec<T>>> + Send + 'a>>;
+
 /// Async value reads aligned with ndarray coordinate semantics.
 pub trait TensorRead: TensorGeometry {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>>;
 
+    /// Each call constructs an independent, demand-driven stream; no tensor-sized buffer.
+    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
+        let batches = coordinate_batches(crate::schema::row_major_coords(self.shape())?);
+        Ok(futures::stream::iter(batches)
+            .map(move |coords| async move {
+                let mut values = Vec::with_capacity(coords.len());
+                for coord in coords {
+                    values.push(self.read_value(&coord).await?);
+                }
+                Ok(values)
+            })
+            .buffered(num_cpus::get().max(1))
+            .boxed())
+    }
+
     fn read_sparse_elements_in_order<'a>(
         &'a self,
-        _range: Range,
+        range: Range,
         requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        let base_order = (0..self.ndim()).collect::<Vec<_>>();
-        let requested_order = requested_order.into_iter().collect::<Vec<_>>();
-
+    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>>
+    where
+        Self::DType: Default + PartialEq,
+    {
         Box::pin(async move {
-            Err(Error::UnsupportedSparseIterationOrder {
-                requested_order,
-                base_order,
-                hint: "materialize or perform external sort for incompatible order".to_string(),
-            })
+            let base_order: Vec<_> = (0..self.ndim()).collect();
+            if requested_order.as_slice() != base_order.as_slice() {
+                return Err(Error::UnsupportedSparseIterationOrder {
+                    requested_order: requested_order.to_vec(),
+                    base_order,
+                    hint: "materialize or perform external sort for incompatible order".into(),
+                });
+            }
+            if !matches!(self.layout(), Layout::Sparse { .. }) {
+                return Err(Error::Unsupported(
+                    "sparse iteration requires sparse layout".into(),
+                ));
+            }
+            crate::schema::validate_shape_dims(self.shape())?;
+            // Sparse ranges select a set of coordinates, independent of selection order.
+            let mut range = range;
+            for axis in &mut range {
+                if let ha_ndarray::AxisRange::Of(indices) = axis {
+                    indices.sort_unstable();
+                    indices.dedup();
+                }
+            }
+            let coords = validate::iter_range_coords(self.shape(), &range)?;
+            let elements = futures::stream::iter(coordinate_batches(coords))
+                .map(move |coords| async move {
+                    let mut elements = Vec::new();
+                    for coord in coords {
+                        let value = self.read_value(&coord).await?;
+                        if value != Self::DType::default() {
+                            elements.push((coord, value));
+                        }
+                    }
+                    Ok::<_, Error>(futures::stream::iter(elements.into_iter().map(Ok)))
+                })
+                .buffered(num_cpus::get().max(1))
+                .try_flatten();
+            Ok(elements.boxed())
         })
     }
 }
@@ -195,29 +245,13 @@ pub trait TensorViewSemantics: TensorGeometry {
 
 /// Unary tensor math operations.
 pub trait TensorUnary: TensorGeometry + Sized {
-    fn exp<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "exp is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type ExpOutput: TensorRead<DType = Self::DType>;
+    type LnOutput: TensorRead<DType = Self::DType>;
+    type RoundOutput: TensorRead<DType = Self::DType>;
 
-    fn ln<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "ln is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
-
-    fn round<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "round is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>>;
+    fn ln(&self) -> BoxFuture<'_, Result<Self::LnOutput>>;
+    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>;
 }
 
 /// Elementwise tensor math operations.
@@ -440,4 +474,17 @@ pub trait TensorMatMul: TensorArray + Sized {
             ))
         })
     }
+}
+
+/// Batch coordinates without expanding the remaining logical range.
+fn coordinate_batches(
+    mut coords: impl Iterator<Item = Vec<u64>>,
+) -> impl Iterator<Item = Vec<Vec<u64>>> {
+    std::iter::from_fn(move || {
+        let batch: Vec<_> = coords
+            .by_ref()
+            .take(crate::schema::MAX_BLOCK_CAPACITY)
+            .collect();
+        (!batch.is_empty()).then_some(batch)
+    })
 }

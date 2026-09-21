@@ -71,7 +71,7 @@ pub async fn new_dir(name: &str) -> (PathBuf, DirLock<FsEntry>) {
 }
 
 pub fn open_dir(root: &Path) -> io::Result<DirLock<FsEntry>> {
-    let cache = Cache::<FsEntry>::new(1_000_000, None);
+    let cache = Cache::<FsEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
     cache.load(root.to_path_buf())
 }
 

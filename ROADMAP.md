@@ -1,5 +1,8 @@
 # fensor roadmap
 
+> **Non-normative:** this file tracks unimplemented work and cannot override
+> this repository's implemented behavior or local contracts.
+
 ## Boundary contract (non-transactional core)
 
 `fensor` is a filesystem-backed tensor storage/index primitive, not a transaction manager.
@@ -50,6 +53,33 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Add conversion/materialization APIs across `Dense <-> Sparse`.
    - Define heuristics and controls for densification/materialization.
    - Exit criteria: conversion fidelity tests pass with no data-loss regressions.
+
+## Implemented lazy unary execution
+
+- Geometric `TensorView` and computed `UnaryView<Source, Op>` are separate types.
+  `exp`, `ln`, and `round` compose sealed typed ndarray operations without
+  intermediate filesystem materialization or per-operation vector conversion.
+  Only unary traits gain associated output types; geometric transform traits and
+  binary/reduction traits retain their existing interfaces.
+- Bases and views expose fresh, bounded row-major value streams. Fixed-size batches
+  and CPU-based concurrency apply backpressure through consumption and awaited I/O.
+- Direct reads, streaming serialization, and final materialization agree;
+  computed views exclude `TensorWrite` at compile time, including after transforms.
+- Sparse chains retain source support through intermediate zeros. Transformed
+  sparse materialization is supported; non-row-major sparse order is rejected.
+- Cache admission accounts for block payload bytes; real-cache tests exercise
+  spill and reload with tensors larger than the configured cache capacity.
+- Range iteration retains interval descriptors instead of expanding axes.
+
+Remaining execution work:
+
+- Index-driven bounded sparse traversal. Current ordered reads scan only the selected
+  logical range; full-range reads still scale with logical size, not stored support.
+- Block-oriented reads/writes to reduce per-coordinate cache/index lookups.
+- Bounded sparse compaction and filesystem metadata scaling; execution limits do
+  not bound these structures or whole-tensor `Vec` collection APIs.
+- Extend the same read-stream contract to additional ndarray operations rather
+  than introducing a separate executor or intermediate tensor files.
 
 ## Layout support matrix
 
@@ -145,11 +175,6 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Finalize sparse index schema contracts over `b-table` (`coord`, `block_offset`, `block_id`) and document extension points for alternate sparse layouts.
    - Add dense/sparse parity tests for identical logical reads/writes.
    - Define compaction/cleanup behavior for sparse blocks when values are overwritten with zero.
-
-3. **TinyChain integration milestones.**
-   - Integrate `fensor` as a non-transactional storage primitive in host/state lifecycle so tensor storage participates in install, queue, capability checks, and telemetry emission.
-   - Use `fensor`-backed persistence for tensor plumbing once lifecycle hooks are wired.
-   - Keep URI and serialization behavior aligned with canonical `/state/collection/tensor` and tuple payload contracts.
 
 ## Deferred explorations
 

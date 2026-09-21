@@ -245,11 +245,8 @@ pub(crate) struct RowMajorCoords {
 }
 
 pub(crate) fn row_major_coords(shape: &[usize]) -> FResult<RowMajorCoords> {
-    let remaining = if shape.is_empty() {
-        0
-    } else {
-        checked_product(shape)?
-    };
+    validate_shape_dims(shape)?;
+    let remaining = checked_product(shape)?;
 
     Ok(RowMajorCoords {
         shape: shape.to_vec(),
@@ -327,10 +324,6 @@ impl b_table::BTreeSchema for SparseIndexSchema {
                 "invalid sparse index key length",
             ))
         }
-    }
-
-    fn is_empty(&self) -> bool {
-        false
     }
 }
 
