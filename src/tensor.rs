@@ -707,7 +707,7 @@ where
                 Ok(())
             } else {
                 let mut blocks = self.storage.blocks().write().await;
-                blocks.create_file(block_id.to_string(), block, 0)?;
+                blocks.create_file(block_id.to_string(), block, 0).await?;
                 Ok(())
             }
         })
@@ -876,7 +876,8 @@ where
         *guard = payload.to_string();
     } else {
         let mut dir = blocks.write().await;
-        dir.create_file(name.to_string(), payload.to_string(), payload.len())?;
+        dir.create_file(name.to_string(), payload.to_string(), payload.len())
+            .await?;
     }
     Ok(())
 }
@@ -1196,7 +1197,7 @@ mod sparse_lifecycle_tests {
     }
 
     fn open_dir(root: &Path) -> io::Result<DirLock<TestFE>> {
-        let cache = Cache::<TestFE>::new(1_000_000, None);
+        let cache = Cache::<TestFE>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
         cache.load(root.to_path_buf())
     }
 

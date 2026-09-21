@@ -5,8 +5,8 @@ non-transactional, and explicit about supported/unsupported behavior.
 
 ## Core constraints
 
-- `fensor` is not a transaction manager. Do not add commit/rollback/finalize
-  semantics here; those belong in `tc-collection`.
+- `fensor` is not a transaction manager. Do not add commit, rollback, or
+  finalize semantics here; callers may layer their own lifecycle policy.
 - Fail closed on corruption. No fallback recovery paths for malformed metadata
   or data files.
 - Keep one obvious code path per feature. Prefer general primitives over

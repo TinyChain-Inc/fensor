@@ -61,7 +61,7 @@ fn unique_tmp_dir(name: &str) -> PathBuf {
 }
 
 fn open_dir(root: &Path) -> io::Result<freqfs::DirLock<TestFE>> {
-    let cache = Cache::<TestFE>::new(1_000_000, None);
+    let cache = Cache::<TestFE>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
     cache.load(root.to_path_buf())
 }
 

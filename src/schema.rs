@@ -328,10 +328,6 @@ impl b_table::BTreeSchema for SparseIndexSchema {
             ))
         }
     }
-
-    fn is_empty(&self) -> bool {
-        false
-    }
 }
 
 impl IndexSchema for SparseIndexSchema {

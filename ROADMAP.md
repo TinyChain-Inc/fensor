@@ -1,5 +1,8 @@
 # fensor roadmap
 
+> **Non-normative:** this file tracks unimplemented work and cannot override
+> this repository's implemented behavior or local contracts.
+
 ## Boundary contract (non-transactional core)
 
 `fensor` is a filesystem-backed tensor storage/index primitive, not a transaction manager.
@@ -145,11 +148,6 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Finalize sparse index schema contracts over `b-table` (`coord`, `block_offset`, `block_id`) and document extension points for alternate sparse layouts.
    - Add dense/sparse parity tests for identical logical reads/writes.
    - Define compaction/cleanup behavior for sparse blocks when values are overwritten with zero.
-
-3. **TinyChain integration milestones.**
-   - Integrate `fensor` as a non-transactional storage primitive in host/state lifecycle so tensor storage participates in install, queue, capability checks, and telemetry emission.
-   - Use `fensor`-backed persistence for tensor plumbing once lifecycle hooks are wired.
-   - Keep URI and serialization behavior aligned with canonical `/state/collection/tensor` and tuple payload contracts.
 
 ## Deferred explorations
 
