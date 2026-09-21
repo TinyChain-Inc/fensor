@@ -144,6 +144,7 @@ pub(crate) struct BlockPosition {
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum DType {
+    U8,
     F32,
     F64,
 }
@@ -151,6 +152,7 @@ pub enum DType {
 impl DType {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::U8 => "u8",
             Self::F32 => "f32",
             Self::F64 => "f64",
         }
@@ -158,6 +160,7 @@ impl DType {
 
     pub fn try_parse(value: &str) -> Option<Self> {
         match value {
+            "u8" => Some(Self::U8),
             "f32" => Some(Self::F32),
             "f64" => Some(Self::F64),
             _ => None,

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use ha_ndarray::Range;
 use safecast::AsType;
 
@@ -38,6 +38,10 @@ pub trait TensorElement:
     + for<'en> en::IntoStream<'en>
 {
     const DTYPE: DType;
+}
+
+impl TensorElement for u8 {
+    const DTYPE: DType = DType::U8;
 }
 
 impl TensorElement for f32 {
@@ -161,6 +165,44 @@ where
         Self::new_storage(blocks_dir, index, schema, storage_schema).await
     }
 
+    /// Create an independent tensor by consuming a reader in bounded batches.
+    ///
+    /// Evaluation is driven by reads; no intermediate tensor is created. The
+    /// destination uses the reader's dtype and shape. Sparse output resets the
+    /// axis hint to `None` and omits zeros. Errors propagate, leaving cleanup of
+    /// partial destination storage to the caller.
+    pub async fn copy_from<R>(dir: DirLock<FE>, source: &R, max_capacity: usize) -> Result<Self>
+    where
+        R: TensorRead<DType = T> + ?Sized,
+        FE: AsType<String> + From<String>,
+    {
+        let mut blocks = source.read_blocks()?;
+        let schema = TensorSchema::new(T::DTYPE, source.shape().to_vec().into())?;
+        let layout = match source.layout() {
+            Layout::Dense => Layout::Dense,
+            Layout::Sparse { .. } => Layout::Sparse { axis: None },
+        };
+        let output = Self::create(dir, schema, layout, max_capacity).await?;
+        let mut coords = crate::schema::row_major_coords(source.shape())?;
+        while let Some(values) = blocks.try_next().await? {
+            for value in values {
+                let coord = coords.next().ok_or_else(|| {
+                    Error::InvalidLayout("reader returned more values than its shape".into())
+                })?;
+                if matches!(layout, Layout::Sparse { .. }) && value == T::default() {
+                    continue;
+                }
+                output.write_value(&coord, value).await?;
+            }
+        }
+        if coords.next().is_some() {
+            return Err(Error::InvalidLayout(
+                "reader returned fewer values than its shape".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     pub async fn load(dir: DirLock<FE>) -> Result<Self>
     where
         FE: AsType<String> + From<String>,
@@ -266,7 +308,7 @@ where
         vec![T::default(); self.block_len()]
     }
 
-    async fn materialize(&self) -> Result<()> {
+    async fn initialize_dense_blocks(&self) -> Result<()> {
         if let Layout::Sparse { .. } = self.layout() {
             return Ok(());
         }
@@ -386,7 +428,7 @@ where
             _dtype: std::marker::PhantomData,
         };
 
-        tensor.materialize().await?;
+        tensor.initialize_dense_blocks().await?;
         tensor.persist_metadata().await?;
 
         Ok(tensor)

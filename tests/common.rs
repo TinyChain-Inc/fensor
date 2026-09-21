@@ -7,6 +7,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use b_table::Node;
 use destream::{de, en};
@@ -17,6 +18,7 @@ use safecast::as_type;
 #[derive(Clone, Debug)]
 pub enum FsEntry {
     Node(Node<u64>),
+    U8(Vec<u8>),
     F32(Vec<f32>),
     F64(Vec<f64>),
     Text(String),
@@ -26,6 +28,7 @@ impl<'en> en::ToStream<'en> for FsEntry {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
             Self::Node(node) => node.to_stream(encoder),
+            Self::U8(values) => values.to_stream(encoder),
             Self::F32(values) => values.to_stream(encoder),
             Self::F64(values) => values.to_stream(encoder),
             Self::Text(text) => text.to_stream(encoder),
@@ -36,7 +39,7 @@ impl<'en> en::ToStream<'en> for FsEntry {
 // `TensorFileEntry<T>: FileLoad` is only satisfiable via the blanket
 // `impl<T: FromStream> FileLoad for T`, so `FsEntry` needs a `FromStream` impl to
 // type-check. Every read in this codebase goes through a concrete `AsType` target
-// (`String`/`Vec<f32>`/`Vec<f64>`/`Node<u64>`), never through `FsEntry` itself, so
+// (`String`/`Vec<u8>`/`Vec<f32>`/`Vec<f64>`/`Node<u64>`), never through `FsEntry` itself, so
 // this is never actually invoked at runtime.
 impl de::FromStream for FsEntry {
     type Context = ();
@@ -49,6 +52,7 @@ impl de::FromStream for FsEntry {
 }
 
 as_type!(FsEntry, Node, Node<u64>);
+as_type!(FsEntry, U8, Vec<u8>);
 as_type!(FsEntry, F32, Vec<f32>);
 as_type!(FsEntry, F64, Vec<f64>);
 as_type!(FsEntry, Text, String);
@@ -59,7 +63,11 @@ pub fn unique_tmp_dir(name: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    path.push(format!("fensor_test_{name}_{unique}"));
+    // Wall-clock timestamps alone can collide between concurrent tests.
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+    let process = std::process::id();
+    path.push(format!("fensor_test_{name}_{unique}_{process}_{sequence}"));
     path
 }
 

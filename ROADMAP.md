@@ -56,6 +56,24 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 
 ## Implemented lazy unary execution
 
+- Views evaluate implicitly through read consumers. `Tensor::copy_from` is the
+  single constructor for copying any reader into independent storage; geometric
+  and computed views have no separate materialization method.
+
+- Native u8 storage covers the full byte range. `TensorUnaryBoolean::not` accepts
+  all supported dtypes; `TensorNumeric::{is_nan, is_inf}` accepts floats and
+  produces u8 views. Nested predicates retain root support through intermediate
+  false results, with no implicit sparse densification.
+
+- `TensorCast<f64>` supports f32-to-f64 nested views without intermediate
+  evaluation. Root support survives dtype changes, and terminal consumers use
+  the output dtype; `Tensor::copy_from` supports a distinct destination adapter.
+
+- `TensorAbs` and `TensorTrig` support absolute value and all nine ndarray
+  trigonometric operations for f32/f64 through the same nested unary evaluator.
+  Sparse operations retain original source support, including for cosine,
+  inverse cosine, and hyperbolic cosine; domain results follow the ndarray backend.
+
 - Geometric `TensorView` and computed `UnaryView<Source, Op>` are separate types.
   `exp`, `ln`, and `round` nest unary views over their immediate sources, following
   ndarray access composition. Consumers read the root geometric view and build
@@ -65,7 +83,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   binary/reduction traits retain their existing interfaces.
 - Bases and views expose fresh, bounded row-major value streams. Fixed-size batches
   and CPU-based concurrency apply backpressure through consumption and awaited I/O.
-- Direct reads, streaming serialization, and final materialization agree;
+- Direct reads, streaming serialization, and `Tensor::copy_from` agree;
   computed views exclude `TensorWrite` at compile time, including after transforms.
 - Sparse chains retain source support through intermediate zeros. Transformed
   sparse materialization is supported; non-row-major sparse order is rejected.
@@ -74,6 +92,10 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 - Range iteration retains interval descriptors instead of expanding axes.
 
 Remaining execution work:
+
+- Extend casting beyond f32-to-f64; add binary boolean operations, comparisons,
+  and complex storage/operations separately. Expression input/output dtypes are
+  already independent, and u8 predicate output storage is supported.
 
 - Index-driven bounded sparse traversal. Current ordered reads scan only the selected
   logical range; full-range reads still scale with logical size, not stored support.
@@ -146,7 +168,7 @@ Remaining execution work:
 
 1. **Complete trait-backed base/view implementation.**
    - Finish `TensorArray`, `TensorRead`, `TensorWrite`, `TensorTransform`, `TensorBlockStore`, and `TensorSparseIndex` for one writable base tensor plus trait-compatible view tensors.
-   - Keep view construction lazy (metadata/mapping only) until explicit materialization is requested.
+   - Keep view construction lazy (metadata/mapping only) until consumed by reads, serialization, or `Tensor::copy_from`.
 
 2. **Accessor test suite (first).**
    - Add focused tests for coordinate-to-offset, offset-to-block, and sparse-key mapping.

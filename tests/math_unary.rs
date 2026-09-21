@@ -26,14 +26,13 @@ async fn dense_single_block_round_matches_expected_values() {
         tensor.write_value(&[r, c], value).await.expect("write");
     }
 
-    let rounded = tensor
-        .view()
-        .round()
-        .await
-        .expect("round should succeed")
-        .materialize(out_dir, 1000)
-        .await
-        .expect("materialize should succeed");
+    let rounded = Tensor::copy_from(
+        out_dir,
+        &tensor.view().round().await.expect("round should succeed"),
+        1000,
+    )
+    .await
+    .expect("copy should succeed");
 
     for ((r, c), value) in values {
         let expected = value.round();
@@ -45,7 +44,7 @@ async fn dense_single_block_round_matches_expected_values() {
 #[tokio::test]
 async fn dense_multi_block_exp_and_ln_stream_correctly() {
     // shape [10] with max_capacity 3 -> block_shape [3], grid ceil(10/3) = 4
-    // blocks, forcing the block-level materialize path to walk multiple blocks.
+    // blocks, forcing the block-level copy path to walk multiple blocks.
     let (_root, dir) = new_dir("dense_multi_block_exp_ln").await;
     let (_exp_root, exp_dir) = new_dir("dense_multi_block_exp_ln_exp_out").await;
     let (_ln_root, ln_dir) = new_dir("dense_multi_block_exp_ln_ln_out").await;
@@ -59,22 +58,20 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
         tensor.write_value(&[i as u64], value).await.expect("write");
     }
 
-    let expd = tensor
-        .view()
-        .exp()
-        .await
-        .expect("exp should succeed")
-        .materialize(exp_dir, 1000)
-        .await
-        .expect("materialize exp");
-    let lnd = tensor
-        .view()
-        .ln()
-        .await
-        .expect("ln should succeed")
-        .materialize(ln_dir, 1000)
-        .await
-        .expect("materialize ln");
+    let expd = Tensor::copy_from(
+        exp_dir,
+        &tensor.view().exp().await.expect("exp should succeed"),
+        1000,
+    )
+    .await
+    .expect("copy exp");
+    let lnd = Tensor::copy_from(
+        ln_dir,
+        &tensor.view().ln().await.expect("ln should succeed"),
+        1000,
+    )
+    .await
+    .expect("copy ln");
 
     for coord in iter_coords(&[10]) {
         let i = coord[0] as usize;
@@ -94,7 +91,7 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
 }
 
 #[tokio::test]
-async fn chain_is_lazy_until_materialize() {
+async fn chain_is_lazy_until_copy() {
     let (_root, dir) = new_dir("lazy_chain_source").await;
     let (out_root, out_dir) = new_dir("lazy_chain_out").await;
     let schema = TensorSchema::new(DType::F32, shape![2, 2]).expect("schema");
@@ -112,21 +109,20 @@ async fn chain_is_lazy_until_materialize() {
 
     assert!(
         !out_root.join("blocks").exists(),
-        "materialize must not have run any I/O yet"
+        "copy must not have run any I/O yet"
     );
 
-    let materialized = chain
-        .materialize(out_dir.clone(), 1000)
+    let copied = Tensor::copy_from(out_dir.clone(), &chain, 1000)
         .await
-        .expect("materialize should succeed");
+        .expect("copy should succeed");
     out_dir.sync().await.expect("sync");
 
     assert!(
         out_root.join("blocks").exists(),
-        "materialize must create the blocks directory"
+        "copy must create the blocks directory"
     );
     assert_eq!(
-        materialized.read_value(&[0, 0]).await.expect("read"),
+        copied.read_value(&[0, 0]).await.expect("read"),
         1.0f32.exp().ln()
     );
 }
@@ -144,14 +140,17 @@ async fn ln_domain_edges_produce_ieee754_values_not_errors() {
         .await
         .expect("write negative");
 
-    let lnd = tensor
-        .view()
-        .ln()
-        .await
-        .expect("ln should succeed, not error")
-        .materialize(out_dir, 1000)
-        .await
-        .expect("materialize should succeed, not error");
+    let lnd = Tensor::copy_from(
+        out_dir,
+        &tensor
+            .view()
+            .ln()
+            .await
+            .expect("ln should succeed, not error"),
+        1000,
+    )
+    .await
+    .expect("copy should succeed, not error");
 
     assert_eq!(lnd.read_value(&[0]).await.expect("read"), f32::NEG_INFINITY);
     assert!(lnd.read_value(&[1]).await.expect("read").is_nan());
@@ -180,30 +179,12 @@ async fn sparse_round_exp_ln_all_supported_on_populated_elements_only() {
         let (_out_root, out_dir) = new_dir(&format!("sparse_unary_supported_{op_name}_out")).await;
         let view = tensor.view();
         let result = match op_name {
-            "round" => {
-                view.round()
-                    .await
-                    .expect("round")
-                    .materialize(out_dir, 1000)
-                    .await
-            }
-            "exp" => {
-                view.exp()
-                    .await
-                    .expect("exp")
-                    .materialize(out_dir, 1000)
-                    .await
-            }
-            "ln" => {
-                view.ln()
-                    .await
-                    .expect("ln")
-                    .materialize(out_dir, 1000)
-                    .await
-            }
+            "round" => Tensor::copy_from(out_dir, &view.round().await.expect("round"), 1000).await,
+            "exp" => Tensor::copy_from(out_dir, &view.exp().await.expect("exp"), 1000).await,
+            "ln" => Tensor::copy_from(out_dir, &view.ln().await.expect("ln"), 1000).await,
             _ => unreachable!(),
         }
-        .unwrap_or_else(|err| panic!("materialize {op_name} should succeed: {err}"));
+        .unwrap_or_else(|err| panic!("copy {op_name} should succeed: {err}"));
 
         let actual_a = result.read_value(&[0, 1, 2]).await.expect("read a");
         if expected_a.is_nan() {
@@ -231,7 +212,7 @@ async fn sparse_round_exp_ln_all_supported_on_populated_elements_only() {
 }
 
 #[tokio::test]
-async fn transformed_sparse_unary_view_materializes() {
+async fn transformed_sparse_unary_view_copies() {
     let (_root, dir) = new_dir("sparse_non_identity_unsupported").await;
     let (_out_root, out_dir) = new_dir("sparse_non_identity_unsupported_out").await;
     let schema = TensorSchema::new(DType::F32, shape![2, 3, 4]).expect("schema");
@@ -253,10 +234,9 @@ async fn transformed_sparse_unary_view_materializes() {
         .expect("slice should succeed");
 
     let chain = sliced.exp().await.expect("exp should succeed lazily");
-    let result = chain
-        .materialize(out_dir, 2)
+    let result = Tensor::copy_from(out_dir, &chain, 2)
         .await
-        .expect("materialize transformed sparse");
+        .expect("copy transformed sparse");
     assert_eq!(
         result.read_value(&[0, 1, 2]).await.expect("populated"),
         1.6f32.exp()
@@ -270,7 +250,7 @@ async fn transformed_sparse_unary_view_materializes() {
 #[tokio::test]
 async fn chained_exp_then_round_matches_per_coordinate_computation_multi_block() {
     // shape [10] with max_capacity 3 -> 4 blocks, exercising the block-level
-    // materialize path under a real multi-op chain, not just a single op.
+    // copy path under a real multi-op chain, not just a single op.
     let (_root, dir) = new_dir("chained_exp_round_multi_block").await;
     let (_out_root, out_dir) = new_dir("chained_exp_round_multi_block_out").await;
     let schema = TensorSchema::new(DType::F32, shape![10]).expect("schema");
@@ -283,17 +263,20 @@ async fn chained_exp_then_round_matches_per_coordinate_computation_multi_block()
         tensor.write_value(&[i as u64], value).await.expect("write");
     }
 
-    let chained = tensor
-        .view()
-        .exp()
-        .await
-        .expect("exp should succeed")
-        .round()
-        .await
-        .expect("round should succeed")
-        .materialize(out_dir, 1000)
-        .await
-        .expect("materialize should succeed");
+    let chained = Tensor::copy_from(
+        out_dir,
+        &tensor
+            .view()
+            .exp()
+            .await
+            .expect("exp should succeed")
+            .round()
+            .await
+            .expect("round should succeed"),
+        1000,
+    )
+    .await
+    .expect("copy should succeed");
 
     for coord in iter_coords(&[10]) {
         let i = coord[0] as usize;
@@ -341,7 +324,7 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
     assert_eq!(first.iter().map(Vec::len).collect::<Vec<_>>(), vec![10]);
     let values: Vec<_> = first.into_iter().flatten().collect();
     let (out_root, out_dir) = new_dir("unary_consumers_out").await;
-    let output = expression.materialize(out_dir, 2).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
     let (wire_root, wire_dir) = new_dir("unary_consumers_wire").await;
     let decoded: TensorViewDecoder<FsEntry, f64> = tbon::de::try_decode(
         wire_dir,
@@ -397,7 +380,7 @@ async fn sparse_chain_preserves_input_support_through_intermediate_zero() {
         .unwrap();
     assert_eq!(rows, vec![(vec![2, 1], 1.0)]);
     let (out_root, out_dir) = new_dir("sparse_chain_support_out").await;
-    let output = expression.materialize(out_dir, 2).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
     for coord in iter_coords(&[3, 2]) {
         assert_eq!(
             output.read_value(&coord).await.unwrap(),
@@ -439,7 +422,7 @@ async fn stream_is_demand_driven_and_errors_on_corrupt_tail() {
 }
 
 #[tokio::test]
-async fn materialization_spills_beyond_cache_budget_and_reloads() {
+async fn copying_spills_beyond_cache_budget_and_reloads() {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let (root, _) = new_dir("unary_small_cache").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
@@ -465,7 +448,9 @@ async fn materialization_spills_beyond_cache_budget_and_reloads() {
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let out_dir = out_cache.load(out_root.clone()).unwrap();
         let expression = tensor.view().exp().await.unwrap();
-        let output = expression.materialize(out_dir.clone(), 16).await.unwrap();
+        let output = Tensor::copy_from(out_dir.clone(), &expression, 16)
+            .await
+            .unwrap();
         assert_eq!(output.read_value(&[1023]).await.unwrap(), 2.0f32.exp());
         out_dir.sync().await.unwrap();
         drop(output);
@@ -605,7 +590,7 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
         let values: Vec<_> = blocks.into_iter().flatten().collect();
         assert_eq!(values.len(), 6);
         let (out_root, out_dir) = new_dir(&format!("{name}_out")).await;
-        let output = expression.materialize(out_dir, 2).await.unwrap();
+        let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
         let (wire_root, wire_dir) = new_dir(&format!("{name}_wire")).await;
         let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(
             wire_dir,

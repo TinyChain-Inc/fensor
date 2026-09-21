@@ -254,6 +254,114 @@ pub trait TensorUnary: TensorGeometry + Sized {
     fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>;
 }
 
+/// Logical negation evaluated only on original support for sparse tensors.
+pub trait TensorUnaryBoolean: TensorGeometry + Sized {
+    type Output: TensorRead<DType = u8>;
+
+    fn not(&self) -> BoxFuture<'_, Result<Self::Output>>;
+}
+
+/// Floating-point predicates returning u8 masks.
+///
+/// Predicate outputs cannot themselves be used as floating-point inputs:
+///
+/// ```compile_fail,E0277
+/// use fensor::{Tensor, TensorFileEntry, TensorNumeric};
+/// async fn unsupported<FE: TensorFileEntry<u8>>(tensor: &Tensor<FE, u8>) {
+///     let _ = TensorNumeric::is_nan(&tensor.view()).await;
+/// }
+/// ```
+///
+/// Source and destination adapters need only support their respective dtypes:
+///
+/// ```
+/// use fensor::{Result, Tensor, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
+/// use freqfs::DirLock;
+/// use safecast::AsType;
+/// async fn mask<S, D>(tensor: &Tensor<S, f32>, dir: DirLock<D>) -> Result<Tensor<D, u8>>
+/// where
+///     S: TensorFileEntry<f32>,
+///     D: TensorFileEntry<u8> + AsType<String> + From<String>,
+/// {
+///     let mask = tensor.view().is_nan().await?.not().await?.clone();
+///     Tensor::copy_from(dir, &mask, 4096).await
+/// }
+/// ```
+pub trait TensorNumeric: TensorGeometry + Sized {
+    type IsNanOutput: TensorRead<DType = u8>;
+    type IsInfOutput: TensorRead<DType = u8>;
+
+    fn is_nan(&self) -> BoxFuture<'_, Result<Self::IsNanOutput>>;
+    fn is_inf(&self) -> BoxFuture<'_, Result<Self::IsInfOutput>>;
+}
+
+/// Lazy element-type conversion. Currently supports f32 to f64.
+///
+/// The destination storage adapter need only support the output dtype:
+///
+/// ```
+/// use fensor::{Result, Tensor, TensorCast, TensorFileEntry};
+/// use freqfs::DirLock;
+/// use safecast::AsType;
+///
+/// async fn widen<Source, Destination>(
+///     source: &Tensor<Source, f32>,
+///     dir: DirLock<Destination>,
+/// ) -> Result<Tensor<Destination, f64>>
+/// where
+///     Source: TensorFileEntry<f32>,
+///     Destination: TensorFileEntry<f64> + AsType<String> + From<String>,
+/// {
+///     let view = source.view();
+///     let cast = TensorCast::<f64>::cast(&view).await?;
+///     Tensor::copy_from(dir, &cast, 4096).await
+/// }
+/// ```
+///
+/// Narrowing is not supported:
+///
+/// ```compile_fail,E0277
+/// use fensor::{Tensor, TensorCast, TensorFileEntry};
+/// async fn narrow<FE: TensorFileEntry<f64>>(source: &Tensor<FE, f64>) {
+///     let _ = TensorCast::<f32>::cast(&source.view()).await;
+/// }
+/// ```
+pub trait TensorCast<To: crate::TensorElement>: TensorGeometry + Sized {
+    type Output: TensorRead<DType = To>;
+
+    fn cast(&self) -> BoxFuture<'_, Result<Self::Output>>;
+}
+
+/// Elementwise absolute value preserving the stored element type.
+pub trait TensorAbs: TensorGeometry + Sized {
+    type Output: TensorRead<DType = Self::DType>;
+
+    fn abs(&self) -> BoxFuture<'_, Result<Self::Output>>;
+}
+
+/// Elementwise trigonometry, evaluated lazily over source support.
+pub trait TensorTrig: TensorGeometry + Sized {
+    type SinOutput: TensorRead<DType = Self::DType>;
+    type AsinOutput: TensorRead<DType = Self::DType>;
+    type SinhOutput: TensorRead<DType = Self::DType>;
+    type CosOutput: TensorRead<DType = Self::DType>;
+    type AcosOutput: TensorRead<DType = Self::DType>;
+    type CoshOutput: TensorRead<DType = Self::DType>;
+    type TanOutput: TensorRead<DType = Self::DType>;
+    type AtanOutput: TensorRead<DType = Self::DType>;
+    type TanhOutput: TensorRead<DType = Self::DType>;
+
+    fn sin(&self) -> BoxFuture<'_, Result<Self::SinOutput>>;
+    fn asin(&self) -> BoxFuture<'_, Result<Self::AsinOutput>>;
+    fn sinh(&self) -> BoxFuture<'_, Result<Self::SinhOutput>>;
+    fn cos(&self) -> BoxFuture<'_, Result<Self::CosOutput>>;
+    fn acos(&self) -> BoxFuture<'_, Result<Self::AcosOutput>>;
+    fn cosh(&self) -> BoxFuture<'_, Result<Self::CoshOutput>>;
+    fn tan(&self) -> BoxFuture<'_, Result<Self::TanOutput>>;
+    fn atan(&self) -> BoxFuture<'_, Result<Self::AtanOutput>>;
+    fn tanh(&self) -> BoxFuture<'_, Result<Self::TanhOutput>>;
+}
+
 /// Elementwise tensor math operations.
 pub trait TensorMath: TensorArray + Sized {
     fn add<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
