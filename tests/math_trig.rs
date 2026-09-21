@@ -3,13 +3,13 @@
 use fensor::unary::UnaryOp;
 use fensor::{
     Layout, Tensor, TensorAbs, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
-    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorViewDecoder,
-    TensorWrite, UnaryView,
+    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, ArrayAccess, AxisRange, Buffer, NDArrayAbs, NDArrayRead, NDArrayTrig, axes, range, shape,
 };
+use number_general::FloatType;
 
 use common::{FsEntry, new_dir};
 
@@ -45,21 +45,13 @@ where
     assert_eq!(values.len(), expected.len());
     let (out_root, out_dir) = new_dir("trig_materialized").await;
     let output = Tensor::copy_from(out_dir, &view, 3).await.unwrap();
-    let (wire_root, wire_dir) = new_dir("trig_wire").await;
-    let decoded: TensorViewDecoder<FsEntry, T> =
-        tbon::de::try_decode(wire_dir, tbon::en::encode(view.view_encoder()).unwrap())
-            .await
-            .unwrap();
-    let decoded = decoded.into_inner();
     for (i, &expected) in expected.iter().enumerate() {
         let coord = [i as u64];
         let point = view.read_value(&coord).await.unwrap();
         assert_float(point, expected);
         assert_float(values[i], expected);
         assert_float(output.read_value(&coord).await.unwrap(), expected);
-        assert_float(decoded.read_value(&coord).await.unwrap(), expected);
-        // Sparse storage and the wire format omit zeros, but dense consumers
-        // preserve the backend's signed zero before serialization.
+        // Sparse storage omits zeros; dense consumers preserve signed zero.
         if matches!(view.layout(), Layout::Dense) && expected == T::default() {
             assert_eq!(
                 Into::<f64>::into(point).is_sign_negative(),
@@ -95,7 +87,6 @@ where
         }
     }
     common::cleanup(&out_root).await;
-    common::cleanup(&wire_root).await;
 }
 
 macro_rules! operation_matrix {
@@ -122,7 +113,8 @@ macro_rules! operation_matrix {
                 ];
                 let tensor = Tensor::<FsEntry, $t>::create(
                     dir,
-                    TensorSchema::new(<$t>::DTYPE, shape![input.len()]).unwrap(),
+                    TensorSchema::new(<$t as number_general::DType>::dtype(), shape![input.len()])
+                        .unwrap(),
                     layout,
                     3,
                 )
@@ -179,7 +171,7 @@ async fn mixed_sparse_chain_preserves_support_transforms_and_reuse() {
     let (root, dir) = new_dir("trig_sparse_chain").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(fensor::DType::F32, shape![1, 4102]).unwrap(),
+        TensorSchema::new(fensor::NumberType::Float(FloatType::F32), shape![1, 4102]).unwrap(),
         Layout::Sparse { axis: Some(0) },
         4096,
     )
@@ -247,21 +239,11 @@ async fn mixed_sparse_chain_preserves_support_transforms_and_reuse() {
     let expression = expression.slice(range![AxisRange::In(0, 8, 1)]).unwrap();
     let (out_root, out_dir) = new_dir("trig_chain_out").await;
     let output = Tensor::copy_from(out_dir, &expression, 16).await.unwrap();
-    let (wire_root, wire_dir) = new_dir("trig_chain_wire").await;
-    let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(
-        wire_dir,
-        tbon::en::encode(expression.view_encoder()).unwrap(),
-    )
-    .await
-    .unwrap();
-    let decoded = decoded.into_inner();
     for i in 0..8 {
         let expected = if i == 0 { 0.0 } else { 1.0 };
         assert_eq!(expression.read_value(&[i]).await.unwrap(), expected);
         assert_eq!(output.read_value(&[i]).await.unwrap(), expected);
-        assert_eq!(decoded.read_value(&[i]).await.unwrap(), expected);
     }
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
-    common::cleanup(&wire_root).await;
 }

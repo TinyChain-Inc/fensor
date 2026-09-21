@@ -56,6 +56,14 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 
 ## Implemented lazy unary execution
 
+- Schemas and geometry report number-general `NumberType` classes; tensors use
+  primitive type parameters directly. Typed `TensorMetadata<T>` replaces
+  text metadata and dtype tags. File-entry adapters own byte codecs, type
+  discrimination, format versions, and migration from old storage. fensor requires
+  destream but does not enable a concrete codec; JSON and TBON storage are tested
+  through explicit caller-owned `FileLoad`/`FileSave` implementations.
+  Whole-tensor transfer formats belong to callers consuming `TensorRead`.
+
 - Views evaluate implicitly through read consumers. `Tensor::copy_from` is the
   single constructor for copying any reader into independent storage; geometric
   and computed views have no separate materialization method.
@@ -83,7 +91,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   binary/reduction traits retain their existing interfaces.
 - Bases and views expose fresh, bounded row-major value streams. Fixed-size batches
   and CPU-based concurrency apply backpressure through consumption and awaited I/O.
-- Direct reads, streaming serialization, and `Tensor::copy_from` agree;
+- Direct reads, block streams, and `Tensor::copy_from` agree;
   computed views exclude `TensorWrite` at compile time, including after transforms.
 - Sparse chains retain source support through intermediate zeros. Transformed
   sparse materialization is supported; non-row-major sparse order is rejected.
@@ -141,7 +149,7 @@ Remaining execution work:
    - Validate metadata and block persistence across real `freqfs` reload boundaries.
    - Corruption and malformed metadata must fail closed with structured errors.
    - Gate: integration tests cover create->write->reload->read and corruption->error flows.
-   - Implemented: `Tensor::view_encoder()` and `TensorViewDecoder` provide a genuinely streaming serialization for a tensor's current view (identity or transformed, dense or sparse), with no full in-memory buffering on either side. The encoder lazily reads values from filesystem storage and emits only non-default payloads to the wire; the decoder writes arriving values directly to fresh independent base tensor storage. There is no trailer or checksum: success is natural exhaustion of the pairs sequence, and end-to-end transfer completeness/integrity is a transport/caller concern rather than something this wire format re-verifies itself. A sender-side read failure propagates as a bounded error-code sentinel (a closed classification of the failure shape, with no free-text/sender-internal detail such as filesystem paths); that sentinel, a malformed/truncated stream, or any other decode-time error triggers fail-closed behaviour with clear error propagation. Reconstruction always produces a fresh, independent identity base tensor with no link back to the source storage. This is a distinct, additive wire surface alongside the existing schema-only `Tensor: ToStream/FromStream` contract, not a replacement for it; it does not by itself satisfy the "Phase 5: Conversion and materialization" `Dense <-> Sparse` conversion exit criteria below, since it always preserves the source's layout category.
+   - Typed metadata is serialized through destream; file adapters preserve element types and select byte codecs. Applications define whole-tensor transfer formats using `TensorRead`. `Tensor::copy_from` creates independent storage from a reader.
 
 4. **Base/view write-through semantics.**
    - Define which transformed tensors are writable and which are read-only.
@@ -168,7 +176,7 @@ Remaining execution work:
 
 1. **Complete trait-backed base/view implementation.**
    - Finish `TensorArray`, `TensorRead`, `TensorWrite`, `TensorTransform`, `TensorBlockStore`, and `TensorSparseIndex` for one writable base tensor plus trait-compatible view tensors.
-   - Keep view construction lazy (metadata/mapping only) until consumed by reads, serialization, or `Tensor::copy_from`.
+   - Keep view construction lazy (metadata/mapping only) until consumed by reads or `Tensor::copy_from`.
 
 2. **Accessor test suite (first).**
    - Add focused tests for coordinate-to-offset, offset-to-block, and sparse-key mapping.
@@ -205,7 +213,7 @@ Remaining execution work:
 - **Adaptive block sizing.** Evaluate configurable or data-driven block sizing after baseline persistence semantics are stable.
 - **Typed tensor families.** Expand beyond `f32` once core lifecycle and sparse-index behavior are validated.
 - **Cross-host sharding hooks.** Keep routing/sharding orchestration in client libraries while exposing reusable shard-local primitives in `fensor`.
-- **Encode-side enumeration optimization.** Encode-side view streaming currently walks every logical coordinate and filters defaults at the codec layer. A future optimization could use sparse-index row enumeration and filesystem directory listing to skip known-empty storage regions entirely, reducing I/O cost for extremely sparse large tensors — but this requires solving how to invert arbitrary view transforms (some non-closed-form) back to base storage coordinates, which is out of scope for now.
+- **Index-driven sparse enumeration.** Sparse reads traverse the selected logical range. Future traversal should use stored support while preserving ordering through geometric transforms.
 
 ## ha-ndarray execution dependency acknowledgement
 

@@ -4,20 +4,21 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    DType, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorReadBulk,
-    TensorSchema, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
+    Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorReadBulk, TensorSchema,
+    TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{AxisRange, Range, Shape, axes, range, shape};
+use number_general::{FloatType, NumberType};
 
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 
 fn dense_schema_f32(shape: Shape) -> TensorSchema {
-    TensorSchema::new(DType::F32, shape).expect("schema")
+    TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema")
 }
 
 fn sparse_schema_f32(shape: Shape) -> TensorSchema {
-    TensorSchema::new(DType::F32, shape).expect("schema")
+    TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema")
 }
 
 async fn create_dense(
@@ -2046,7 +2047,7 @@ mod section_h_persistence {
     }
 
     #[tokio::test]
-    async fn unknown_metadata_version_rejected_on_reload() {
+    async fn unrecognized_metadata_rejected_on_reload() {
         let root = common::unique_tmp_dir("h_meta_version");
         tokio::fs::create_dir(&root).await.expect("mkdir");
         let schema = dense_schema_f32(shape![2, 3, 4]);
@@ -2059,7 +2060,7 @@ mod section_h_persistence {
             dir.sync().await.expect("sync");
         }
 
-        // Rewrite the metadata file with a structurally valid but unsupported version.
+        // Replace the typed entry with an unrecognized payload.
         let meta = root.join("blocks").join("metadata");
         let bad = "version=999\ndtype=f32\nlayout=dense\nshape=2,3,4\nblock_shape=1,1,4\nstrides=12,4,1\n";
         let _ = tokio::fs::write(&meta, bad).await;
@@ -2068,7 +2069,7 @@ mod section_h_persistence {
         let err = Tensor::<FsEntry, f32>::load(dir2)
             .await
             .err()
-            .expect("unknown version must fail closed");
+            .expect("unrecognized metadata must fail closed");
         assert!(
             matches!(err, Error::InvalidSchema(_) | Error::Io(_)),
             "got {err:?}"

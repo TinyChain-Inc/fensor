@@ -5,10 +5,11 @@ use b_table::Node;
 use destream::{de, en};
 use freqfs::Cache;
 use ha_ndarray::{AxisRange, axes, range, shape};
+use number_general::{FloatType, NumberType};
 use safecast::as_type;
 
 use crate::schema::row_major_coords;
-use crate::{DType, Error, Layout, Tensor, TensorSchema};
+use crate::{Error, Layout, Tensor, TensorSchema};
 
 use super::*;
 
@@ -16,39 +17,54 @@ use super::*;
 enum TestFE {
     Node(Node<u64>),
     F32(Vec<f32>),
-    Text(String),
+    MetadataF32(crate::TensorMetadata<f32>),
 }
-
 impl<'en> en::ToStream<'en> for TestFE {
     fn to_stream<E: en::Encoder<'en>>(
         &'en self,
         encoder: E,
     ) -> std::result::Result<E::Ok, E::Error> {
         match self {
-            Self::Node(node) => node.to_stream(encoder),
-            Self::F32(values) => values.to_stream(encoder),
-            Self::Text(text) => text.to_stream(encoder),
+            Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
+            Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
+            Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
         }
     }
 }
-
-// Only ever read via a concrete `AsType` target (mirrors `src/lib.rs::sparse_lifecycle_tests`).
-impl de::FromStream for TestFE {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(
-        _: (),
-        _decoder: &mut D,
-    ) -> std::result::Result<Self, D::Error> {
-        Err(de::Error::custom(
-            "TestFE does not support generic decoding; read via a concrete AsType target",
-        ))
+struct TestFEVisitor;
+impl de::Visitor for TestFEVisitor {
+    type Value = TestFE;
+    fn expecting() -> &'static str {
+        "a typed filesystem entry"
+    }
+    async fn visit_seq<A: de::SeqAccess>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let entry = match seq.expect_next::<u8>(()).await? {
+            0 => TestFE::Node(seq.expect_next(()).await?),
+            1 => TestFE::F32(seq.expect_next(()).await?),
+            2 => TestFE::MetadataF32(seq.expect_next(()).await?),
+            tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
+        };
+        if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+            return Err(de::Error::custom("unexpected entry field"));
+        }
+        Ok(entry)
     }
 }
-
+impl de::FromStream for TestFE {
+    type Context = ();
+    async fn from_stream<D: de::Decoder>(
+        _: (),
+        decoder: &mut D,
+    ) -> std::result::Result<Self, D::Error> {
+        decoder.decode_seq(TestFEVisitor).await
+    }
+}
 as_type!(TestFE, Node, Node<u64>);
 as_type!(TestFE, F32, Vec<f32>);
-as_type!(TestFE, Text, String);
+as_type!(TestFE, MetadataF32, crate::TensorMetadata<f32>);
 
 fn unique_tmp_dir(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -82,7 +98,7 @@ async fn create_dense(
     max_capacity: usize,
 ) -> (PathBuf, Tensor<TestFE, f32>) {
     let (root, dir) = new_dir(name).await;
-    let schema = TensorSchema::new(DType::F32, shape).expect("schema");
+    let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema");
     let tensor = Tensor::<TestFE, f32>::create(dir, schema, Layout::Dense, max_capacity)
         .await
         .expect("create dense");
@@ -1316,4 +1332,29 @@ async fn unsqueeze_then_squeeze_round_trip() {
         );
     }
     cleanup(&root).await;
+}
+
+impl freqfs::FileLoad for TestFE {
+    async fn load(
+        _: &std::path::Path,
+        file: tokio::fs::File,
+        _: std::fs::Metadata,
+    ) -> std::io::Result<Self> {
+        tbon::de::read_from((), file)
+            .await
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+impl freqfs::FileSave for TestFE {
+    async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
+        use futures::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
+        let mut size = 0;
+        while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+            file.write_all(&chunk).await?;
+            size += chunk.len() as u64;
+        }
+        Ok(size)
+    }
 }

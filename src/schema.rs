@@ -2,6 +2,7 @@ use std::io;
 
 use b_table::{IndexSchema, Schema};
 use ha_ndarray::{Shape, Strides};
+use number_general::{FloatType, NumberType, UIntType};
 use smallvec::SmallVec;
 
 use crate::{Error, PORTABLE_INLINE_RANK, Result as FResult};
@@ -24,13 +25,21 @@ pub const MAX_BLOCK_CAPACITY: usize = 4096;
 /// (possibly-transformed) shape/strides live on `TensorView` instead.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct TensorSchema {
-    dtype: DType,
+    dtype: NumberType,
     shape: TensorShape,
     strides: TensorStrides,
 }
 
 impl TensorSchema {
-    pub fn new(dtype: DType, shape: TensorShape) -> FResult<Self> {
+    pub fn new(dtype: NumberType, shape: TensorShape) -> FResult<Self> {
+        if !matches!(
+            dtype,
+            NumberType::UInt(UIntType::U8) | NumberType::Float(FloatType::F32 | FloatType::F64)
+        ) {
+            return Err(Error::InvalidSchema(format!(
+                "unsupported tensor dtype: {dtype}"
+            )));
+        }
         validate_shape_dims(shape.as_slice())?;
         let strides = contiguous_strides(shape.as_slice())?;
         Ok(Self {
@@ -40,7 +49,7 @@ impl TensorSchema {
         })
     }
 
-    pub fn dtype(&self) -> DType {
+    pub fn dtype(&self) -> NumberType {
         self.dtype
     }
 
@@ -143,32 +152,6 @@ pub(crate) struct BlockPosition {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub enum DType {
-    U8,
-    F32,
-    F64,
-}
-
-impl DType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::U8 => "u8",
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-        }
-    }
-
-    pub fn try_parse(value: &str) -> Option<Self> {
-        match value {
-            "u8" => Some(Self::U8),
-            "f32" => Some(Self::F32),
-            "f64" => Some(Self::F64),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum Layout {
     Dense,
     Sparse { axis: Option<usize> },
@@ -239,8 +222,7 @@ fn checked_product(shape: &[usize]) -> FResult<u64> {
         .ok_or_else(|| Error::InvalidSchema("shape element count overflows usize".to_string()))
 }
 
-/// Row-major (C-order) coordinate walk over `shape`, used to materialize or
-/// reconstruct a tensor view's data as a flat sequence for wire transfer.
+/// Row-major (C-order) coordinate walk over `shape` for bounded reads and copies.
 pub(crate) struct RowMajorCoords {
     shape: Vec<usize>,
     coord: Vec<u64>,
@@ -569,14 +551,17 @@ mod tests {
 
     #[test]
     fn tensor_schema_new_computes_strides() {
-        let schema = TensorSchema::new(DType::F32, vec![4usize, 5, 6].into()).expect("schema");
+        let schema =
+            TensorSchema::new(NumberType::Float(FloatType::F32), vec![4usize, 5, 6].into())
+                .expect("schema");
         assert_eq!(schema.shape().as_slice(), &[4, 5, 6]);
         assert_eq!(schema.strides().as_slice(), &[30, 6, 1]);
     }
 
     #[test]
     fn tensor_schema_new_rejects_empty_shape() {
-        let err = TensorSchema::new(DType::F32, Shape::new()).expect_err("empty shape rejected");
+        let err = TensorSchema::new(NumberType::Float(FloatType::F32), Shape::new())
+            .expect_err("empty shape rejected");
         assert!(matches!(err, crate::Error::InvalidSchema(_)));
     }
 

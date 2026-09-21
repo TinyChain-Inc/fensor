@@ -11,7 +11,6 @@ use ha_ndarray::{
 
 use crate::Result;
 use crate::schema::Layout;
-use crate::stream::TensorViewEncoder;
 use crate::tensor::{TensorElement, TensorFileEntry};
 use crate::traits::{
     BoxFuture, SparseElementStream, TensorAbs, TensorCast, TensorGeometry, TensorNumeric,
@@ -37,7 +36,6 @@ mod sealed {
         type Root: TensorRead<DType = Self::Input>;
 
         fn root(&self) -> &Self::Root;
-        fn block_shape(&self) -> &[usize];
         fn build(
             &self,
             input: ArrayAccess<'static, Self::Input>,
@@ -318,7 +316,7 @@ impl UnaryOp<f32> for Cast<f64> {
 ///     requires_write(&source);
 ///     let computed = source.abs().await.unwrap().cast().await.unwrap().sin().await.unwrap().round().await.unwrap()
 ///         .transpose(None).unwrap().clone();
-///     let _encoder = computed.view_encoder();
+///     let _cloned = computed.clone();
 /// }
 /// ```
 #[derive(Clone)]
@@ -585,8 +583,8 @@ where
 {
     type DType = O::Output;
 
-    fn dtype(&self) -> Self::DType {
-        Self::DType::default()
+    fn dtype(&self) -> number_general::NumberType {
+        <Self::DType as number_general::DType>::dtype()
     }
     fn layout(&self) -> Layout {
         self.source.layout()
@@ -713,17 +711,6 @@ where
     }
 }
 
-impl<S, O> UnaryView<S, O>
-where
-    S: Expression,
-    S::DType: TensorElement,
-    O: UnaryOp<S::DType>,
-{
-    pub fn view_encoder(&self) -> TensorViewEncoder<'_, Self> {
-        TensorViewEncoder::new(self, self.block_shape())
-    }
-}
-
 impl<FE, T> Expression for TensorView<'_, FE, T>
 where
     FE: TensorFileEntry<T>,
@@ -734,10 +721,6 @@ where
 
     fn root(&self) -> &Self::Root {
         self
-    }
-
-    fn block_shape(&self) -> &[usize] {
-        self.tensor().block_shape()
     }
 
     fn build(&self, input: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
@@ -756,10 +739,6 @@ where
 
     fn root(&self) -> &Self::Root {
         self.source.root()
-    }
-
-    fn block_shape(&self) -> &[usize] {
-        self.source.block_shape()
     }
 
     fn build(

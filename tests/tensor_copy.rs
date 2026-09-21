@@ -2,10 +2,11 @@
 
 use common::{FsEntry, new_dir};
 use fensor::{
-    DType, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema,
-    TensorTransform, TensorWrite,
+    Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
+    TensorWrite,
 };
 use ha_ndarray::{AxisRange, axes, range, shape};
+use number_general::{FloatType, NumberType, UIntType};
 
 mod common;
 
@@ -15,7 +16,7 @@ async fn copy_base_and_geometric_readers_into_independent_storage() {
         let (root, dir) = new_dir("copy_source").await;
         let source = Tensor::<FsEntry, u8>::create(
             dir,
-            TensorSchema::new(DType::U8, shape![2, 3]).unwrap(),
+            TensorSchema::new(NumberType::UInt(UIntType::U8), shape![2, 3]).unwrap(),
             layout,
             2,
         )
@@ -58,7 +59,7 @@ async fn copy_propagates_source_and_destination_errors() {
     let (root, dir) = new_dir("copy_errors").await;
     let source = Tensor::<FsEntry, f32>::create(
         dir.clone(),
-        TensorSchema::new(DType::F32, shape![2]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2]).unwrap(),
         Layout::Dense,
         2,
     )
