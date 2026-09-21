@@ -3,8 +3,9 @@ use std::pin::Pin;
 
 use futures::{Stream, StreamExt, TryStreamExt};
 use ha_ndarray::{Axes, Range, Shape};
+use number_general::NumberType;
 
-use crate::schema::{DType, Layout};
+use crate::schema::Layout;
 use crate::validate;
 use crate::{Error, Result, TensorSchema};
 
@@ -14,7 +15,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait TensorGeometry: Send + Sync {
     type DType: Copy + Send + Sync + 'static;
 
-    fn dtype(&self) -> Self::DType;
+    fn dtype(&self) -> NumberType;
 
     fn layout(&self) -> Layout;
 
@@ -35,7 +36,7 @@ pub trait TensorArray: TensorGeometry {
 
     fn strides(&self) -> &[usize];
 
-    fn schema_dtype(&self) -> DType {
+    fn schema_dtype(&self) -> NumberType {
         self.schema().dtype()
     }
 }
@@ -277,11 +278,10 @@ pub trait TensorUnaryBoolean: TensorGeometry + Sized {
 /// ```
 /// use fensor::{Result, Tensor, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
 /// use freqfs::DirLock;
-/// use safecast::AsType;
 /// async fn mask<S, D>(tensor: &Tensor<S, f32>, dir: DirLock<D>) -> Result<Tensor<D, u8>>
 /// where
 ///     S: TensorFileEntry<f32>,
-///     D: TensorFileEntry<u8> + AsType<String> + From<String>,
+///     D: TensorFileEntry<u8>,
 /// {
 ///     let mask = tensor.view().is_nan().await?.not().await?.clone();
 ///     Tensor::copy_from(dir, &mask, 4096).await
@@ -302,7 +302,6 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// ```
 /// use fensor::{Result, Tensor, TensorCast, TensorFileEntry};
 /// use freqfs::DirLock;
-/// use safecast::AsType;
 ///
 /// async fn widen<Source, Destination>(
 ///     source: &Tensor<Source, f32>,
@@ -310,7 +309,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// ) -> Result<Tensor<Destination, f64>>
 /// where
 ///     Source: TensorFileEntry<f32>,
-///     Destination: TensorFileEntry<f64> + AsType<String> + From<String>,
+///     Destination: TensorFileEntry<f64>,
 /// {
 ///     let view = source.view();
 ///     let cast = TensorCast::<f64>::cast(&view).await?;

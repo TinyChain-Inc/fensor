@@ -14,7 +14,7 @@ use crate::traits::{
     TensorWrite,
 };
 
-use crate::{PORTABLE_INLINE_RANK, stream, validate};
+use crate::{PORTABLE_INLINE_RANK, validate};
 
 /// A geometric view of filesystem-backed tensor storage.
 pub struct TensorView<'t, FE, T: TensorElement> {
@@ -103,10 +103,6 @@ where
             })
     }
 
-    pub fn view_encoder(&self) -> stream::TensorViewEncoder<'_, Self> {
-        stream::TensorViewEncoder::new(self, self.tensor.block_shape())
-    }
-
     fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
         validate::validate_coord(&self.shape, coord)?;
         let k = self.flat_offset(coord)?;
@@ -123,10 +119,6 @@ where
             .collect();
         validate::validate_coord(self.tensor.shape(), &base_coord)?;
         Ok(base_coord)
-    }
-
-    pub(crate) fn tensor(&self) -> &'t Tensor<FE, T> {
-        self.tensor
     }
 }
 
@@ -253,7 +245,7 @@ where
 {
     type DType = T;
 
-    fn dtype(&self) -> Self::DType {
+    fn dtype(&self) -> number_general::NumberType {
         self.tensor.dtype()
     }
 

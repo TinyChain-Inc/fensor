@@ -6,27 +6,30 @@ use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
 use futures::{StreamExt as _, TryStreamExt as _};
 use ha_ndarray::Range;
+#[cfg(test)]
+use number_general::FloatType;
+use number_general::NumberType;
 use safecast::AsType;
 
 use crate::error::{Error, Result};
 use crate::schema::{
-    BlockPosition, DType, Layout, MAX_BLOCK_CAPACITY, SparseIndexSchema, SparseTableSchema,
-    StorageSchema, TensorSchema,
+    BlockPosition, Layout, MAX_BLOCK_CAPACITY, SparseIndexSchema, SparseTableSchema, StorageSchema,
+    TensorSchema,
 };
 use crate::traits::{
     BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorRead, TensorReadBulk,
     TensorSparseIndex, TensorWrite, TensorWriteBulk,
 };
-use crate::validate;
 use crate::view::TensorView;
+use crate::{TensorMetadata, validate};
 
 const BLOCKS: &str = "blocks";
 const INDEX: &str = "index";
 const METADATA: &str = "metadata";
-const METADATA_VERSION: u32 = 2;
 
 pub trait TensorElement:
     ha_ndarray::Number
+    + number_general::DType
     + Copy
     + Default
     + PartialEq
@@ -35,31 +38,33 @@ pub trait TensorElement:
     + 'static
     + de::FromStream<Context = ()>
     + for<'en> en::ToStream<'en>
-    + for<'en> en::IntoStream<'en>
 {
-    const DTYPE: DType;
 }
 
-impl TensorElement for u8 {
-    const DTYPE: DType = DType::U8;
-}
-
-impl TensorElement for f32 {
-    const DTYPE: DType = DType::F32;
-}
-
-impl TensorElement for f64 {
-    const DTYPE: DType = DType::F64;
-}
+impl TensorElement for u8 {}
+impl TensorElement for f32 {}
+impl TensorElement for f64 {}
 
 pub trait TensorFileEntry<T: TensorElement>:
-    FileLoad + AsType<b_table::Node<u64>> + AsType<Vec<T>> + Send + Sync + 'static
+    FileLoad
+    + AsType<b_table::Node<u64>>
+    + AsType<Vec<T>>
+    + AsType<TensorMetadata<T>>
+    + Send
+    + Sync
+    + 'static
 {
 }
 
 impl<FE, T> TensorFileEntry<T> for FE
 where
-    FE: FileLoad + AsType<b_table::Node<u64>> + AsType<Vec<T>> + Send + Sync + 'static,
+    FE: FileLoad
+        + AsType<b_table::Node<u64>>
+        + AsType<Vec<T>>
+        + AsType<TensorMetadata<T>>
+        + Send
+        + Sync
+        + 'static,
     T: TensorElement,
 {
 }
@@ -133,10 +138,7 @@ where
         schema: TensorSchema,
         layout: Layout,
         max_capacity: usize,
-    ) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
+    ) -> Result<Self> {
         if max_capacity == 0 || max_capacity > MAX_BLOCK_CAPACITY {
             return Err(Error::InvalidSchema(format!(
                 "max block capacity must be non-zero and at most {}, got {max_capacity}",
@@ -174,10 +176,12 @@ where
     pub async fn copy_from<R>(dir: DirLock<FE>, source: &R, max_capacity: usize) -> Result<Self>
     where
         R: TensorRead<DType = T> + ?Sized,
-        FE: AsType<String> + From<String>,
     {
         let mut blocks = source.read_blocks()?;
-        let schema = TensorSchema::new(T::DTYPE, source.shape().to_vec().into())?;
+        let schema = TensorSchema::new(
+            <T as number_general::DType>::dtype(),
+            source.shape().to_vec().into(),
+        )?;
         let layout = match source.layout() {
             Layout::Dense => Layout::Dense,
             Layout::Sparse { .. } => Layout::Sparse { axis: None },
@@ -203,13 +207,10 @@ where
         Ok(output)
     }
 
-    pub async fn load(dir: DirLock<FE>) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
+    pub async fn load(dir: DirLock<FE>) -> Result<Self> {
         let mut dir_guard = dir.try_write()?;
         let blocks_dir = dir_guard.get_or_create_dir(BLOCKS.to_string())?;
-        let (schema, storage_schema) = load_metadata_file(&blocks_dir).await?;
+        let (schema, storage_schema) = load_metadata_file::<FE, T>(&blocks_dir).await?;
         validate_tensor_dtype::<T>(schema.dtype())?;
         let index: Option<SparseIndex<FE>> = if let Layout::Sparse { .. } = storage_schema.layout {
             let index_dir = dir_guard.get_dir(INDEX).cloned().ok_or_else(|| {
@@ -349,13 +350,13 @@ where
         Ok(())
     }
 
-    async fn persist_metadata(&self) -> Result<()>
-    where
-        FE: AsType<String> + From<String>,
-    {
-        let payload = encode_schema(&self.schema, self.storage.storage_schema());
-        let _ = decode_schema(&payload)?;
-        write_metadata_file(self.storage.blocks(), METADATA, &payload).await
+    async fn persist_metadata(&self) -> Result<()> {
+        let metadata = TensorMetadata::<T>::new(
+            self.schema.shape().clone(),
+            self.layout(),
+            self.storage.storage_schema().block_schema.shape.clone(),
+        )?;
+        write_metadata_file(self.storage.blocks(), metadata).await
     }
 
     async fn delete_block(&self, block_id: u64) {
@@ -406,10 +407,7 @@ where
         index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
         schema: TensorSchema,
         storage_schema: StorageSchema,
-    ) -> Result<Self>
-    where
-        FE: AsType<String> + From<String>,
-    {
+    ) -> Result<Self> {
         let storage = match index {
             Some(si) => Storage::Sparse(SparseStorage {
                 blocks,
@@ -460,8 +458,8 @@ where
 {
     type DType = T;
 
-    fn dtype(&self) -> Self::DType {
-        T::default()
+    fn dtype(&self) -> NumberType {
+        <T as number_general::DType>::dtype()
     }
 
     fn layout(&self) -> Layout {
@@ -780,163 +778,37 @@ where
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
-async fn load_metadata_file<FE>(blocks: &DirLock<FE>) -> Result<(TensorSchema, StorageSchema)>
+async fn load_metadata_file<FE, T>(blocks: &DirLock<FE>) -> Result<(TensorSchema, StorageSchema)>
 where
-    FE: AsType<String> + FileLoad + Send + Sync + 'static,
+    FE: AsType<TensorMetadata<T>> + FileLoad,
+    T: TensorElement,
 {
-    let file = {
-        let dir = blocks.read().await;
-        dir.get_file(METADATA)
-            .cloned()
-            .ok_or_else(|| Error::InvalidSchema("missing tensor metadata file".to_string()))?
-    };
-    let payload = {
-        let guard = file.read::<String>().await?;
-        guard.clone()
-    };
-    decode_schema(&payload)
+    let file = blocks
+        .read()
+        .await
+        .get_file(METADATA)
+        .cloned()
+        .ok_or_else(|| Error::InvalidSchema("missing tensor metadata file".into()))?;
+    file.read::<TensorMetadata<T>>().await?.schemas()
 }
 
-async fn write_metadata_file<FE>(blocks: &DirLock<FE>, name: &str, payload: &str) -> Result<()>
+async fn write_metadata_file<FE, T>(blocks: &DirLock<FE>, metadata: TensorMetadata<T>) -> Result<()>
 where
-    FE: AsType<String> + From<String> + FileLoad + Send + Sync + 'static,
+    FE: AsType<TensorMetadata<T>> + FileLoad,
+    T: TensorElement,
 {
-    let existing = {
-        let dir = blocks.read().await;
-        dir.get_file(name).cloned()
-    };
+    let existing = blocks.read().await.get_file(METADATA).cloned();
     if let Some(file) = existing {
-        let mut guard = file.write::<String>().await?;
-        *guard = payload.to_string();
+        *file.write::<TensorMetadata<T>>().await? = metadata;
     } else {
-        let mut dir = blocks.write().await;
-        dir.create_file(name.to_string(), payload.to_string(), payload.len())
+        let size = metadata.size();
+        blocks
+            .write()
+            .await
+            .create_file(METADATA.to_string(), metadata, size)
             .await?;
     }
     Ok(())
-}
-
-fn encode_schema(schema: &TensorSchema, storage_schema: &StorageSchema) -> String {
-    let dtype = schema.dtype().as_str();
-    let layout = match storage_schema.layout {
-        Layout::Dense => "dense".to_string(),
-        Layout::Sparse { axis } => format!(
-            "sparse:{}",
-            axis.map(|a| a.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        ),
-    };
-    let shape = schema
-        .shape()
-        .iter()
-        .map(|dim| dim.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let block_shape = storage_schema
-        .block_schema
-        .shape
-        .iter()
-        .map(|dim| dim.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let strides = schema
-        .strides()
-        .iter()
-        .map(|dim| dim.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let s = format!(
-        "version={METADATA_VERSION}\ndtype={dtype}\nlayout={layout}\nshape={shape}\nblock_shape={block_shape}\nstrides={strides}\n"
-    );
-    s
-}
-
-fn decode_schema(payload: &str) -> Result<(TensorSchema, StorageSchema)> {
-    let mut fields = std::collections::HashMap::<String, String>::new();
-    for line in payload.lines().filter(|line| !line.is_empty()) {
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| Error::InvalidSchema(format!("invalid metadata line: {line}")))?;
-        fields.insert(key.to_string(), value.to_string());
-    }
-
-    let version = fields
-        .get("version")
-        .ok_or_else(|| Error::InvalidSchema("missing metadata version".to_string()))?
-        .parse::<u32>()
-        .map_err(|cause| Error::InvalidSchema(format!("invalid metadata version: {cause}")))?;
-
-    if version != METADATA_VERSION {
-        return Err(Error::InvalidSchema(format!(
-            "unsupported metadata version {version}; expected {METADATA_VERSION}"
-        )));
-    }
-
-    let dtype_value = fields
-        .get("dtype")
-        .ok_or_else(|| Error::InvalidSchema("missing dtype in metadata".to_string()))?;
-    let dtype = DType::try_parse(dtype_value).ok_or_else(|| {
-        Error::InvalidSchema(format!("unsupported dtype in metadata: {dtype_value}"))
-    })?;
-
-    let layout = parse_layout(
-        fields
-            .get("layout")
-            .ok_or_else(|| Error::InvalidSchema("missing layout in metadata".to_string()))?,
-    )?;
-
-    let shape = parse_usize_vec(
-        fields
-            .get("shape")
-            .ok_or_else(|| Error::InvalidSchema("missing shape in metadata".to_string()))?,
-    )?;
-    let block_shape = parse_usize_vec(
-        fields
-            .get("block_shape")
-            .ok_or_else(|| Error::InvalidSchema("missing block_shape in metadata".to_string()))?,
-    )?;
-    let _strides = parse_usize_vec(
-        fields
-            .get("strides")
-            .ok_or_else(|| Error::InvalidSchema("missing strides in metadata".to_string()))?,
-    )?;
-
-    let tensor_schema = TensorSchema::new(dtype, shape.clone().into())?;
-    let storage_schema = StorageSchema::from_block_shape(&shape, layout, block_shape.into())?;
-
-    Ok((tensor_schema, storage_schema))
-}
-
-fn parse_layout(layout: &str) -> Result<Layout> {
-    if layout == "dense" {
-        return Ok(Layout::Dense);
-    }
-    if let Some(axis_hint) = layout.strip_prefix("sparse:") {
-        let axis = if axis_hint == "none" {
-            None
-        } else {
-            Some(axis_hint.parse::<usize>().map_err(|cause| {
-                Error::InvalidSchema(format!("invalid sparse axis hint: {cause}"))
-            })?)
-        };
-        return Ok(Layout::Sparse { axis });
-    }
-    Err(Error::InvalidSchema(format!(
-        "invalid layout in metadata: {layout}"
-    )))
-}
-
-fn parse_usize_vec(value: &str) -> Result<Vec<usize>> {
-    if value.is_empty() {
-        return Ok(vec![]);
-    }
-    value
-        .split(',')
-        .map(|dim| {
-            dim.parse::<usize>()
-                .map_err(|cause| Error::InvalidSchema(format!("invalid usize value: {cause}")))
-        })
-        .collect()
 }
 
 pub(crate) fn sparse_axis_for_layout(layout: Layout, ndim: usize) -> usize {
@@ -947,12 +819,12 @@ pub(crate) fn sparse_axis_for_layout(layout: Layout, ndim: usize) -> usize {
     axis.min(ndim.saturating_sub(1))
 }
 
-fn validate_tensor_dtype<T: TensorElement>(dtype: DType) -> Result<()> {
-    if dtype != T::DTYPE {
+fn validate_tensor_dtype<T: TensorElement>(dtype: NumberType) -> Result<()> {
+    if dtype != <T as number_general::DType>::dtype() {
         return Err(Error::InvalidSchema(format!(
             "tensor dtype mismatch: schema {:?} != tensor {:?}",
             dtype,
-            T::DTYPE,
+            <T as number_general::DType>::dtype(),
         )));
     }
     Ok(())
@@ -964,62 +836,11 @@ fn validate_tensor_dtype<T: TensorElement>(dtype: DType) -> Result<()> {
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
-    use ha_ndarray::shape;
-
-    #[test]
-    fn schema_metadata_roundtrip() {
-        let schema = TensorSchema::new(DType::F32, shape![3, 4, 5]).expect("schema");
-        let storage_schema = StorageSchema::from_block_shape(
-            &[3, 4, 5],
-            Layout::Sparse { axis: Some(1) },
-            shape![1, 2, 5],
-        )
-        .expect("storage schema");
-
-        let encoded = encode_schema(&schema, &storage_schema);
-        let (decoded_schema, _decoded_storage) = decode_schema(&encoded).expect("decode");
-        assert_eq!(decoded_schema, schema);
-    }
-
-    #[test]
-    fn schema_metadata_roundtrip_f64() {
-        let schema = TensorSchema::new(DType::F64, shape![2, 2]).expect("schema");
-        let storage_schema = StorageSchema::from_block_shape(&[2, 2], Layout::Dense, shape![1, 2])
-            .expect("storage schema");
-
-        let encoded = encode_schema(&schema, &storage_schema);
-        assert!(encoded.contains("dtype=f64"));
-
-        let (decoded_schema, _) = decode_schema(&encoded).expect("decode");
-        assert_eq!(decoded_schema, schema);
-    }
-
-    #[test]
-    fn metadata_rejects_unknown_version() {
-        let payload =
-            "version=999\ndtype=f32\nlayout=dense\nshape=2,3\nblock_shape=1,3\nstrides=3,1\n";
-        let err = decode_schema(payload).expect_err("should reject");
-        assert!(matches!(err, Error::InvalidSchema(_)));
-    }
-
-    #[test]
-    fn metadata_rejects_invalid_layout() {
-        let payload =
-            "version=2\ndtype=f32\nlayout=weird\nshape=2,3\nblock_shape=1,3\nstrides=3,1\n";
-        let err = decode_schema(payload).expect_err("should reject");
-        assert!(matches!(err, Error::InvalidSchema(_)));
-    }
-
-    #[test]
-    fn metadata_rejects_missing_fields() {
-        let payload = "version=2\ndtype=f32\nlayout=dense\nshape=2,3\n";
-        let err = decode_schema(payload).expect_err("should reject");
-        assert!(matches!(err, Error::InvalidSchema(_)));
-    }
 
     #[test]
     fn typed_tensor_rejects_schema_dtype_mismatch() {
-        let err = validate_tensor_dtype::<f32>(DType::F64).expect_err("expected mismatch");
+        let err = validate_tensor_dtype::<f32>(NumberType::Float(FloatType::F64))
+            .expect_err("expected mismatch");
         assert!(matches!(err, Error::InvalidSchema(_)));
     }
 }
@@ -1086,39 +907,79 @@ mod sparse_lifecycle_tests {
     enum TestFE {
         Node(Node<u64>),
         F32(Vec<f32>),
-        Text(String),
+        MetadataF32(crate::TensorMetadata<f32>),
     }
-
     impl<'en> en::ToStream<'en> for TestFE {
         fn to_stream<E: en::Encoder<'en>>(
             &'en self,
             encoder: E,
         ) -> std::result::Result<E::Ok, E::Error> {
             match self {
-                Self::Node(node) => node.to_stream(encoder),
-                Self::F32(values) => values.to_stream(encoder),
-                Self::Text(text) => text.to_stream(encoder),
+                Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
+                Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
+                Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
             }
         }
     }
-
-    // Only ever read via a concrete `AsType` target (mirrors `tests/common.rs::FsEntry`).
+    struct TestFEVisitor;
+    impl de::Visitor for TestFEVisitor {
+        type Value = TestFE;
+        fn expecting() -> &'static str {
+            "a typed filesystem entry"
+        }
+        async fn visit_seq<A: de::SeqAccess>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let entry = match seq.expect_next::<u8>(()).await? {
+                0 => TestFE::Node(seq.expect_next(()).await?),
+                1 => TestFE::F32(seq.expect_next(()).await?),
+                2 => TestFE::MetadataF32(seq.expect_next(()).await?),
+                tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
+            };
+            if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+                return Err(de::Error::custom("unexpected entry field"));
+            }
+            Ok(entry)
+        }
+    }
     impl de::FromStream for TestFE {
         type Context = ();
-
         async fn from_stream<D: de::Decoder>(
             _: (),
-            _decoder: &mut D,
+            decoder: &mut D,
         ) -> std::result::Result<Self, D::Error> {
-            Err(de::Error::custom(
-                "TestFE does not support generic decoding; read via a concrete AsType target",
-            ))
+            decoder.decode_seq(TestFEVisitor).await
         }
     }
 
+    impl freqfs::FileLoad for TestFE {
+        async fn load(
+            _: &std::path::Path,
+            file: tokio::fs::File,
+            _: std::fs::Metadata,
+        ) -> std::io::Result<Self> {
+            tbon::de::read_from((), file)
+                .await
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }
+    }
+    impl freqfs::FileSave for TestFE {
+        async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
+            use futures::TryStreamExt;
+            use tokio::io::AsyncWriteExt;
+            let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
+            let mut size = 0;
+            while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+                file.write_all(&chunk).await?;
+                size += chunk.len() as u64;
+            }
+            Ok(size)
+        }
+    }
     as_type!(TestFE, Node, Node<u64>);
     as_type!(TestFE, F32, Vec<f32>);
-    as_type!(TestFE, Text, String);
+    as_type!(TestFE, MetadataF32, crate::TensorMetadata<f32>);
 
     fn unique_tmp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -1153,7 +1014,7 @@ mod sparse_lifecycle_tests {
         axis: Option<usize>,
     ) -> (PathBuf, Tensor<TestFE, f32>) {
         let (root, dir) = new_dir(name).await;
-        let schema = TensorSchema::new(DType::F32, shape).expect("schema");
+        let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema");
         let tensor =
             Tensor::<TestFE, f32>::create(dir, schema, Layout::Sparse { axis }, max_capacity)
                 .await

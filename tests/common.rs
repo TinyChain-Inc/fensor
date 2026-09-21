@@ -18,44 +18,71 @@ use safecast::as_type;
 #[derive(Clone, Debug)]
 pub enum FsEntry {
     Node(Node<u64>),
-    U8(Vec<u8>),
     F32(Vec<f32>),
+    MetadataF32(fensor::TensorMetadata<f32>),
+    U8(Vec<u8>),
     F64(Vec<f64>),
-    Text(String),
+    MetadataU8(fensor::TensorMetadata<u8>),
+    MetadataF64(fensor::TensorMetadata<f64>),
 }
-
 impl<'en> en::ToStream<'en> for FsEntry {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+    fn to_stream<E: en::Encoder<'en>>(
+        &'en self,
+        encoder: E,
+    ) -> std::result::Result<E::Ok, E::Error> {
         match self {
-            Self::Node(node) => node.to_stream(encoder),
-            Self::U8(values) => values.to_stream(encoder),
-            Self::F32(values) => values.to_stream(encoder),
-            Self::F64(values) => values.to_stream(encoder),
-            Self::Text(text) => text.to_stream(encoder),
+            Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
+            Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
+            Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
+            Self::U8(value) => en::IntoStream::into_stream((3u8, value), encoder),
+            Self::F64(value) => en::IntoStream::into_stream((4u8, value), encoder),
+            Self::MetadataU8(value) => en::IntoStream::into_stream((5u8, value), encoder),
+            Self::MetadataF64(value) => en::IntoStream::into_stream((6u8, value), encoder),
         }
     }
 }
-
-// `TensorFileEntry<T>: FileLoad` is only satisfiable via the blanket
-// `impl<T: FromStream> FileLoad for T`, so `FsEntry` needs a `FromStream` impl to
-// type-check. Every read in this codebase goes through a concrete `AsType` target
-// (`String`/`Vec<u8>`/`Vec<f32>`/`Vec<f64>`/`Node<u64>`), never through `FsEntry` itself, so
-// this is never actually invoked at runtime.
-impl de::FromStream for FsEntry {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(_: (), _decoder: &mut D) -> Result<Self, D::Error> {
-        Err(de::Error::custom(
-            "FsEntry does not support generic decoding; read via a concrete AsType target",
-        ))
+struct FsEntryVisitor;
+impl de::Visitor for FsEntryVisitor {
+    type Value = FsEntry;
+    fn expecting() -> &'static str {
+        "a typed filesystem entry"
+    }
+    async fn visit_seq<A: de::SeqAccess>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let entry = match seq.expect_next::<u8>(()).await? {
+            0 => FsEntry::Node(seq.expect_next(()).await?),
+            1 => FsEntry::F32(seq.expect_next(()).await?),
+            2 => FsEntry::MetadataF32(seq.expect_next(()).await?),
+            3 => FsEntry::U8(seq.expect_next(()).await?),
+            4 => FsEntry::F64(seq.expect_next(()).await?),
+            5 => FsEntry::MetadataU8(seq.expect_next(()).await?),
+            6 => FsEntry::MetadataF64(seq.expect_next(()).await?),
+            tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
+        };
+        if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+            return Err(de::Error::custom("unexpected entry field"));
+        }
+        Ok(entry)
     }
 }
-
+impl de::FromStream for FsEntry {
+    type Context = ();
+    async fn from_stream<D: de::Decoder>(
+        _: (),
+        decoder: &mut D,
+    ) -> std::result::Result<Self, D::Error> {
+        decoder.decode_seq(FsEntryVisitor).await
+    }
+}
 as_type!(FsEntry, Node, Node<u64>);
-as_type!(FsEntry, U8, Vec<u8>);
 as_type!(FsEntry, F32, Vec<f32>);
+as_type!(FsEntry, MetadataF32, fensor::TensorMetadata<f32>);
+as_type!(FsEntry, U8, Vec<u8>);
 as_type!(FsEntry, F64, Vec<f64>);
-as_type!(FsEntry, Text, String);
+as_type!(FsEntry, MetadataU8, fensor::TensorMetadata<u8>);
+as_type!(FsEntry, MetadataF64, fensor::TensorMetadata<f64>);
 
 pub fn unique_tmp_dir(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -162,4 +189,29 @@ where
     Tensor::<FsEntry, T>::create(dir, schema, Layout::Sparse { axis }, 1000)
         .await
         .expect("created")
+}
+
+impl freqfs::FileLoad for FsEntry {
+    async fn load(
+        _: &std::path::Path,
+        file: tokio::fs::File,
+        _: std::fs::Metadata,
+    ) -> std::io::Result<Self> {
+        tbon::de::read_from((), file)
+            .await
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+impl freqfs::FileSave for FsEntry {
+    async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
+        use futures::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
+        let mut size = 0;
+        while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+            file.write_all(&chunk).await?;
+            size += chunk.len() as u64;
+        }
+        Ok(size)
+    }
 }

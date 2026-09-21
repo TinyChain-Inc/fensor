@@ -1,19 +1,18 @@
 mod error;
+mod metadata;
 mod schema;
-mod stream;
 mod tensor;
 mod traits;
 pub mod unary;
 mod validate;
 mod view;
-mod wire_tags;
 
 pub use error::{Error, Result};
+pub use metadata::TensorMetadata;
+pub use number_general::NumberType;
 pub use schema::{
-    DType, Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape,
-    contiguous_strides,
+    Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape, contiguous_strides,
 };
-pub use stream::{TensorViewDecoder, TensorViewEncoder};
 pub use traits::{
     BoxFuture, SparseElementStream, TensorAbs, TensorArray, TensorBlockStore, TensorCast,
     TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorNumeric, TensorRead,
@@ -25,10 +24,5 @@ pub use traits::{
 pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 pub use unary::UnaryView;
 pub use view::TensorView;
-
-pub type TensorU8<FE> = Tensor<FE, u8>;
-
-pub type TensorF32<FE> = Tensor<FE, f32>;
-pub type TensorF64<FE> = Tensor<FE, f64>;
 
 pub(crate) const PORTABLE_INLINE_RANK: usize = 8;

@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    DType, Error, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
-    TensorWrite, contiguous_strides,
+    Error, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorTransform, TensorWrite,
+    contiguous_strides,
 };
 use ha_ndarray::{AxisRange, Range, axes, range, shape};
+use number_general::{FloatType, NumberType};
 
 mod common;
 
@@ -13,7 +14,8 @@ use common::{FsEntry, cleanup, iter_coords, new_dir};
 
 async fn create_tensor(name: &str, layout: Layout) -> (PathBuf, Tensor<FsEntry, f32>) {
     let (root, dir) = new_dir(name).await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 3, 4]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3, 4]).expect("schema");
     // Keep blocks small so reads and transforms cross storage boundaries.
     let tensor = Tensor::create(dir, schema, layout, 4)
         .await
@@ -237,7 +239,8 @@ async fn dense_sparse_parity_for_supported_operations() {
 #[tokio::test]
 async fn public_create_rejects_invalid_sparse_axis_hint() {
     let (root, dir) = common::new_dir("invalid_sparse_axis").await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3]).expect("schema");
     let result = fensor::Tensor::<common::FsEntry, f32>::create(
         dir,
         schema,

@@ -9,25 +9,40 @@ A filesystem-backed `Tensor` data structure featuring support for dense and spar
 - If metadata or data is malformed, inconsistent, or unreadable, operations must return a structured error with a clear message.
 - Recovery workflows (restore/rebuild/migration) are external operational concerns, not `fensor` runtime behavior.
 
-## Serializing a tensor
+## Storage and data types
 
-`tensor.view_encoder()` (or a view's `view_encoder()`) streams schema information
-and nonzero coordinate/value pairs through `destream`. `TensorViewDecoder<FE, T>`
-writes them into a fresh filesystem-backed tensor; call `.into_inner()` to obtain
-it. Geometric and computed views use the same format. Read and decode errors are
-propagated; cleanup of partial destination storage remains the caller's responsibility.
-There is no trailer or checksum, so end-to-end completeness belongs to the transport.
+fensor requires `destream` for typed serialization, but selects no byte codec.
+Filesystem adapters implement `freqfs::FileLoad` and `FileSave` for their entry
+type. freqfs saves and reloads that same entry, then checks the requested payload
+through `AsType`. An adapter can use JSON, TBON, or another destream codec.
+freqfs supplies no codec adapters or blanket I/O implementations. The test suite
+uses explicit caller-owned TBON and JSON adapters.
 
-`DType` and `Layout` have standalone stream encodings. `Tensor` and `TensorSchema`
-do not expose a separate schema-only stream API; persistent schema metadata is
-written and loaded by the storage implementation.
+Adapters support `Vec<T>`, `b_table::Node<u64>`, and `TensorMetadata<T>`.
+`TensorMetadata<T>` contains logical shape, layout, and block shape. Its destream
+representation contains geometry only; **the adapter must preserve the Rust
+payload type across reloads**, for example with distinct tagged entry variants
+for f32, f64, and u8 blocks and metadata. Decoding the same untagged metadata as
+whichever `T` was requested does not meet this contract. The adapter also owns
+format versioning and compatibility. fensor validates geometry and block lengths.
 
-Native stored dtypes are `u8`, `f32`, and `f64`, exposed through `TensorU8`,
-`TensorF32`, and `TensorF64`. u8 stores all values from 0 to 255, not just boolean
-masks. The new `DType::U8` uses the string `"u8"`; metadata version and wire
-structure are unchanged, and existing float data requires no migration. Older
-readers reject the new dtype. Downstream exhaustive matches on `DType` must add
-its `U8` variant. Storage adapters for u8 need `AsType<Vec<u8>>` support.
+This replaces the former version-2 text metadata. Existing storage needs an
+explicit adapter migration; fensor does not guess formats or fall back on errors.
+
+There is no public whole-tensor wire codec. Applications can consume
+`TensorRead::read_blocks` or `read_sparse_elements_in_order` to define transfer
+formats, and use `Tensor::copy_from` to construct independent filesystem storage.
+
+Use `Tensor<FE, u8>`, `Tensor<FE, f32>`, or `Tensor<FE, f64>` directly. Schema and
+geometry dtype metadata use `number_general::NumberType` (also re-exported by
+fensor), for example `NumberType::Float(FloatType::F32)` or
+`NumberType::UInt(UIntType::U8)`. Unsupported and abstract number classes are
+rejected when constructing a schema. `TensorElement` uses number-general's
+primitive `DType` trait rather than maintaining its own dtype constants.
+The associated `TensorGeometry::DType` still names the Rust element type;
+`dtype()` returns its `NumberType` class.
+
+There is no fensor dtype string codec. u8 stores all values from 0 to 255.
 
 ## Lazy math and bounded reads
 
@@ -96,10 +111,7 @@ and dropping the stream drops pending reads. Independent streams can be consumed
 concurrently, and recompute their own results; they do not share a mutable cursor.
 These are live views, not snapshots: concurrent source writes are not isolated.
 
-Direct reads, view serialization, and `Tensor::copy_from` evaluate the same expression.
-Both view families expose `view_encoder()`, returning `TensorViewEncoder<'_, View>`;
-its generic view parameter replaces the previous storage/lifetime parameters.
-The wire format and decoder are unchanged.
+Direct reads, block streams, and `Tensor::copy_from` evaluate the same expression.
 `Tensor::copy_from(dir, &expression, max_capacity).await?` constructs independent
 filesystem-backed storage from any `TensorRead`, including base tensors, geometric
 views, and computed views. Evaluation happens implicitly as the constructor

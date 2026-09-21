@@ -3,11 +3,12 @@
 
 use fensor::unary::{Exp, Round};
 use fensor::{
-    DType, Error, Layout, Tensor, TensorRead, TensorSchema, TensorTransform, TensorUnary,
-    TensorView, TensorViewDecoder, TensorViewSemantics, TensorWrite, UnaryView,
+    Error, Layout, Tensor, TensorRead, TensorSchema, TensorTransform, TensorUnary, TensorView,
+    TensorViewSemantics, TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{AxisRange, axes, range, shape};
+use number_general::{FloatType, NumberType};
 
 use common::{FsEntry, create_dense_tensor, create_sparse_tensor, iter_coords, new_dir};
 
@@ -17,7 +18,8 @@ mod common;
 async fn dense_single_block_round_matches_expected_values() {
     let (_root, dir) = new_dir("dense_round_single_block").await;
     let (_out_root, out_dir) = new_dir("dense_round_single_block_out").await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 2]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 2]).expect("schema");
     let tensor = create_dense_tensor::<f32>(dir, schema).await;
 
     let values: [((u64, u64), f32); 4] =
@@ -48,7 +50,7 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
     let (_root, dir) = new_dir("dense_multi_block_exp_ln").await;
     let (_exp_root, exp_dir) = new_dir("dense_multi_block_exp_ln_exp_out").await;
     let (_ln_root, ln_dir) = new_dir("dense_multi_block_exp_ln_ln_out").await;
-    let schema = TensorSchema::new(DType::F32, shape![10]).expect("schema");
+    let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape![10]).expect("schema");
     let tensor = Tensor::<FsEntry, f32>::create(dir, schema, Layout::Dense, 3)
         .await
         .expect("create multi-block dense tensor");
@@ -94,7 +96,8 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
 async fn chain_is_lazy_until_copy() {
     let (_root, dir) = new_dir("lazy_chain_source").await;
     let (out_root, out_dir) = new_dir("lazy_chain_out").await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 2]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 2]).expect("schema");
     let tensor = create_dense_tensor::<f32>(dir, schema).await;
     tensor.write_value(&[0, 0], 1.0).await.expect("write");
 
@@ -131,7 +134,7 @@ async fn chain_is_lazy_until_copy() {
 async fn ln_domain_edges_produce_ieee754_values_not_errors() {
     let (_root, dir) = new_dir("ln_domain_edges").await;
     let (_out_root, out_dir) = new_dir("ln_domain_edges_out").await;
-    let schema = TensorSchema::new(DType::F32, shape![2]).expect("schema");
+    let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape![2]).expect("schema");
     let tensor = create_dense_tensor::<f32>(dir, schema).await;
 
     tensor.write_value(&[0], 0.0).await.expect("write zero");
@@ -159,7 +162,8 @@ async fn ln_domain_edges_produce_ieee754_values_not_errors() {
 #[tokio::test]
 async fn sparse_round_exp_ln_all_supported_on_populated_elements_only() {
     let (_root, dir) = new_dir("sparse_unary_supported").await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 3, 4]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3, 4]).expect("schema");
     let tensor = create_sparse_tensor::<f32>(dir, schema, Some(1)).await;
 
     tensor
@@ -215,7 +219,8 @@ async fn sparse_round_exp_ln_all_supported_on_populated_elements_only() {
 async fn transformed_sparse_unary_view_copies() {
     let (_root, dir) = new_dir("sparse_non_identity_unsupported").await;
     let (_out_root, out_dir) = new_dir("sparse_non_identity_unsupported_out").await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 3, 4]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3, 4]).expect("schema");
     let tensor = create_sparse_tensor::<f32>(dir, schema, Some(1)).await;
 
     tensor.write_value(&[0, 1, 2], 1.6).await.expect("write");
@@ -253,7 +258,7 @@ async fn chained_exp_then_round_matches_per_coordinate_computation_multi_block()
     // copy path under a real multi-op chain, not just a single op.
     let (_root, dir) = new_dir("chained_exp_round_multi_block").await;
     let (_out_root, out_dir) = new_dir("chained_exp_round_multi_block_out").await;
-    let schema = TensorSchema::new(DType::F32, shape![10]).expect("schema");
+    let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape![10]).expect("schema");
     let tensor = Tensor::<FsEntry, f32>::create(dir, schema, Layout::Dense, 3)
         .await
         .expect("create multi-block dense tensor");
@@ -291,7 +296,7 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
     let (root, dir) = new_dir("unary_consumers").await;
     let tensor = Tensor::<FsEntry, f64>::create(
         dir,
-        TensorSchema::new(DType::F64, shape![2, 5]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F64), shape![2, 5]).unwrap(),
         Layout::Dense,
         3,
     )
@@ -325,25 +330,15 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
     let values: Vec<_> = first.into_iter().flatten().collect();
     let (out_root, out_dir) = new_dir("unary_consumers_out").await;
     let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
-    let (wire_root, wire_dir) = new_dir("unary_consumers_wire").await;
-    let decoded: TensorViewDecoder<FsEntry, f64> = tbon::de::try_decode(
-        wire_dir,
-        tbon::en::encode(expression.view_encoder()).unwrap(),
-    )
-    .await
-    .unwrap();
-    let decoded = decoded.into_inner();
     for (i, coord) in iter_coords(&[5, 2]).enumerate() {
         let expected = (((coord[1] * 5 + coord[0]) as f64 / 4.0).round()).exp();
         assert_eq!(values[i], expected);
         assert_eq!(expression.read_value(&coord).await.unwrap(), expected);
         assert_eq!(output.read_value(&coord).await.unwrap(), expected);
-        assert_eq!(decoded.read_value(&coord).await.unwrap(), expected);
     }
     assert_eq!(tensor.read_value(&[0, 0]).await.unwrap(), 0.0);
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
-    common::cleanup(&wire_root).await;
 }
 
 #[tokio::test]
@@ -351,7 +346,7 @@ async fn sparse_chain_preserves_input_support_through_intermediate_zero() {
     let (root, dir) = new_dir("sparse_chain_support").await;
     let tensor = create_sparse_tensor::<f32>(
         dir,
-        TensorSchema::new(DType::F32, shape![2, 3]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3]).unwrap(),
         Some(1),
     )
     .await;
@@ -396,7 +391,7 @@ async fn stream_is_demand_driven_and_errors_on_corrupt_tail() {
     let (root, dir) = new_dir("unary_corrupt_tail").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir.clone(),
-        TensorSchema::new(DType::F32, shape![8192]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![8192]).unwrap(),
         Layout::Dense,
         4096,
     )
@@ -429,7 +424,7 @@ async fn copying_spills_beyond_cache_budget_and_reloads() {
         let dir = cache.load(root.clone()).unwrap();
         let tensor = Tensor::<FsEntry, f32>::create(
             dir.clone(),
-            TensorSchema::new(DType::F32, shape![1024]).unwrap(),
+            TensorSchema::new(NumberType::Float(FloatType::F32), shape![1024]).unwrap(),
             Layout::Dense,
             16,
         )
@@ -474,7 +469,7 @@ async fn block_larger_than_cache_is_a_recoverable_error() {
     let dir = cache.load(root.clone()).unwrap();
     let result = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(DType::F32, shape![1024]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![1024]).unwrap(),
         Layout::Dense,
         1024,
     )
@@ -491,7 +486,7 @@ async fn large_sparse_shape_constructs_streams_without_expanding_axes() {
     let length = 1_000_000_000;
     let tensor = create_sparse_tensor::<f32>(
         dir,
-        TensorSchema::new(DType::F32, shape![length]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![length]).unwrap(),
         None,
     )
     .await;
@@ -510,8 +505,11 @@ async fn large_sparse_shape_constructs_streams_without_expanding_axes() {
 #[tokio::test]
 async fn scalar_view_streaming_is_explicitly_unsupported() {
     let (root, dir) = new_dir("unary_scalar_view").await;
-    let tensor =
-        create_dense_tensor::<f32>(dir, TensorSchema::new(DType::F32, shape![2]).unwrap()).await;
+    let tensor = create_dense_tensor::<f32>(
+        dir,
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2]).unwrap(),
+    )
+    .await;
     let scalar = tensor
         .view()
         .exp()
@@ -532,7 +530,7 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
         let (root, dir) = new_dir(name).await;
         let tensor = Tensor::<FsEntry, f32>::create(
             dir,
-            TensorSchema::new(DType::F32, shape![2, 1, 3]).unwrap(),
+            TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 1, 3]).unwrap(),
             layout,
             3,
         )
@@ -591,14 +589,6 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
         assert_eq!(values.len(), 6);
         let (out_root, out_dir) = new_dir(&format!("{name}_out")).await;
         let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
-        let (wire_root, wire_dir) = new_dir(&format!("{name}_wire")).await;
-        let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(
-            wire_dir,
-            tbon::en::encode(expression.view_encoder()).unwrap(),
-        )
-        .await
-        .unwrap();
-        let decoded = decoded.into_inner();
         if matches!(layout, Layout::Sparse { .. }) {
             let rows: Vec<_> = expression
                 .read_sparse_elements_in_order(
@@ -624,11 +614,9 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
             assert_eq!(values[i], expected, "{name}: {coord:?}");
             assert_eq!(expression.read_value(&coord).await.unwrap(), expected);
             assert_eq!(output.read_value(&coord).await.unwrap(), expected);
-            assert_eq!(decoded.read_value(&coord).await.unwrap(), expected);
         }
         common::cleanup(&root).await;
         common::cleanup(&out_root).await;
-        common::cleanup(&wire_root).await;
     }
 }
 
@@ -639,7 +627,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
         let length = 1_000_000_000;
         let tensor = create_sparse_tensor::<f32>(
             dir,
-            TensorSchema::new(DType::F32, shape![length]).unwrap(),
+            TensorSchema::new(NumberType::Float(FloatType::F32), shape![length]).unwrap(),
             None,
         )
         .await;
@@ -734,7 +722,7 @@ async fn sparse_range_reads_only_selected_storage() {
     let (root, dir) = new_dir("sparse_range_corruption").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir.clone(),
-        TensorSchema::new(DType::F32, shape![8]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![8]).unwrap(),
         Layout::Sparse { axis: None },
         2,
     )
@@ -773,7 +761,7 @@ async fn sparse_unary_batches_preserve_support_and_independent_consumption() {
     let (root, dir) = new_dir("sparse_unary_batch_boundary").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(DType::F32, shape![1, 4100]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![1, 4100]).unwrap(),
         Layout::Sparse { axis: Some(0) },
         4096,
     )
@@ -832,7 +820,7 @@ async fn dense_scalar_write_rejects_malformed_existing_block() {
     let (root, dir) = new_dir("dense_write_malformed_block").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir.clone(),
-        TensorSchema::new(DType::F32, shape![4]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![4]).unwrap(),
         Layout::Dense,
         4,
     )

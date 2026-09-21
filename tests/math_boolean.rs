@@ -2,15 +2,16 @@
 
 use fensor::unary::UnaryOp;
 use fensor::{
-    DType, Error, Layout, Tensor, TensorArray, TensorCast, TensorElement, TensorFileEntry,
-    TensorGeometry, TensorNumeric, TensorRead, TensorSchema, TensorTransform, TensorU8,
-    TensorUnaryBoolean, TensorView, TensorViewDecoder, TensorWrite, UnaryView,
+    Error, Layout, Tensor, TensorCast, TensorElement, TensorFileEntry, TensorGeometry,
+    TensorNumeric, TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorView,
+    TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, ArrayAccess, AxisRange, Buffer, NDArrayNumeric, NDArrayRead, NDArrayUnaryBoolean, axes,
     range, shape,
 };
+use number_general::{FloatType, NumberType, UIntType};
 
 use common::{FsEntry, new_dir};
 mod common;
@@ -27,18 +28,10 @@ where
     let output = Tensor::<FsEntry, u8>::copy_from(out_dir, &view, 2)
         .await
         .unwrap();
-    let (wire_root, wire_dir) = new_dir("boolean_wire").await;
-    let decoded: TensorViewDecoder<FsEntry, u8> =
-        tbon::de::try_decode(wire_dir, tbon::en::encode(view.view_encoder()).unwrap())
-            .await
-            .unwrap();
-    let decoded = decoded.into_inner();
-    assert_eq!(decoded.schema().dtype(), DType::U8);
     for (i, &value) in expected.iter().enumerate() {
         let coord = [i as u64];
         assert_eq!(view.read_value(&coord).await.unwrap(), value);
         assert_eq!(output.read_value(&coord).await.unwrap(), value);
-        assert_eq!(decoded.read_value(&coord).await.unwrap(), value);
     }
     if matches!(view.layout(), Layout::Sparse { .. }) {
         let rows: Vec<_> = view
@@ -59,7 +52,6 @@ where
         );
     }
     common::cleanup(&out_root).await;
-    common::cleanup(&wire_root).await;
 }
 
 macro_rules! float_predicates {
@@ -79,7 +71,8 @@ macro_rules! float_predicates {
                 ];
                 let tensor = Tensor::<FsEntry, $t>::create(
                     dir,
-                    TensorSchema::new(<$t>::DTYPE, shape![input.len()]).unwrap(),
+                    TensorSchema::new(<$t as number_general::DType>::dtype(), shape![input.len()])
+                        .unwrap(),
                     layout,
                     2,
                 )
@@ -123,12 +116,12 @@ float_predicates!(f32_predicate_parity, f32);
 float_predicates!(f64_predicate_parity, f64);
 
 #[tokio::test]
-async fn u8_storage_views_not_and_wire_roundtrips() {
+async fn u8_storage_views_not_and_reload() {
     for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
         let (root, dir) = new_dir("u8_storage").await;
-        let tensor: TensorU8<FsEntry> = Tensor::create(
+        let tensor: Tensor<FsEntry, u8> = Tensor::create(
             dir.clone(),
-            TensorSchema::new(DType::U8, shape![4]).unwrap(),
+            TensorSchema::new(NumberType::UInt(UIntType::U8), shape![4]).unwrap(),
             layout,
             2,
         )
@@ -159,21 +152,9 @@ async fn u8_storage_views_not_and_wire_roundtrips() {
             expected[0] = 0;
         }
         check_consumers(tensor.view().not().await.unwrap(), &expected).await;
-        let (wire_root, wire_dir) = new_dir("u8_native_wire").await;
-        let decoded: TensorViewDecoder<FsEntry, u8> =
-            tbon::de::try_decode(wire_dir, tbon::en::encode(flipped.view_encoder()).unwrap())
-                .await
-                .unwrap();
-        let decoded = decoded.into_inner();
         for (i, value) in [255, 127, 1, 0].into_iter().enumerate() {
-            assert_eq!(decoded.read_value(&[i as u64]).await.unwrap(), value);
+            assert_eq!(flipped.read_value(&[i as u64]).await.unwrap(), value);
         }
-        let schema_wire = (tensor.schema().dtype(), vec![4u64], layout);
-        let decoded_schema: (DType, Vec<u64>, Layout) =
-            tbon::de::try_decode((), tbon::en::encode(&schema_wire).unwrap())
-                .await
-                .unwrap();
-        assert_eq!(decoded_schema, schema_wire);
         dir.sync().await.unwrap();
         drop(flipped);
         drop(tensor);
@@ -190,7 +171,6 @@ async fn u8_storage_views_not_and_wire_roundtrips() {
                 .is_err()
         );
         common::cleanup(&root).await;
-        common::cleanup(&wire_root).await;
     }
 }
 
@@ -199,7 +179,7 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
     let (root, dir) = new_dir("boolean_chain").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(DType::F32, shape![1, 4100]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![1, 4100]).unwrap(),
         Layout::Sparse { axis: Some(0) },
         4096,
     )
@@ -255,16 +235,9 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
     let selected = expression.slice(range![AxisRange::In(0, 4, 1)]).unwrap();
     let (out_root, out_dir) = new_dir("boolean_chain_out").await;
     let output = Tensor::copy_from(out_dir, &selected, 2).await.unwrap();
-    let (wire_root, wire_dir) = new_dir("boolean_chain_wire").await;
-    let decoded: TensorViewDecoder<FsEntry, u8> =
-        tbon::de::try_decode(wire_dir, tbon::en::encode(selected.view_encoder()).unwrap())
-            .await
-            .unwrap();
-    let decoded = decoded.into_inner();
     for (i, value) in [0, 0, 1, 1].into_iter().enumerate() {
         assert_eq!(selected.read_value(&[i as u64]).await.unwrap(), value);
         assert_eq!(output.read_value(&[i as u64]).await.unwrap(), value);
-        assert_eq!(decoded.read_value(&[i as u64]).await.unwrap(), value);
     }
     let source = tensor
         .view()
@@ -298,7 +271,7 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
             .unwrap(),
         0
     );
-    for root in [&root, &out_root, &wire_root, &mid_root] {
+    for root in [&root, &out_root, &mid_root] {
         common::cleanup(root).await;
     }
 }
@@ -311,7 +284,7 @@ async fn u8_cache_spill_and_reload() {
         let dir = cache.load(root.clone()).unwrap();
         let tensor = Tensor::<FsEntry, u8>::create(
             dir.clone(),
-            TensorSchema::new(DType::U8, shape![2048]).unwrap(),
+            TensorSchema::new(NumberType::UInt(UIntType::U8), shape![2048]).unwrap(),
             Layout::Dense,
             128,
         )
@@ -339,11 +312,11 @@ async fn u8_cache_spill_and_reload() {
 }
 
 #[tokio::test]
-async fn u8_corruption_and_invalid_wire_values_fail_closed() {
+async fn u8_malformed_blocks_fail_closed() {
     let (root, dir) = new_dir("u8_corruption").await;
     let tensor = Tensor::<FsEntry, u8>::create(
         dir.clone(),
-        TensorSchema::new(DType::U8, shape![4]).unwrap(),
+        TensorSchema::new(NumberType::UInt(UIntType::U8), shape![4]).unwrap(),
         Layout::Dense,
         4,
     )
@@ -372,28 +345,5 @@ async fn u8_corruption_and_invalid_wire_values_fail_closed() {
             .await
             .is_err()
     );
-    for value in [-1i16, 256] {
-        let (wire_root, wire_dir) = new_dir("u8_invalid_payload").await;
-        let wire = (
-            (DType::U8, vec![1u64], Layout::Dense, vec![1usize]),
-            vec![(vec![0u64], value)],
-        );
-        let decoded: Result<TensorViewDecoder<FsEntry, u8>, _> =
-            tbon::de::try_decode(wire_dir, tbon::en::encode(&wire).unwrap()).await;
-        assert!(
-            decoded.is_err(),
-            "invalid u8 value {value} must be rejected"
-        );
-        common::cleanup(&wire_root).await;
-    }
-    let (wire_root, wire_dir) = new_dir("u8_wrong_dtype").await;
-    let wire = (
-        (DType::F32, vec![1u64], Layout::Dense, vec![1usize]),
-        vec![(vec![0u64], 1f32)],
-    );
-    let decoded: Result<TensorViewDecoder<FsEntry, u8>, _> =
-        tbon::de::try_decode(wire_dir, tbon::en::encode(&wire).unwrap()).await;
-    assert!(decoded.is_err());
     common::cleanup(&root).await;
-    common::cleanup(&wire_root).await;
 }

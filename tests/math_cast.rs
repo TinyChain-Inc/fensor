@@ -2,14 +2,15 @@
 
 use fensor::unary::Cast;
 use fensor::{
-    DType, Layout, Tensor, TensorArray, TensorCast, TensorRead, TensorSchema, TensorTransform,
-    TensorTrig, TensorUnary, TensorView, TensorViewDecoder, TensorWrite, UnaryView,
+    Layout, Tensor, TensorArray, TensorCast, TensorRead, TensorSchema, TensorTransform, TensorTrig,
+    TensorUnary, TensorView, TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, ArrayAccess, AxisRange, Buffer, NDArrayCast, NDArrayRead, NDArrayTrig, NDArrayUnary,
     axes, range, shape,
 };
+use number_general::{FloatType, NumberType};
 
 use common::{FsEntry, new_dir};
 
@@ -41,7 +42,7 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     ];
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(DType::F32, shape![input.len()]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![input.len()]).unwrap(),
         Layout::Dense,
         3,
     )
@@ -64,34 +65,25 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     let values: Vec<_> = blocks.into_iter().flatten().collect();
     let (out_root, out_dir) = new_dir("cast_dense_out").await;
     let output: Tensor<FsEntry, f64> = Tensor::copy_from(out_dir.clone(), &cast, 4).await.unwrap();
-    assert_eq!(output.schema().dtype(), DType::F64);
+    assert_eq!(output.schema().dtype(), NumberType::Float(FloatType::F64));
     out_dir.sync().await.unwrap();
     drop(output);
     drop(out_dir);
     let reloaded = Tensor::<FsEntry, f64>::load(common::open_dir(&out_root).unwrap())
         .await
         .unwrap();
-    let (wire_root, wire_dir) = new_dir("cast_dense_wire").await;
-    let decoded: TensorViewDecoder<FsEntry, f64> =
-        tbon::de::try_decode(wire_dir, tbon::en::encode(cast.view_encoder()).unwrap())
-            .await
-            .unwrap();
-    let decoded = decoded.into_inner();
-    assert_eq!(decoded.schema().dtype(), DType::F64);
     for (i, expected) in expected.into_iter().enumerate() {
         let coord = [i as u64];
         assert_value(expected, f64::from(input[i]));
         assert_value(cast.read_value(&coord).await.unwrap(), expected);
         assert_value(values[i], expected);
         assert_value(reloaded.read_value(&coord).await.unwrap(), expected);
-        assert_value(decoded.read_value(&coord).await.unwrap(), expected);
     }
     assert!(cast.read_value(&[1]).await.unwrap().is_sign_negative());
     assert!(values[1].is_sign_negative());
     assert!(reloaded.read_value(&[1]).await.unwrap().is_sign_negative());
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
-    common::cleanup(&wire_root).await;
 }
 
 #[tokio::test]
@@ -99,7 +91,7 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
     let (root, dir) = new_dir("cast_chain").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(DType::F32, shape![1, 4100]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![1, 4100]).unwrap(),
         Layout::Dense,
         128,
     )
@@ -173,7 +165,7 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
     let (root, dir) = new_dir("cast_sparse").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(DType::F32, shape![2, 3]).unwrap(),
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3]).unwrap(),
         Layout::Sparse { axis: Some(0) },
         3,
     )
@@ -206,14 +198,6 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
     assert_eq!(rows, vec![(vec![2, 1], 1.0f64)]);
     let (out_root, out_dir) = new_dir("cast_sparse_out").await;
     let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
-    let (wire_root, wire_dir) = new_dir("cast_sparse_wire").await;
-    let decoded: TensorViewDecoder<FsEntry, f64> = tbon::de::try_decode(
-        wire_dir,
-        tbon::en::encode(expression.view_encoder()).unwrap(),
-    )
-    .await
-    .unwrap();
-    let decoded = decoded.into_inner();
     let blocks: Vec<Vec<f64>> = expression
         .read_blocks()
         .unwrap()
@@ -225,7 +209,6 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
         let expected = if coord == vec![2, 1] { 1.0 } else { 0.0 };
         assert_eq!(values[i], expected);
         assert_eq!(output.read_value(&coord).await.unwrap(), expected);
-        assert_eq!(decoded.read_value(&coord).await.unwrap(), expected);
     }
     let final_zero = expression.ln().await.unwrap();
     let rows: Vec<_> = final_zero
@@ -238,5 +221,4 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
     assert!(rows.is_empty());
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
-    common::cleanup(&wire_root).await;
 }
