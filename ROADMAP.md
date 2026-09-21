@@ -57,8 +57,10 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 ## Implemented lazy unary execution
 
 - Geometric `TensorView` and computed `UnaryView<Source, Op>` are separate types.
-  `exp`, `ln`, and `round` compose sealed typed ndarray operations without
-  intermediate filesystem materialization or per-operation vector conversion.
+  `exp`, `ln`, and `round` nest unary views over their immediate sources, following
+  ndarray access composition. Consumers read the root geometric view and build
+  the complete ndarray expression before evaluating once per batch, without
+  intermediate filesystem materialization, vector conversion, or sparse filtering.
   Only unary traits gain associated output types; geometric transform traits and
   binary/reduction traits retain their existing interfaces.
 - Bases and views expose fresh, bounded row-major value streams. Fixed-size batches

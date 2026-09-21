@@ -20,17 +20,19 @@ A filesystem-backed `Tensor` data structure featuring support for dense and spar
 
 `tensor.view().exp().await?`, `ln`, and `round` build reusable expressions over
 `ha-ndarray` arrays. `TensorView` contains only coordinate geometry;
-`UnaryView<Source, Op>` contains a geometric source and a typed operation.
-`fensor::unary::{Exp, Ln, Round, Then}` name the sealed operation types:
-`round().exp()` produces `UnaryView<Source, Then<Round, Exp>>`, retaining one
-source rather than wrapping an evaluated intermediate view. `TensorUnary` uses
+`UnaryView<Source, Op>` contains its immediate source and one typed operation.
+`fensor::unary::{Exp, Ln, Round}` name the sealed operation types:
+`round().exp()` produces `UnaryView<UnaryView<Source, Round>, Exp>`, following
+`ha-ndarray`'s nested-access structure. `TensorUnary` uses
 `ExpOutput`, `LnOutput`, and `RoundOutput` associated types while preserving the
 borrowed `.exp().await?` call syntax. No `FE: Clone` bound is needed to clone
 geometric or unary view descriptions.
 
 Chaining does not read data or write intermediate tensors.
-Each consumed batch constructs an ndarray expression and evaluates its final
-result; backend execution and fusion remain `ha-ndarray`'s responsibility.
+Consumers read each batch from the root geometric view, recursively construct
+one ndarray expression through the nested unary views, and evaluate only its
+final result. Intermediate views do not evaluate buffers or filter sparse support.
+Backend execution and fusion remain `ha-ndarray`'s responsibility.
 `TensorElement` extends `ha-ndarray::Number`; the supported stored types remain
 `f32` and `f64`.
 

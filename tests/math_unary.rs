@@ -1,7 +1,7 @@
 //! Integration tests for `TensorUnary` (`exp`, `ln`, `round`) via lazy
 //! typed `UnaryView` chains over filesystem-backed geometric views.
 
-use fensor::unary::{Exp, Round, Then};
+use fensor::unary::{Exp, Round};
 use fensor::{
     DType, Error, Layout, Tensor, TensorRead, TensorSchema, TensorTransform, TensorUnary,
     TensorView, TensorViewDecoder, TensorViewSemantics, TensorWrite, UnaryView,
@@ -320,7 +320,7 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
             .await
             .unwrap();
     }
-    let expression: UnaryView<TensorView<'_, FsEntry, f64>, Then<Round, Exp>> = tensor
+    let expression: UnaryView<UnaryView<TensorView<'_, FsEntry, f64>, Round>, Exp> = tensor
         .view()
         .round()
         .await
@@ -373,7 +373,7 @@ async fn sparse_chain_preserves_input_support_through_intermediate_zero() {
     )
     .await;
     tensor.write_value(&[1, 2], -0.2).await.unwrap();
-    let expression = tensor
+    let expression: UnaryView<UnaryView<TensorView<'_, FsEntry, f32>, Round>, Exp> = tensor
         .view()
         .round()
         .await
@@ -604,14 +604,46 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
             .unwrap();
         let values: Vec<_> = blocks.into_iter().flatten().collect();
         assert_eq!(values.len(), 6);
+        let (out_root, out_dir) = new_dir(&format!("{name}_out")).await;
+        let output = expression.materialize(out_dir, 2).await.unwrap();
+        let (wire_root, wire_dir) = new_dir(&format!("{name}_wire")).await;
+        let decoded: TensorViewDecoder<FsEntry, f32> = tbon::de::try_decode(
+            wire_dir,
+            tbon::en::encode(expression.view_encoder()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let decoded = decoded.into_inner();
+        if matches!(layout, Layout::Sparse { .. }) {
+            let rows: Vec<_> = expression
+                .read_sparse_elements_in_order(
+                    range![AxisRange::In(0, 3, 1), AxisRange::In(0, 2, 1)],
+                    axes![0, 1],
+                )
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                iter_coords(&[3, 2])
+                    .zip(values.iter().copied())
+                    .collect::<Vec<_>>()
+            );
+        }
         for (i, coord) in iter_coords(&[3, 2]).enumerate() {
             // Row 1 of the original tensor, reversed along its final axis;
             // the two output columns both select the broadcast singleton.
             let expected = (5.0 - coord[0] as f32).exp().ln();
             assert_eq!(values[i], expected, "{name}: {coord:?}");
             assert_eq!(expression.read_value(&coord).await.unwrap(), expected);
+            assert_eq!(output.read_value(&coord).await.unwrap(), expected);
+            assert_eq!(decoded.read_value(&coord).await.unwrap(), expected);
         }
         common::cleanup(&root).await;
+        common::cleanup(&out_root).await;
+        common::cleanup(&wire_root).await;
     }
 }
 
