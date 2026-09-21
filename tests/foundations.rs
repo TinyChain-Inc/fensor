@@ -1,235 +1,28 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use fensor::{
-    BoxFuture, DType, Error, Layout, TensorArray, TensorGeometry, TensorRead, TensorSchema,
-    TensorTransform, TensorWrite, contiguous_strides,
+    DType, Error, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
+    TensorWrite, contiguous_strides,
 };
-use ha_ndarray::{Axes, AxisRange, Range, Shape, Strides, axes, range, shape};
+use ha_ndarray::{AxisRange, Range, axes, range, shape};
 
 mod common;
 
-#[derive(Clone)]
-struct TestTensor {
-    schema: TensorSchema,
-    layout: Layout,
-    shape: Shape,
-    strides: Strides,
-    values: Vec<f32>,
-    base_offset: usize,
+use common::{FsEntry, cleanup, iter_coords, new_dir};
+
+async fn create_tensor(name: &str, layout: Layout) -> (PathBuf, Tensor<FsEntry, f32>) {
+    let (root, dir) = new_dir(name).await;
+    let schema = TensorSchema::new(DType::F32, shape![2, 3, 4]).expect("schema");
+    // Keep blocks small so reads and transforms cross storage boundaries.
+    let tensor = Tensor::create(dir, schema, layout, 4)
+        .await
+        .expect("create tensor");
+    (root, tensor)
 }
 
-impl TestTensor {
-    fn new(layout: Layout) -> Self {
-        let shape: Shape = shape![2, 3, 4];
-        let schema = TensorSchema::new(DType::F32, shape.clone()).expect("valid schema");
-        let strides = schema.strides().clone();
-        let values = vec![0.0; shape.iter().product()];
-
-        Self {
-            schema,
-            layout,
-            shape,
-            strides,
-            values,
-            base_offset: 0,
-        }
-    }
-
-    fn validate_coord(&self, coord: &[u64]) -> fensor::Result<()> {
-        if coord.len() != self.shape.len() {
-            return Err(Error::InvalidCoord(
-                "incorrect number of coordinates".to_string(),
-            ));
-        }
-        for (c, dim) in coord.iter().zip(self.shape.iter()) {
-            if (*c as usize) >= *dim {
-                return Err(Error::InvalidCoord("coordinate out of bounds".to_string()));
-            }
-        }
-        Ok(())
-    }
-
-    fn linear_offset(&self, coord: &[u64]) -> usize {
-        self.base_offset
-            + coord
-                .iter()
-                .zip(self.strides.iter())
-                .map(|(c, s)| (*c as usize) * *s)
-                .sum::<usize>()
-    }
-}
-
-impl TensorGeometry for TestTensor {
-    type DType = f32;
-
-    fn dtype(&self) -> Self::DType {
-        0.0
-    }
-
-    fn layout(&self) -> Layout {
-        self.layout
-    }
-
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-}
-
-impl TensorArray for TestTensor {
-    fn schema(&self) -> &TensorSchema {
-        &self.schema
-    }
-
-    fn strides(&self) -> &[usize] {
-        &self.strides
-    }
-}
-
-impl TensorRead for TestTensor {
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, fensor::Result<Self::DType>> {
-        Box::pin(async move {
-            self.validate_coord(coord)?;
-            Ok(self.values[self.linear_offset(coord)])
-        })
-    }
-}
-
-impl TensorWrite for TestTensor {
-    fn write_value<'a>(
-        &'a self,
-        coord: &'a [u64],
-        value: Self::DType,
-    ) -> BoxFuture<'a, fensor::Result<()>> {
-        Box::pin(async move {
-            self.validate_coord(coord)?;
-            let offset = self.linear_offset(coord);
-
-            // Interior mutability is not needed for these tests; clone/write/forget keeps test code minimal.
-            let mut clone = self.values.clone();
-            clone[offset] = value;
-
-            let this = self as *const Self as *mut Self;
-            unsafe {
-                (*this).values = clone;
-            }
-
-            Ok(())
-        })
-    }
-}
-
-impl TensorTransform for TestTensor {
-    fn reshape(mut self, shape: Shape) -> fensor::Result<Self> {
-        let old_size: usize = self.shape.iter().product();
-        let new_size: usize = shape.iter().product();
-
-        if old_size != new_size {
-            return Err(Error::InvalidLayout(
-                "reshape requires an equal number of elements".to_string(),
-            ));
-        }
-
-        self.strides = contiguous_strides(&shape)?;
-        self.shape = shape;
-        self.base_offset = 0;
-        Ok(self)
-    }
-
-    fn slice(mut self, range: Range) -> fensor::Result<Self> {
-        if range.len() != self.shape.len() {
-            return Err(Error::InvalidLayout(
-                "slice range rank must match tensor rank".to_string(),
-            ));
-        }
-
-        let mut next_shape = Shape::with_capacity(range.len());
-        let mut next_strides = Strides::with_capacity(range.len());
-        let shape = self.shape.clone();
-        let strides = self.strides.clone();
-
-        for (axis, (bound, dim)) in range.iter().zip(shape.iter()).enumerate() {
-            match bound {
-                AxisRange::In(start, stop, step)
-                    if *step > 0 && *start <= *stop && *stop <= *dim =>
-                {
-                    self.base_offset += start * strides[axis];
-                    next_shape.push((stop - start) / step);
-                    next_strides.push(strides[axis] * step);
-                }
-                AxisRange::At(i) if *i < *dim => {
-                    self.base_offset += i * strides[axis];
-                    next_shape.push(1);
-                    next_strides.push(strides[axis]);
-                }
-                _ => {
-                    return Err(Error::InvalidLayout(format!(
-                        "slice bound at axis {axis} is out of bounds"
-                    )));
-                }
-            }
-        }
-
-        self.shape = next_shape;
-        self.strides = next_strides;
-        Ok(self)
-    }
-
-    fn transpose(mut self, permutation: Option<Axes>) -> fensor::Result<Self> {
-        let shape = self.shape.clone();
-        let base_strides = self.strides.clone();
-        let ndim = shape.len();
-        let axes = permutation.unwrap_or_else(|| (0..ndim).collect());
-
-        if axes.len() != ndim {
-            return Err(Error::InvalidLayout(
-                "transpose permutation rank must match tensor rank".to_string(),
-            ));
-        }
-
-        let mut seen = vec![false; ndim];
-        for axis in &axes {
-            if *axis >= ndim || seen[*axis] {
-                return Err(Error::InvalidLayout(
-                    "transpose permutation must be a valid axis permutation".to_string(),
-                ));
-            }
-            seen[*axis] = true;
-        }
-
-        let mut shape = Shape::with_capacity(ndim);
-        let mut strides = Strides::with_capacity(ndim);
-        for axis in axes {
-            shape.push(self.shape[axis]);
-            strides.push(base_strides[axis]);
-        }
-
-        self.shape = shape;
-        self.strides = strides;
-        Ok(self)
-    }
-}
-
-fn iter_coords(shape: &[usize]) -> Vec<Vec<u64>> {
-    fn rec(shape: &[usize], out: &mut Vec<Vec<u64>>, prefix: &mut Vec<u64>, axis: usize) {
-        if axis == shape.len() {
-            out.push(prefix.clone());
-            return;
-        }
-
-        for i in 0..shape[axis] {
-            prefix.push(i as u64);
-            rec(shape, out, prefix, axis + 1);
-            prefix.pop();
-        }
-    }
-
-    let mut out = Vec::new();
-    rec(shape, &mut out, &mut Vec::new(), 0);
-    out
-}
-
-async fn seed_values(tensor: &TestTensor) {
-    for coord in iter_coords(tensor.schema.shape()) {
+async fn seed_values(tensor: &Tensor<FsEntry, f32>) {
+    for coord in iter_coords(tensor.shape()) {
         let value = (coord[0] * 100 + coord[1] * 10 + coord[2]) as f32;
         tensor
             .write_value(&coord, value)
@@ -249,9 +42,13 @@ fn transpose_range(range: &Range, permutation: &[usize]) -> Range {
 
 #[tokio::test]
 async fn accessor_coordinate_offset_and_read_write_dense() {
-    let tensor = TestTensor::new(Layout::Dense);
+    let (root, tensor) = create_tensor(
+        "accessor_coordinate_offset_and_read_write_dense",
+        Layout::Dense,
+    )
+    .await;
 
-    assert_eq!(tensor.linear_offset(&[1, 2, 3]), 23);
+    assert_eq!(tensor.view().flat_offset(&[1, 2, 3]).expect("offset"), 23);
 
     tensor.write_value(&[1, 2, 3], 7.5).await.expect("write");
     tensor.write_value(&[0, 0, 0], 1.25).await.expect("write");
@@ -263,16 +60,19 @@ async fn accessor_coordinate_offset_and_read_write_dense() {
     assert_eq!(v_a, 7.5);
     assert_eq!(v_b, 1.25);
     assert_eq!(v_c, 0.0);
+
+    cleanup(&root).await;
 }
 
 #[tokio::test]
 async fn standalone_transpose_arbitrary_permutation() {
-    let tensor = TestTensor::new(Layout::Dense);
+    let (root, tensor) =
+        create_tensor("standalone_transpose_arbitrary_permutation", Layout::Dense).await;
     seed_values(&tensor).await;
 
     let perm = axes![2, 0, 1];
     let transposed = tensor
-        .clone()
+        .view()
         .transpose(Some(perm.clone()))
         .expect("transpose");
 
@@ -296,11 +96,13 @@ async fn standalone_transpose_arbitrary_permutation() {
             .expect("read transposed");
         assert_eq!(actual, expected, "coord {:?}", t_coord);
     }
+
+    cleanup(&root).await;
 }
 
 #[tokio::test]
 async fn standalone_slice_range_selection() {
-    let tensor = TestTensor::new(Layout::Dense);
+    let (root, tensor) = create_tensor("standalone_slice_range_selection", Layout::Dense).await;
     seed_values(&tensor).await;
 
     let r: Range = range![
@@ -309,7 +111,7 @@ async fn standalone_slice_range_selection() {
         AxisRange::In(0, 4, 2)
     ];
 
-    let sliced = tensor.clone().slice(r).expect("slice");
+    let sliced = tensor.view().slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 2, 2]);
 
     for s_coord in iter_coords(sliced.shape()) {
@@ -318,11 +120,17 @@ async fn standalone_slice_range_selection() {
         let actual = sliced.read_value(&s_coord).await.expect("read slice");
         assert_eq!(actual, expected, "coord {:?}", s_coord);
     }
+
+    cleanup(&root).await;
 }
 
 #[tokio::test]
 async fn composition_transpose_slice_and_slice_transpose_consistency() {
-    let tensor = TestTensor::new(Layout::Dense);
+    let (root, tensor) = create_tensor(
+        "composition_transpose_slice_and_slice_transpose_consistency",
+        Layout::Dense,
+    )
+    .await;
     seed_values(&tensor).await;
 
     let perm = axes![2, 0, 1];
@@ -333,7 +141,7 @@ async fn composition_transpose_slice_and_slice_transpose_consistency() {
     ];
 
     let left = tensor
-        .clone()
+        .view()
         .slice(r.clone())
         .expect("slice")
         .transpose(Some(perm.clone()))
@@ -341,7 +149,7 @@ async fn composition_transpose_slice_and_slice_transpose_consistency() {
 
     let remapped = transpose_range(&r, &perm);
     let right = tensor
-        .clone()
+        .view()
         .transpose(Some(perm))
         .expect("transpose")
         .slice(remapped)
@@ -354,12 +162,15 @@ async fn composition_transpose_slice_and_slice_transpose_consistency() {
         let right_v = right.read_value(&coord).await.expect("right read");
         assert_eq!(left_v, right_v, "coord {:?}", coord);
     }
+
+    cleanup(&root).await;
 }
 
 #[tokio::test]
 async fn dense_sparse_parity_for_supported_operations() {
-    let dense = TestTensor::new(Layout::Dense);
-    let sparse = TestTensor::new(Layout::Sparse { axis: Some(1) });
+    let (dense_root, dense) = create_tensor("parity_dense", Layout::Dense).await;
+    let (sparse_root, sparse) =
+        create_tensor("parity_sparse", Layout::Sparse { axis: Some(1) }).await;
 
     let writes: HashMap<Vec<u64>, f32> = [
         (vec![0, 0, 0], 1.0),
@@ -379,17 +190,19 @@ async fn dense_sparse_parity_for_supported_operations() {
     }
 
     for coord in iter_coords(dense.shape()) {
+        let expected = writes.get(&coord).copied().unwrap_or(0.0);
         let d = dense.read_value(&coord).await.expect("dense read");
         let s = sparse.read_value(&coord).await.expect("sparse read");
-        assert_eq!(d, s, "base coord {:?}", coord);
+        assert_eq!(d, expected, "dense base coord {:?}", coord);
+        assert_eq!(s, expected, "sparse base coord {:?}", coord);
     }
 
     let permuted_dense = dense
-        .clone()
+        .view()
         .transpose(Some(axes![1, 2, 0]))
         .expect("transpose");
     let permuted_sparse = sparse
-        .clone()
+        .view()
         .transpose(Some(axes![1, 2, 0]))
         .expect("transpose");
 
@@ -408,14 +221,17 @@ async fn dense_sparse_parity_for_supported_operations() {
         AxisRange::In(1, 4, 1)
     ];
 
-    let sliced_dense = dense.clone().slice(r.clone()).expect("slice");
-    let sliced_sparse = sparse.clone().slice(r).expect("slice");
+    let sliced_dense = dense.view().slice(r.clone()).expect("slice");
+    let sliced_sparse = sparse.view().slice(r).expect("slice");
 
     for coord in iter_coords(sliced_dense.shape()) {
         let d = sliced_dense.read_value(&coord).await.expect("dense read");
         let s = sliced_sparse.read_value(&coord).await.expect("sparse read");
         assert_eq!(d, s, "sliced coord {:?}", coord);
     }
+
+    cleanup(&dense_root).await;
+    cleanup(&sparse_root).await;
 }
 
 #[tokio::test]
@@ -446,7 +262,8 @@ fn public_schema_contiguous_strides_match_expected() {
 
 #[tokio::test]
 async fn sparse_incompatible_order_error_is_structured() {
-    let tensor = TestTensor::new(Layout::Sparse { axis: None });
+    let (root, tensor) =
+        create_tensor("incompatible_sparse_order", Layout::Sparse { axis: None }).await;
 
     let err = match tensor
         .read_sparse_elements_in_order(
@@ -474,4 +291,6 @@ async fn sparse_incompatible_order_error_is_structured() {
         }
         other => panic!("unexpected error variant: {other}"),
     }
+
+    cleanup(&root).await;
 }

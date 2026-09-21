@@ -8,14 +8,15 @@ repository = "https://github.com/TinyChain-Inc/fensor"
 
 [dependencies]
 b-table = { path = "../b-table", features = ["stream"] }
-destream = "0.10"
-freqfs = "0.12"
+destream = { path = "../destream", version = "0.10" }
+freqfs = { path = "../freqfs", version = "0.13" }
 ha-ndarray = "0.5"
 futures = "0.3"
 rand = "0.8"
 safecast = "0.2"
 smallvec = "1"
+num_cpus = "1.17.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
-tbon = "0.9"
+tbon = { path = "../tbon", version = "0.9" }

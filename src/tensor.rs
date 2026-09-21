@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
 
@@ -6,8 +5,7 @@ use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
 use futures::StreamExt as _;
-use futures::stream;
-use ha_ndarray::{Axes, Range};
+use ha_ndarray::Range;
 use safecast::AsType;
 
 use crate::error::{Error, Result};
@@ -16,10 +14,10 @@ use crate::schema::{
     StorageSchema, TensorSchema,
 };
 use crate::traits::{
-    BoxFuture, SparseElementStream, TensorArray, TensorBlockStore, TensorGeometry, TensorRead,
-    TensorReadBulk, TensorSparseIndex, TensorWrite, TensorWriteBulk,
+    BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorRead, TensorReadBulk,
+    TensorSparseIndex, TensorWrite, TensorWriteBulk,
 };
-use crate::validate::{self, validate_coord};
+use crate::validate;
 use crate::view::TensorView;
 
 const BLOCKS: &str = "blocks";
@@ -28,7 +26,8 @@ const METADATA: &str = "metadata";
 const METADATA_VERSION: u32 = 2;
 
 pub trait TensorElement:
-    Copy
+    ha_ndarray::Number
+    + Copy
     + Default
     + PartialEq
     + Send
@@ -111,12 +110,6 @@ enum SparseWriteAction {
     DeleteRow(u64),
     NoOp,
     CreateBlockAndWrite(u64),
-}
-
-struct SparseIterState<T> {
-    pending_blocks: VecDeque<(u64, u64)>,
-    buffered: VecDeque<(Vec<u64>, T)>,
-    range: Range,
 }
 
 #[derive(Clone)]
@@ -226,42 +219,6 @@ where
         &self.storage.storage_schema().strides
     }
 
-    pub(crate) fn grid_shape(&self) -> &[usize] {
-        &self.storage.storage_schema().shape
-    }
-
-    pub(crate) fn block_origin_from_grid_id(&self, block_grid_id: u64) -> Vec<u64> {
-        let block_shape = self.block_shape();
-        let grid_shape = self.grid_shape();
-        let grid_strides = self.grid_strides();
-
-        (0..block_shape.len())
-            .map(|axis| {
-                let grid_coord =
-                    (block_grid_id / grid_strides[axis] as u64) as usize % grid_shape[axis];
-                (grid_coord * block_shape[axis]) as u64
-            })
-            .collect()
-    }
-
-    pub(crate) fn base_coord_from_block_offset(
-        &self,
-        origin: &[u64],
-        offset_in_block: usize,
-    ) -> Vec<u64> {
-        let block_shape = self.block_shape();
-        let block_strides = self.block_strides();
-
-        origin
-            .iter()
-            .enumerate()
-            .map(|(axis, &start)| {
-                let local = (offset_in_block / block_strides[axis]) % block_shape[axis];
-                start + local as u64
-            })
-            .collect()
-    }
-
     pub(crate) fn num_blocks(&self) -> u64 {
         self.storage
             .storage_schema()
@@ -334,15 +291,20 @@ where
         offset_in_block: usize,
         value: T,
     ) -> Result<()> {
-        let mut block = match self.read_block(block_id).await? {
-            Some(block) => block,
-            None => {
-                return Err(IoError::new(ErrorKind::NotFound, "Missing block".to_string()).into());
-            }
+        let file = {
+            let blocks = self.storage.blocks().read().await;
+            blocks
+                .get_file(&block_id.to_string())
+                .cloned()
+                .ok_or_else(|| Error::from(IoError::new(ErrorKind::NotFound, "Missing block")))?
         };
+        let mut block = file.write::<Vec<T>>().await?;
+        if block.len() != self.block_len() {
+            return Err(Error::InvalidLayout("invalid stored block length".into()));
+        }
         validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
         block[offset_in_block] = value;
-        self.write_block(block_id, block).await
+        Ok(())
     }
 
     async fn persist_metadata(&self) -> Result<()>
@@ -511,102 +473,18 @@ where
                 return Ok(T::default());
             };
 
-            let Some(block) = self.read_block(id).await? else {
-                return Err(
-                    IoError::new(ErrorKind::NotFound, "Block is missing".to_string()).into(),
-                );
+            let file = {
+                let blocks = self.storage.blocks().read().await;
+                blocks.get_file(&id.to_string()).cloned().ok_or_else(|| {
+                    Error::from(IoError::new(ErrorKind::NotFound, "Block is missing"))
+                })?
             };
-
+            let block = file.read::<Vec<T>>().await?;
+            if block.len() != self.block_len() {
+                return Err(Error::InvalidLayout("invalid stored block length".into()));
+            }
             validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
             Ok(block[offset_in_block])
-        })
-    }
-
-    fn read_sparse_elements_in_order<'a>(
-        &'a self,
-        range: Range,
-        requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        Box::pin(async move {
-            let base_order: Vec<usize> = (0..self.ndim()).collect();
-            let requested_order: Vec<usize> = requested_order.into_iter().collect();
-
-            if requested_order != base_order {
-                return Err(Error::UnsupportedSparseIterationOrder {
-                    requested_order,
-                    base_order,
-                    hint: "materialize or perform external sort for incompatible order".to_string(),
-                });
-            }
-
-            if range.len() != self.ndim() {
-                return Err(Error::InvalidLayout(format!(
-                    "range has {} axes but tensor has {} dimensions",
-                    range.len(),
-                    self.ndim()
-                )));
-            }
-
-            let index = self.sparse_index()?;
-
-            let mut block_refs: Vec<(u64, u64)> = {
-                let guard = index.read().await;
-                let mut rows = guard.into_rows().await.map_err(Error::from)?;
-                let mut refs = Vec::new();
-                while let Some(row) = rows.next().await {
-                    let row = row.map_err(Error::from)?;
-                    refs.push((row[1], row[2]));
-                }
-                refs
-            };
-            block_refs.sort_by_key(|&(block_grid_id, _)| block_grid_id);
-
-            let state = SparseIterState {
-                pending_blocks: block_refs.into(),
-                buffered: VecDeque::new(),
-                range,
-            };
-
-            let elements = stream::unfold(state, move |mut state| async move {
-                loop {
-                    if let Some(item) = state.buffered.pop_front() {
-                        return Some((Ok(item), state));
-                    }
-
-                    let (block_grid_id, block_id) = state.pending_blocks.pop_front()?;
-
-                    let block = match self.read_block(block_id).await {
-                        Ok(Some(block)) => block,
-                        Ok(None) => {
-                            let err: Error =
-                                IoError::new(ErrorKind::NotFound, "Block is missing".to_string())
-                                    .into();
-                            return Some((Err(err), state));
-                        }
-                        Err(e) => return Some((Err(e), state)),
-                    };
-
-                    let origin = self.block_origin_from_grid_id(block_grid_id);
-                    for (offset_in_block, &value) in block.iter().enumerate() {
-                        if value == T::default() {
-                            continue;
-                        }
-
-                        let coord = self.base_coord_from_block_offset(&origin, offset_in_block);
-                        if let Err(err) = validate_coord(self.shape(), &coord) {
-                            return Some((Err(err), state));
-                        };
-
-                        match validate::range_contains_coord(&state.range, &coord) {
-                            Ok(true) => state.buffered.push_back((coord, value)),
-                            Ok(false) => {}
-                            Err(e) => return Some((Err(e), state)),
-                        }
-                    }
-                }
-            });
-
-            Ok(elements.boxed())
         })
     }
 }
@@ -634,7 +512,7 @@ where
 
             match self.layout() {
                 Layout::Dense => {
-                    if self.read_block(block_grid_id).await?.is_none() {
+                    if !self.block_exists(block_grid_id).await {
                         self.write_block(block_grid_id, self.default_block())
                             .await?;
                     }
@@ -688,6 +566,9 @@ where
             let blocks = self.storage.blocks().read().await;
             if let Some(file) = blocks.get_file(&block_id.to_string()) {
                 let guard = file.read::<Vec<T>>().await?;
+                if guard.len() != self.block_len() {
+                    return Err(Error::InvalidLayout("invalid stored block length".into()));
+                }
                 Ok(Some(guard.clone()))
             } else {
                 Ok(None)
@@ -697,6 +578,11 @@ where
 
     fn write_block<'a>(&'a self, block_id: u64, block: Self::Block) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            if block.len() != self.block_len() {
+                return Err(Error::InvalidLayout(
+                    "block length must match storage schema".into(),
+                ));
+            }
             let file = {
                 let blocks = self.storage.blocks().read().await;
                 blocks.get_file(&block_id.to_string()).cloned()
@@ -707,7 +593,13 @@ where
                 Ok(())
             } else {
                 let mut blocks = self.storage.blocks().write().await;
-                blocks.create_file(block_id.to_string(), block, 0)?;
+                let size = block
+                    .len()
+                    .checked_mul(std::mem::size_of::<T>())
+                    .ok_or_else(|| Error::InvalidLayout("block byte size overflow".into()))?;
+                blocks
+                    .create_file(block_id.to_string(), block, size)
+                    .await?;
                 Ok(())
             }
         })
@@ -876,7 +768,8 @@ where
         *guard = payload.to_string();
     } else {
         let mut dir = blocks.write().await;
-        dir.create_file(name.to_string(), payload.to_string(), payload.len())?;
+        dir.create_file(name.to_string(), payload.to_string(), payload.len())
+            .await?;
     }
     Ok(())
 }
@@ -1196,7 +1089,7 @@ mod sparse_lifecycle_tests {
     }
 
     fn open_dir(root: &Path) -> io::Result<DirLock<TestFE>> {
-        let cache = Cache::<TestFE>::new(1_000_000, None);
+        let cache = Cache::<TestFE>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
         cache.load(root.to_path_buf())
     }
 

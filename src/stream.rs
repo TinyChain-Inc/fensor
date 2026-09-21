@@ -1,10 +1,10 @@
 use destream::{de, en};
 use freqfs::DirLock;
+use futures::{StreamExt, TryStreamExt};
 
-use crate::schema::{self, DType, Layout, RowMajorCoords, TensorSchema};
+use crate::schema::{self, DType, Layout, TensorSchema};
 use crate::tensor::{Tensor, TensorElement, TensorFileEntry};
-use crate::traits::{TensorArray, TensorGeometry, TensorRead, TensorViewSemantics, TensorWrite};
-use crate::view;
+use crate::traits::{TensorRead, TensorViewSemantics, TensorWrite};
 use crate::wire_tags::{LAYOUT_TAG_DENSE, LAYOUT_TAG_SPARSE};
 
 fn encode_sparse_axis<E: en::Error>(axis: Option<usize>) -> Result<Option<u64>, E> {
@@ -89,28 +89,30 @@ impl<'en> en::IntoStream<'en> for Layout {
 // Tensor view streaming: lazy encode + streaming decode
 // ---------------------------------------------------------------------------
 
-pub struct TensorViewEncoder<'v, 't, FE, T> {
-    view: &'v view::TensorView<'t, FE, T>,
+/// Streaming encoder for either a geometric view or a computed unary view.
+pub struct TensorViewEncoder<'v, V> {
+    view: &'v V,
+    block_shape: &'v [usize],
 }
 
-impl<'v, 't, FE, T> TensorViewEncoder<'v, 't, FE, T> {
-    pub(crate) fn new(view: &'v view::TensorView<'t, FE, T>) -> Self {
-        Self { view }
+impl<'v, V> TensorViewEncoder<'v, V> {
+    pub(crate) fn new(view: &'v V, block_shape: &'v [usize]) -> Self {
+        Self { view, block_shape }
     }
 }
 
-fn encode_view<'en, 't, E, FE, T>(
-    view: &'en view::TensorView<'t, FE, T>,
+fn encode_view<'en, E, V>(
+    view: &'en V,
+    block_shape: &[usize],
     encoder: E,
 ) -> Result<E::Ok, E::Error>
 where
     E: en::Encoder<'en>,
-    't: 'en,
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    V: TensorRead + TensorViewSemantics,
+    V::DType: TensorElement,
 {
     // Encode schema info needed to reconstruct the tensor: (dtype, shape, layout, block_shape)
-    let dtype = view.tensor().schema().dtype();
+    let dtype = V::DType::DTYPE;
     let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
     // A `Sparse { axis }` hint is preserved only when the tensor is currently an
     // identity/base view -- `transpose`/`slice`/`reshape` never update layout when
@@ -126,7 +128,7 @@ where
             axis: if is_identity { axis } else { None },
         },
     };
-    let block_shape: Vec<usize> = view.tensor().block_shape().to_vec();
+    let block_shape = block_shape.to_vec();
     let view_shape: Vec<usize> = view.shape().to_vec();
     let schema_info = (dtype, shape, layout, block_shape);
     let view_values = ViewSnapshotValues {
@@ -136,82 +138,69 @@ where
     en::IntoStream::into_stream((schema_info, view_values), encoder)
 }
 
-impl<'v, 'en, 't, FE, T> en::ToStream<'en> for TensorViewEncoder<'v, 't, FE, T>
+impl<'v, 'en, V> en::ToStream<'en> for TensorViewEncoder<'v, V>
 where
     'v: 'en,
-    't: 'en,
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    V: TensorRead + TensorViewSemantics,
+    V::DType: TensorElement,
 {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        encode_view(self.view, encoder)
+        encode_view(self.view, self.block_shape, encoder)
     }
 }
 
-impl<'v, 't, 'en, FE, T> en::IntoStream<'en> for TensorViewEncoder<'v, 't, FE, T>
+impl<'v, 'en, V> en::IntoStream<'en> for TensorViewEncoder<'v, V>
 where
     'v: 'en,
-    't: 'en,
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    V: TensorRead + TensorViewSemantics,
+    V::DType: TensorElement,
 {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        encode_view(self.view, encoder)
+        encode_view(self.view, self.block_shape, encoder)
     }
 }
 
-struct ViewSnapshotValues<'en, 't, FE, T> {
-    view: &'en view::TensorView<'t, FE, T>,
+struct ViewSnapshotValues<'en, V> {
+    view: &'en V,
     shape: Vec<usize>,
 }
 
-enum ValuesEncodingState<'en, 't, FE, T> {
-    Walking {
-        view: &'en view::TensorView<'t, FE, T>,
-        coords: RowMajorCoords,
-    },
-    Done,
-}
-
-impl<'en, 't, FE, T> en::IntoStream<'en> for ViewSnapshotValues<'en, 't, FE, T>
+impl<'en, V> en::IntoStream<'en> for ViewSnapshotValues<'en, V>
 where
-    't: 'en,
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    V: TensorRead,
+    V::DType: TensorElement,
 {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         let coords = schema::row_major_coords(&self.shape).map_err(en::Error::custom)?;
-        let initial = ValuesEncodingState::Walking {
-            view: self.view,
-            coords,
-        };
-        let stream = Box::pin(futures::stream::unfold(initial, |state| async move {
-            let ValuesEncodingState::Walking { view, mut coords } = state else {
-                return None;
-            };
-
-            loop {
-                let Some(coord) = coords.next() else {
-                    break None;
-                };
-
-                let value = view.read_value(&coord).await;
-
-                match value {
-                    Ok(value) => {
-                        if value == T::default() {
-                            continue;
-                        }
-
-                        break Some((
-                            Ok((coord, value)),
-                            ValuesEncodingState::Walking { view, coords },
-                        ));
-                    }
-                    Err(error) => break Some((Err(format!("{error}")), ValuesEncodingState::Done)),
+        let blocks = self.view.read_blocks().map_err(en::Error::custom)?;
+        let values = blocks
+            .map_ok(|block| {
+                futures::stream::iter(block.into_iter().map(Ok::<V::DType, crate::Error>))
+            })
+            .try_flatten()
+            .boxed();
+        let initial = (values, coords, false);
+        let stream = Box::pin(futures::stream::unfold(
+            initial,
+            |(mut values, mut coords, done)| async move {
+                if done {
+                    return None;
                 }
-            }
-        }));
+                loop {
+                    match values.next().await? {
+                        Ok(value) => {
+                            let coord = coords.next().expect("value stream matches shape");
+                            if value != V::DType::default() {
+                                return Some((Ok((coord, value)), (values, coords, false)));
+                            }
+                        }
+                        Err(error) => {
+                            return Some((Err(format!("{error}")), (values, coords, true)));
+                        }
+                    }
+                }
+            },
+        ));
         encoder.encode_seq_stream(stream)
     }
 }

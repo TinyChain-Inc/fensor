@@ -1,5 +1,8 @@
 # TinyChain Code Style
 
+These rules apply throughout this repository. Keep local crate notes short and
+link back here so the repository does not fork its style guide.
+
 ## Imports
 
 Group `use` statements in this order, separated by one blank line:

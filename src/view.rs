@@ -3,11 +3,14 @@ mod tests;
 
 use std::{iter, sync::Arc};
 
+use freqfs::DirLock;
+use futures::TryStreamExt;
 use ha_ndarray::{Axes, AxisRange, Range, Shape};
+use safecast::AsType;
 use smallvec::SmallVec;
 
 use crate::error::{Error, Result};
-use crate::schema::{self, Layout, TensorViewShape};
+use crate::schema::{self, Layout, TensorSchema, TensorViewShape};
 use crate::tensor::{Tensor, TensorElement, TensorFileEntry};
 use crate::traits::{
     BoxFuture, TensorArray, TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics,
@@ -16,12 +19,23 @@ use crate::traits::{
 
 use crate::{PORTABLE_INLINE_RANK, stream, validate};
 
-#[derive(Clone)]
-pub struct TensorView<'t, FE, T> {
+/// A geometric view of filesystem-backed tensor storage.
+pub struct TensorView<'t, FE, T: TensorElement> {
     tensor: &'t Tensor<FE, T>,
     base_offset: i64,
     axes: SmallVec<[AxisContrib; PORTABLE_INLINE_RANK]>,
     shape: TensorViewShape,
+}
+
+impl<FE, T: TensorElement> Clone for TensorView<'_, FE, T> {
+    fn clone(&self) -> Self {
+        Self {
+            tensor: self.tensor,
+            base_offset: self.base_offset,
+            axes: self.axes.clone(),
+            shape: self.shape.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -92,8 +106,8 @@ where
             })
     }
 
-    pub fn view_encoder(&self) -> stream::TensorViewEncoder<'_, 't, FE, T> {
-        stream::TensorViewEncoder::new(self)
+    pub fn view_encoder(&self) -> stream::TensorViewEncoder<'_, Self> {
+        stream::TensorViewEncoder::new(self, self.tensor.block_shape())
     }
 
     fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
@@ -602,4 +616,49 @@ where
             self.tensor.write_value(&base_coord, value).await
         })
     }
+}
+
+impl<'t, FE, T> TensorView<'t, FE, T>
+where
+    FE: TensorFileEntry<T> + AsType<String> + From<String>,
+    T: TensorElement,
+{
+    /// Consume this expression into independent filesystem storage.
+    pub async fn materialize(
+        &self,
+        dir: DirLock<FE>,
+        max_capacity: usize,
+    ) -> Result<Tensor<FE, T>> {
+        materialize(self, dir, max_capacity).await
+    }
+}
+
+pub(crate) async fn materialize<FE, V>(
+    view: &V,
+    dir: DirLock<FE>,
+    max_capacity: usize,
+) -> Result<Tensor<FE, V::DType>>
+where
+    V: TensorRead,
+    V::DType: TensorElement,
+    FE: TensorFileEntry<V::DType> + AsType<String> + From<String>,
+{
+    let mut blocks = view.read_blocks()?;
+    let schema = TensorSchema::new(V::DType::DTYPE, view.shape().to_vec().into())?;
+    let layout = match view.layout() {
+        Layout::Dense => Layout::Dense,
+        Layout::Sparse { .. } => Layout::Sparse { axis: None },
+    };
+    let output = Tensor::create(dir, schema, layout, max_capacity).await?;
+    let mut coords = schema::row_major_coords(view.shape())?;
+    while let Some(values) = blocks.try_next().await? {
+        for value in values {
+            let coord = coords.next().expect("stream shape matches output");
+            if matches!(layout, Layout::Sparse { .. }) && value == V::DType::default() {
+                continue;
+            }
+            output.write_value(&coord, value).await?;
+        }
+    }
+    Ok(output)
 }
