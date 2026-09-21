@@ -15,15 +15,18 @@ pub use schema::{
 };
 pub use stream::{TensorViewDecoder, TensorViewEncoder};
 pub use traits::{
-    BoxFuture, SparseElementStream, TensorArray, TensorBlockStore, TensorGeometry, TensorMatMul,
-    TensorMath, TensorMathScalar, TensorRead, TensorReadBulk, TensorReduce, TensorReduceAll,
-    TensorReduceBoolean, TensorSparseIndex, TensorTransform, TensorUnary, TensorViewSemantics,
-    TensorWrite, TensorWriteBulk, ValueBlockStream,
+    BoxFuture, SparseElementStream, TensorAbs, TensorArray, TensorBlockStore, TensorCast,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorNumeric, TensorRead,
+    TensorReadBulk, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorSparseIndex,
+    TensorTransform, TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics, TensorWrite,
+    TensorWriteBulk, ValueBlockStream,
 };
 
 pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 pub use unary::UnaryView;
 pub use view::TensorView;
+
+pub type TensorU8<FE> = Tensor<FE, u8>;
 
 pub type TensorF32<FE> = Tensor<FE, f32>;
 pub type TensorF64<FE> = Tensor<FE, f64>;

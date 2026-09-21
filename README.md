@@ -11,10 +11,23 @@ A filesystem-backed `Tensor` data structure featuring support for dense and spar
 
 ## Serializing a tensor
 
-`Tensor<FE, T>` has two, independent wire-format surfaces:
+`tensor.view_encoder()` (or a view's `view_encoder()`) streams schema information
+and nonzero coordinate/value pairs through `destream`. `TensorViewDecoder<FE, T>`
+writes them into a fresh filesystem-backed tensor; call `.into_inner()` to obtain
+it. Geometric and computed views use the same format. Read and decode errors are
+propagated; cleanup of partial destination storage remains the caller's responsibility.
+There is no trailer or checksum, so end-to-end completeness belongs to the transport.
 
-- **Schema-only (`Tensor: ToStream`/`FromStream`/`IntoStream`)**: encodes just the `TensorSchema` (dtype/shape/layout). Only a base (identity-view) tensor can be encoded this way; encoding a transformed (sliced/transposed/reshaped) view is rejected, since views are metadata-only and never persisted. Decoding always builds a fresh, empty base tensor at the given directory via `Tensor::create` — no element data is carried.
-- **View + data streaming (`Tensor::view_encoder` / `TensorViewDecoder`)**: `tensor.view_encoder()` returns a `TensorViewEncoder<'_, View>` that streams the tensor's *current* view — identity or transformed, dense or sparse — directly to the wire via `destream`'s `ToStream`/`IntoStream` contract. The encoder lazily reads from the tensor's filesystem-backed storage and emits values one at a time, with no full in-memory buffering; only non-default (nonzero) values are transmitted, reducing network traffic for sparse-heavy or mostly-empty tensors. On the receiving end, `TensorViewDecoder<FE, T>` implements `destream`'s `FromStream` and writes each arriving value directly to a fresh, independent, identity base tensor's filesystem storage as it arrives off the wire — also with no full in-memory buffering. There is no trailer or checksum on this wire format: a successful transfer is signaled by natural exhaustion of the pairs sequence, and end-to-end transfer completeness/integrity is left to the transport/caller layer rather than re-implemented here. A read failure on the sending side propagates as a bounded error-code sentinel — a closed classification of which failure shape occurred, deliberately excluding free-text detail (filesystem paths, coordinates, or other sender-machine specifics) since this wire format is meant to cross a machine boundary. On that sentinel, a malformed/truncated stream, or any other decode-time failure after the destination storage is created, the directory is truncated and deleted before a fail-closed error is returned. Call `.into_inner()` on the decoder to extract the reconstructed tensor. Like the design it replaces, this produces a fresh, independent identity base tensor with no link back to the source storage; it remains a distinct, additive wire surface alongside the existing schema-only `Tensor: ToStream/FromStream/IntoStream` contract, which is completely unrelated and still only carries dtype/shape/layout metadata without element data.
+`DType` and `Layout` have standalone stream encodings. `Tensor` and `TensorSchema`
+do not expose a separate schema-only stream API; persistent schema metadata is
+written and loaded by the storage implementation.
+
+Native stored dtypes are `u8`, `f32`, and `f64`, exposed through `TensorU8`,
+`TensorF32`, and `TensorF64`. u8 stores all values from 0 to 255, not just boolean
+masks. The new `DType::U8` uses the string `"u8"`; metadata version and wire
+structure are unchanged, and existing float data requires no migration. Older
+readers reject the new dtype. Downstream exhaustive matches on `DType` must add
+its `U8` variant. Storage adapters for u8 need `AsType<Vec<u8>>` support.
 
 ## Lazy math and bounded reads
 
@@ -28,13 +41,51 @@ A filesystem-backed `Tensor` data structure featuring support for dense and spar
 borrowed `.exp().await?` call syntax. No `FE: Clone` bound is needed to clone
 geometric or unary view descriptions.
 
+`TensorAbs` adds `abs`; `TensorTrig` adds `sin`, `asin`, `sinh`, `cos`, `acos`,
+`cosh`, `tan`, `atan`, and `tanh` for both f32 and f64. Import these traits alongside
+`TensorUnary` to compose operations, for example
+`tensor.view().abs().await?.sin().await?.round().await?`. Their sealed operation
+markers are exported through `fensor::unary`, and every operation returns another
+nested, read-only `UnaryView`. Absolute value preserves the stored dtype;
+trigonometric methods have a distinct associated output type for each operation.
+
+`TensorCast<f64>` adds lazy f32-to-f64 conversion. Import `TensorCast` and call
+`tensor.view().cast().await?`, or use `TensorCast::<f64>::cast(&view).await?` to
+name the target explicitly. The result is `UnaryView<Source, Cast<f64>>`; operations
+before the cast execute in f32 and operations after it execute in f64. Widening
+follows ha-ndarray conversion behavior, preserving finite f32 values exactly,
+signed zero, infinities, and NaN classification (not a NaN payload guarantee).
+Other casts are not yet supported.
+
+Boolean operations return u8 views with values 0 or 1:
+
+| Trait | Operations | Inputs |
+| --- | --- | --- |
+| `TensorUnaryBoolean` | `not` | u8, f32, f64 |
+| `TensorNumeric` | `is_nan`, `is_inf` | f32, f64 |
+
+For example, `tensor.view().is_nan().await?.not().await?` constructs a nested
+mask expression. Dense `not` returns 1 for either signed zero and 0 for nonzeros,
+including NaN and infinity. Numeric predicates follow ha-ndarray's classification.
+All predicate views are read-only and use the same bounded consumers as numeric views.
+
+Sparse predicates preserve original nonzero source support. Implicit zeros stay
+absent even for `not`, so direct sparse `not` produces no populated output. A
+chain `is_nan().not()` produces ones for finite nonzero values (and infinities),
+while NaNs and implicit zeros produce zero. False intermediate results retain
+support until the final consumer. Materializing between predicates drops those
+zeros: `is_nan()` materialized before `not()` therefore behaves differently from
+the unmaterialized sparse chain. No implicit densification is performed.
+
 Chaining does not read data or write intermediate tensors.
 Consumers read each batch from the root geometric view, recursively construct
 one ndarray expression through the nested unary views, and evaluate only its
-final result. Intermediate views do not evaluate buffers or filter sparse support.
+final result. `UnaryOp<Input>::Output` and the root input dtype are independent,
+so a cast does not require an intermediate buffer. Intermediate views do not
+evaluate buffers or filter sparse support.
 Backend execution and fusion remain `ha-ndarray`'s responsibility.
 `TensorElement` extends `ha-ndarray::Number`; the supported stored types remain
-`f32` and `f64`.
+`u8`, `f32`, and `f64`.
 
 `TensorRead::read_blocks()` returns logical row-major batches of values,
 independent of physical storage tiling. Each call creates a fresh stream with
@@ -45,23 +96,34 @@ and dropping the stream drops pending reads. Independent streams can be consumed
 concurrently, and recompute their own results; they do not share a mutable cursor.
 These are live views, not snapshots: concurrent source writes are not isolated.
 
-Direct reads, view serialization, and `materialize` evaluate the same expression.
+Direct reads, view serialization, and `Tensor::copy_from` evaluate the same expression.
 Both view families expose `view_encoder()`, returning `TensorViewEncoder<'_, View>`;
 its generic view parameter replaces the previous storage/lifetime parameters.
 The wire format and decoder are unchanged.
-`materialize(dir, max_capacity)` uses the same bounded read stream;
-`max_capacity` controls destination storage blocks independently. Materialization
-writes only the final tensor, awaits storage writes, and propagates read/write
-errors. Partial output after failure remains the caller's lifecycle responsibility.
+`Tensor::copy_from(dir, &expression, max_capacity).await?` constructs independent
+filesystem-backed storage from any `TensorRead`, including base tensors, geometric
+views, and computed views. Evaluation happens implicitly as the constructor
+consumes bounded batches; views have no separate materialization method.
+`max_capacity` controls destination storage blocks independently. The destination
+file-entry type must support the output dtype and may differ from the source's.
+Encoded and copied schemas use the expression's output dtype, with existing
+formats unchanged. Sparse copies reset the axis hint to `None` and omit final zeros.
+Source read and destination write errors propagate; cleanup of partial output
+remains the caller's responsibility. Readers returning too many or too few values
+for their shape return a structured layout error.
+
 `UnaryView` does not implement `TensorWrite`, so writes through a computed view
 are rejected at compile time. Geometric views retain their existing write-through
 constraints. `TensorTransform` still returns `Self`: transforms update the
 geometric source and retain the typed unary composition. Slicing and transposition compose with unary
 operations on both dense and sparse tensors. Scalar (rank-zero) views cannot
-be streamed or materialized and return a structured schema error.
+be streamed or copied and return a structured schema error.
 
 Sparse unary operations act only on nonzero source values; implicit zeros remain
-zero, even for `exp` and `ln`. A chain retains its original input support until
+zero, even for `exp`, `ln`, `cos`, `acos`, and `cosh`. Thus a populated `0.2`
+under `round().cos()` yields `1`, while an implicit zero stays absent. Operations
+preserve backend NaN and infinity results without domain clamping. A chain retains
+its original input support across casts and until
 consumption: a populated `0.2` produces `1` under `round().exp()`, while an absent
 coordinate stays zero. Materializing `round()` first drops that zero from sparse
 support, so a subsequent `exp()` on the stored result leaves it zero. A final
