@@ -3,8 +3,8 @@ use std::io;
 use std::path::Path;
 
 use fensor::{
-    Layout, Tensor, TensorCast, TensorGeometry, TensorMath, TensorMetadata, TensorRead,
-    TensorSchema, TensorWrite,
+    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorGeometry, TensorMath,
+    TensorMathScalar, TensorMetadata, TensorRead, TensorSchema, TensorWhere, TensorWrite,
 };
 
 use freqfs::{Cache, FileLoad, FileSave};
@@ -179,4 +179,61 @@ async fn binary_sources_use_independent_codecs() {
 
     assert_eq!(output.read_value(&[4]).await.unwrap(), 6.);
     assert_eq!(output.read_value(&[0]).await.unwrap(), 0.);
+}
+
+// Conditional expressions and predicates retain independent source/destination adapters.
+#[tokio::test]
+async fn conditional_sources_and_output_use_independent_codecs() {
+    let a_root = common::unique_tmp_dir("conditional_json");
+    tokio::fs::create_dir(&a_root).await.unwrap();
+    let cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
+    let a = Tensor::<JsonEntry, f32>::create(
+        cache.load(a_root).unwrap(),
+        TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
+        Layout::Sparse { axis: None },
+        2,
+    )
+    .await
+    .unwrap();
+    let (_, b_dir) = common::new_dir("conditional_tbon").await;
+    let b = Tensor::<FsEntry, f32>::create(
+        b_dir,
+        TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
+        Layout::Sparse { axis: None },
+        3,
+    )
+    .await
+    .unwrap();
+    a.write_value(&[3], 2.).await.unwrap();
+    b.write_value(&[4], 3.).await.unwrap();
+    let condition = a
+        .view()
+        .gt(&b.view())
+        .await
+        .unwrap()
+        .and_scalar(127)
+        .await
+        .unwrap();
+    let expression = condition
+        .cond(&a.view().add_scalar(1.).await.unwrap(), &b.view())
+        .await
+        .unwrap()
+        .clone();
+    let out_root = common::unique_tmp_dir("conditional_json_output");
+    tokio::fs::create_dir(&out_root).await.unwrap();
+    let out_cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
+    let out_dir = out_cache.load(out_root.clone()).unwrap();
+    let output: Tensor<JsonEntry, f32> = Tensor::copy_from(out_dir.clone(), &expression, 4)
+        .await
+        .unwrap();
+    output.sync().await.unwrap();
+    drop(output);
+    drop(out_dir);
+    let reload_cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
+    let output = Tensor::<JsonEntry, f32>::load(reload_cache.load(out_root).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(output.read_value(&[0]).await.unwrap(), 0.);
+    assert_eq!(output.read_value(&[3]).await.unwrap(), 3.);
+    assert_eq!(output.read_value(&[4]).await.unwrap(), 3.);
 }

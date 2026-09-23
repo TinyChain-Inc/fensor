@@ -2,7 +2,9 @@ pub mod binary;
 mod error;
 mod expression;
 mod metadata;
+pub mod scalar;
 mod schema;
+mod selection;
 mod tensor;
 mod traits;
 pub mod unary;
@@ -16,11 +18,13 @@ pub use number_general::NumberType;
 pub use schema::{
     Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape, contiguous_strides,
 };
+pub use selection::WhereView;
 pub use traits::{
-    BoxFuture, SparseElementStream, TensorAbs, TensorArray, TensorBlockStore, TensorCast,
-    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorNumeric, TensorRead,
-    TensorReadBulk, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorSparseIndex,
-    TensorTransform, TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics, TensorWrite,
+    BoxFuture, SparseElementStream, TensorAbs, TensorArray, TensorBlockStore, TensorBoolean,
+    TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar, TensorGeometry,
+    TensorMatMul, TensorMath, TensorMathScalar, TensorNumeric, TensorRead, TensorReadBulk,
+    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorSparseIndex, TensorTransform,
+    TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite,
     TensorWriteBulk, ValueBlockStream,
 };
 

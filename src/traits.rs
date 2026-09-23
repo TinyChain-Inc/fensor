@@ -374,63 +374,163 @@ where
     fn rem<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::RemOutput>>;
 }
 
-/// Elementwise tensor math operations with scalar arguments.
-pub trait TensorMathScalar: TensorArray + Sized {
-    fn add_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "add_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Lazy elementwise arithmetic with scalar arguments.
+///
+/// Scalars preserve the source's support: implicit sparse zeros stay absent even
+/// when the operation would map zero to a nonzero value. Arithmetic follows
+/// ha-ndarray's numerical contract, including wrapping u8 operations.
+pub trait TensorMathScalar: TensorGeometry {
+    type AddOutput: TensorRead<DType = Self::DType>;
 
-    fn div_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "div_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type SubOutput: TensorRead<DType = Self::DType>;
 
-    fn log_scalar<'a>(&'a self, _base: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "log_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type MulOutput: TensorRead<DType = Self::DType>;
 
-    fn mul_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "mul_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type DivOutput: TensorRead<DType = Self::DType>;
 
-    fn pow_scalar<'a>(&'a self, _exp: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "pow_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type PowOutput: TensorRead<DType = Self::DType>;
 
-    fn rem_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "rem_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type LogOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Float;
 
-    fn sub_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sub_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type RemOutput: TensorRead<DType = Self::DType>;
+
+    fn add_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::AddOutput>>;
+
+    fn sub_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::SubOutput>>;
+
+    fn mul_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::MulOutput>>;
+
+    fn div_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::DivOutput>>;
+
+    fn pow_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::PowOutput>>;
+
+    fn log_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LogOutput>>
+    where
+        Self::DType: ha_ndarray::Float;
+
+    fn rem_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::RemOutput>>;
+}
+
+/// Lazy elementwise comparisons returning exactly zero or one.
+///
+/// Operands must have matching shapes and dtypes. Sparse expressions retain the
+/// union of original source support; comparisons do not populate absent values.
+/// Floating comparisons follow IEEE unordered-NaN and signed-zero rules.
+pub trait TensorCompare<Rhs = Self>: TensorGeometry
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type EqOutput: TensorRead<DType = u8>;
+
+    type NeOutput: TensorRead<DType = u8>;
+
+    type GtOutput: TensorRead<DType = u8>;
+
+    type GeOutput: TensorRead<DType = u8>;
+
+    type LtOutput: TensorRead<DType = u8>;
+
+    type LeOutput: TensorRead<DType = u8>;
+
+    fn eq<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::EqOutput>>;
+
+    fn ne<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::NeOutput>>;
+
+    fn gt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GtOutput>>;
+
+    fn ge<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GeOutput>>;
+
+    fn lt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LtOutput>>;
+
+    fn le<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LeOutput>>;
+}
+
+/// Lazy elementwise comparisons with scalar arguments, returning zero or one.
+///
+/// Source support is preserved: comparing implicit sparse zeros to zero does
+/// not populate them.
+pub trait TensorCompareScalar: TensorGeometry {
+    type EqOutput: TensorRead<DType = u8>;
+
+    type NeOutput: TensorRead<DType = u8>;
+
+    type GtOutput: TensorRead<DType = u8>;
+
+    type GeOutput: TensorRead<DType = u8>;
+
+    type LtOutput: TensorRead<DType = u8>;
+
+    type LeOutput: TensorRead<DType = u8>;
+
+    fn eq_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::EqOutput>>;
+
+    fn ne_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::NeOutput>>;
+
+    fn gt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GtOutput>>;
+
+    fn ge_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GeOutput>>;
+
+    fn lt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LtOutput>>;
+
+    fn le_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LeOutput>>;
+}
+
+/// Lazy elementwise logical operations returning exactly zero or one.
+///
+/// Zero is false; nonzero values, including NaN, are true. These are not bitwise
+/// operations. Shapes and dtypes must match; sparse support is their union.
+pub trait TensorBoolean<Rhs = Self>: TensorGeometry
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type AndOutput: TensorRead<DType = u8>;
+
+    type OrOutput: TensorRead<DType = u8>;
+
+    type XorOutput: TensorRead<DType = u8>;
+
+    fn and<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::AndOutput>>;
+
+    fn or<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::OrOutput>>;
+
+    fn xor<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::XorOutput>>;
+}
+
+/// Lazy elementwise logical operations with scalar arguments.
+///
+/// Zero is false and nonzero is true, including NaN. Results are zero or one;
+/// scalars do not add support to implicit sparse coordinates.
+pub trait TensorBooleanScalar: TensorGeometry {
+    type AndOutput: TensorRead<DType = u8>;
+
+    type OrOutput: TensorRead<DType = u8>;
+
+    type XorOutput: TensorRead<DType = u8>;
+
+    fn and_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::AndOutput>>;
+
+    fn or_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::OrOutput>>;
+
+    fn xor_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::XorOutput>>;
+}
+
+/// Lazy selection with union-of-source-support semantics.
+///
+/// A zero condition selects `or_else`; any nonzero condition selects `then`.
+/// All shapes must match and branch dtypes must match. Both branches are read,
+/// including an unselected branch, and their errors propagate. Sparse support
+/// is the union of the condition and both branches, independent of selection.
+pub trait TensorWhere<Then, Else>: TensorGeometry<DType = u8>
+where
+    Then: TensorGeometry,
+    Else: TensorGeometry<DType = Then::DType>,
+{
+    type Output: TensorRead<DType = Then::DType>;
+
+    fn cond<'a>(&'a self, then: &'a Then, or_else: &'a Else)
+    -> BoxFuture<'a, Result<Self::Output>>;
 }
 
 /// Axis-wise tensor reductions.

@@ -1,13 +1,16 @@
 //! Filesystem-backed binary expression parity and source-support regressions.
 use fensor::{
-    Layout, Tensor, TensorArray, TensorCast, TensorElement, TensorFileEntry, TensorGeometry,
-    TensorMath, TensorNumeric, TensorRead, TensorSchema, TensorTransform, TensorUnary,
-    TensorUnaryBoolean, TensorWrite,
+    Layout, Tensor, TensorArray, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
+    TensorCompareScalar, TensorElement, TensorFileEntry, TensorGeometry, TensorMath,
+    TensorMathScalar, TensorNumeric, TensorRead, TensorSchema, TensorTransform, TensorUnary,
+    TensorUnaryBoolean, TensorWhere, TensorWrite,
 };
 
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{
-    Array, ArrayAccess, AxisRange, Buffer, NDArrayMath, NDArrayRead, Number, axes, range, shape,
+    Array, ArrayAccess, AxisRange, Buffer, NDArrayBoolean, NDArrayBooleanScalar, NDArrayCompare,
+    NDArrayCompareScalar, NDArrayMath, NDArrayMathScalar, NDArrayRead, NDArrayWhere, Number, axes,
+    range, shape,
 };
 
 use number_general::DType;
@@ -163,7 +166,7 @@ macro_rules! matrix {
                             })
                             .collect::<Vec<_>>();
 
-                        let reference: ArrayAccess<'_, $t> = ArrayAccess::from(
+                        let reference: ArrayAccess<'_, _> = ArrayAccess::from(
                             Array::new(Buffer::from(canonical(&left, ls)), shape![left.len()])
                                 .unwrap()
                                 .$op(
@@ -185,7 +188,7 @@ macro_rules! matrix {
                         if ls && rs {
                             for (i, value) in expected.iter_mut().enumerate() {
                                 if left[i] == 0 as $t && right[i] == 0 as $t {
-                                    *value = 0 as $t;
+                                    *value = Default::default();
                                 }
                             }
                         }
@@ -653,4 +656,660 @@ async fn binary_tree_transforms_preserve_operand_order_and_scalar_limits() {
             .await
             .is_err()
     );
+}
+
+fn backend<T: TensorElement>(values: &[T], sparse: bool) -> ArrayAccess<'static, T> {
+    let values: Vec<_> = values
+        .iter()
+        .map(|v| if sparse && *v == T::ZERO { T::ZERO } else { *v })
+        .collect();
+    let len = values.len();
+
+    ArrayAccess::from(Array::new(Buffer::from(values), shape![len]).unwrap())
+}
+
+macro_rules! scalar_cases {
+    ($name:ident, $t:ty, $values:expr, $scalars:expr, [$($op:ident),+]) => {
+        #[tokio::test]
+        async fn $name() {
+            let values: Vec<$t> = $values;
+
+            for sparse in [false, true] {
+                let layout = if sparse { Layout::Sparse { axis: None } } else { Layout::Dense };
+                let tensor = source(&values, layout, 3).await;
+
+                for scalar in $scalars {
+                    $(
+                        let reference = backend(&values, sparse).$op(scalar).unwrap();
+                        let mut expected = reference.buffer().unwrap().to_slice().unwrap().into_vec();
+
+                        if sparse {
+                            for (input, output) in values.iter().zip(&mut expected) {
+                                if *input == 0 as $t { *output = Default::default(); }
+                            }
+                        }
+
+                        check(tensor.view().$op(scalar).await.unwrap(), expected).await;
+                    )+
+                }
+            }
+        }
+    };
+}
+scalar_cases!(
+    f32_scalar_math,
+    f32,
+    vec![
+        0.,
+        -0.,
+        -2.,
+        0.2,
+        1.,
+        2.,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY
+    ],
+    [0., -1., 2.],
+    [
+        add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, rem_scalar, log_scalar
+    ]
+);
+scalar_cases!(
+    f32_scalar_predicates,
+    f32,
+    vec![
+        0.,
+        -0.,
+        -2.,
+        0.2,
+        1.,
+        2.,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY
+    ],
+    [0., -0., 1., f32::NAN, f32::INFINITY],
+    [
+        eq_scalar, ne_scalar, gt_scalar, ge_scalar, lt_scalar, le_scalar, and_scalar, or_scalar,
+        xor_scalar
+    ]
+);
+scalar_cases!(
+    f64_scalar_math,
+    f64,
+    vec![
+        0.,
+        -0.,
+        -2.,
+        0.2,
+        1.,
+        2.,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY
+    ],
+    [0., -1., 2.],
+    [
+        add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, rem_scalar, log_scalar
+    ]
+);
+scalar_cases!(
+    f64_scalar_predicates,
+    f64,
+    vec![
+        0.,
+        -0.,
+        -2.,
+        0.2,
+        1.,
+        2.,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY
+    ],
+    [0., -0., 1., f64::NAN, f64::INFINITY],
+    [
+        eq_scalar, ne_scalar, gt_scalar, ge_scalar, lt_scalar, le_scalar, and_scalar, or_scalar,
+        xor_scalar
+    ]
+);
+scalar_cases!(
+    u8_scalar_math,
+    u8,
+    vec![0, 1, 2, 127, 255],
+    [0, 1, 2, 127, 255],
+    [
+        add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, rem_scalar
+    ]
+);
+scalar_cases!(
+    u8_scalar_predicates,
+    u8,
+    vec![0, 1, 2, 127, 255],
+    [0, 1, 127, 255],
+    [
+        eq_scalar, ne_scalar, gt_scalar, ge_scalar, lt_scalar, le_scalar, and_scalar, or_scalar,
+        xor_scalar
+    ]
+);
+matrix!(
+    f32_comparisons_and_booleans,
+    f32,
+    vec![
+        0.,
+        -0.,
+        -2.,
+        0.2,
+        1.,
+        2.,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY
+    ],
+    vec![
+        -0.,
+        1.,
+        2.,
+        0.,
+        1.,
+        f32::NAN,
+        0.,
+        f32::INFINITY,
+        f32::NEG_INFINITY
+    ],
+    [eq, ne, gt, ge, lt, le, and, or, xor]
+);
+matrix!(
+    f64_comparisons_and_booleans,
+    f64,
+    vec![
+        0.,
+        -0.,
+        -2.,
+        0.2,
+        1.,
+        2.,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY
+    ],
+    vec![
+        -0.,
+        1.,
+        2.,
+        0.,
+        1.,
+        f64::NAN,
+        0.,
+        f64::INFINITY,
+        f64::NEG_INFINITY
+    ],
+    [eq, ne, gt, ge, lt, le, and, or, xor]
+);
+matrix!(
+    u8_comparisons_and_booleans,
+    u8,
+    vec![0, 0, 1, 127, 255],
+    vec![0, 255, 1, 0, 127],
+    [eq, ne, gt, ge, lt, le, and, or, xor]
+);
+
+#[tokio::test]
+async fn scalar_independent_arithmetic_and_truth_tables() {
+    let tensor = source(&[0u8, 1, 127, 255], Layout::Dense, 2).await;
+    check(
+        tensor.view().add_scalar(1).await.unwrap(),
+        vec![1, 2, 128, 0],
+    )
+    .await;
+    check(
+        tensor.view().sub_scalar(1).await.unwrap(),
+        vec![255, 0, 126, 254],
+    )
+    .await;
+    check(
+        tensor.view().mul_scalar(2).await.unwrap(),
+        vec![0, 2, 254, 254],
+    )
+    .await;
+    check(tensor.view().pow_scalar(2).await.unwrap(), vec![0, 1, 1, 1]).await;
+    check(tensor.view().div_scalar(0).await.unwrap(), vec![0; 4]).await;
+    check(tensor.view().rem_scalar(0).await.unwrap(), vec![0; 4]).await;
+    check(
+        tensor.view().and_scalar(127).await.unwrap(),
+        vec![0, 1, 1, 1],
+    )
+    .await;
+    check(
+        tensor.view().xor_scalar(255).await.unwrap(),
+        vec![1, 0, 0, 0],
+    )
+    .await;
+    check(
+        tensor.view().gt_scalar(127).await.unwrap(),
+        vec![0, 0, 0, 1],
+    )
+    .await;
+
+    let floats = source(
+        &[0f32, -0., f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        Layout::Dense,
+        2,
+    )
+    .await;
+    check(
+        floats.view().eq_scalar(0.).await.unwrap(),
+        vec![1, 1, 0, 0, 0],
+    )
+    .await;
+    check(
+        floats.view().ne_scalar(0.).await.unwrap(),
+        vec![0, 0, 1, 1, 1],
+    )
+    .await;
+    check(
+        floats.view().and_scalar(1.).await.unwrap(),
+        vec![0, 0, 1, 1, 1],
+    )
+    .await;
+}
+
+macro_rules! selection_cases {
+    ($name:ident, $t:ty, $left:expr, $right:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let left: Vec<$t> = $left;
+            let right: Vec<$t> = $right;
+            let conditions = [0u8, 1, 127, 255, 0, 0];
+
+            for cs in [false, true] {
+                for ls in [false, true] {
+                    for rs in [false, true] {
+                        let layout = |s| {
+                            if s {
+                                Layout::Sparse { axis: None }
+                            } else {
+                                Layout::Dense
+                            }
+                        };
+                        let c = source(&conditions, layout(cs), 2).await;
+                        let a = source(&left, layout(ls), 3).await;
+                        let b = source(&right, layout(rs), 4).await;
+                        let expression = c.view().cond(&a.view(), &b.view()).await.unwrap();
+                        let expected: Vec<$t> = conditions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| {
+                                let (v, sparse) = if *c == 0 {
+                                    (right[i], rs)
+                                } else {
+                                    (left[i], ls)
+                                };
+                                if sparse && v == 0 as $t { 0 as $t } else { v }
+                            })
+                            .collect();
+
+                        let reference = backend(&conditions, cs)
+                            .cond(backend(&left, ls), backend(&right, rs))
+                            .unwrap()
+                            .buffer()
+                            .unwrap()
+                            .to_slice()
+                            .unwrap()
+                            .into_vec();
+                        assert!(reference.iter().zip(&expected).all(|(a, b)| a.matches(*b)));
+                        assert_eq!(expression.layout(), layout(cs && ls && rs));
+                        check(expression, expected).await;
+                    }
+                }
+            }
+        }
+    };
+}
+selection_cases!(
+    f32_selection,
+    f32,
+    vec![0., -0., f32::NAN, f32::INFINITY, 2., 0.],
+    vec![-0., f32::NAN, 1., 0., f32::NEG_INFINITY, 0.]
+);
+selection_cases!(
+    f64_selection,
+    f64,
+    vec![0., -0., f64::NAN, f64::INFINITY, 2., 0.],
+    vec![-0., f64::NAN, 1., 0., f64::NEG_INFINITY, 0.]
+);
+selection_cases!(
+    u8_selection,
+    u8,
+    vec![0, 1, 127, 255, 2, 0],
+    vec![0, 255, 1, 0, 127, 0]
+);
+
+#[tokio::test]
+async fn sparse_scalar_comparison_and_selection_support() {
+    let layout = Layout::Sparse { axis: None };
+    let a = source(&[0f32, 2., 0., 0.], layout, 2).await;
+    let b = source(&[0f32, 0., 3., 0.], layout, 3).await;
+    let c = source(&[0u8, 0, 0, 1], layout, 2).await;
+
+    check(a.view().add_scalar(1.).await.unwrap(), vec![0., 3., 0., 0.]).await;
+    check(a.view().eq_scalar(0.).await.unwrap(), vec![0; 4]).await;
+    check(a.view().eq(&b.view()).await.unwrap(), vec![0; 4]).await;
+    check(
+        a.view().eq(&b.view()).await.unwrap().not().await.unwrap(),
+        vec![0, 1, 1, 0],
+    )
+    .await;
+
+    let selected = c.view().cond(&a.view(), &b.view()).await.unwrap();
+    check(selected.clone(), vec![0., 0., 3., 0.]).await;
+    // Retain support from an unselected branch and from the condition itself.
+    check(selected.eq_scalar(0.).await.unwrap(), vec![0, 1, 0, 1]).await;
+    let (_, dir) = new_dir("selected_support_boundary").await;
+    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &selected, 2).await.unwrap();
+    check(copy.view().eq_scalar(0.).await.unwrap(), vec![0; 4]).await;
+}
+
+#[tokio::test]
+async fn mixed_elementwise_transforms_and_broadcast() {
+    let a = source(&[0f32, 1., 2., 3., 4., 5.], Layout::Dense, 2).await;
+    let one = source(&[1f64], Layout::Dense, 1).await;
+    let a = a
+        .view()
+        .reshape(shape![2, 3])
+        .unwrap()
+        .flip(1)
+        .unwrap()
+        .cast()
+        .await
+        .unwrap()
+        .add_scalar(1f64)
+        .await
+        .unwrap()
+        .transpose(None)
+        .unwrap();
+    let rhs = one.view().broadcast(shape![3, 2]).unwrap();
+    let condition = a.gt(&rhs).await.unwrap().and_scalar(255).await.unwrap();
+    let expression = condition
+        .cond(&a, &rhs)
+        .await
+        .unwrap()
+        .transpose(None)
+        .unwrap();
+    check(expression, vec![3., 2., 1., 6., 5., 4.]).await;
+
+    assert!(a.eq(&one.view()).await.is_err());
+    assert!(a.and(&one.view()).await.is_err());
+    assert!(condition.cond(&one.view(), &rhs).await.is_err());
+    assert!(condition.cond(&rhs, &one.view()).await.is_err());
+    let small_condition = source(&[1u8], Layout::Dense, 1).await;
+    assert!(small_condition.view().cond(&a, &rhs).await.is_err());
+}
+
+#[tokio::test]
+async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
+    let mut values = vec![0f32; 4101];
+    for i in [0, 4095, 4096, 4100] {
+        values[i] = 0.2;
+    }
+    let a = source(&values, Layout::Sparse { axis: None }, 31).await;
+    let zeros = source(&vec![0f32; 4101], Layout::Sparse { axis: None }, 32).await;
+    let condition = a.view().round().await.unwrap().eq_scalar(0.).await.unwrap();
+    let expression = condition
+        .cond(&zeros.view(), &a.view())
+        .await
+        .unwrap()
+        .eq_scalar(0.)
+        .await
+        .unwrap()
+        .xor_scalar(0)
+        .await
+        .unwrap();
+    let consume = || async {
+        expression
+            .read_blocks()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    };
+    let mut dropped = expression.read_blocks().unwrap();
+    assert_eq!(dropped.try_next().await.unwrap().unwrap().len(), 4096);
+    drop(dropped);
+    let (first, second) = futures::join!(consume(), consume());
+    assert_eq!(first, second);
+    assert_eq!(
+        first.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![4096, 5]
+    );
+    assert_eq!(
+        first.into_iter().flatten().collect::<Vec<_>>(),
+        values
+            .iter()
+            .map(|v| u8::from(*v != 0.))
+            .collect::<Vec<_>>()
+    );
+    let entries: Vec<_> = expression
+        .read_sparse_elements_in_order(range![AxisRange::In(0, 4101, 1)], axes![0])
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        entries,
+        vec![
+            (vec![0], 1),
+            (vec![4095], 1),
+            (vec![4096], 1),
+            (vec![4100], 1)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn conditional_selected_range_propagates_each_operand_error() {
+    use fensor::TensorSparseIndex;
+
+    let (_, dir) = new_dir("conditional_corruption").await;
+    let corrupt = Tensor::<FsEntry, u8>::create(
+        dir.clone(),
+        TensorSchema::new(u8::dtype(), shape![8]).unwrap(),
+        Layout::Sparse { axis: None },
+        2,
+    )
+    .await
+    .unwrap();
+    corrupt.write_value(&[0], 1).await.unwrap();
+    corrupt.write_value(&[7], 1).await.unwrap();
+    let id = corrupt.lookup_block_id(&[7, 3]).await.unwrap().unwrap();
+    let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
+    blocks.write().await.delete(&id.to_string()).await;
+    let empty = source(&[0u8; 8], Layout::Sparse { axis: None }, 3).await;
+
+    for position in 0..3 {
+        let operands =
+            std::array::from_fn::<_, 3, _>(|i| if i == position { &corrupt } else { &empty });
+        let expression = operands[0]
+            .view()
+            .cond(&operands[1].view(), &operands[2].view())
+            .await
+            .unwrap()
+            .or_scalar(1)
+            .await
+            .unwrap();
+        let values: Vec<_> = expression
+            .read_sparse_elements_in_order(range![AxisRange::At(0)], axes![0])
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(values, vec![(vec![0], 1)]);
+        assert!(expression.read_value(&[7]).await.is_err());
+        let mut stream = expression
+            .read_sparse_elements_in_order(range![AxisRange::At(7)], axes![0])
+            .await
+            .unwrap();
+        assert!(stream.try_next().await.is_err());
+        assert!(
+            expression
+                .read_blocks()
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn conditional_far_end_range_is_bounded_and_validated() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (_, dir) = new_dir("conditional_far_end").await;
+        let a = Tensor::<FsEntry, u8>::create(
+            dir,
+            TensorSchema::new(u8::dtype(), shape![1_000_000_000]).unwrap(),
+            Layout::Sparse { axis: None },
+            32,
+        )
+        .await
+        .unwrap();
+        a.write_value(&[999_999_999], 127).await.unwrap();
+        let condition = a.view().eq_scalar(0).await.unwrap();
+        let expression = condition
+            .cond(&a.view(), &a.view())
+            .await
+            .unwrap()
+            .add_scalar(1)
+            .await
+            .unwrap();
+        let entries: Vec<_> = expression
+            .read_sparse_elements_in_order(
+                range![AxisRange::Of(
+                    vec![999_999_999, 999_999_998, 999_999_999].into()
+                )],
+                axes![0],
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(entries, vec![(vec![999_999_999], 128)]);
+        let stepped: Vec<_> = expression
+            .read_sparse_elements_in_order(
+                range![AxisRange::In(999_999_997, 1_000_000_000, 2)],
+                axes![0],
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(stepped, entries);
+        assert!(
+            expression
+                .read_sparse_elements_in_order(range![AxisRange::At(1_000_000_000)], axes![0])
+                .await
+                .is_err()
+        );
+        assert!(
+            expression
+                .read_sparse_elements_in_order(range![], axes![1])
+                .await
+                .is_err()
+        );
+        assert!(
+            expression
+                .read_sparse_elements_in_order(range![AxisRange::In(1, 1, 1)], axes![0])
+                .await
+                .unwrap()
+                .next()
+                .await
+                .is_none()
+        );
+    })
+    .await
+    .expect("a tiny selected range must not scan a billion coordinates");
+}
+
+#[tokio::test]
+async fn conditional_live_sources_transforms_and_scalar_limit() {
+    let a = source(&[1f32, 2., 3., 4.], Layout::Dense, 2).await;
+    let b = source(&[5f32, 6., 7., 8.], Layout::Dense, 3).await;
+    let condition = a.view().gt_scalar(2.).await.unwrap();
+    let selected = condition.cond(&a.view(), &b.view()).await.unwrap();
+    check(
+        selected
+            .clone()
+            .unsqueeze(axes![0])
+            .unwrap()
+            .slice(range![
+                AxisRange::At(0),
+                AxisRange::Of(vec![3, 1, 3].into())
+            ])
+            .unwrap()
+            .unsqueeze(axes![0])
+            .unwrap()
+            .squeeze(axes![0])
+            .unwrap(),
+        vec![4., 6., 4.],
+    )
+    .await;
+    // Construction does not capture either condition values or branch values.
+    a.write_value(&[1], 9.).await.unwrap();
+    b.write_value(&[0], 10.).await.unwrap();
+    check(selected.clone(), vec![10., 9., 3., 4.]).await;
+    let scalar = selected.slice(range![AxisRange::At(1)]).unwrap();
+    assert_eq!(scalar.read_value(&[]).await.unwrap(), 9.);
+    assert!(scalar.read_blocks().is_err());
+    let (_, dir) = new_dir("conditional_scalar_copy").await;
+    assert!(
+        Tensor::<FsEntry, f32>::copy_from(dir, &scalar, 2)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn conditional_copy_under_cache_pressure_reloads() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (root, _) = new_dir("conditional_cache").await;
+        let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
+        let dir = cache.load(root).unwrap();
+        let a = Tensor::<FsEntry, u8>::create(
+            dir,
+            TensorSchema::new(u8::dtype(), shape![1024]).unwrap(),
+            Layout::Dense,
+            32,
+        )
+        .await
+        .unwrap();
+        a.write_value(&[1023], 255).await.unwrap();
+        let condition = a.view().eq_scalar(0).await.unwrap();
+        let expression = condition
+            .cond(&a.view().add_scalar(1).await.unwrap(), &a.view())
+            .await
+            .unwrap();
+        let (out_root, _) = new_dir("conditional_cache_copy").await;
+        let out_cache =
+            freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
+        let out_dir = out_cache.load(out_root.clone()).unwrap();
+        let output: Tensor<FsEntry, u8> = Tensor::copy_from(out_dir.clone(), &expression, 32)
+            .await
+            .unwrap();
+        assert_eq!(output.read_value(&[1023]).await.unwrap(), 255);
+        output.sync().await.unwrap();
+        drop(output);
+        drop(out_dir);
+        let reloaded = Tensor::<FsEntry, u8>::load(common::open_dir(&out_root).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.read_value(&[0]).await.unwrap(), 1);
+        assert_eq!(reloaded.read_value(&[1023]).await.unwrap(), 255);
+    })
+    .await
+    .expect("conditional copying must make progress under cache pressure");
 }
