@@ -18,7 +18,10 @@ where
 
 pub struct Batch<T: TensorElement> {
     pub array: ArrayAccess<'static, T>,
-    // None means full support. This is independent of intermediate numerical zeros.
+    // One byte per coordinate in this evaluation batch, not the whole tensor.
+    // Streaming batches contain at most 4096 coordinates; point reads use one.
+    // None means every coordinate in this batch is supported, independently of
+    // intermediate numerical zeros. Batches need not align with storage blocks.
     pub support: Option<Vec<u8>>,
 }
 
@@ -46,6 +49,10 @@ impl<T: TensorElement> Batch<T> {
 }
 
 /// Union original support without inspecting intermediate numerical values.
+///
+/// Both masks describe the same bounded coordinate batch, including when called
+/// recursively by nested expressions. The result has at most 4096 bytes; this
+/// helper neither reads tensor data nor materializes whole-tensor support.
 pub fn union_support(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Option<Vec<u8>> {
     match (left, right) {
         (Some(left), Some(right)) => {
@@ -67,6 +74,10 @@ where
 
 type EvaluatedBatch<T> = (Vec<Vec<u64>>, Vec<T>);
 
+/// Evaluate bounded coordinate batches with at most `num_cpus::get().max(1)`
+/// batches in flight. Expression temporaries scale with batch size, expression
+/// size, and concurrency, not total tensor size. Collecting the returned stream
+/// can still allocate whole-tensor output in the caller.
 pub fn batches<'a, E, I>(
     expression: &'a E,
     coords: I,
