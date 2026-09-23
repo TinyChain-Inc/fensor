@@ -559,14 +559,18 @@ where
     O: UnaryOp<S::DType>,
 {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move { Ok(expression::evaluate(self, &[coord.to_vec()]).await?[0]) })
+        Box::pin(async move {
+            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
+                .await?
+                .values[0])
+        })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
         let coords = crate::schema::row_major_coords(self.shape())?;
 
-        Ok(expression::batches(self, coords)
-            .map_ok(|(_, values)| values)
+        Ok(expression::evaluated_batches(self, coords)
+            .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
 
@@ -578,12 +582,12 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::batches(self, coords)
+            Ok(expression::evaluated_batches(self, coords)
                 .map_ok(|(coords, values)| {
                     futures::stream::iter(
                         coords
                             .into_iter()
-                            .zip(values)
+                            .zip(values.values)
                             .filter(|(_, value)| *value != Self::DType::default())
                             .map(Ok),
                     )

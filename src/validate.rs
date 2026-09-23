@@ -96,6 +96,8 @@ pub(crate) fn full_range(shape: &[usize]) -> Range {
     shape.iter().map(|&dim| AxisRange::In(0, dim, 1)).collect()
 }
 
+// Rank-sized traversal state plus caller-sized explicit selections, if supplied.
+// Interval axes are descriptors; no range-sized coordinate table is constructed.
 pub(crate) struct RangeCoords {
     range: Range,
     lengths: Vec<usize>,
@@ -103,7 +105,18 @@ pub(crate) struct RangeCoords {
     remaining: usize,
 }
 
+// Checked cardinality allows write-length validation without visiting coordinates.
+impl ExactSizeIterator for RangeCoords {
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
 impl Iterator for RangeCoords {
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+
     type Item = Vec<u64>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {

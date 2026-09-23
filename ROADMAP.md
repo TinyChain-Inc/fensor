@@ -88,7 +88,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   the complete ndarray expression before evaluating once per batch, without
   intermediate filesystem materialization, vector conversion, or sparse filtering.
   Unary traits and `TensorMath<Rhs>` use associated output types; geometric
-  transform and reduction interfaces retain their existing contracts.
+  transform interfaces retain their existing contracts.
 - `BinaryView<Left, Right, Op>` supports add/sub/mul/div/pow/rem for matching
   f32/f64/u8 and log for matching floats. Shape mismatches fail at construction;
   broadcasting and dtype conversions are explicit. Nested unary/binary expressions
@@ -125,9 +125,23 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   evaluation. Both branches are read and propagate errors. All new expressions
   support transforms, bounded reads, and copying, but cannot be written through.
 
+- Whole-tensor numeric/boolean reductions and typed lazy axis reductions support
+  f32, f64, and u8. They reduce retained source support, excluding implicit sparse
+  zeros but including supported intermediate zeros. Empty axis groups stay absent;
+  terminal empty extrema return errors, with identity results for other terminals.
+- Reduction output transforms share geometric coordinate mapping with storage
+  views. Bounded source batches and one partial accumulator per active group avoid
+  whole-group allocation; only the outer consumer starts concurrent batches.
+  Boolean terminals short-circuit, so later corruption may remain unobserved.
+
+- Bounded execution is an explicit design rule, enforced at batch boundaries.
+  Whole-result collection APIs are removed; callers explicitly collect streams.
+  Bulk writes validate range length without collecting coordinates. Existing
+  gather slices/reversals share input-sized tables instead of duplicating them.
+
 Remaining execution work:
 
-- Reductions, matrix multiplication, and additional casts remain separate work.
+- Matrix multiplication and additional casts remain separate work.
 - Extend casting beyond f32-to-f64 and add complex storage/operations separately.
   Expression input/output dtypes are already independent, and u8 predicate output storage is supported.
 
@@ -135,7 +149,8 @@ Remaining execution work:
   logical range; full-range reads still scale with logical size, not stored support.
 - Block-oriented reads/writes to reduce per-coordinate cache/index lookups.
 - Bounded sparse compaction and filesystem metadata scaling; execution limits do
-  not bound these structures or whole-tensor `Vec` collection APIs.
+  not bound filesystem metadata. Whole-result collection APIs and the previous
+  whole-index compaction implementation have been removed.
 - Extend the same read-stream contract to additional ndarray operations rather
   than introducing a separate executor or intermediate tensor files.
 

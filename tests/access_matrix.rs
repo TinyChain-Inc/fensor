@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorReadBulk, TensorSchema,
-    TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
+    Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
+    TensorViewSemantics, TensorWrite, TensorWriteBulk,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{AxisRange, Range, Shape, axes, range, shape};
@@ -1307,27 +1307,34 @@ mod section_c2_squeeze_unsqueeze_chains {
 }
 
 // ====================================================================
-// Section D — Bulk read/write (TensorReadBulk / TensorWriteBulk)
-// Currently inherit `Error::Unsupported` defaults.
+// Section D — Explicit caller-side stream collection and bounded writes
 // ====================================================================
 
 mod section_d_bulk_io {
     use super::*;
 
     #[tokio::test]
-    async fn read_values_dense_contiguous_range() {
+    async fn collect_dense_range_stream() {
         let (root, tensor, _) =
             create_dense("d_read_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
         seed_values(&tensor).await;
 
         let values = tensor
-            .read_values(range![
+            .view()
+            .slice(range![
                 AxisRange::In(0, 2, 1),
                 AxisRange::In(0, 3, 1),
                 AxisRange::In(0, 4, 1)
             ])
+            .unwrap()
+            .read_blocks()
+            .unwrap()
+            .try_collect::<Vec<_>>()
             .await
-            .expect("bulk read must be supported");
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         assert_eq!(values.len(), 24);
         for (idx, coord) in iter_coords(tensor.shape()).enumerate() {
@@ -1338,20 +1345,28 @@ mod section_d_bulk_io {
     }
 
     #[tokio::test]
-    async fn read_values_sparse_returns_zeros_for_missing() {
+    async fn collect_sparse_range_stream_includes_implicit_zeros() {
         let (root, tensor, _) =
             create_sparse("d_read_sparse", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("write");
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("write");
 
         let values = tensor
-            .read_values(range![
+            .view()
+            .slice(range![
                 AxisRange::In(0, 2, 1),
                 AxisRange::In(0, 3, 1),
                 AxisRange::In(0, 4, 1)
             ])
+            .unwrap()
+            .read_blocks()
+            .unwrap()
+            .try_collect::<Vec<_>>()
             .await
-            .expect("bulk sparse read must be supported");
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         assert_eq!(values.len(), 24);
         let mut nonzero = 0;
@@ -1366,11 +1381,19 @@ mod section_d_bulk_io {
     }
 
     #[tokio::test]
-    async fn read_all_returns_full_tensor_row_major() {
+    async fn collect_full_stream_row_major() {
         let (root, tensor, _) = create_dense("d_read_all", shape![2, 3, 4], shape![1, 1, 4]).await;
         seed_values(&tensor).await;
 
-        let values = tensor.read_all().await.expect("read_all must be supported");
+        let values = tensor
+            .read_blocks()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         assert_eq!(values.len(), 24);
 
         for (idx, coord) in iter_coords(tensor.shape()).enumerate() {

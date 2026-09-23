@@ -229,6 +229,8 @@ pub(crate) struct RowMajorCoords {
     remaining: u64,
 }
 
+/// Stores only the shape and one current coordinate (both rank-sized).
+/// Total size is a counter, never a coordinate allocation.
 pub(crate) fn row_major_coords(shape: &[usize]) -> FResult<RowMajorCoords> {
     validate_shape_dims(shape)?;
     let remaining = checked_product(shape)?;

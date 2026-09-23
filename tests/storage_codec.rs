@@ -4,7 +4,8 @@ use std::path::Path;
 
 use fensor::{
     Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorGeometry, TensorMath,
-    TensorMathScalar, TensorMetadata, TensorRead, TensorSchema, TensorWhere, TensorWrite,
+    TensorMathScalar, TensorMetadata, TensorRead, TensorReduce, TensorReduceAll, TensorSchema,
+    TensorWhere, TensorWrite,
 };
 
 use freqfs::{Cache, FileLoad, FileSave};
@@ -236,4 +237,9 @@ async fn conditional_sources_and_output_use_independent_codecs() {
     assert_eq!(output.read_value(&[0]).await.unwrap(), 0.);
     assert_eq!(output.read_value(&[3]).await.unwrap(), 3.);
     assert_eq!(output.read_value(&[4]).await.unwrap(), 3.);
+    let reduced = expression.sum(ha_ndarray::axes![0], false).await.unwrap();
+    assert_eq!(reduced.sum_all().await.unwrap(), 6.);
+    let (_, dir) = common::new_dir("reduced_independent_codec").await;
+    let reduced_copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &reduced, 1).await.unwrap();
+    assert_eq!(reduced_copy.read_value(&[0]).await.unwrap(), 6.);
 }
