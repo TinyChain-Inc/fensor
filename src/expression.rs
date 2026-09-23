@@ -45,6 +45,16 @@ impl<T: TensorElement> Batch<T> {
     }
 }
 
+/// Union original support without inspecting intermediate numerical values.
+pub fn union_support(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            Some(left.into_iter().zip(right).map(|(l, r)| l | r).collect())
+        }
+        _ => None,
+    }
+}
+
 pub async fn evaluate<E>(expression: &E, coords: &[Vec<u64>]) -> Result<Vec<E::DType>>
 where
     E: Expression + ?Sized,

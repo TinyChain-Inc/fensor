@@ -18,7 +18,7 @@ use crate::traits::{
     ValueBlockStream,
 };
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
@@ -300,6 +300,12 @@ impl UnaryOp<f32> for Cast<f64> {
 pub struct UnaryView<Source, Op> {
     source: Source,
     op: Op,
+}
+
+impl<S, O> UnaryView<S, O> {
+    pub(crate) fn new(source: S, op: O) -> Self {
+        Self { source, op }
+    }
 }
 
 impl<E> TensorUnary for E

@@ -168,7 +168,47 @@ Source read and destination write errors propagate; cleanup of partial output
 remains the caller's responsibility. Readers returning too many or too few values
 for their shape return a structured layout error.
 
-`UnaryView` and `BinaryView` do not implement `TensorWrite`, so writes through a computed view
+The elementwise API also supports these trait families:
+
+| Trait | Operations | Inputs | Output |
+| --- | --- | --- | --- |
+| `TensorMathScalar` | `add_scalar`, `sub_scalar`, `mul_scalar`, `div_scalar`, `pow_scalar`, `rem_scalar` | f32, f64, u8 | Same dtype |
+| `TensorMathScalar` | `log_scalar` | f32, f64 | Same dtype |
+| `TensorCompare`, `TensorCompareScalar` | `eq`, `ne`, `gt`, `ge`, `lt`, `le`, and `_scalar` variants | Matching f32, f64, or u8 | u8 |
+| `TensorBoolean`, `TensorBooleanScalar` | `and`, `or`, `xor`, and `_scalar` variants | Matching f32, f64, or u8 | u8 |
+| `TensorWhere` | `cond(&then, &or_else)` | u8 condition; matching branch dtypes | Branch dtype |
+
+All methods borrow their operands and return lazy views asynchronously. For example:
+
+```rust,ignore
+let adjusted = tensor.view().add_scalar(1.0).await?;
+let condition = adjusted.gt_scalar(0.0).await?;
+let result = condition.cond(&adjusted, &other.view()).await?;
+let stored = Tensor::copy_from(dir, &result, max_capacity).await?;
+```
+
+Scalar parameters have the source dtype and are stored in sealed operations on
+`UnaryView`. `BinaryView` comparisons and booleans produce u8 without storing an
+intermediate tensor. `WhereView` retains its condition and both branches. Shapes
+must match; broadcasting and the existing f32-to-f64 cast remain explicit.
+`TensorMathScalar` now uses per-operation associated read outputs instead of its
+previous unimplemented storage-returning interface.
+
+Boolean operations are logical, not bitwise: zero is false and every nonzero
+value, including NaN, is true. Results are exactly 0 or 1. Comparisons follow
+ha-ndarray's IEEE rules, including unordered NaNs and equality of signed zeros.
+
+Scalar operations preserve source support: sparse `add_scalar(1)` and
+`eq_scalar(0)` do not populate implicit zeros. Tensor comparisons and booleans
+retain the union of both sources, including intermediate false results.
+Conditional selection retains the union of its condition and both branches;
+absent condition values select the else branch. An unselected branch can retain
+support for a later operation even when the selected value is zero. Selection
+is sparse only when all three inputs are sparse. Both branches are read, so
+errors in an unselected branch propagate. Copying into storage ends this original
+support contract and establishes support from the stored nonzero values.
+
+`UnaryView`, `BinaryView`, and `WhereView` do not implement `TensorWrite`, so writes through a computed view
 are rejected at compile time. Geometric views retain their existing write-through
 constraints. `TensorTransform` still returns `Self`: transforms update the
 geometric leaves and retain typed operation order. Slicing and transposition compose with

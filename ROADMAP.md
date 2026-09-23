@@ -117,12 +117,19 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   reload. Directory-only synchronization is insufficient for an in-memory root;
   durable synchronization and transaction policy remain with the caller.
 
+- Scalar arithmetic, tensor/scalar comparisons, and logical boolean operations
+  use typed expressions for f32, f64, and u8 (logarithms remain float-only).
+  Scalars preserve source support; binary predicates preserve its union.
+- Conditional `WhereView` selection accepts u8 conditions and matching branch
+  dtypes/shapes, retaining support from all three sources without intermediate
+  evaluation. Both branches are read and propagate errors. All new expressions
+  support transforms, bounded reads, and copying, but cannot be written through.
+
 Remaining execution work:
 
-- Scalar arithmetic, reductions, matrix multiplication, and additional casts remain separate work.
-- Extend casting beyond f32-to-f64; add binary boolean operations, comparisons,
-  and complex storage/operations separately. Expression input/output dtypes are
-  already independent, and u8 predicate output storage is supported.
+- Reductions, matrix multiplication, and additional casts remain separate work.
+- Extend casting beyond f32-to-f64 and add complex storage/operations separately.
+  Expression input/output dtypes are already independent, and u8 predicate output storage is supported.
 
 - Index-driven bounded sparse traversal. Current ordered reads scan only the selected
   logical range; full-range reads still scale with logical size, not stored support.
