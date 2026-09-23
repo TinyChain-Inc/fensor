@@ -208,7 +208,7 @@ is sparse only when all three inputs are sparse. Both branches are read, so
 errors in an unselected branch propagate. Copying into storage ends this original
 support contract and establishes support from the stored nonzero values.
 
-`UnaryView`, `BinaryView`, and `WhereView` do not implement `TensorWrite`, so writes through a computed view
+`UnaryView`, `BinaryView`, `WhereView`, and `ReduceView` do not implement `TensorWrite`, so writes through a computed view
 are rejected at compile time. Geometric views retain their existing write-through
 constraints. `TensorTransform` still returns `Self`: transforms update the
 geometric leaves and retain typed operation order. Slicing and transposition compose with
@@ -244,3 +244,59 @@ rank), ndarray execution temporaries, and each concurrent consumer. In particula
 `read_all`/`read_values`, collecting a stream, and sparse compaction are allocating
 APIs and are not covered by the bounded streaming contract. No blanket OOM
 immunity is promised for cache budgets or collecting an entire tensor.
+
+## Reductions
+
+`TensorReduceAll` provides asynchronous `sum_all`, `product_all`, `min_all`, and
+`max_all` on stored tensors and expressions. `TensorReduceBoolean` provides
+`all` and `any`. `TensorReduce` constructs lazy `ReduceView<Source, Op>` values
+with `sum`, `product`, `min`, and `max`, each taking axes and `keepdims`:
+
+```rust,ignore
+let rows = tensor.view().sum(axes![1], false).await?;
+let columns = rows.transpose(None)?;
+let total = columns.sum_all().await?;
+let stored = Tensor::copy_from(dir, &columns, max_capacity).await?;
+```
+
+These operations support f32, f64, and u8 without changing accumulator or output
+dtype. The previously unimplemented axis trait now returns per-operation
+associated read outputs instead of storage. Axes are sorted and deduplicated;
+invalid axes fail during construction. Empty axes reduce singleton groups.
+`keepdims` retains reduced axes at extent one; removing every axis produces `[1]`,
+following ha-ndarray. Reduction views support elementwise composition, nested
+reductions, copying, and geometric transforms, but cannot be written through.
+Transforms after reduction address reduced outputs, not source axes.
+
+Sparse reductions consume **retained source support**, excluding implicit zeros.
+A supported `0.2` followed by `round()` still contributes zero, including to
+products, extrema, and `all`. Dense reductions include every coordinate. Thus
+reducing a sparse tensor can differ from reducing its dense equivalent.
+
+An axis group with no supported inputs remains absent for every operation,
+including product and extrema. A supported group whose result is zero retains
+support for subsequent expressions; only sparse output removes final zeros.
+Copying into storage establishes support from the stored nonzero values.
+Whole-tensor empty-support results are sum `0`, product `1`, `all=true`, and
+`any=false`; `min_all` and `max_all` return `Error::Unsupported`.
+
+Boolean reductions short-circuit after a decisive consumed batch. Errors in that
+batch or earlier propagate, while later errors may remain unobserved; prefetched
+reads may already have started. Dropping the remaining stream cancels pending
+consumption. Numeric reductions consume the complete selected domain.
+
+A reduction is an evaluation boundary. Each source batch contains at most 4096
+coordinates; support is retained alongside evaluated values. Supported values
+are reduced by ha-ndarray and partial results combined using its scalar rules.
+Only one partial accumulator is retained per active group. The outer consumer
+provides CPU-limited ordered concurrency; nested reductions start no buffered
+streams. Output groups are processed sequentially within each output batch.
+No whole-group or whole-output allocation is needed unless the caller collects
+an entire stream. Results remain live rather than snapshots.
+
+Sparse range reads visit only selected output groups, but must scan their source
+coordinates. A small output range can therefore require a large source scan.
+Index-driven traversal and block-oriented I/O remain future work. Floating
+reductions follow ha-ndarray's aggregate accuracy contract, not bitwise equality
+across evaluation orders. u8 accumulation wraps; extrema propagate NaNs and
+preserve the specified signed-zero behavior. Persistent formats are unchanged.

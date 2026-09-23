@@ -1,7 +1,9 @@
 pub mod binary;
 mod error;
 mod expression;
+mod mapping;
 mod metadata;
+pub mod reduce;
 pub mod scalar;
 mod schema;
 mod selection;
@@ -15,6 +17,7 @@ pub use binary::BinaryView;
 pub use error::{Error, Result};
 pub use metadata::TensorMetadata;
 pub use number_general::NumberType;
+pub use reduce::ReduceView;
 pub use schema::{
     Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape, contiguous_strides,
 };

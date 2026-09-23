@@ -533,93 +533,45 @@ where
     -> BoxFuture<'a, Result<Self::Output>>;
 }
 
-/// Axis-wise tensor reductions.
-pub trait TensorReduce: TensorArray + Sized {
-    fn max<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "max reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Lazy axis reductions over retained source support, including intermediate zeros.
+/// Empty sparse groups remain absent. Axes are sorted and deduplicated.
+pub trait TensorReduce: TensorGeometry {
+    type SumOutput: TensorRead<DType = Self::DType>;
 
-    fn min<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "min reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type ProductOutput: TensorRead<DType = Self::DType>;
 
-    fn product<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "product reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type MinOutput: TensorRead<DType = Self::DType>;
 
-    fn sum<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sum reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type MaxOutput: TensorRead<DType = Self::DType>;
+
+    fn sum(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::SumOutput>>;
+
+    fn product(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::ProductOutput>>;
+
+    fn min(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MinOutput>>;
+
+    fn max(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MaxOutput>>;
 }
 
-/// Scalar tensor reductions.
-pub trait TensorReduceAll: TensorArray {
-    fn max_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "max_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Terminal reductions over retained source support, not implicit sparse zeros.
+/// Empty support gives sum=0 and product=1; extrema return an error.
+pub trait TensorReduceAll: TensorRead {
+    fn sum_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
 
-    fn min_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "min_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn product_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
 
-    fn product_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "product_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn min_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
 
-    fn sum_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sum_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn max_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
 }
 
-/// Boolean scalar tensor reductions.
-pub trait TensorReduceBoolean: TensorArray {
-    fn all<'a>(&'a self) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Short-circuit boolean reductions over retained source support.
+/// Empty support gives all=true and any=false. Errors after a decisive batch
+/// may remain unobserved; dropping the remaining stream cancels pending work.
+pub trait TensorReduceBoolean: TensorRead {
+    fn all(&self) -> BoxFuture<'_, Result<bool>>;
 
-    fn any<'a>(&'a self) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "any is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn any(&self) -> BoxFuture<'_, Result<bool>>;
 }
 
 /// Matrix/tensor contraction operations.

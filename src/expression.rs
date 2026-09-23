@@ -5,7 +5,7 @@ use ha_ndarray::{Array, ArrayAccess, Buffer, NDArrayRead, NDArrayWhere};
 
 use crate::traits::{BoxFuture, coordinate_batches};
 use crate::{
-    Layout, Result, TensorElement, TensorFileEntry, TensorGeometry, TensorRead, TensorView,
+    Layout, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorRead, TensorView,
 };
 
 // This module is private: callers cannot introduce arbitrary expression sources.
@@ -62,17 +62,39 @@ pub fn union_support(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Option<Ve
     }
 }
 
-pub async fn evaluate<E>(expression: &E, coords: &[Vec<u64>]) -> Result<Vec<E::DType>>
+pub async fn evaluate<E>(expression: &E, coords: &[Vec<u64>]) -> Result<EvaluatedBatch<E::DType>>
 where
     E: Expression + ?Sized,
     E::DType: TensorElement,
 {
     let batch = expression.build(coords).await?;
 
-    Ok(batch.array.buffer()?.to_slice()?.into_vec())
+    Ok(EvaluatedBatch {
+        values: batch.array.buffer()?.to_slice()?.into_vec(),
+        support: batch.support,
+    })
 }
 
-type EvaluatedBatch<T> = (Vec<Vec<u64>>, Vec<T>);
+pub struct EvaluatedBatch<T> {
+    pub values: Vec<T>,
+    pub support: Option<Vec<u8>>,
+}
+
+impl<T> EvaluatedBatch<T> {
+    pub fn populated(self) -> Vec<T> {
+        match self.support {
+            Some(support) => self
+                .values
+                .into_iter()
+                .zip(support)
+                .filter_map(|(v, s)| (s != 0).then_some(v))
+                .collect(),
+            None => self.values,
+        }
+    }
+}
+
+type CoordinateBatch<T> = (Vec<Vec<u64>>, EvaluatedBatch<T>);
 
 /// Evaluate bounded coordinate batches with at most `num_cpus::get().max(1)`
 /// batches in flight. Expression temporaries scale with batch size, expression
@@ -81,7 +103,7 @@ type EvaluatedBatch<T> = (Vec<Vec<u64>>, Vec<T>);
 pub fn batches<'a, E, I>(
     expression: &'a E,
     coords: I,
-) -> BoxStream<'a, Result<EvaluatedBatch<E::DType>>>
+) -> BoxStream<'a, Result<CoordinateBatch<E::DType>>>
 where
     E: Expression + ?Sized,
     E::DType: TensorElement,
@@ -121,5 +143,15 @@ where
                 support,
             })
         })
+    }
+}
+
+impl<FE, T> Expression for Tensor<FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
+    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<T>>> {
+        Box::pin(async move { self.view().build(coords).await })
     }
 }

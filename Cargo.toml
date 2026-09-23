@@ -19,6 +19,8 @@ num_cpus = "1.17.0"
 number-general = { path = "../number-general", version = "0.14" }
 
 [dev-dependencies]
+num-rational = "0.4"
+num-traits = "0.2"
 tbon = { path = "../tbon", version = "0.9", features = ["tokio-io"] }
 destream_json = { path = "../destream_json", version = "0.15", features = ["tokio-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }

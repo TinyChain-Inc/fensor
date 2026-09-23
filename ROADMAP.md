@@ -88,7 +88,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   the complete ndarray expression before evaluating once per batch, without
   intermediate filesystem materialization, vector conversion, or sparse filtering.
   Unary traits and `TensorMath<Rhs>` use associated output types; geometric
-  transform and reduction interfaces retain their existing contracts.
+  transform interfaces retain their existing contracts.
 - `BinaryView<Left, Right, Op>` supports add/sub/mul/div/pow/rem for matching
   f32/f64/u8 and log for matching floats. Shape mismatches fail at construction;
   broadcasting and dtype conversions are explicit. Nested unary/binary expressions
@@ -125,9 +125,18 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   evaluation. Both branches are read and propagate errors. All new expressions
   support transforms, bounded reads, and copying, but cannot be written through.
 
+- Whole-tensor numeric/boolean reductions and typed lazy axis reductions support
+  f32, f64, and u8. They reduce retained source support, excluding implicit sparse
+  zeros but including supported intermediate zeros. Empty axis groups stay absent;
+  terminal empty extrema return errors, with identity results for other terminals.
+- Reduction output transforms share geometric coordinate mapping with storage
+  views. Bounded source batches and one partial accumulator per active group avoid
+  whole-group allocation; only the outer consumer starts concurrent batches.
+  Boolean terminals short-circuit, so later corruption may remain unobserved.
+
 Remaining execution work:
 
-- Reductions, matrix multiplication, and additional casts remain separate work.
+- Matrix multiplication and additional casts remain separate work.
 - Extend casting beyond f32-to-f64 and add complex storage/operations separately.
   Expression input/output dtypes are already independent, and u8 predicate output storage is supported.
 
