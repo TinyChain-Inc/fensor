@@ -238,12 +238,45 @@ spill; an oversized file, exhausted admission deadline, or disk failure returns
 an I/O error. Configure the cache size, minimum free disk space, and admission
 wait when constructing `freqfs::Cache`.
 
-The fixed batch size and CPU-based concurrency bound execution batches, not total process RSS. Budget separately
-for cache contents, filesystem/index metadata, coordinate buffers (batch size ×
-rank), ndarray execution temporaries, and each concurrent consumer. In particular,
-`read_all`/`read_values`, collecting a stream, and sparse compaction are allocating
-APIs and are not covered by the bounded streaming contract. No blanket OOM
-immunity is promised for cache budgets or collecting an entire tensor.
+## Bounded execution contract
+
+Tensor execution must not allocate values, coordinates, support masks, or
+partial-result collections proportional to total tensor size, output size, or
+reduction-group size. Coordinates must be generated lazily and consumed in
+bounded batches. Each collection must have an identifiable bound. Only the outer
+consumer may introduce concurrent batches.
+
+Rank-sized metadata and caller-supplied values or explicit index selections are
+separate, documented memory costs. They must not justify expanding implicit
+ranges or collecting execution results. Filesystem/cache metadata remains subject
+to its own limits; this contract is not a total-process memory guarantee.
+
+Execution batches contain at most 4096 elements, independently of the storage
+block-capacity limit. Coordinate counts, ndarray expression sizes, evaluated
+values, and support masks are checked at the evaluation boundary. Support masks
+are checked before union/filter operations. Nested reductions consume source
+batches without starting additional concurrent streams.
+
+Remaining allocations have explicit bounds: shapes and strides scale with rank;
+coordinate buffers scale with batch size times rank; expression temporaries and
+support masks scale with batch size and expression size; each active reduction
+group retains one accumulator. Cache contents, filesystem/index metadata, and
+independent concurrent consumers require separate budgeting.
+
+`AxisRange::Of` retains metadata proportional to explicitly supplied indices,
+including order and duplicates. Creating a new explicit selection may allocate
+one offset per supplied index. Slices and reversals of existing gather tables
+share their storage, while interval ranges remain compact descriptors.
+
+**API change:** `TensorReadBulk`, `read_all`, `read_values`, and
+`Tensor::compact_sparse` have been removed. There are no compatibility aliases
+or collecting replacements. Callers can explicitly collect `read_blocks()`;
+for a geometric range, slice a view and consume its stream. Collecting output
+is the caller's memory decision. Bounded compaction remains future work.
+`TensorWriteBulk::write_values` still accepts a caller-owned vector, validates
+range cardinality before any writes, and iterates coordinates lazily.
+`Tensor::copy_from` remains a bounded filesystem-backed consumer. Storage block
+reads may copy one validated block, never a whole tensor.
 
 ## Reductions
 

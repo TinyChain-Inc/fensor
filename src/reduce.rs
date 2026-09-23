@@ -32,7 +32,7 @@ impl sealed::Sealed for Sum {}
 
 impl<T: TensorElement + Real> ReduceOp<T> for Sum {
     fn partial(&self, values: Vec<T>) -> Result<T> {
-        Ok(expression::array(values)?.sum_all()?)
+        Ok(expression::batch_array(values)?.sum_all()?)
     }
 
     fn combine(left: T, right: T) -> T {
@@ -52,7 +52,7 @@ impl sealed::Sealed for Product {}
 
 impl<T: TensorElement + Real> ReduceOp<T> for Product {
     fn partial(&self, values: Vec<T>) -> Result<T> {
-        Ok(expression::array(values)?.product_all()?)
+        Ok(expression::batch_array(values)?.product_all()?)
     }
 
     fn combine(left: T, right: T) -> T {
@@ -72,7 +72,7 @@ impl sealed::Sealed for Min {}
 
 impl<T: TensorElement + Real> ReduceOp<T> for Min {
     fn partial(&self, values: Vec<T>) -> Result<T> {
-        Ok(expression::array(values)?.min_all()?)
+        Ok(expression::batch_array(values)?.min_all()?)
     }
 
     fn combine(left: T, right: T) -> T {
@@ -92,7 +92,7 @@ impl sealed::Sealed for Max {}
 
 impl<T: TensorElement + Real> ReduceOp<T> for Max {
     fn partial(&self, values: Vec<T>) -> Result<T> {
-        Ok(expression::array(values)?.max_all()?)
+        Ok(expression::batch_array(values)?.max_all()?)
     }
 
     fn combine(left: T, right: T) -> T {
@@ -110,7 +110,7 @@ fn accumulate<T: TensorElement, O: ReduceOp<T>>(
     state: &mut Option<T>,
     batch: expression::EvaluatedBatch<T>,
 ) -> Result<()> {
-    let values = batch.populated();
+    let values = batch.populated()?;
 
     if !values.is_empty() {
         let partial = op.partial(values)?;
@@ -130,7 +130,7 @@ where
     O: ReduceOp<E::DType>,
 {
     let coords = crate::schema::row_major_coords(source.shape())?;
-    let mut batches = expression::batches(source, coords);
+    let mut batches = expression::evaluated_batches(source, coords);
     let mut state = None;
 
     while let Some((_, batch)) = batches.try_next().await? {
@@ -170,10 +170,10 @@ where
     fn all(&self) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
             let coords = crate::schema::row_major_coords(self.shape())?;
-            let mut batches = expression::batches(self, coords);
+            let mut batches = expression::evaluated_batches(self, coords);
 
             while let Some((_, batch)) = batches.try_next().await? {
-                if batch.populated().into_iter().any(|v| v == E::DType::ZERO) {
+                if batch.populated()?.into_iter().any(|v| v == E::DType::ZERO) {
                     return Ok(false);
                 }
             }
@@ -185,10 +185,10 @@ where
     fn any(&self) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
             let coords = crate::schema::row_major_coords(self.shape())?;
-            let mut batches = expression::batches(self, coords);
+            let mut batches = expression::evaluated_batches(self, coords);
 
             while let Some((_, batch)) = batches.try_next().await? {
-                if batch.populated().into_iter().any(|v| v != E::DType::ZERO) {
+                if batch.populated()?.into_iter().any(|v| v != E::DType::ZERO) {
                     return Ok(true);
                 }
             }
@@ -235,6 +235,7 @@ pub struct ReduceView<Source, Op> {
     axes: Axes,
     keepdims: bool,
     output_shape: Shape,
+    // One stride per output axis, not per output value.
     output_strides: Vec<usize>,
     mapping: CoordinateMap,
     op: Op,
@@ -274,7 +275,8 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
         })
     }
 
-    fn group(&self, coord: &[u64]) -> Result<crate::validate::RangeCoords> {
+    // One descriptor per source axis; even a huge group is enumerated lazily.
+    fn source_group_coords(&self, coord: &[u64]) -> Result<crate::validate::RangeCoords> {
         let coord = self
             .mapping
             .resolve(coord, &self.output_shape, &self.output_strides)?;
@@ -381,14 +383,15 @@ where
 {
     fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
+            // Output buffers are bounded by the current evaluation batch.
             let mut values = Vec::with_capacity(coords.len());
             let mut support = Vec::with_capacity(coords.len());
 
             for coord in coords {
                 let mut state = None;
                 // No buffered stream here: only the outer consumer starts concurrent batches.
-                for source_coords in coordinate_batches(self.group(coord)?) {
-                    let batch = expression::evaluate(&self.source, &source_coords).await?;
+                for source_coords in coordinate_batches(self.source_group_coords(coord)?) {
+                    let batch = expression::evaluate_batch(&self.source, &source_coords).await?;
                     accumulate::<_, O>(&self.op, &mut state, batch)?;
                 }
                 support.push(u8::from(state.is_some()));
@@ -396,7 +399,7 @@ where
             }
 
             Ok(Batch {
-                array: expression::array(values)?,
+                array: expression::batch_array(values)?,
                 support: match self.layout() {
                     Layout::Dense => None,
                     Layout::Sparse { .. } => Some(support),
@@ -413,13 +416,17 @@ where
     O: ReduceOp<S::DType>,
 {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move { Ok(expression::evaluate(self, &[coord.to_vec()]).await?.values[0]) })
+        Box::pin(async move {
+            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
+                .await?
+                .values[0])
+        })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
         let coords = crate::schema::row_major_coords(self.shape())?;
 
-        Ok(expression::batches(self, coords)
+        Ok(expression::evaluated_batches(self, coords)
             .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
@@ -432,7 +439,7 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::batches(self, coords)
+            Ok(expression::evaluated_batches(self, coords)
                 .map_ok(|(coords, values)| {
                     futures::stream::iter(
                         coords

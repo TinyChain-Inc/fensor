@@ -4,7 +4,7 @@ use std::sync::Arc;
 use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::TryStreamExt as _;
 use ha_ndarray::Range;
 #[cfg(test)]
 use number_general::FloatType;
@@ -17,8 +17,8 @@ use crate::schema::{
     TensorSchema,
 };
 use crate::traits::{
-    BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorRead, TensorReadBulk,
-    TensorSparseIndex, TensorWrite, TensorWriteBulk,
+    BoxFuture, TensorArray, TensorBlockStore, TensorGeometry, TensorRead, TensorSparseIndex,
+    TensorWrite, TensorWriteBulk,
 };
 use crate::view::TensorView;
 use crate::{TensorMetadata, validate};
@@ -293,37 +293,7 @@ where
         self.block_shape().iter().product::<usize>().max(1)
     }
 
-    pub async fn compact_sparse(&self) -> Result<()> {
-        let index = self.sparse_index()?;
-        let all_rows = {
-            let guard = index.read().await;
-            let mut rows = guard.into_rows().await.map_err(Error::from)?;
-            let mut collected: Vec<Vec<u64>> = Vec::new();
-            while let Some(row) = rows.next().await {
-                let row = row.map_err(Error::from)?;
-                collected.push(row.to_vec());
-            }
-            collected
-        };
-
-        let mut to_delete: Vec<(Vec<u64>, u64)> = Vec::new();
-        for row in &all_rows {
-            let key = vec![row[0], row[1]];
-            let block_id = row[2];
-            let all_zero = self.is_empty_block(block_id).await?;
-            if all_zero {
-                to_delete.push((key, block_id));
-            }
-        }
-
-        for (key, block_id) in to_delete {
-            self.delete_row(key).await?;
-            self.delete_block(block_id).await;
-        }
-
-        Ok(())
-    }
-
+    // One validated storage block, independent of tensor size.
     fn default_block(&self) -> Vec<T> {
         vec![T::default(); self.block_len()]
     }
@@ -711,28 +681,8 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// TensorReadBulk / TensorWriteBulk impls
+// TensorWriteBulk implementation
 // ---------------------------------------------------------------------------
-impl<FE, T> TensorReadBulk for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    fn read_values<'a>(&'a self, range: Range) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
-        Box::pin(async move {
-            let mut values = Vec::new();
-            for coord in validate::iter_range_coords(self.shape(), &range)? {
-                values.push(self.read_value(&coord).await?);
-            }
-            Ok(values)
-        })
-    }
-
-    fn read_all<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
-        Box::pin(async move { self.read_values(validate::full_range(self.shape())).await })
-    }
-}
-
 impl<FE, T> TensorWriteBulk for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
@@ -744,8 +694,8 @@ where
         values: Vec<Self::DType>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let coords: Vec<Vec<u64>> =
-                validate::iter_range_coords(self.shape(), &range)?.collect();
+            // Cardinality is checked without expanding the selected range.
+            let coords = validate::iter_range_coords(self.shape(), &range)?;
             if coords.len() != values.len() {
                 return Err(Error::DataMismatch(format!(
                     "expected {} values for range but got {}",
@@ -753,7 +703,7 @@ where
                     values.len()
                 )));
             }
-            for (coord, value) in coords.into_iter().zip(values) {
+            for (coord, value) in coords.zip(values) {
                 self.write_value(&coord, value).await?;
             }
             Ok(())
@@ -1110,43 +1060,6 @@ mod sparse_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn compact_sparse_removes_all_zero_rows() {
-        let (root, tensor) = create_sparse("compact", shape![2, 3, 4], 4, Some(1)).await;
-
-        tensor.write_value(&[0, 1, 2], 5.0).await.expect("nz");
-        tensor.write_value(&[0, 1, 2], 0.0).await.expect("zero");
-
-        tensor
-            .compact_sparse()
-            .await
-            .expect("compact must be supported");
-
-        assert!(
-            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
-            "compaction must drop all-zero rows"
-        );
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn compact_sparse_preserves_nonzero_rows() {
-        let (root, tensor) = create_sparse("compact_preserve", shape![2, 3, 4], 4, Some(1)).await;
-
-        tensor.write_value(&[0, 1, 2], 5.0).await.expect("write nz");
-
-        tensor.compact_sparse().await.expect("compact");
-
-        assert!(
-            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_some(),
-            "compact must not remove rows with nonzero values"
-        );
-        assert_eq!(tensor.read_value(&[0, 1, 2]).await.expect("read"), 5.0);
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
     async fn sparse_write_zero_to_new_coord_is_noop() {
         let (root, tensor) = create_sparse("noop", shape![2, 3, 4], 4, Some(1)).await;
 
@@ -1162,37 +1075,16 @@ mod sparse_lifecycle_tests {
 
         cleanup(&root).await;
     }
-
     #[tokio::test]
-    async fn compact_sparse_idempotent() {
-        let (root, tensor) = create_sparse("compact_idem", shape![2, 3, 4], 4, Some(1)).await;
-
-        tensor.write_value(&[0, 1, 2], 5.0).await.expect("nz");
-        tensor.write_value(&[1, 2, 3], 3.0).await.expect("nz2");
-        tensor.write_value(&[0, 1, 2], 0.0).await.expect("zero");
-
-        tensor.compact_sparse().await.expect("first compact");
-
-        assert!(
-            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
-            "zero row removed after first compact"
-        );
-        assert!(
-            block_id_for_coord(&tensor, &[1, 2, 3]).await.is_some(),
-            "nonzero row preserved after first compact"
-        );
-
-        tensor.compact_sparse().await.expect("second compact");
-
-        assert!(
-            block_id_for_coord(&tensor, &[0, 1, 2]).await.is_none(),
-            "still absent after second compact"
-        );
-        assert!(
-            block_id_for_coord(&tensor, &[1, 2, 3]).await.is_some(),
-            "nonzero row still present after second compact"
-        );
-
+    async fn oversized_evaluation_is_rejected_before_reading_coordinates() {
+        let (root, tensor) = create_sparse("batch_bound", shape![1], 1, None).await;
+        let coords = vec![vec![99]; crate::expression::MAX_BATCH_ELEMENTS + 1];
+        let error = crate::expression::evaluate_batch(&tensor, &coords)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidLayout(_)));
+        assert!(error.to_string().contains("coordinate batch"));
         cleanup(&root).await;
     }
 }

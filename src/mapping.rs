@@ -17,8 +17,89 @@ pub(crate) struct CoordinateMap {
 #[derive(Clone)]
 pub(crate) enum AxisContrib {
     Stride(i64),
-    Gather(Arc<[i64]>),
+    Gather(GatherOffsets),
     Broadcast(i64),
+}
+
+/// Caller-selection-sized metadata. Slices and reversals share the table.
+#[derive(Clone)]
+pub(crate) struct GatherOffsets {
+    offsets: Arc<[i64]>,
+    start: usize,
+    step: usize,
+    reversed: bool,
+    len: usize,
+}
+
+impl From<Vec<i64>> for GatherOffsets {
+    fn from(offsets: Vec<i64>) -> Self {
+        Self {
+            len: offsets.len(),
+            offsets: offsets.into(),
+            start: 0,
+            step: 1,
+            reversed: false,
+        }
+    }
+}
+
+impl GatherOffsets {
+    fn index(&self, index: usize) -> Option<usize> {
+        if index >= self.len {
+            return None;
+        }
+        let delta = index.checked_mul(self.step)?;
+        if self.reversed {
+            self.start.checked_sub(delta)
+        } else {
+            self.start.checked_add(delta)
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&i64> {
+        self.offsets.get(self.index(index)?)
+    }
+
+    fn first(&self) -> Option<&i64> {
+        self.get(0)
+    }
+
+    fn slice(&self, start: usize, step: usize, len: usize) -> Result<Self> {
+        let start = if len == 0 {
+            self.start
+        } else {
+            self.index(start)
+                .ok_or_else(|| Error::InvalidLayout("gather slice out of bounds".into()))?
+        };
+        let step = if len <= 1 {
+            1
+        } else {
+            self.step
+                .checked_mul(step)
+                .ok_or_else(|| Error::InvalidLayout("gather stride overflow".into()))?
+        };
+        Ok(Self {
+            offsets: self.offsets.clone(),
+            start,
+            step,
+            reversed: self.reversed,
+            len,
+        })
+    }
+
+    fn flipped(&self) -> Self {
+        let start = if self.len == 0 {
+            self.start
+        } else {
+            // Valid descriptors address only entries in the shared table.
+            self.index(self.len - 1).expect("valid gather descriptor")
+        };
+        Self {
+            start,
+            reversed: !self.reversed,
+            ..self.clone()
+        }
+    }
 }
 
 impl CoordinateMap {
@@ -430,18 +511,7 @@ fn slice_bound_in(
     let (offset_delta, axis) = match current {
         AxisContrib::Stride(s) => ((start as i64) * s, AxisContrib::Stride(s * (step as i64))),
         AxisContrib::Broadcast(c) => (0, AxisContrib::Broadcast(*c)),
-        AxisContrib::Gather(g) => {
-            let offsets = (0..extent)
-                .map(|c| {
-                    g.get(start + c * step).copied().ok_or_else(|| {
-                        Error::InvalidLayout(format!(
-                            "slice bound at axis {axis_index} out of bounds for gather"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<i64>>>()?;
-            (0, AxisContrib::Gather(offsets.into()))
-        }
+        AxisContrib::Gather(g) => (0, AxisContrib::Gather(g.slice(start, step, extent)?)),
     };
 
     Ok((offset_delta, axis, extent))
@@ -461,6 +531,7 @@ fn slice_bound_of(
     match current {
         AxisContrib::Broadcast(c) => Ok(AxisContrib::Broadcast(*c)),
         AxisContrib::Stride(s) => {
+            // A new explicit selection may allocate one offset per supplied index.
             let offsets: Vec<i64> = indices.iter().map(|idx| (*idx as i64) * s).collect();
             Ok(AxisContrib::Gather(offsets.into()))
         }
@@ -484,6 +555,40 @@ fn flip_axis_contrib(current: &AxisContrib, dim: usize) -> (i64, AxisContrib) {
     match current {
         AxisContrib::Stride(s) => (((dim as i64) - 1) * s, AxisContrib::Stride(-s)),
         AxisContrib::Broadcast(c) => (0, AxisContrib::Broadcast(*c)),
-        AxisContrib::Gather(g) => (0, AxisContrib::Gather(g.iter().rev().copied().collect())),
+        AxisContrib::Gather(g) => (0, AxisContrib::Gather(g.flipped())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gather_transforms_share_the_original_table() {
+        let original = GatherOffsets::from(vec![9, 2, 9, 4, 7, 3]);
+        let sliced = original.slice(1, 2, 3).unwrap();
+        let flipped = sliced.flipped();
+        let nested = flipped.slice(1, 1, 2).unwrap();
+        for view in [&sliced, &flipped, &nested] {
+            assert!(Arc::ptr_eq(&original.offsets, &view.offsets));
+        }
+        assert_eq!(
+            (0..3).map(|i| *flipped.get(i).unwrap()).collect::<Vec<_>>(),
+            [3, 4, 2]
+        );
+        assert_eq!(
+            (0..2).map(|i| *nested.get(i).unwrap()).collect::<Vec<_>>(),
+            [4, 2]
+        );
+        assert_eq!(*original.get(0).unwrap(), *original.get(2).unwrap());
+        assert_eq!(
+            *nested
+                .slice(1, usize::MAX, 1)
+                .unwrap()
+                .flipped()
+                .get(0)
+                .unwrap(),
+            2
+        );
     }
 }

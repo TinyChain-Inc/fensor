@@ -96,32 +96,14 @@ pub trait TensorRead: TensorGeometry {
     }
 }
 
-/// Bulk/contiguous read semantics for tensor backends.
-pub trait TensorReadBulk: TensorRead {
-    fn read_values<'a>(&'a self, _range: Range) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "bulk read is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
-
-    fn read_all<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "read_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
-}
-
 /// Async value writes aligned with ndarray coordinate semantics.
 pub trait TensorWrite: TensorGeometry {
     fn write_value<'a>(&'a self, coord: &'a [u64], value: Self::DType)
     -> BoxFuture<'a, Result<()>>;
 }
 
-/// Bulk/contiguous write semantics for tensor backends.
+/// Bulk writes consume caller-owned values without collecting their coordinates.
+/// The caller budgets the supplied buffer; tensor-to-tensor writes and fill iterate lazily.
 pub trait TensorWriteBulk: TensorWrite {
     fn write_values<'a>(
         &'a self,
@@ -188,7 +170,8 @@ pub trait TensorTransform: TensorGeometry + Sized {
     }
 }
 
-/// Async block-level storage primitives used by higher-level tensor accessors.
+/// Async storage-block access, bounded by validated storage block capacity.
+/// A block is not a whole-tensor collection.
 pub trait TensorBlockStore: Send + Sync {
     type Block: Clone + Send + Sync + 'static;
 
@@ -596,7 +579,7 @@ pub(crate) fn coordinate_batches(
     std::iter::from_fn(move || {
         let batch: Vec<_> = coords
             .by_ref()
-            .take(crate::schema::MAX_BLOCK_CAPACITY)
+            .take(crate::expression::MAX_BATCH_ELEMENTS)
             .collect();
         (!batch.is_empty()).then_some(batch)
     })

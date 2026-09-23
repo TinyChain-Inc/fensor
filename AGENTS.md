@@ -16,6 +16,26 @@ non-transactional, and explicit about supported/unsupported behavior.
   canonical implementation in the trait methods themselves. Avoid parallel
   `*_impl` forwarding layers that create a second path to inspect/debug.
 
+## Bounded execution
+
+Tensor execution must not allocate values, coordinates, support masks, or
+partial-result collections proportional to total tensor size, output size, or
+reduction-group size. Coordinates must be generated lazily and consumed in
+bounded batches. Each collection must have an identifiable bound. Only the outer
+consumer may introduce concurrent batches.
+
+Rank-sized metadata and caller-supplied values or explicit index selections are
+separate, documented memory costs. They must not justify expanding implicit
+ranges or collecting execution results. Filesystem/cache metadata remains subject
+to its own limits; this contract is not a total-process memory guarantee.
+
+- Execution batches contain at most 4096 elements; storage block capacity is a
+  separate bound. Validate batch lengths before evaluation and after consumption.
+- Do not add whole-result collection helpers or whole-index compaction. Callers
+  may explicitly collect streams; bounded compaction is future work.
+- Preserve explicit selection order and duplicates. Slicing or reversing an
+  existing gather table must share its storage rather than copy its entries.
+
 ## Tensor semantics
 
 - Preserve base/view semantics: one writable base tensor with trait-compatible

@@ -134,6 +134,11 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
   whole-group allocation; only the outer consumer starts concurrent batches.
   Boolean terminals short-circuit, so later corruption may remain unobserved.
 
+- Bounded execution is an explicit design rule, enforced at batch boundaries.
+  Whole-result collection APIs are removed; callers explicitly collect streams.
+  Bulk writes validate range length without collecting coordinates. Existing
+  gather slices/reversals share input-sized tables instead of duplicating them.
+
 Remaining execution work:
 
 - Matrix multiplication and additional casts remain separate work.
@@ -144,7 +149,8 @@ Remaining execution work:
   logical range; full-range reads still scale with logical size, not stored support.
 - Block-oriented reads/writes to reduce per-coordinate cache/index lookups.
 - Bounded sparse compaction and filesystem metadata scaling; execution limits do
-  not bound these structures or whole-tensor `Vec` collection APIs.
+  not bound filesystem metadata. Whole-result collection APIs and the previous
+  whole-index compaction implementation have been removed.
 - Extend the same read-stream contract to additional ndarray operations rather
   than introducing a separate executor or intermediate tensor files.
 
