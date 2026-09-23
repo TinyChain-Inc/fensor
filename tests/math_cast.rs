@@ -65,8 +65,9 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     let values: Vec<_> = blocks.into_iter().flatten().collect();
     let (out_root, out_dir) = new_dir("cast_dense_out").await;
     let output: Tensor<FsEntry, f64> = Tensor::copy_from(out_dir.clone(), &cast, 4).await.unwrap();
+
     assert_eq!(output.schema().dtype(), NumberType::Float(FloatType::F64));
-    out_dir.sync().await.unwrap();
+    output.sync().await.unwrap();
     drop(output);
     drop(out_dir);
     let reloaded = Tensor::<FsEntry, f64>::load(common::open_dir(&out_root).unwrap())

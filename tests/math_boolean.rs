@@ -151,11 +151,14 @@ async fn u8_storage_views_not_and_reload() {
         if matches!(layout, Layout::Sparse { .. }) {
             expected[0] = 0;
         }
+
         check_consumers(tensor.view().not().await.unwrap(), &expected).await;
+
         for (i, value) in [255, 127, 1, 0].into_iter().enumerate() {
             assert_eq!(flipped.read_value(&[i as u64]).await.unwrap(), value);
         }
-        dir.sync().await.unwrap();
+
+        tensor.sync().await.unwrap();
         drop(flipped);
         drop(tensor);
         drop(dir);
@@ -292,12 +295,14 @@ async fn u8_cache_spill_and_reload() {
         .unwrap();
         let mut files = tokio::fs::read_dir(root.join("blocks")).await.unwrap();
         let mut count = 0;
+
         while files.next_entry().await.unwrap().is_some() {
             count += 1;
         }
+
         assert!(count > 1, "u8 payloads must count towards cache admission");
         tensor.write_value(&[2047], 255).await.unwrap();
-        dir.sync().await.unwrap();
+        tensor.sync().await.unwrap();
         drop(tensor);
         drop(dir);
         let reloaded = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())

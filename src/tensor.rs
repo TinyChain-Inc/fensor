@@ -133,6 +133,25 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
+    /// Write pending blocks and the current sparse index root to the filesystem buffer.
+    ///
+    /// Call this before dropping and reopening a tensor. Syncing the containing
+    /// directory alone does not publish the index's in-memory root. The caller
+    /// must exclude concurrent writes and remains responsible for durable directory
+    /// synchronization and any transaction policy.
+    pub async fn sync(&self) -> Result<()>
+    where
+        FE: freqfs::FileSave + Clone,
+    {
+        self.storage.blocks().sync().await?;
+
+        if let Some(index) = self.storage.index() {
+            index.sync().await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn create(
         dir: DirLock<FE>,
         schema: TensorSchema,

@@ -118,7 +118,7 @@ async fn chain_is_lazy_until_copy() {
     let copied = Tensor::copy_from(out_dir.clone(), &chain, 1000)
         .await
         .expect("copy should succeed");
-    out_dir.sync().await.expect("sync");
+    copied.sync().await.expect("sync");
 
     assert!(
         out_root.join("blocks").exists(),
@@ -446,8 +446,9 @@ async fn copying_spills_beyond_cache_budget_and_reloads() {
         let output = Tensor::copy_from(out_dir.clone(), &expression, 16)
             .await
             .unwrap();
+
         assert_eq!(output.read_value(&[1023]).await.unwrap(), 2.0f32.exp());
-        out_dir.sync().await.unwrap();
+        output.sync().await.unwrap();
         drop(output);
         drop(out_dir);
         let reloaded = Tensor::<FsEntry, f32>::load(common::open_dir(&out_root).unwrap())

@@ -3,9 +3,10 @@ use std::io;
 use std::path::Path;
 
 use fensor::{
-    Layout, Tensor, TensorCast, TensorGeometry, TensorMetadata, TensorRead, TensorSchema,
-    TensorWrite,
+    Layout, Tensor, TensorCast, TensorGeometry, TensorMath, TensorMetadata, TensorRead,
+    TensorSchema, TensorWrite,
 };
+
 use freqfs::{Cache, FileLoad, FileSave};
 use futures::TryStreamExt;
 use ha_ndarray::shape;
@@ -81,7 +82,7 @@ async fn json_storage_supports_dense_sparse_copy_and_reload() {
         .await
         .unwrap();
         tensor.write_value(&[4], 7.5).await.unwrap();
-        dir.sync().await.unwrap();
+        tensor.sync().await.unwrap();
         drop(tensor);
         drop(dir);
         drop(cache);
@@ -97,8 +98,9 @@ async fn json_storage_supports_dense_sparse_copy_and_reload() {
         let copy = Tensor::<FsEntry, f64>::copy_from(copy_dir.clone(), &cast, 2)
             .await
             .unwrap();
+
         assert_eq!(copy.read_value(&[4]).await.unwrap(), 7.5);
-        copy_dir.sync().await.unwrap();
+        copy.sync().await.unwrap();
         drop(copy);
         drop(copy_dir);
         let copy = Tensor::<FsEntry, f64>::load(common::open_dir(&copy_root).unwrap())
@@ -139,6 +141,42 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
     for value in malformed {
         let decoded: Result<TensorMetadata<f32>, _> =
             destream_json::de::try_decode((), destream_json::en::encode(&value).unwrap()).await;
+
         assert!(decoded.is_err());
     }
+}
+
+// A binary expression can borrow sources with different adapters and block shapes.
+#[tokio::test]
+async fn binary_sources_use_independent_codecs() {
+    let a_root = common::unique_tmp_dir("binary_json");
+    tokio::fs::create_dir(&a_root).await.unwrap();
+    let cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
+    let a_dir = cache.load(a_root).unwrap();
+    let a = Tensor::<JsonEntry, f32>::create(
+        a_dir.clone(),
+        TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
+        Layout::Dense,
+        2,
+    )
+    .await
+    .unwrap();
+    let (_, b_dir) = common::new_dir("binary_tbon").await;
+    let b = Tensor::<FsEntry, f32>::create(
+        b_dir,
+        TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
+        Layout::Dense,
+        3,
+    )
+    .await
+    .unwrap();
+    a.write_value(&[4], 2.5).await.unwrap();
+    b.write_value(&[4], 3.5).await.unwrap();
+    a.sync().await.unwrap();
+    let expression = a.view().add(&b.view()).await.unwrap().clone();
+    let (_, output_dir) = common::new_dir("binary_codecs_copy").await;
+    let output: Tensor<FsEntry, f32> = Tensor::copy_from(output_dir, &expression, 4).await.unwrap();
+
+    assert_eq!(output.read_value(&[4]).await.unwrap(), 6.);
+    assert_eq!(output.read_value(&[0]).await.unwrap(), 0.);
 }

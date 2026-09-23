@@ -1797,15 +1797,28 @@ mod section_h_persistence {
             .expect("create");
             tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
             tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
-            dir.sync().await.expect("sync");
+            tensor.sync().await.expect("sync");
         }
 
         let dir2 = open_dir(&root).expect("reopen");
         let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
+
         assert_eq!(schema, *loaded.schema());
         assert_eq!(loaded.read_value(&[0, 0, 0]).await.expect("read"), 1.0);
         assert_eq!(loaded.read_value(&[1, 2, 3]).await.expect("read"), 9.0);
         assert_eq!(loaded.read_value(&[1, 0, 0]).await.expect("read"), 0.0);
+
+        loaded.write_value(&[0, 0, 0], 0.0).await.expect("delete");
+        loaded.write_value(&[1, 0, 0], 4.0).await.expect("insert");
+        loaded.sync().await.expect("sync updated root");
+        drop(loaded);
+        let reloaded = Tensor::<FsEntry, f32>::load(open_dir(&root).expect("reopen again"))
+            .await
+            .expect("reload updated root");
+
+        assert_eq!(reloaded.read_value(&[0, 0, 0]).await.expect("read"), 0.0);
+        assert_eq!(reloaded.read_value(&[1, 2, 3]).await.expect("read"), 9.0);
+        assert_eq!(reloaded.read_value(&[1, 0, 0]).await.expect("read"), 4.0);
 
         cleanup(&root).await;
     }

@@ -1,4 +1,6 @@
+pub mod binary;
 mod error;
+mod expression;
 mod metadata;
 mod schema;
 mod tensor;
@@ -7,6 +9,7 @@ pub mod unary;
 mod validate;
 mod view;
 
+pub use binary::BinaryView;
 pub use error::{Error, Result};
 pub use metadata::TensorMetadata;
 pub use number_general::NumberType;

@@ -54,7 +54,7 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
    - Define heuristics and controls for densification/materialization.
    - Exit criteria: conversion fidelity tests pass with no data-loss regressions.
 
-## Implemented lazy unary execution
+## Implemented lazy elementwise execution
 
 - Schemas and geometry report number-general `NumberType` classes; tensors use
   primitive type parameters directly. Typed `TensorMetadata<T>` replaces
@@ -84,11 +84,26 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 
 - Geometric `TensorView` and computed `UnaryView<Source, Op>` are separate types.
   `exp`, `ln`, and `round` nest unary views over their immediate sources, following
-  ndarray access composition. Consumers read the root geometric view and build
+  ndarray access composition. Consumers read geometric leaves directly and build
   the complete ndarray expression before evaluating once per batch, without
   intermediate filesystem materialization, vector conversion, or sparse filtering.
-  Only unary traits gain associated output types; geometric transform traits and
-  binary/reduction traits retain their existing interfaces.
+  Unary traits and `TensorMath<Rhs>` use associated output types; geometric
+  transform and reduction interfaces retain their existing contracts.
+- `BinaryView<Left, Right, Op>` supports add/sub/mul/div/pow/rem for matching
+  f32/f64/u8 and log for matching floats. Shape mismatches fail at construction;
+  broadcasting and dtype conversions are explicit. Nested unary/binary expressions
+  share one recursive batch builder, terminal evaluation, and ordered concurrency
+  boundary. Memory scales with expression size and bounded batches.
+- Binary support is the union of original leaf support, with absent children
+  masked to zero before their parent operation. Intermediate zeros retain support;
+  copying creates a new support boundary. Only two sparse operands produce a
+  sparse result. Neither computed view family implements TensorWrite or TensorArray.
+- Numerical rules and backend conformance belong to
+  [ha-ndarray's contract](../ha-ndarray/NUMERICS.md), including wrapping u8
+  arithmetic, zero integer divisors, IEEE floating behavior, and cast compatibility.
+  fensor retains its distinct sparse source-support semantics and bounded execution.
+  Certified reference and capability-rejection tests live in ha-ndarray's shared
+  suite. Actual GPU conformance remains a pending ha-ndarray validation gate.
 - Bases and views expose fresh, bounded row-major value streams. Fixed-size batches
   and CPU-based concurrency apply backpressure through consumption and awaited I/O.
 - Direct reads, block streams, and `Tensor::copy_from` agree;
@@ -98,9 +113,13 @@ Transactional orchestration belongs to `tc-collection`, which composes `fensor` 
 - Cache admission accounts for block payload bytes; real-cache tests exercise
   spill and reload with tensors larger than the configured cache capacity.
 - Range iteration retains interval descriptors instead of expanding axes.
+- `Tensor::sync` writes blocks and publishes the current sparse index root before
+  reload. Directory-only synchronization is insufficient for an in-memory root;
+  durable synchronization and transaction policy remain with the caller.
 
 Remaining execution work:
 
+- Scalar arithmetic, reductions, matrix multiplication, and additional casts remain separate work.
 - Extend casting beyond f32-to-f64; add binary boolean operations, comparisons,
   and complex storage/operations separately. Expression input/output dtypes are
   already independent, and u8 predicate output storage is supported.

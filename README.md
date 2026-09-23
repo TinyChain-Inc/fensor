@@ -33,6 +33,12 @@ There is no public whole-tensor wire codec. Applications can consume
 `TensorRead::read_blocks` or `read_sparse_elements_in_order` to define transfer
 formats, and use `Tensor::copy_from` to construct independent filesystem storage.
 
+Before dropping and reopening a tensor, call `tensor.sync().await?` to write its
+blocks and publish its current sparse index root. Syncing only the containing
+`DirLock` does not publish an in-memory index root. Exclude concurrent tensor
+writes during synchronization. This writes to filesystem buffers; callers own
+subsequent durable directory synchronization and any transaction policy.
+
 Use `Tensor<FE, u8>`, `Tensor<FE, f32>`, or `Tensor<FE, f64>` directly. Schema and
 geometry dtype metadata use `number_general::NumberType` (also re-exported by
 fensor), for example `NumberType::Float(FloatType::F32)` or
@@ -54,7 +60,7 @@ There is no fensor dtype string codec. u8 stores all values from 0 to 255.
 `ha-ndarray`'s nested-access structure. `TensorUnary` uses
 `ExpOutput`, `LnOutput`, and `RoundOutput` associated types while preserving the
 borrowed `.exp().await?` call syntax. No `FE: Clone` bound is needed to clone
-geometric or unary view descriptions.
+geometric, unary, or binary view descriptions.
 
 `TensorAbs` adds `abs`; `TensorTrig` adds `sin`, `asin`, `sinh`, `cos`, `acos`,
 `cosh`, `tan`, `atan`, and `tanh` for both f32 and f64. Import these traits alongside
@@ -92,10 +98,48 @@ support until the final consumer. Materializing between predicates drops those
 zeros: `is_nan()` materialized before `not()` therefore behaves differently from
 the unmaterialized sparse chain. No implicit densification is performed.
 
+### Binary arithmetic
+
+`TensorMath<Rhs>` constructs read-only `BinaryView<Left, Right, Op>` descriptions.
+Operation markers are exported through `fensor::binary`.
+
+| Methods | Operand and result types |
+| --- | --- |
+| `add`, `sub`, `mul`, `div`, `pow`, `rem` | matching f32, f64, or u8 |
+| `log` (left value, right base) | matching f32 or f64 |
+
+Use `left.view().add(&right.view()).await?`; either operand can also be a
+computed view. Shapes must match at construction. Broadcasting is explicit:
+`left.view().add(&right.view().broadcast(shape![2, 3])?).await?`.
+Use the existing explicit f32-to-f64 cast when needed.
+
+u8 addition, subtraction, multiplication, and exponentiation wrap modulo 256.
+u8 division and remainder by zero return zero. Float results follow ha-ndarray,
+including NaN, infinity, signed zero, gradual underflow, and cast behavior as
+specified in [ha-ndarray's numerical contract](../ha-ndarray/NUMERICS.md).
+fensor delegates numerical evaluation to that backend; its source-support rules
+below are a separate storage/expression contract.
+Backend validation uses certified MPFR/MPC references and exact aggregate
+references. Native and CPU-OpenCL results do not replace ha-ndarray's pending
+actual-GPU conformance gate.
+
+Binary support is the union of its operands' source support. Dense leaves support
+every coordinate; sparse leaves support their original nonzero values. Unary
+nodes preserve that support, including intermediate zeros. Unsupported child
+coordinates are masked to zero with lazy ndarray selections before the parent
+operation. A binary view is sparse (with no axis hint) only when both operands
+are sparse; otherwise it is dense.
+
+For sparse `a`, `(a - a).exp()` returns one on a's support and zero elsewhere.
+Dividing those retained zero results by themselves yields NaN on that support,
+but coordinates absent from both inputs remain absent. These rules apply to
+all seven operations, including power and logarithm. Final zeros are omitted
+from sparse output; copying to storage establishes a new support boundary.
+
 Chaining does not read data or write intermediate tensors.
-Consumers read each batch from the root geometric view, recursively construct
-one ndarray expression through the nested unary views, and evaluate only its
-final result. `UnaryOp<Input>::Output` and the root input dtype are independent,
+Consumers read each batch directly from the geometric leaves, recursively construct
+one ndarray expression through nested unary and binary views, and evaluate only its
+final result. `UnaryOp<Input>::Output` and its input dtype are independent,
 so a cast does not require an intermediate buffer. Intermediate views do not
 evaluate buffers or filter sparse support.
 Backend execution and fusion remain `ha-ndarray`'s responsibility.
@@ -124,11 +168,11 @@ Source read and destination write errors propagate; cleanup of partial output
 remains the caller's responsibility. Readers returning too many or too few values
 for their shape return a structured layout error.
 
-`UnaryView` does not implement `TensorWrite`, so writes through a computed view
+`UnaryView` and `BinaryView` do not implement `TensorWrite`, so writes through a computed view
 are rejected at compile time. Geometric views retain their existing write-through
 constraints. `TensorTransform` still returns `Self`: transforms update the
-geometric source and retain the typed unary composition. Slicing and transposition compose with unary
-operations on both dense and sparse tensors. Scalar (rank-zero) views cannot
+geometric leaves and retain typed operation order. Slicing and transposition compose with
+expressions on both dense and sparse tensors. Scalar (rank-zero) views cannot
 be streamed or copied and return a structured schema error.
 
 Sparse unary operations act only on nonzero source values; implicit zeros remain

@@ -1,49 +1,26 @@
-//! Typed, read-only unary views over geometric tensor views.
+//! Typed, read-only unary views over tensor expressions.
 
-use std::iter;
 use std::marker::PhantomData;
 
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{
-    Array, ArrayAccess, Axes, Buffer, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayRead,
-    NDArrayTrig, NDArrayUnary, NDArrayUnaryBoolean, Range, Shape,
+    ArrayAccess, Axes, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayTrig, NDArrayUnary,
+    NDArrayUnaryBoolean, Range, Shape,
 };
 
 use crate::Result;
+use crate::expression::{self, Batch, Expression};
 use crate::schema::Layout;
-use crate::tensor::{TensorElement, TensorFileEntry};
+use crate::tensor::TensorElement;
 use crate::traits::{
     BoxFuture, SparseElementStream, TensorAbs, TensorCast, TensorGeometry, TensorNumeric,
     TensorRead, TensorTransform, TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics,
     ValueBlockStream,
 };
-use crate::view::TensorView;
 
 mod sealed {
-    use ha_ndarray::ArrayAccess;
-
-    use crate::{Result, TensorElement, TensorGeometry, TensorRead};
-
     pub trait Sealed {}
-
-    // Only geometric and unary views implement this contract. Consumers read
-    // the root once and build the nested expression before evaluating it.
-    pub trait Expression: TensorGeometry
-    where
-        Self::DType: TensorElement,
-    {
-        type Input: TensorElement;
-        type Root: TensorRead<DType = Self::Input>;
-
-        fn root(&self) -> &Self::Root;
-        fn build(
-            &self,
-            input: ArrayAccess<'static, Self::Input>,
-        ) -> Result<ArrayAccess<'static, Self::DType>>;
-    }
 }
-
-use sealed::Expression;
 
 /// An operation which builds an ndarray expression without evaluating it.
 ///
@@ -325,49 +302,10 @@ pub struct UnaryView<Source, Op> {
     op: Op,
 }
 
-impl<'t, FE, T> TensorUnary for TensorView<'t, FE, T>
+impl<E> TensorUnary for E
 where
-    FE: TensorFileEntry<T>,
-    T: TensorElement + ha_ndarray::Float + ha_ndarray::Real,
-{
-    type ExpOutput = UnaryView<Self, Exp>;
-    type LnOutput = UnaryView<Self, Ln>;
-    type RoundOutput = UnaryView<Self, Round>;
-
-    fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Exp,
-            })
-        })
-    }
-
-    fn ln(&self) -> BoxFuture<'_, Result<Self::LnOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Ln,
-            })
-        })
-    }
-
-    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Round,
-            })
-        })
-    }
-}
-
-impl<S, O> TensorUnary for UnaryView<S, O>
-where
-    S: Expression + Clone,
-    S::DType: TensorElement,
-    O::Output: ha_ndarray::Float + ha_ndarray::Real,
-    O: UnaryOp<S::DType>,
+    E: Expression + Clone,
+    E::DType: TensorElement + ha_ndarray::Float + ha_ndarray::Real,
 {
     type ExpOutput = UnaryView<Self, Exp>;
     type LnOutput = UnaryView<Self, Ln>;
@@ -615,19 +553,14 @@ where
     O: UnaryOp<S::DType>,
 {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            let value = self.root().read_value(coord).await?;
-            Ok(evaluate(vec![value], self)?[0])
-        })
+        Box::pin(async move { Ok(expression::evaluate(self, &[coord.to_vec()]).await?[0]) })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        // The geometric source owns the single bounded, ordered read pipeline.
-        // Evaluate the entire typed expression once for each consumed batch.
-        Ok(self
-            .root()
-            .read_blocks()?
-            .and_then(move |values| async move { evaluate(values, self) })
+        let coords = crate::schema::row_major_coords(self.shape())?;
+
+        Ok(expression::batches(self, coords)
+            .map_ok(|(_, values)| values)
             .boxed())
     }
 
@@ -637,23 +570,17 @@ where
         requested_order: Axes,
     ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
         Box::pin(async move {
-            let source = self
-                .root()
-                .read_sparse_elements_in_order(range, requested_order)
-                .await?;
-            Ok(source
-                .try_chunks(crate::schema::MAX_BLOCK_CAPACITY)
-                .map_err(|error| error.1)
-                .and_then(move |elements| async move {
-                    let (coords, values): (Vec<_>, Vec<_>) = elements.into_iter().unzip();
-                    let values = evaluate(values, self)?;
-                    Ok(futures::stream::iter(
+            let coords = crate::traits::sparse_coords(self, range, requested_order)?;
+
+            Ok(expression::batches(self, coords)
+                .map_ok(|(coords, values)| {
+                    futures::stream::iter(
                         coords
                             .into_iter()
                             .zip(values)
                             .filter(|(_, value)| *value != Self::DType::default())
                             .map(Ok),
-                    ))
+                    )
                 })
                 .try_flatten()
                 .boxed())
@@ -711,80 +638,20 @@ where
     }
 }
 
-impl<FE, T> Expression for TensorView<'_, FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
-    type Input = T;
-    type Root = Self;
-
-    fn root(&self) -> &Self::Root {
-        self
-    }
-
-    fn build(&self, input: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(input)
-    }
-}
-
 impl<S, O> Expression for UnaryView<S, O>
 where
     S: Expression,
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
-    type Input = S::Input;
-    type Root = S::Root;
-
-    fn root(&self) -> &Self::Root {
-        self.source.root()
-    }
-
-    fn build(
-        &self,
-        input: ArrayAccess<'static, Self::Input>,
-    ) -> Result<ArrayAccess<'static, Self::DType>> {
-        self.op.apply(self.source.build(input)?)
-    }
-}
-
-// Determine sparse support before constructing any operations. Intermediate
-// zeros stay in the expression until its final buffer is evaluated.
-fn evaluate<E>(values: Vec<E::Input>, expression: &E) -> Result<Vec<E::DType>>
-where
-    E: Expression,
-    E::DType: TensorElement,
-{
-    let sparse = matches!(expression.layout(), Layout::Sparse { .. });
-    let positions: Vec<usize> = if sparse {
-        values
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| (*v != E::Input::default()).then_some(i))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let len = values.len();
-    let input = if sparse {
-        positions.iter().map(|&i| values[i]).collect::<Vec<_>>()
-    } else {
-        values
-    };
-    if input.is_empty() {
-        return Ok(vec![E::DType::default(); len]);
-    }
-    let shape = iter::once(input.len()).collect();
-    let array = ArrayAccess::from(Array::new(Buffer::from(input), shape)?);
-    let output = expression.build(array)?.buffer()?.to_slice()?.into_vec();
-    if sparse {
-        let mut values = vec![E::DType::default(); len];
-        for (i, value) in positions.into_iter().zip(output) {
-            values[i] = value;
-        }
-        Ok(values)
-    } else {
-        Ok(output)
+    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+        Box::pin(async move {
+            let source = self.source.build(coords).await?;
+            Batch {
+                array: self.op.apply(source.array)?,
+                support: source.support,
+            }
+            .masked()
+        })
     }
 }

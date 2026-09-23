@@ -76,32 +76,11 @@ pub trait TensorRead: TensorGeometry {
         Self::DType: Default + PartialEq,
     {
         Box::pin(async move {
-            let base_order: Vec<_> = (0..self.ndim()).collect();
-            if requested_order.as_slice() != base_order.as_slice() {
-                return Err(Error::UnsupportedSparseIterationOrder {
-                    requested_order: requested_order.to_vec(),
-                    base_order,
-                    hint: "materialize or perform external sort for incompatible order".into(),
-                });
-            }
-            if !matches!(self.layout(), Layout::Sparse { .. }) {
-                return Err(Error::Unsupported(
-                    "sparse iteration requires sparse layout".into(),
-                ));
-            }
-            crate::schema::validate_shape_dims(self.shape())?;
-            // Sparse ranges select a set of coordinates, independent of selection order.
-            let mut range = range;
-            for axis in &mut range {
-                if let ha_ndarray::AxisRange::Of(indices) = axis {
-                    indices.sort_unstable();
-                    indices.dedup();
-                }
-            }
-            let coords = validate::iter_range_coords(self.shape(), &range)?;
+            let coords = sparse_coords(self, range, requested_order)?;
             let elements = futures::stream::iter(coordinate_batches(coords))
                 .map(move |coords| async move {
                     let mut elements = Vec::new();
+
                     for coord in coords {
                         let value = self.read_value(&coord).await?;
                         if value != Self::DType::default() {
@@ -357,67 +336,42 @@ pub trait TensorTrig: TensorGeometry + Sized {
     fn acos(&self) -> BoxFuture<'_, Result<Self::AcosOutput>>;
     fn cosh(&self) -> BoxFuture<'_, Result<Self::CoshOutput>>;
     fn tan(&self) -> BoxFuture<'_, Result<Self::TanOutput>>;
+
     fn atan(&self) -> BoxFuture<'_, Result<Self::AtanOutput>>;
+
     fn tanh(&self) -> BoxFuture<'_, Result<Self::TanhOutput>>;
 }
 
 /// Elementwise tensor math operations.
-pub trait TensorMath: TensorArray + Sized {
-    fn add<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "add is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+pub trait TensorMath<Rhs = Self>: TensorGeometry + Sized
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type AddOutput: TensorRead<DType = Self::DType>;
+    type SubOutput: TensorRead<DType = Self::DType>;
+    type MulOutput: TensorRead<DType = Self::DType>;
+    type DivOutput: TensorRead<DType = Self::DType>;
+    type PowOutput: TensorRead<DType = Self::DType>;
+    type LogOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Float;
+    type RemOutput: TensorRead<DType = Self::DType>;
 
-    fn div<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "div is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn add<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::AddOutput>>;
 
-    fn log<'a>(&'a self, _base: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "log is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn sub<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::SubOutput>>;
 
-    fn mul<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "mul is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn mul<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::MulOutput>>;
 
-    fn pow<'a>(&'a self, _exp: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "pow is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn div<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::DivOutput>>;
 
-    fn sub<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sub is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn pow<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::PowOutput>>;
 
-    fn rem<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "rem is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn log<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LogOutput>>
+    where
+        Self::DType: ha_ndarray::Float;
+
+    fn rem<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::RemOutput>>;
 }
 
 /// Elementwise tensor math operations with scalar arguments.
@@ -584,7 +538,7 @@ pub trait TensorMatMul: TensorArray + Sized {
 }
 
 /// Batch coordinates without expanding the remaining logical range.
-fn coordinate_batches(
+pub(crate) fn coordinate_batches(
     mut coords: impl Iterator<Item = Vec<u64>>,
 ) -> impl Iterator<Item = Vec<Vec<u64>>> {
     std::iter::from_fn(move || {
@@ -594,4 +548,39 @@ fn coordinate_batches(
             .collect();
         (!batch.is_empty()).then_some(batch)
     })
+}
+
+pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
+    tensor: &V,
+    range: Range,
+    requested_order: Axes,
+) -> Result<validate::RangeCoords> {
+    let base_order: Vec<_> = (0..tensor.ndim()).collect();
+
+    if requested_order.as_slice() != base_order.as_slice() {
+        return Err(Error::UnsupportedSparseIterationOrder {
+            requested_order: requested_order.to_vec(),
+            base_order,
+            hint: "materialize or perform external sort for incompatible order".into(),
+        });
+    }
+
+    if !matches!(tensor.layout(), Layout::Sparse { .. }) {
+        return Err(Error::Unsupported(
+            "sparse iteration requires sparse layout".into(),
+        ));
+    }
+
+    crate::schema::validate_shape_dims(tensor.shape())?;
+    // Sparse ranges select a set of coordinates, independent of selection order.
+    let mut range = range;
+
+    for axis in &mut range {
+        if let ha_ndarray::AxisRange::Of(indices) = axis {
+            indices.sort_unstable();
+            indices.dedup();
+        }
+    }
+
+    validate::iter_range_coords(tensor.shape(), &range)
 }
