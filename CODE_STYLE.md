@@ -40,7 +40,7 @@ consistency remains automatic.
 
 - Use `Shape`, `Strides`, and the private `Coord` for small rank-sized `u64`
   metadata. Reuse `ha_ndarray::Axes` for `usize` axis identifiers and permutations.
-  Their inline capacity of eight is an allocation optimization, not a rank limit.
+  Their `PORTABLE_INLINE_RANK` capacity is an allocation optimization, not a rank limit.
 - Use `Range` for rank-sized slice bounds; explicit `AxisRange::Of` selections own
   `Vec<u64>` and preserve order and duplicates. Shared gather tables retain `Arc`.
 - Use `Vec` for values, support masks, batches, runs, scatter lists, public
@@ -62,3 +62,12 @@ declarations and constructor members inside explicit trait implementations. Keep
 public trait declarations, behavioral control flow, and unusual bounds directly
 readable. Preserve each operation's documentation and explicit backend mapping;
 do not introduce an operation registry or generate execution implementations.
+
+## Numeric limits
+
+Name independent bounds and policies at their owning implementation. Derive
+dependent capacities rather than adding duplicate constants. Internal comments
+refer to the owner; public documentation links to DESIGN.md's bound table, which
+records current values. Boundary tests use the owning constant and adjacent
+values where accessible; explicit numerical and benchmark fixtures retain their
+inputs. Do not expose private limits solely for documentation or tests.

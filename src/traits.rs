@@ -51,7 +51,9 @@ pub type ValueBlockStream<'a, T> = Pin<Box<dyn Stream<Item = Result<Vec<T>>> + S
 /// Successful complete consumption visits every logical coordinate exactly once,
 /// including zero-valued coordinates. Built-in readers deliver completed batches
 /// without input-order error precedence; dropping a stream cancels pending work.
-/// Coordinates and values have equal length, at most 4096. Each call is independent.
+/// Coordinates and values have equal length within the
+/// [execution limit](https://github.com/TinyChain-Inc/fensor/blob/main/DESIGN.md#bound-and-policy-constants).
+/// Each call is independent.
 pub type CoordinateBlockStream<'a, T> =
     Pin<Box<dyn Stream<Item = Result<(Vec<Vec<u64>>, Vec<T>)>> + Send + 'a>>;
 
@@ -289,13 +291,17 @@ pub trait TensorUnaryBoolean: TensorGeometry + Sized {
 /// ```
 /// use fensor::{Result, Tensor, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
 /// use freqfs::DirLock;
-/// async fn mask<S, D>(tensor: &Tensor<S, f32>, dir: DirLock<D>) -> Result<Tensor<D, u8>>
+/// async fn mask<S, D>(
+///     tensor: &Tensor<S, f32>,
+///     dir: DirLock<D>,
+///     max_capacity: usize,
+/// ) -> Result<Tensor<D, u8>>
 /// where
 ///     S: TensorFileEntry<f32>,
 ///     D: TensorFileEntry<u8>,
 /// {
 ///     let mask = tensor.view().is_nan().await?.not().await?.clone();
-///     Tensor::copy_from(dir, &mask, 4096).await
+///     Tensor::copy_from(dir, &mask, max_capacity).await
 /// }
 /// ```
 pub trait TensorNumeric: TensorGeometry + Sized {
@@ -319,6 +325,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// async fn widen<Source, Destination>(
 ///     source: &Tensor<Source, f32>,
 ///     dir: DirLock<Destination>,
+///     max_capacity: usize,
 /// ) -> Result<Tensor<Destination, f64>>
 /// where
 ///     Source: TensorFileEntry<f32>,
@@ -326,7 +333,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// {
 ///     let view = source.view();
 ///     let cast = TensorCast::<f64>::cast(&view).await?;
-///     Tensor::copy_from(dir, &cast, 4096).await
+///     Tensor::copy_from(dir, &cast, max_capacity).await
 /// }
 /// ```
 ///

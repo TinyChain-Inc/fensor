@@ -1,7 +1,8 @@
 //! Bounded storage plans. Runs preserve request order without mapped coordinate lists.
 //! Every run covers requested elements, so groups and the total run count
-//! are bounded by 4096. Affine progressions validate endpoints before any I/O;
-//! coordinate carries and block/key boundaries delimit constant-stride runs.
+//! are bounded by `expression::MAX_BATCH_ELEMENTS`. Affine progressions validate
+//! endpoints before any I/O; coordinate carries and block/key boundaries delimit
+//! constant-stride runs.
 //! Coalescing is descriptive only: it neither deduplicates outputs nor caches data.
 
 use std::collections::BTreeMap;
@@ -79,7 +80,7 @@ struct Scratch {
 
 // Shared address arithmetic for read planning and scalar/copy writes. Coordinates
 // and schema cardinality are validated by callers. The block offset is below the
-// validated storage capacity (at most 4096), so only that offset narrows to usize.
+// validated MAX_BLOCK_CAPACITY, so only that offset narrows to usize.
 pub(crate) fn block_position(
     coord: impl Iterator<Item = u64>,
     block_shape: &[u64],
@@ -620,9 +621,12 @@ mod tests {
         let huge = StorageShape {
             shape: &[1_000_000_000, 1_000_000_000],
             strides: &[1_000_000_000, 1],
-            block_shape: &[1, 4096],
-            block_strides: &[4096, 1],
-            grid_strides: &[244141, 1],
+            block_shape: &[1, crate::schema::MAX_BLOCK_CAPACITY as u64],
+            block_strides: &[crate::schema::MAX_BLOCK_CAPACITY as u64, 1],
+            grid_strides: &[
+                1_000_000_000u64.div_ceil(crate::schema::MAX_BLOCK_CAPACITY as u64),
+                1,
+            ],
             sparse_axis: None,
         };
         let request = BatchRequest::linear(999_999_999_999_999_968, 32).unwrap();
@@ -631,28 +635,35 @@ mod tests {
 
     #[tokio::test]
     async fn singleton_axes_do_not_expand_narrow_requests() {
+        let batch_len = crate::expression::MAX_BATCH_ELEMENTS;
+        let block_len = 128; // Deliberately narrower than one execution batch.
+        let expected_runs = batch_len.div_ceil(block_len);
         let storage = StorageShape {
-            shape: &[4097, 1],
+            shape: &[batch_len as u64 + 1, 1],
             strides: &[1, 1],
-            block_shape: &[128, 1],
+            block_shape: &[block_len as u64, 1],
             block_strides: &[1, 1],
             grid_strides: &[1, 1],
             sparse_axis: None,
         };
 
         for request in [
-            BatchRequest::linear(0, 4096).unwrap(),
+            BatchRequest::linear(0, batch_len).unwrap(),
             BatchRequest::rectangles(vec![
-                Cartesian::new(vec![Axis::range(0, 4096), Axis::Selected(vec![0])]).unwrap(),
+                Cartesian::new(vec![
+                    Axis::range(0, batch_len as u64),
+                    Axis::Selected(vec![0]),
+                ])
+                .unwrap(),
             ])
             .unwrap(),
         ] {
             crate::read_metrics::CURRENT
                 .scope(Default::default(), async {
                     let runs = storage.plan(&request, None).unwrap();
-                    assert_eq!(runs.len(), 32);
+                    assert_eq!(runs.len(), expected_runs);
                     crate::read_metrics::CURRENT
-                        .with(|m| assert_eq!(m.borrow().boundary_decodes, 32));
+                        .with(|m| assert_eq!(m.borrow().boundary_decodes, expected_runs));
                 })
                 .await;
         }

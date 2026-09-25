@@ -91,7 +91,7 @@ where
     }
 }
 
-// At most 4096 requests across all tiles; each key is one rank-sized coordinate.
+// At most MAX_BATCH_ELEMENTS requests across all tiles; each key is rank-sized.
 // Values retain request order and duplicates for scattering after computation.
 type TileRequests = BTreeMap<Vec<u64>, Vec<(usize, u64, u64)>>;
 
@@ -771,7 +771,10 @@ mod tests {
                     <= expression::MAX_BATCH_ELEMENTS
             );
         }
-        assert!(BatchRequest::explicit(vec![vec![0, 0, 0]; 4097]).is_err());
+        assert!(
+            BatchRequest::explicit(vec![vec![0, 0, 0]; expression::MAX_BATCH_ELEMENTS + 1])
+                .is_err()
+        );
         let requests = plan_tiles(
             &mapping,
             &shape,

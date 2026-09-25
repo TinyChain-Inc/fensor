@@ -441,7 +441,7 @@ where
                 }
 
                 // Complete small groups share a storage read; lengths and rectangles
-                // contain at most 4096 entries, independent of the output size.
+                // contain at most MAX_BATCH_ELEMENTS entries, independent of the output size.
                 let mut total = slice.len();
                 let mut lengths = vec![total];
                 let mut rectangles = vec![slice.rectangle()?];

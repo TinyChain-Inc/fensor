@@ -86,7 +86,7 @@ where
 pub struct Batch<T: TensorElement> {
     pub array: ArrayAccess<'static, T>,
     // One byte per coordinate in this evaluation batch, not the whole tensor.
-    // Streaming batches contain at most 4096 coordinates; point reads use one.
+    // Streaming batches contain at most MAX_BATCH_ELEMENTS coordinates; point reads use one.
     // None means every coordinate in this batch is supported, independently of
     // intermediate numerical zeros. Batches need not align with storage blocks.
     pub support: Option<Vec<u8>>,
@@ -128,8 +128,8 @@ impl<T: TensorElement> Batch<T> {
 /// Union original support without inspecting intermediate numerical values.
 ///
 /// Both masks describe the same bounded coordinate batch, including when called
-/// recursively by nested expressions. The result has at most 4096 bytes; this
-/// helper neither reads tensor data nor materializes whole-tensor support.
+/// recursively by nested expressions. The result has at most `MAX_BATCH_ELEMENTS`
+/// u8 entries; this helper neither reads tensor data nor collects whole-tensor support.
 pub fn union_support(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
     for mask in [&left, &right].into_iter().flatten() {
         validate_bound("support union", mask.len())?;

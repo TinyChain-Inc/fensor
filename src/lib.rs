@@ -6,7 +6,8 @@
 //! spill/reload is separate from result persistence.
 //!
 //! Execution never collects a whole tensor, output, or reduction group. Batches
-//! contain at most 4096 elements; rank metadata, caller-owned values/selections,
+//! obey the [execution limit](https://github.com/TinyChain-Inc/fensor/blob/main/DESIGN.md#bound-and-policy-constants);
+//! rank metadata, caller-owned values/selections,
 //! filesystem/cache metadata, and independent consumers are separate costs.
 //! Computed views are read-only, and streams are live rather than snapshots.
 //!

@@ -33,6 +33,9 @@ const INDEX: &str = "index";
 
 const METADATA: &str = "metadata";
 
+/// Maximum sparse-index keys retained per page, independent of execution batches.
+const SPARSE_INDEX_PAGE_ENTRIES: usize = 4096;
+
 pub trait TensorElement:
     ha_ndarray::Number
     + number_general::DType
@@ -419,7 +422,8 @@ where
     }
 
     /// Only copying uses this grouped path: sparse zeros are omitted, not deletions.
-    /// Maps retain at most 4096 positions/values, never another coordinate list.
+    /// Maps retain at most `expression::MAX_BATCH_ELEMENTS` positions/values,
+    /// never another coordinate list.
     async fn write_copy_batch(&self, coords: &[Vec<u64>], values: Vec<T>) -> Result<()> {
         if coords.len() != values.len() || values.len() > crate::expression::MAX_BATCH_ELEMENTS {
             return Err(Error::InvalidLayout("invalid copy batch lengths".into()));
@@ -632,7 +636,8 @@ where
 
         let columns = ["coord".to_string(), "block_offset".to_string()];
         let sparse_axis = sparse_axis_for_layout(self.layout());
-        let mut keys = Vec::new(); // At most 4096 fixed-size keys, never an entire index.
+        // At most SPARSE_INDEX_PAGE_ENTRIES fixed-size keys, never an entire index.
+        let mut keys = Vec::new();
         let table = self.sparse_index()?.read().await;
 
         for range in ranges {
@@ -652,7 +657,7 @@ where
 
                 #[cfg(test)]
                 crate::read_metrics::record(|m| m.index_entries += 1);
-                if keys.len() == crate::expression::MAX_BATCH_ELEMENTS {
+                if keys.len() == SPARSE_INDEX_PAGE_ENTRIES {
                     return Ok(keys);
                 }
             }
@@ -744,7 +749,7 @@ where
 
                     if cursor.keys.len() == 0 && !cursor.done {
                         let keys = self.slice_index_page(cursor.last, lo, hi).await?;
-                        cursor.done = keys.len() < crate::expression::MAX_BATCH_ELEMENTS;
+                        cursor.done = keys.len() < SPARSE_INDEX_PAGE_ENTRIES;
                         cursor.keys = keys.into_iter();
                     }
 
@@ -1290,7 +1295,7 @@ mod sparse_lifecycle_tests {
     async fn slice_index_pages_resume_within_and_between_coordinates() {
         use crate::TensorReduceAll;
 
-        let entries = crate::expression::MAX_BATCH_ELEMENTS + 1;
+        let entries = SPARSE_INDEX_PAGE_ENTRIES + 1;
 
         for axis in [None, Some(1)] {
             let (root, tensor) =
@@ -1306,7 +1311,7 @@ mod sparse_lifecycle_tests {
                 entries as u64 - 1
             };
             let first = tensor.slice_index_page(None, 0, hi).await.unwrap();
-            assert_eq!(first.len(), crate::expression::MAX_BATCH_ELEMENTS);
+            assert_eq!(first.len(), SPARSE_INDEX_PAGE_ENTRIES);
             let second = tensor
                 .slice_index_page(first.last().copied(), 0, hi)
                 .await
@@ -1464,7 +1469,10 @@ mod sparse_lifecycle_tests {
                     .await
                     .is_err()
             );
-            assert!(BatchRequest::explicit(vec![vec![0, 0]; 4097]).is_err());
+            assert!(
+                BatchRequest::explicit(vec![vec![0, 0]; crate::expression::MAX_BATCH_ELEMENTS + 1])
+                    .is_err()
+            );
 
             // Validate the entire borrowed block, even for one selected value.
             let id = *groups.keys().next().unwrap();
@@ -1758,7 +1766,10 @@ mod sparse_lifecycle_tests {
         for (coords, values) in [
             (vec![vec![0], vec![4]], vec![1., 2.]),
             (vec![vec![0]], vec![]),
-            (vec![vec![0]; 4097], vec![1.; 4097]),
+            (
+                vec![vec![0]; crate::expression::MAX_BATCH_ELEMENTS + 1],
+                vec![1.; crate::expression::MAX_BATCH_ELEMENTS + 1],
+            ),
         ] {
             assert!(tensor.write_copy_batch(&coords, values).await.is_err());
             assert_eq!(tensor.read_value(&[0]).await.unwrap(), 0.);

@@ -388,8 +388,8 @@ pub(crate) fn explicit_requests(
         .map(|coords| BatchRequest::explicit(coords).expect("bounded coordinate iterator"))
 }
 
-/// Pack whole spatial tiles. Descriptors use rank-sized axes; at most 4096
-/// nonempty tiles fit a request, including batches of singleton matrices.
+/// Pack whole spatial tiles. Descriptors use rank-sized axes; at most
+/// `MAX_BATCH_ELEMENTS` nonempty tiles fit a request, including singleton matrices.
 pub(crate) fn tiled_requests(
     shape: &[u64],
 ) -> Result<impl Iterator<Item = BatchRequest> + Send + use<>> {

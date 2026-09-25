@@ -169,7 +169,8 @@ Wrapping integers, NaN extrema, signed-zero rules, and empty-support identities
 are preserved. Unordered consumers promise no input-order error precedence.
 Numeric terminals return the first observed error and drop pending evaluation.
 
-Execution batches contain at most 4096 elements. Values, coordinates, masks, and
+Execution batches obey the [execution limit](DESIGN.md#bound-and-policy-constants).
+Values, coordinates, masks, and
 partial-result collections must not scale with total tensor, output, or reduction
 group size. Caller-supplied values and explicit indices, rank-sized metadata,
 cache/filesystem metadata, and independent consumers are separate memory costs.

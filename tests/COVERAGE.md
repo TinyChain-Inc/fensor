@@ -14,7 +14,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Matrix transforms, batches, nesting, exceptional values and exact bounds | Dedicated `matmul` cases, retained independently |
 | Sparse slice dtype semantics and persistence | `slice_reductions` small f32/f64/u8 fixtures |
 | Multi-node sparse index topology across axes/capacities/shapes | `slice_reductions::indexed_topology` (f32) |
-| Index continuation within/between coordinates at 4096 entries | Tensor unit `slice_index_pages_resume_within_and_between_coordinates` |
+| Index continuation within/between coordinates at the index-page limit | Tensor unit `slice_index_pages_resume_within_and_between_coordinates` |
 | Sparse output order, duplicates, final zeros, NaN and lengths | Expression unit `sparse_output_*` |
 | Request/affine/irregular planning bounds and block grouping | Request, storage-read, matrix and tensor unit cases |
 | Support masks, intermediate zeros and bounded group packing | Expression and slice unit cases; reduction integration cases |

@@ -332,7 +332,7 @@ mod tests {
             dir,
             TensorSchema::new(f32::dtype(), shape![64, 4]).unwrap(),
             Layout::Dense,
-            4096,
+            crate::schema::MAX_BLOCK_CAPACITY,
         )
         .await
         .unwrap();

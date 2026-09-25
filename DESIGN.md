@@ -196,7 +196,8 @@ do not couple independent bounds.
 
 | Meaning | Owner / constant | Current value |
 |---|---|---:|
-| Execution elements; also index-page entries | `expression::MAX_BATCH_ELEMENTS` | 4096 |
+| Execution elements | `expression::MAX_BATCH_ELEMENTS` | 4096 |
+| Sparse-index page entries | `tensor::SPARSE_INDEX_PAGE_ENTRIES` | 4096 |
 | Values per storage block | `schema::MAX_BLOCK_CAPACITY` | 4096 |
 | Sparse-index leaf bytes | `schema::SPARSE_INDEX_BLOCK_BYTES` | 4096 |
 | Sparse-index node order | `schema::SPARSE_INDEX_ORDER` | 16 |
@@ -204,16 +205,18 @@ do not couple independent bounds.
 | Rectangle area / unique outputs | `matmul::MAX_RECTANGLE_AMPLIFICATION` | 2 |
 | Inline rank capacity | `PORTABLE_INLINE_RANK` | 8 |
 
-Result tiles hold at most `TILE_SIDE * TILE_SIDE` values (1024). Full spatial tiles
-derive 128-position contraction chunks; narrow requests can use up to 4096. These
-are derived capacities, not extra configuration. Boundary tests use owning
-constants and adjacent values; numerical and benchmark fixtures retain
+Result tiles hold at most `TILE_SIDE * TILE_SIDE` values. Contraction chunks use
+`min(remaining_k, MAX_BATCH_ELEMENTS / max(selected_rows, selected_columns))`;
+full tiles therefore use `MAX_BATCH_ELEMENTS / TILE_SIDE` contraction positions.
+These are derived capacities, not extra configuration. Index pagination bounds
+retained keys separately from the requests constructed for their visible regions.
+Boundary tests use owning constants and adjacent values; numerical and benchmark fixtures retain
 explicit inputs. Structural contract tests are indexed in [coverage ownership](tests/COVERAGE.md).
 
 ## Geometry and collection ownership
 
-`Shape` and `Strides` hold `u64` metadata inline through rank eight and spill above
-it. `Axes` comes from ha-ndarray and contains machine-sized axis identifiers.
+`Shape` and `Strides` hold `u64` metadata inline through `PORTABLE_INLINE_RANK`
+and spill above it. `Axes` comes from ha-ndarray and contains machine-sized axis identifiers.
 Private coordinate scratch uses `Coord`; public coordinate batches remain
 `Vec<Vec<u64>>`. `Range` holds local `AxisRange` bounds with `u64` endpoints and
 steps. Explicit selections are caller-sized vectors, never expanded intervals.
