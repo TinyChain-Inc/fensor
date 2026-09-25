@@ -3,14 +3,16 @@
 use std::collections::BTreeMap;
 
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{Axes, MatrixDual, NDArrayRead, NDArrayTransform, Number, Range, Shape};
+use ha_ndarray::{MatrixDual, NDArrayRead, NDArrayTransform, Number};
 
 use crate::expression::{self, Batch, Expression};
 use crate::mapping::CoordinateMap;
 use crate::request::{self, Axis, BatchRequest, Cartesian, RequestKind};
+use crate::schema::Coord;
 use crate::{
-    BoxFuture, Layout, Result, SparseElementStream, TensorElement, TensorGeometry, TensorMatMul,
-    TensorRead, TensorTransform, TensorViewSemantics, ValueBlockStream,
+    Axes, BoxFuture, Layout, Range, Result, Shape, SparseElementStream, TensorElement,
+    TensorGeometry, TensorMatMul, TensorRead, TensorTransform, TensorViewSemantics,
+    ValueBlockStream,
 };
 
 /// Maximum rows and columns per spatial tile; result size is TILE_SIDE squared.
@@ -60,7 +62,7 @@ pub struct MatMulView<Left, Right> {
     right: Right,
     // Original output geometry is rank-sized; transforms retain a shared mapping.
     output_shape: Shape,
-    output_strides: Vec<usize>,
+    output_strides: crate::Strides,
     mapping: CoordinateMap,
 }
 
@@ -75,7 +77,7 @@ where
     fn matmul<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::Output>> {
         Box::pin(async move {
             let output_shape = self.matmul_output_shape(rhs)?;
-            let output_strides = crate::schema::contiguous_strides(&output_shape)?.to_vec();
+            let output_strides = crate::schema::contiguous_strides(&output_shape)?;
             let mapping = CoordinateMap::identity(output_shape.clone(), &output_strides);
 
             Ok(MatMulView {
@@ -91,12 +93,12 @@ where
 
 // At most 4096 requests across all tiles; each key is one rank-sized coordinate.
 // Values retain request order and duplicates for scattering after computation.
-type TileRequests = BTreeMap<Vec<u64>, Vec<(usize, usize, usize)>>;
+type TileRequests = BTreeMap<Vec<u64>, Vec<(usize, u64, u64)>>;
 
 fn plan_tiles(
     mapping: &CoordinateMap,
-    shape: &[usize],
-    strides: &[usize],
+    shape: &[u64],
+    strides: &[u64],
     coords: &BatchRequest,
 ) -> Result<TileRequests> {
     if coords.len() > expression::MAX_BATCH_ELEMENTS {
@@ -109,17 +111,17 @@ fn plan_tiles(
 
     let mut tiles: TileRequests = BTreeMap::new();
     let mut cursor = coords.cursor(&mapping.shape)?;
-    let mut input = Vec::new();
-    let mut mapped = Vec::new();
+    let mut input = Coord::new();
+    let mut mapped = Coord::new();
     let mut position = 0;
 
     while cursor.next_into(&mut input) {
         mapping.resolve_into(&input, shape, strides, &mut mapped)?;
-        let column = mapped[mapped.len() - 1] as usize;
-        let row = mapped[mapped.len() - 2] as usize;
+        let column = mapped[mapped.len() - 1];
+        let row = mapped[mapped.len() - 2];
         let mut coord = mapped[..mapped.len() - 2].to_vec();
-        coord.push((row / TILE_SIDE) as u64);
-        coord.push((column / TILE_SIDE) as u64);
+        coord.push(row / TILE_SIDE as u64);
+        coord.push(column / TILE_SIDE as u64);
         tiles
             .entry(coord)
             .or_default()
@@ -133,16 +135,16 @@ fn plan_tiles(
 // All rectangle metadata is bounded by the current request batch. Scatter entries
 // retain duplicates; arithmetic uses each unique requested pair only once.
 struct Rectangle {
-    rows: Vec<usize>,
-    columns: Vec<usize>,
+    rows: Vec<u64>,
+    columns: Vec<u64>,
     scatter: Scatter,
 }
 
-fn plan_rectangles(requests: Vec<(usize, usize, usize)>) -> Vec<Rectangle> {
+fn plan_rectangles(requests: Vec<(usize, u64, u64)>) -> Vec<Rectangle> {
     // Sort one request vector rather than allocating a list for every unique pair.
     let mut requests = requests;
     requests.sort_unstable_by_key(|(_, row, column)| (*row, *column));
-    let mut by_row: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut by_row: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
 
     for &(_, row, column) in &requests {
         let columns = by_row.entry(row).or_default();
@@ -160,7 +162,7 @@ fn plan_rectangles(requests: Vec<(usize, usize, usize)>) -> Vec<Rectangle> {
     let groups = if rows.len() * columns.len() <= MAX_RECTANGLE_AMPLIFICATION * unique {
         vec![(columns, rows)]
     } else {
-        let mut groups: BTreeMap<Vec<usize>, Vec<usize>> = BTreeMap::new();
+        let mut groups: BTreeMap<Vec<u64>, Vec<u64>> = BTreeMap::new();
 
         for (row, columns) in by_row {
             groups.entry(columns).or_default().push(row);
@@ -239,22 +241,22 @@ struct MatrixPlan {
     rectangle: Rectangle,
 }
 
-type AxisTiles = BTreeMap<usize, Vec<(usize, usize)>>;
+type AxisTiles = BTreeMap<u64, Vec<(usize, u64)>>;
 
 fn axis_tiles(axis: &Axis) -> AxisTiles {
-    let mut tiles = BTreeMap::<usize, Vec<_>>::new();
+    let mut tiles = BTreeMap::<u64, Vec<_>>::new();
 
     for position in 0..axis.len() {
-        let value = axis.at(position) as usize;
+        let value = axis.at(position);
         tiles
-            .entry(value / TILE_SIDE)
+            .entry(value / TILE_SIDE as u64)
             .or_default()
-            .push((position, value));
+            .push((position as usize, value));
     }
     tiles
 }
 
-fn selected_axis(positions: &[(usize, usize)]) -> (Vec<usize>, Vec<(usize, usize)>) {
+fn selected_axis(positions: &[(usize, u64)]) -> (Vec<u64>, Vec<(usize, usize)>) {
     let mut values: Vec<_> = positions.iter().map(|(_, value)| *value).collect();
     values.sort_unstable();
     values.dedup();
@@ -270,7 +272,7 @@ fn selected_axis(positions: &[(usize, usize)]) -> (Vec<usize>, Vec<(usize, usize
     (values, scatter)
 }
 
-fn cartesian_plans(rectangles: &[Cartesian], shape: &[usize]) -> Result<Vec<MatrixPlan>> {
+fn cartesian_plans(rectangles: &[Cartesian], shape: &[u64]) -> Result<Vec<MatrixPlan>> {
     let rank = shape.len();
     let mut plans = Vec::new();
     let mut start = 0;
@@ -282,7 +284,7 @@ fn cartesian_plans(rectangles: &[Cartesian], shape: &[usize]) -> Result<Vec<Matr
         let mut prefixes = prefix_request.cursor(&shape[..rank - 2])?;
         let row_tiles = axis_tiles(&axes[rank - 2]);
         let column_tiles = axis_tiles(&axes[rank - 1]);
-        let mut prefix = Vec::new();
+        let mut prefix = Coord::new();
 
         while prefixes.next_into(&mut prefix) {
             for row_positions in row_tiles.values() {
@@ -291,13 +293,13 @@ fn cartesian_plans(rectangles: &[Cartesian], shape: &[usize]) -> Result<Vec<Matr
                 for column_positions in column_tiles.values() {
                     let (columns, column_scatter) = selected_axis(column_positions);
                     plans.push(MatrixPlan {
-                        prefix: prefix.clone(),
+                        prefix: prefix.to_vec(),
                         rectangle: Rectangle {
                             rows: rows.clone(),
                             columns,
                             scatter: Scatter::Cartesian {
                                 start,
-                                width: axes[rank - 1].len(),
+                                width: axes[rank - 1].len() as usize,
                                 rows: row_scatter.clone(),
                                 columns: column_scatter,
                             },
@@ -305,48 +307,42 @@ fn cartesian_plans(rectangles: &[Cartesian], shape: &[usize]) -> Result<Vec<Matr
                     });
                 }
             }
-            start += axes[rank - 2].len() * axes[rank - 1].len();
+            start += (axes[rank - 2].len() * axes[rank - 1].len()) as usize;
         }
     }
 
     Ok(plans)
 }
 
-fn linear_plans(start: usize, len: usize, shape: &[usize]) -> Vec<MatrixPlan> {
+fn linear_plans(start: u64, len: usize, shape: &[u64]) -> Result<Vec<MatrixPlan>> {
     // A span intersects at most len row segments. No coordinate/pair expansion.
     let rank = shape.len();
     let width = shape[rank - 1];
-    let height = shape[rank - 2];
-    let mut tiles = BTreeMap::<Vec<u64>, Vec<(usize, usize, usize, usize)>>::new();
-    let mut done = 0;
+    let mut tiles = BTreeMap::<Vec<u64>, Vec<(usize, u64, u64, usize)>>::new();
+    let mut coord = crate::schema::Coord::new();
 
-    while done < len {
-        let flat = start + done;
-        let column = flat % width;
-        let row = (flat / width) % height;
-        let mut matrix = flat / width / height;
-        let mut key = vec![0; rank];
-
-        for i in (0..rank - 2).rev() {
-            key[i] = (matrix % shape[i]) as u64;
-            matrix /= shape[i];
+    for (flat, output, length) in crate::request::linear_segments(start, len, width)? {
+        crate::request::decode_flat(flat, shape, &mut coord)?;
+        let row = coord[rank - 2];
+        let mut done = 0;
+        while done < length {
+            let column = coord[rank - 1] + done as u64;
+            let mut key = coord.to_vec();
+            key[rank - 2] = row / TILE_SIDE as u64;
+            key[rank - 1] = column / TILE_SIDE as u64;
+            let count = (length - done).min(TILE_SIDE - (column % TILE_SIDE as u64) as usize);
+            tiles
+                .entry(key)
+                .or_default()
+                .push((output + done, row, column, count));
+            done += count;
         }
-        key[rank - 2] = (row / TILE_SIDE) as u64;
-        key[rank - 1] = (column / TILE_SIDE) as u64;
-        let count = (len - done)
-            .min(width - column)
-            .min(TILE_SIDE - column % TILE_SIDE);
-        tiles
-            .entry(key)
-            .or_default()
-            .push((done, row, column, count));
-        done += count;
     }
-    tiles
+    Ok(tiles
         .into_iter()
         .map(|(mut prefix, segments)| {
-            let row_origin = prefix[rank - 2] as usize * TILE_SIDE;
-            let column_origin = prefix[rank - 1] as usize * TILE_SIDE;
+            let row_origin = prefix[rank - 2] * TILE_SIDE as u64;
+            let column_origin = prefix[rank - 1] * TILE_SIDE as u64;
             prefix.truncate(rank - 2);
             let mut row_mask = 0u64;
             let mut column_mask = 0u64;
@@ -358,11 +354,11 @@ fn linear_plans(start: usize, len: usize, shape: &[usize]) -> Vec<MatrixPlan> {
 
             let rows: Vec<_> = (0..TILE_SIDE)
                 .filter(|i| row_mask & (1 << i) != 0)
-                .map(|i| row_origin + i)
+                .map(|i| row_origin + i as u64)
                 .collect();
             let columns: Vec<_> = (0..TILE_SIDE)
                 .filter(|i| column_mask & (1 << i) != 0)
-                .map(|i| column_origin + i)
+                .map(|i| column_origin + i as u64)
                 .collect();
             let spans = segments
                 .into_iter()
@@ -384,20 +380,20 @@ fn linear_plans(start: usize, len: usize, shape: &[usize]) -> Vec<MatrixPlan> {
                 },
             }
         })
-        .collect()
+        .collect())
 }
 
 fn plan_request(
     mapping: &CoordinateMap,
-    shape: &[usize],
-    strides: &[usize],
+    shape: &[u64],
+    strides: &[u64],
     request: &BatchRequest,
 ) -> Result<Vec<MatrixPlan>> {
     request.validate(&mapping.shape)?;
     if mapping.is_identity(shape, strides) {
         match request.kind() {
             RequestKind::Rectangles(rectangles) => return cartesian_plans(rectangles, shape),
-            RequestKind::Linear { start } => return Ok(linear_plans(*start, request.len(), shape)),
+            RequestKind::Linear { start } => return linear_plans(*start, request.len(), shape),
             RequestKind::Explicit(_) => {}
         }
     }
@@ -417,16 +413,16 @@ fn plan_request(
 }
 
 fn operand_request(
-    shape: &[usize],
+    shape: &[u64],
     prefix: &[u64],
-    fixed: &[usize],
-    start: usize,
+    fixed: &[u64],
+    start: u64,
     count: usize,
     left: bool,
 ) -> Result<BatchRequest> {
-    let mut axes: Vec<_> = prefix.iter().map(|v| Axis::range(*v as usize, 1)).collect();
-    let selection = Axis::Selected(fixed.iter().map(|v| *v as u64).collect());
-    let contraction = Axis::range(start, count);
+    let mut axes: Vec<_> = prefix.iter().map(|v| Axis::range(*v, 1)).collect();
+    let selection = Axis::Selected(fixed.to_vec());
+    let contraction = Axis::range(start, count as u64);
     if left {
         axes.extend([selection, contraction]);
     } else {
@@ -469,7 +465,7 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn preferred_requests(&self, shape: &[usize]) -> Result<Option<expression::RequestIterator>> {
+    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
         let requests: expression::RequestIterator = if shape.len() < 2 {
             Box::new(request::linear_requests(shape)?)
         } else {
@@ -514,7 +510,7 @@ where
                 let step = contraction_step(rows.len(), columns.len());
 
                 for start in (0..inner).step_by(step) {
-                    let count = (inner - start).min(step);
+                    let count = (inner - start).min(step as u64) as usize;
                     let left_coords =
                         operand_request(self.left.shape(), &key, &rows, start, count, true)?;
                     let right_coords =
@@ -597,7 +593,7 @@ where
         self.left.dtype()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         &self.mapping.shape
     }
 
@@ -738,8 +734,8 @@ mod tests {
 
     #[test]
     fn matrix_shapes_reject_overflow_and_empty_dimensions() {
-        assert!(crate::validate::matmul_output_shape(&[usize::MAX, 2], &[2, 1]).is_err());
-        assert!(crate::validate::matmul_output_shape(&[usize::MAX, 1], &[1, 2]).is_err());
+        assert!(crate::validate::matmul_output_shape(&[u64::MAX, 2], &[2, 1]).is_err());
+        assert!(crate::validate::matmul_output_shape(&[u64::MAX, 1], &[1, 2]).is_err());
         assert!(crate::validate::matmul_output_shape(&[1, 0], &[0, 1]).is_err());
     }
 
@@ -792,9 +788,11 @@ mod tests {
     #[test]
     fn irregular_rectangles_bound_arithmetic_and_retain_duplicates() {
         for requests in [
-            (0..TILE_SIDE).map(|i| (i, i, i)).collect::<Vec<_>>(),
+            (0..TILE_SIDE)
+                .map(|i| (i, i as u64, i as u64))
+                .collect::<Vec<_>>(),
             (0..TILE_SIDE * TILE_SIDE)
-                .map(|i| (i, i / TILE_SIDE, i % TILE_SIDE))
+                .map(|i| (i, (i / TILE_SIDE) as u64, (i % TILE_SIDE) as u64))
                 .collect(),
             vec![(0, 0, 0), (1, 0, 0), (2, 1, 1), (3, 0, 1)],
         ] {
@@ -886,8 +884,8 @@ mod tests {
                 assert!(coords[position].is_empty());
                 let mut coord = plan.prefix.clone();
                 coord.extend([
-                    rect.rows[offset / rect.columns.len()] as u64,
-                    rect.columns[offset % rect.columns.len()] as u64,
+                    rect.rows[offset / rect.columns.len()],
+                    rect.columns[offset % rect.columns.len()],
                 ]);
                 coords[position] = coord;
             });

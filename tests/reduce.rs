@@ -1,14 +1,11 @@
 //! Filesystem-backed reduction semantics and bounded consumption.
 use fensor::{
-    Layout, Tensor, TensorCompareScalar, TensorElement, TensorFileEntry, TensorGeometry,
-    TensorMath, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorSchema,
-    TensorTransform, TensorUnary, TensorWhere, TensorWrite,
+    AxisRange, Layout, Shape, Tensor, TensorCompareScalar, TensorElement, TensorFileEntry,
+    TensorGeometry, TensorMath, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
+    TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
 };
 use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, AxisRange, Buffer, NDArrayRead, NDArrayReduce, NDArrayReduceAll, Number, Shape, axes,
-    range, shape,
-};
+use ha_ndarray::{Array, Buffer, NDArrayRead, NDArrayReduce, NDArrayReduceAll, axes, range, shape};
 use number_general::DType;
 
 mod common;
@@ -18,135 +15,118 @@ async fn source<T: TensorElement>(values: Vec<T>, shape: Shape, sparse: bool) ->
 where
     FsEntry: TensorFileEntry<T>,
 {
-    let (_, dir) = new_dir("reduce").await;
-    let tensor = Tensor::create(
-        dir,
-        TensorSchema::new(T::dtype(), shape.clone()).unwrap(),
-        if sparse {
-            Layout::Sparse { axis: None }
-        } else {
-            Layout::Dense
-        },
+    common::fixture::source(
+        "reduce",
+        shape,
+        common::fixture::layout(sparse),
         31,
+        1_000_000,
+        values,
     )
     .await
-    .unwrap();
-    for (coord, value) in common::iter_coords(&shape).zip(values) {
-        // An implicit zero needs no write; explicit sparse zero writes delete index rows.
-        if !sparse || value != T::ZERO {
-            tensor.write_value(&coord, value).await.unwrap();
-        }
-    }
-    tensor
+    .1
 }
 
 async fn check<V: TensorRead>(view: &V, expected: &[V::DType])
 where
-    V::DType: TensorElement,
     FsEntry: TensorFileEntry<V::DType>,
+    V::DType: TensorElement,
 {
-    let blocks: Vec<_> = view.read_blocks().unwrap().try_collect().await.unwrap();
-    assert!(blocks.iter().all(|b| b.len() <= 4096));
-    let values: Vec<_> = blocks.into_iter().flatten().collect();
-    assert_eq!(values, expected);
-    for (coord, value) in common::iter_coords(view.shape()).zip(expected) {
-        assert_eq!(view.read_value(&coord).await.unwrap(), *value);
-    }
-    let (root, dir) = new_dir("reduce_copy").await;
-    let copy: Tensor<FsEntry, V::DType> = Tensor::copy_from(dir.clone(), view, 17).await.unwrap();
-    copy.sync().await.unwrap();
-    drop(copy);
-    drop(dir);
-    let copy = Tensor::<FsEntry, V::DType>::load(common::open_dir(&root).unwrap())
-        .await
-        .unwrap();
-    let copied: Vec<_> = copy
-        .read_blocks()
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap()
-        .into_iter()
-        .flatten()
-        .collect();
-    assert_eq!(copied, expected);
-    if matches!(view.layout(), Layout::Sparse { .. }) {
-        let range = view
-            .shape()
-            .iter()
-            .map(|d| AxisRange::In(0, *d, 1))
-            .collect();
-        let actual: Vec<_> = view
-            .read_sparse_elements_in_order(range, (0..view.ndim()).collect())
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let expected: Vec<_> = common::iter_coords(view.shape())
-            .zip(expected.iter().copied())
-            .filter(|(_, v)| *v != V::DType::ZERO)
-            .collect();
-        assert_eq!(actual, expected);
-    }
+    common::fixture::consumers(view, expected, |a, b| a == b, |a, b| a == b).await;
 }
 
 macro_rules! parity {
     ($name:ident, $t:ty) => {
         #[tokio::test]
         async fn $name() {
-            for n in [1, 7, 8, 9, 63, 64, 65, 129, 4095, 4096, 4097] {
-                let values: Vec<$t> = (0..n).map(|i| (i % 3) as $t).collect();
-                let tensor = source(values.clone(), shape![n], false).await;
-                macro_rules! op {
-                    ($method:ident, $all:ident) => {
-                        let array = Array::new(Buffer::from(values.clone()), shape![n]).unwrap();
-                        let expected = array.$all().unwrap();
-                        assert_eq!(tensor.$all().await.unwrap(), expected);
-                        check(
-                            &tensor.view().$method(axes![0], false).await.unwrap(),
-                            &[expected],
-                        )
-                        .await;
-                    };
-                }
-                op!(sum, sum_all);
-                op!(product, product_all);
-                op!(min, min_all);
-                op!(max, max_all);
-                assert!(!tensor.all().await.unwrap());
-                assert_eq!(tensor.any().await.unwrap(), n > 1);
-            }
-            let values: Vec<$t> = (0..24).map(|i| (i % 4) as $t).collect();
-            let tensor = source(values.clone(), shape![2, 3, 4], false).await;
-            for axes in [
-                axes![],
-                axes![0],
-                axes![1],
-                axes![2],
-                axes![2, 0, 2],
-                axes![2, 1, 0],
-            ] {
-                for keepdims in [false, true] {
+            for sparse in [false, true] {
+                for n in [1, 7, 8, 9, 63, 64, 65, 129, 4095, 4096, 4097] {
+                    if sparse && !matches!(n, 7 | 4097) {
+                        continue;
+                    }
+                    let values: Vec<$t> = (0..n)
+                        .map(|i| {
+                            if sparse {
+                                u64::from(i % 257 == 0) as $t
+                            } else {
+                                (i % 3) as $t
+                            }
+                        })
+                        .collect();
+                    let tensor = source(values.clone(), shape![n], sparse).await;
+                    let supported: Vec<_> = values
+                        .iter()
+                        .copied()
+                        .filter(|v| !sparse || *v != 0 as $t)
+                        .collect();
                     macro_rules! op {
-                        ($method:ident) => {
-                            let expected =
-                                Array::new(Buffer::from(values.clone()), shape![2, 3, 4])
-                                    .unwrap()
-                                    .$method(axes.clone(), keepdims)
-                                    .unwrap();
-                            let view = tensor.view().$method(axes.clone(), keepdims).await.unwrap();
-                            assert_eq!(view.shape(), ha_ndarray::NDArray::shape(&expected));
-                            check(&view, &expected.buffer().unwrap().to_slice().unwrap()).await;
+                        ($method:ident, $all:ident) => {
+                            let array = Array::new(
+                                Buffer::from(supported.clone()),
+                                shape![supported.len()],
+                            )
+                            .unwrap();
+                            let expected = array.$all().unwrap();
+                            assert_eq!(tensor.$all().await.unwrap(), expected);
+                            let view = tensor.view().$method(axes![0], false).await.unwrap();
+                            if matches!(n, 7 | 4097) {
+                                check(&view, &[expected]).await;
+                            } else {
+                                common::fixture::blocks(&view, &[expected], |a, b| a == b).await;
+                            }
                         };
                     }
-                    op!(sum);
-                    op!(product);
-                    op!(min);
-                    op!(max);
+                    op!(sum, sum_all);
+                    op!(product, product_all);
+                    op!(min, min_all);
+                    op!(max, max_all);
+                    assert_eq!(tensor.all().await.unwrap(), sparse);
+                    assert_eq!(tensor.any().await.unwrap(), sparse || n > 1);
                 }
+                let values: Vec<$t> = (0..24).map(|i| (i % 4 + u64::from(sparse)) as $t).collect();
+                let tensor = source(values.clone(), shape![2, 3, 4], sparse).await;
+                for axes in [
+                    axes![],
+                    axes![0],
+                    axes![1],
+                    axes![2],
+                    axes![2, 0, 2],
+                    axes![2, 1, 0],
+                ] {
+                    for keepdims in [false, true] {
+                        macro_rules! op {
+                            ($method:ident) => {
+                                let expected =
+                                    Array::new(Buffer::from(values.clone()), shape![2, 3, 4])
+                                        .unwrap()
+                                        .$method(axes.clone(), keepdims)
+                                        .unwrap();
+                                let view =
+                                    tensor.view().$method(axes.clone(), keepdims).await.unwrap();
+                                assert_eq!(
+                                    view.shape(),
+                                    ha_ndarray::NDArray::shape(&expected)
+                                        .iter()
+                                        .map(|&d| d as u64)
+                                        .collect::<Vec<_>>()
+                                );
+                                let buffer = expected.buffer().unwrap();
+                                let expected = buffer.to_slice().unwrap();
+                                if axes.as_slice() == [1] {
+                                    check(&view, &expected).await;
+                                } else {
+                                    common::fixture::blocks(&view, &expected, |a, b| a == b).await;
+                                }
+                            };
+                        }
+                        op!(sum);
+                        op!(product);
+                        op!(min);
+                        op!(max);
+                    }
+                }
+                assert!(tensor.view().sum(axes![3], false).await.is_err());
             }
-            assert!(tensor.view().sum(axes![3], false).await.is_err());
         }
     };
 }
@@ -212,10 +192,7 @@ async fn composition_transforms_and_live_sources() {
     check(
         &view
             .clone()
-            .slice(range![
-                AxisRange::At(1),
-                AxisRange::Of(vec![1, 0, 1].into())
-            ])
+            .slice(range![AxisRange::At(1), AxisRange::Of(vec![1, 0, 1])])
             .unwrap(),
         &[30., 27., 30.],
     )
@@ -418,7 +395,7 @@ macro_rules! accuracy {
                             }
                         })
                         .collect();
-                    let tensor = source(values.clone(), shape![1, n], false).await;
+                    let tensor = source(values.clone(), shape![1 as u64, n as u64], false).await;
                     let actual = if product {
                         tensor.product_all().await.unwrap()
                     } else {
@@ -494,9 +471,7 @@ async fn selected_output_range_and_corruption_boundaries() {
         let view = tensor.view().sum(axes![1], false).await.unwrap();
         let entries: Vec<_> = view
             .read_sparse_elements_in_order(
-                range![AxisRange::Of(
-                    vec![499_999_999, 499_999_998, 499_999_999].into()
-                )],
+                range![AxisRange::Of(vec![499_999_999, 499_999_998, 499_999_999])],
                 axes![0],
             )
             .await

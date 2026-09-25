@@ -1,14 +1,14 @@
 //! Filesystem-backed binary expression parity and source-support regressions.
 use fensor::{
-    Layout, Tensor, TensorArray, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
-    TensorCompareScalar, TensorElement, TensorFileEntry, TensorGeometry, TensorMath,
+    AxisRange, Layout, Tensor, TensorArray, TensorBoolean, TensorBooleanScalar, TensorCast,
+    TensorCompare, TensorCompareScalar, TensorElement, TensorFileEntry, TensorGeometry, TensorMath,
     TensorMathScalar, TensorNumeric, TensorRead, TensorSchema, TensorTransform, TensorUnary,
     TensorUnaryBoolean, TensorWhere, TensorWrite,
 };
 
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{
-    Array, ArrayAccess, AxisRange, Buffer, NDArrayBoolean, NDArrayBooleanScalar, NDArrayCompare,
+    Array, ArrayAccess, Buffer, NDArrayBoolean, NDArrayBooleanScalar, NDArrayCompare,
     NDArrayCompareScalar, NDArrayMath, NDArrayMathScalar, NDArrayRead, NDArrayWhere, Number, axes,
     range, shape,
 };
@@ -52,7 +52,7 @@ where
     let (_, dir) = new_dir("binary_source").await;
     let tensor = Tensor::create(
         dir,
-        TensorSchema::new(T::dtype(), shape![values.len()]).unwrap(),
+        TensorSchema::new(T::dtype(), shape![values.len() as u64]).unwrap(),
         layout,
         capacity,
     )
@@ -410,9 +410,7 @@ async fn far_end_sparse_range_is_bounded_and_ordered() {
     let run = async {
         expression
             .read_sparse_elements_in_order(
-                range![AxisRange::Of(
-                    vec![999_999_999, 999_999_998, 999_999_999].into()
-                )],
+                range![AxisRange::Of(vec![999_999_999, 999_999_998, 999_999_999])],
                 axes![0],
             )
             .await
@@ -635,10 +633,7 @@ async fn binary_tree_transforms_preserve_operand_order_and_scalar_limits() {
         .unwrap()
         .unsqueeze(axes![0])
         .unwrap()
-        .slice(range![
-            AxisRange::At(0),
-            AxisRange::Of(vec![3, 1, 3].into())
-        ])
+        .slice(range![AxisRange::At(0), AxisRange::Of(vec![3, 1, 3])])
         .unwrap()
         .unsqueeze(axes![0])
         .unwrap()
@@ -1187,9 +1182,7 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
             .unwrap();
         let entries: Vec<_> = expression
             .read_sparse_elements_in_order(
-                range![AxisRange::Of(
-                    vec![999_999_999, 999_999_998, 999_999_999].into()
-                )],
+                range![AxisRange::Of(vec![999_999_999, 999_999_998, 999_999_999])],
                 axes![0],
             )
             .await
@@ -1246,10 +1239,7 @@ async fn conditional_live_sources_transforms_and_scalar_limit() {
             .clone()
             .unsqueeze(axes![0])
             .unwrap()
-            .slice(range![
-                AxisRange::At(0),
-                AxisRange::Of(vec![3, 1, 3].into())
-            ])
+            .slice(range![AxisRange::At(0), AxisRange::Of(vec![3, 1, 3])])
             .unwrap()
             .unsqueeze(axes![0])
             .unwrap()

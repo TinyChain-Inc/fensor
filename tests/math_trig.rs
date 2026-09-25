@@ -2,12 +2,13 @@
 
 use fensor::unary::UnaryOp;
 use fensor::{
-    Layout, Tensor, TensorAbs, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
-    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
+    AxisRange, Layout, Tensor, TensorAbs, TensorElement, TensorFileEntry, TensorGeometry,
+    TensorRead, TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite,
+    UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
-    Array, ArrayAccess, AxisRange, Buffer, NDArrayAbs, NDArrayRead, NDArrayTrig, axes, range, shape,
+    Array, ArrayAccess, Buffer, NDArrayAbs, NDArrayRead, NDArrayTrig, axes, range, shape,
 };
 use number_general::FloatType;
 
@@ -69,7 +70,10 @@ where
     }
     if matches!(view.layout(), Layout::Sparse { .. }) {
         let rows: Vec<_> = view
-            .read_sparse_elements_in_order(range![AxisRange::In(0, expected.len(), 1)], axes![0])
+            .read_sparse_elements_in_order(
+                range![AxisRange::In(0, expected.len() as u64, 1)],
+                axes![0],
+            )
             .await
             .unwrap()
             .try_collect()
@@ -113,8 +117,11 @@ macro_rules! operation_matrix {
                 ];
                 let tensor = Tensor::<FsEntry, $t>::create(
                     dir,
-                    TensorSchema::new(<$t as number_general::DType>::dtype(), shape![input.len()])
-                        .unwrap(),
+                    TensorSchema::new(
+                        <$t as number_general::DType>::dtype(),
+                        shape![input.len() as u64],
+                    )
+                    .unwrap(),
                     layout,
                     3,
                 )
@@ -214,7 +221,10 @@ async fn mixed_sparse_chain_preserves_support_transforms_and_reuse() {
         vec![4096, 6]
     );
     let rows: Vec<_> = expression
-        .read_sparse_elements_in_order(range![AxisRange::In(0, expression.size(), 1)], axes![0])
+        .read_sparse_elements_in_order(
+            range![AxisRange::In(0, expression.size().unwrap(), 1)],
+            axes![0],
+        )
         .await
         .unwrap()
         .try_collect()

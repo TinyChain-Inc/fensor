@@ -3,11 +3,11 @@
 
 use fensor::unary::{Exp, Round};
 use fensor::{
-    Error, Layout, Tensor, TensorRead, TensorSchema, TensorTransform, TensorUnary, TensorView,
-    TensorViewSemantics, TensorWrite, UnaryView,
+    AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorTransform, TensorUnary,
+    TensorView, TensorViewSemantics, TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
-use ha_ndarray::{AxisRange, axes, range, shape};
+use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
 use common::{FsEntry, create_dense_tensor, create_sparse_tensor, iter_coords, new_dir};
@@ -633,25 +633,21 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
         )
         .await;
         for offset in [1, 3, 5] {
-            tensor
-                .write_value(&[(length - offset) as u64], 0.2)
-                .await
-                .unwrap();
+            tensor.write_value(&[(length - offset)], 0.2).await.unwrap();
         }
         let view = tensor.view();
         let unary = view.round().await.unwrap().exp().await.unwrap();
-        let selection = range![AxisRange::Of(
-            vec![length - 1, length - 5, length - 1, length - 3].into()
-        )];
-        let expected_coords = vec![
-            vec![(length - 5) as u64],
-            vec![(length - 3) as u64],
-            vec![(length - 1) as u64],
-        ];
+        let selection = range![AxisRange::Of(vec![
+            length - 1,
+            length - 5,
+            length - 1,
+            length - 3
+        ])];
+        let expected_coords = vec![vec![(length - 5)], vec![(length - 3)], vec![(length - 1)]];
         async fn check(
             reader: &impl TensorRead<DType = f32>,
-            length: usize,
-            selection: ha_ndarray::Range,
+            length: u64,
+            selection: fensor::Range,
             expected_coords: &[Vec<u64>],
         ) {
             let rows: Vec<_> = reader

@@ -2,13 +2,12 @@
 mod tests;
 
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{Axes, Range, Shape};
 
 use crate::mapping::{AxisContrib, CoordinateMap};
 use crate::schema::Layout;
 use crate::{
-    BoxFuture, Error, Result, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorGeometry,
-    TensorRead, TensorTransform, TensorViewSemantics, TensorWrite,
+    Axes, BoxFuture, Error, Range, Result, Shape, Tensor, TensorArray, TensorElement,
+    TensorFileEntry, TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, TensorWrite,
 };
 
 /// A geometric view of filesystem-backed tensor storage.
@@ -37,7 +36,7 @@ where
         }
     }
 
-    pub fn flat_offset(&self, coord: &[u64]) -> Result<i64> {
+    pub fn flat_offset(&self, coord: &[u64]) -> Result<i128> {
         self.mapping.flat_offset(coord)
     }
 
@@ -52,7 +51,7 @@ where
         &self,
         slice: crate::slice::Slice,
     ) -> Result<crate::slice::Requests<'_>> {
-        if slice.len() <= crate::expression::MAX_BATCH_ELEMENTS
+        if slice.len() <= crate::expression::MAX_BATCH_ELEMENTS as u64
             || matches!(self.layout(), Layout::Dense)
         {
             return Ok(slice.stream());
@@ -87,7 +86,7 @@ where
         self.tensor.layout()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         &self.mapping.shape
     }
 }

@@ -2,12 +2,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt, TryStreamExt};
-use ha_ndarray::{Axes, Range, Shape};
 use number_general::NumberType;
 
 use crate::schema::Layout;
-use crate::validate;
-use crate::{Error, Result, TensorSchema};
+use crate::{Axes, Error, Range, Result, Shape, TensorSchema, validate};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -19,14 +17,15 @@ pub trait TensorGeometry: Send + Sync {
 
     fn layout(&self) -> Layout;
 
-    fn shape(&self) -> &[usize];
+    fn shape(&self) -> &[u64];
 
     fn ndim(&self) -> usize {
         self.shape().len()
     }
 
-    fn size(&self) -> usize {
-        self.shape().iter().product()
+    /// Checked logical cardinality, independent of the machine-sized batch buffers.
+    fn size(&self) -> Result<u64> {
+        crate::schema::checked_product(self.shape())
     }
 }
 
@@ -34,7 +33,7 @@ pub trait TensorGeometry: Send + Sync {
 pub trait TensorArray: TensorGeometry {
     fn schema(&self) -> &TensorSchema;
 
-    fn strides(&self) -> &[usize];
+    fn strides(&self) -> &[u64];
 
     fn schema_dtype(&self) -> NumberType {
         self.schema().dtype()
@@ -691,7 +690,7 @@ pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
     let mut range = range;
 
     for axis in &mut range {
-        if let ha_ndarray::AxisRange::Of(indices) = axis {
+        if let crate::AxisRange::Of(indices) = axis {
             indices.sort_unstable();
             indices.dedup();
         }

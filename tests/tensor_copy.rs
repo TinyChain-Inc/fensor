@@ -2,10 +2,10 @@
 
 use common::{FsEntry, new_dir};
 use fensor::{
-    Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
-    TensorWrite,
+    AxisRange, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema,
+    TensorTransform, TensorWrite,
 };
-use ha_ndarray::{AxisRange, axes, range, shape};
+use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType, UIntType};
 
 mod common;
@@ -103,7 +103,7 @@ impl TensorGeometry for CoordinateReader<'_> {
         self.tensor.layout()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         self.tensor.shape()
     }
 }
@@ -269,7 +269,7 @@ impl TensorGeometry for PausedReader<'_> {
         self.0.layout()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         self.0.shape()
     }
 }

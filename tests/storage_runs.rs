@@ -1,11 +1,11 @@
 //! Filesystem parity between compact/affine stream requests and explicit point reads.
 
 use fensor::{
-    Layout, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema, TensorTransform,
-    TensorWrite,
+    AxisRange, Layout, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
+    TensorTransform, TensorWrite,
 };
 use futures::TryStreamExt;
-use ha_ndarray::{AxisRange, axes, range, shape};
+use ha_ndarray::{axes, range, shape};
 
 mod common;
 use common::FsEntry;
@@ -70,7 +70,7 @@ where
                 source
                     .view()
                     .slice(range![
-                        AxisRange::Of(vec![2, 0, 2].into()),
+                        AxisRange::Of(vec![2, 0, 2]),
                         AxisRange::In(0, 5, 1),
                         AxisRange::In(0, 7, 1)
                     ])

@@ -1,14 +1,12 @@
 //! Filesystem-backed tiled matrix multiplication and source support.
 
 use fensor::{
-    Layout, Tensor, TensorCast, TensorCompareScalar, TensorElement, TensorFileEntry,
-    TensorGeometry, TensorMatMul, TensorMath, TensorRead, TensorReduce, TensorReduceAll,
-    TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
+    AxisRange, Layout, Shape, Tensor, TensorCast, TensorCompareScalar, TensorElement,
+    TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorRead, TensorReduce,
+    TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
 };
 use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, AxisRange, Buffer, MatrixDual, NDArrayRead, Number, Shape, axes, range, shape,
-};
+use ha_ndarray::{Array, Buffer, MatrixDual, NDArrayRead, Number, axes, range, shape};
 use number_general::DType;
 
 mod common;
@@ -23,27 +21,16 @@ async fn source<T: TensorElement>(
 where
     FsEntry: TensorFileEntry<T>,
 {
-    let (_, dir) = new_dir("matmul_source").await;
-    let tensor = Tensor::create(
-        dir,
-        TensorSchema::new(T::dtype(), dims.clone()).unwrap(),
-        if sparse {
-            Layout::Sparse { axis: None }
-        } else {
-            Layout::Dense
-        },
+    common::fixture::source(
+        "matmul",
+        dims,
+        common::fixture::layout(sparse),
         capacity,
+        1_000_000,
+        values.iter().copied(),
     )
     .await
-    .unwrap();
-
-    for (coord, value) in common::iter_coords(&dims).zip(values) {
-        if !sparse || *value != T::ZERO {
-            tensor.write_value(&coord, *value).await.unwrap();
-        }
-    }
-
-    tensor
+    .1
 }
 
 trait Matches: TensorElement {
@@ -71,16 +58,8 @@ impl Matches for f64 {
 async fn check_blocks<V: TensorRead>(view: &V, expected: &[V::DType])
 where
     V::DType: Matches,
-    FsEntry: TensorFileEntry<V::DType>,
 {
-    let blocks: Vec<_> = view.read_blocks().unwrap().try_collect().await.unwrap();
-    assert!(blocks.iter().all(|b| b.len() <= 4096));
-    let actual: Vec<_> = blocks.into_iter().flatten().collect();
-    assert_eq!(actual.len(), expected.len());
-    assert!(
-        actual.iter().zip(expected).all(|(a, b)| a.matches(*b)),
-        "actual {actual:?}, expected {expected:?}"
-    );
+    common::fixture::blocks(view, expected, Matches::matches).await;
 }
 
 async fn check<V: TensorRead>(view: &V, expected: &[V::DType])
@@ -88,61 +67,10 @@ where
     V::DType: Matches,
     FsEntry: TensorFileEntry<V::DType>,
 {
-    check_blocks(view, expected).await;
-
-    for (coord, value) in common::iter_coords(view.shape()).zip(expected) {
-        assert!(view.read_value(&coord).await.unwrap().matches(*value));
-    }
-
-    let (root, dir) = new_dir("matmul_copy").await;
-    let copy: Tensor<FsEntry, V::DType> = Tensor::copy_from(dir.clone(), view, 17).await.unwrap();
-    copy.sync().await.unwrap();
-    drop(copy);
-    drop(dir);
-    let copy = Tensor::<FsEntry, V::DType>::load(common::open_dir(&root).unwrap())
-        .await
-        .unwrap();
-    let copied: Vec<_> = copy
-        .read_blocks()
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap()
-        .into_iter()
-        .flatten()
-        .collect();
-    assert!(
-        copied
-            .iter()
-            .zip(expected)
-            .all(|(a, b)| a.matches(*b) || (*a == V::DType::ZERO && *b == V::DType::ZERO))
-    );
-
-    if matches!(view.layout(), Layout::Sparse { .. }) {
-        let entries: Vec<_> = view
-            .read_sparse_elements_in_order(
-                view.shape()
-                    .iter()
-                    .map(|d| AxisRange::In(0, *d, 1))
-                    .collect(),
-                (0..view.ndim()).collect(),
-            )
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let wanted: Vec<_> = common::iter_coords(view.shape())
-            .zip(expected)
-            .filter(|(_, v)| **v != V::DType::ZERO)
-            .collect();
-        assert_eq!(entries.len(), wanted.len());
-
-        for ((coord, v), (c, e)) in entries.iter().zip(wanted) {
-            assert_eq!(*coord, c);
-            assert!(v.matches(*e));
-        }
-    }
+    common::fixture::consumers(view, expected, Matches::matches, |a, b| {
+        a.matches(b) || (a == V::DType::ZERO && b == V::DType::ZERO)
+    })
+    .await;
 }
 
 macro_rules! parity {
@@ -171,8 +99,8 @@ macro_rules! parity {
                     .unwrap()
                     .into_vec();
                 for (ls, rs) in [(false, false), (false, true), (true, false), (true, true)] {
-                    let a = source(&av, shape![m, k], ls, 31).await;
-                    let b = source(&bv, shape![k, n], rs, 47).await;
+                    let a = source(&av, shape![m as u64, k as u64], ls, 31).await;
+                    let b = source(&bv, shape![k as u64, n as u64], rs, 47).await;
                     let view = a.view().matmul(&b.view()).await.unwrap();
                     // Full persistence/consumer parity belongs to these two shapes;
                     // every shape still checks the numerical block-stream path.
@@ -290,7 +218,7 @@ async fn batches_nested_expressions_and_transforms() {
             .clone()
             .slice(range![
                 AxisRange::At(1),
-                AxisRange::Of(vec![1, 0, 1].into()),
+                AxisRange::Of(vec![1, 0, 1]),
                 AxisRange::In(0, 2, 1)
             ])
             .unwrap(),
@@ -413,8 +341,8 @@ macro_rules! accuracy {
                 let bv: Vec<$t> = (0..k)
                     .map(|i| (1. + (i % 7) as f64 / 1024.) as $t)
                     .collect();
-                let a = source(&av, shape![1, k], false, 31).await;
-                let b = source(&bv, shape![k, 1], false, 17).await;
+                let a = source(&av, shape![1 as u64, k as u64], false, 31).await;
+                let b = source(&bv, shape![k as u64, 1 as u64], false, 17).await;
                 let value = a
                     .view()
                     .matmul(&b.view())
@@ -432,8 +360,8 @@ macro_rules! accuracy {
                 if k == 4097 {
                     // Different request rectangles choose different contraction widths;
                     // compare each consumer to the exact bound, not bitwise equality.
-                    let left = a.view().broadcast(shape![2, k]).unwrap();
-                    let right = b.view().broadcast(shape![k, 33]).unwrap();
+                    let left = a.view().broadcast(shape![2 as u64, k as u64]).unwrap();
+                    let right = b.view().broadcast(shape![k as u64, 33 as u64]).unwrap();
                     let product = left.matmul(&right).await.unwrap();
                     let ordinary: Vec<_> = product
                         .read_blocks()

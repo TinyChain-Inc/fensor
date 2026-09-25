@@ -42,8 +42,9 @@ No whole-result collectors or whole-index compaction APIs.
 - Keep support independent of intermediate values; copying establishes a new
   sparse support boundary. Preserve ordered sparse-read rejection and scalar
   zero-write lifecycle behavior.
-- Shapes/coordinates use `u64` at schema/wire boundaries; runtime axes use
-  `usize`. Centralize conversions. Preserve adapter-owned payload typing.
+- Logical shapes, strides, coordinates, and cardinalities use `u64`; runtime
+  axes and bounded buffer indices use `usize`. Follow the collection rules in
+  `CODE_STYLE.md`. Preserve adapter-owned payload typing.
 - Validate batch sizes and support lengths before evaluation/combination and
   after consumption. Keep errors structured; no debug-only safety checks.
 - Keep counters test-only and isolated from storage synchronization. Use local

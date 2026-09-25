@@ -2,42 +2,42 @@
 
 use std::{iter, sync::Arc};
 
-use ha_ndarray::{Axes, AxisRange, Range, Shape};
 use smallvec::SmallVec;
 
-use crate::schema::{self, TensorViewShape};
-use crate::{Error, PORTABLE_INLINE_RANK, Result, validate};
+use crate::schema::Coord;
+use crate::{Axes, AxisRange, Error, PORTABLE_INLINE_RANK, Range, Result, Shape, schema, validate};
 
 #[derive(Clone)]
 pub(crate) struct CoordinateMap {
-    pub base_offset: i64,
-    pub axes: SmallVec<[AxisContrib; PORTABLE_INLINE_RANK]>,
-    pub shape: TensorViewShape,
+    pub base_offset: i128,
+    // Large descriptors stay heap-backed; their gather metadata is shared.
+    pub axes: Vec<AxisContrib>,
+    pub shape: Shape,
 }
 
 #[derive(Clone)]
 pub(crate) enum AxisContrib {
-    Stride(i64),
+    Stride(i128),
     Gather(GatherOffsets),
-    Broadcast(i64),
+    Broadcast(i128),
 }
 
 /// A separable forward slice: base coordinates are fixed or advance on one axis.
 /// This metadata is rank-sized; unsupported affine reshapes retain logical reads.
 pub(crate) struct StorageSlice {
-    pub(crate) origins: Vec<usize>,
-    pub(crate) axes: Vec<(usize, usize)>,
+    pub(crate) origins: Coord,
+    pub(crate) axes: Vec<(usize, u64)>,
 }
 
 impl StorageSlice {
-    pub(crate) fn identity(shape: &[usize]) -> Self {
+    pub(crate) fn identity(shape: &[u64]) -> Self {
         Self {
-            origins: vec![0; shape.len()],
+            origins: Coord::from_elem(0, shape.len()),
             axes: (0..shape.len()).map(|i| (i, 1)).collect(),
         }
     }
 
-    pub(crate) fn bounds(&self, regions: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
+    pub(crate) fn bounds(&self, regions: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
         for (base, (&origin, &(lo, hi))) in self.origins.iter().zip(regions).enumerate() {
             if !self.axes.iter().any(|(axis, _)| *axis == base) && !(lo..hi).contains(&origin) {
                 return None;
@@ -63,15 +63,15 @@ impl StorageSlice {
 /// Caller-selection-sized metadata. Slices and reversals share the table.
 #[derive(Clone)]
 pub(crate) struct GatherOffsets {
-    offsets: Arc<[i64]>,
+    offsets: Arc<[i128]>,
     start: usize,
     step: usize,
     reversed: bool,
     len: usize,
 }
 
-impl From<Vec<i64>> for GatherOffsets {
-    fn from(offsets: Vec<i64>) -> Self {
+impl From<Vec<i128>> for GatherOffsets {
+    fn from(offsets: Vec<i128>) -> Self {
         Self {
             len: offsets.len(),
             offsets: offsets.into(),
@@ -96,11 +96,11 @@ impl GatherOffsets {
         }
     }
 
-    fn get(&self, index: usize) -> Option<&i64> {
+    fn get(&self, index: usize) -> Option<&i128> {
         self.offsets.get(self.index(index)?)
     }
 
-    fn first(&self) -> Option<&i64> {
+    fn first(&self) -> Option<&i128> {
         self.get(0)
     }
 
@@ -145,19 +145,24 @@ impl GatherOffsets {
 impl CoordinateMap {
     pub(crate) fn storage_slice(
         &self,
-        shape: &[usize],
-        strides: &[usize],
+        shape: &[u64],
+        strides: &[u64],
     ) -> Result<Option<StorageSlice>> {
-        let mut origins = Vec::new();
-        self.resolve_into(&vec![0; self.shape.len()], shape, strides, &mut origins)?;
-        let origins: Vec<_> = origins.into_iter().map(|v| v as usize).collect();
-        let mut axes: Vec<(usize, usize)> = Vec::with_capacity(self.axes.len());
+        let mut origins = Coord::new();
+        self.resolve_into(
+            &Coord::from_elem(0, self.shape.len()),
+            shape,
+            strides,
+            &mut origins,
+        )?;
+
+        let mut axes: Vec<(usize, u64)> = Vec::with_capacity(self.axes.len());
 
         for (contribution, &dim) in self.axes.iter().zip(&self.shape) {
             let AxisContrib::Stride(stride) = contribution else {
                 return Ok(None);
             };
-            let Ok(stride) = usize::try_from(*stride) else {
+            let Ok(stride) = u64::try_from(*stride) else {
                 return Ok(None);
             };
             if stride == 0 {
@@ -181,26 +186,26 @@ impl CoordinateMap {
         Ok(Some(StorageSlice { origins, axes }))
     }
 
-    pub fn identity(shape: Shape, strides: &[usize]) -> Self {
+    pub fn identity(shape: Shape, strides: &[u64]) -> Self {
         Self {
             base_offset: 0,
             axes: strides
                 .iter()
-                .map(|s| AxisContrib::Stride(*s as i64))
+                .map(|s| AxisContrib::Stride(*s as i128))
                 .collect(),
             shape,
         }
     }
 
-    pub fn resolve(&self, coord: &[u64], shape: &[usize], strides: &[usize]) -> Result<Vec<u64>> {
-        let mut out = Vec::new();
+    pub fn resolve(&self, coord: &[u64], shape: &[u64], strides: &[u64]) -> Result<Vec<u64>> {
+        let mut out = Coord::new();
         self.resolve_into(coord, shape, strides, &mut out)?;
-        Ok(out)
+        Ok(out.into_vec())
     }
 
-    pub fn is_identity(&self, shape: &[usize], strides: &[usize]) -> bool {
+    pub fn is_identity(&self, shape: &[u64], strides: &[u64]) -> bool {
         self.base_offset == 0 && self.shape.as_slice() == shape && self.axes.len() == strides.len()
-            && self.axes.iter().zip(strides).all(|(axis,stride)| matches!(axis, AxisContrib::Stride(s) if i64::try_from(*stride).ok() == Some(*s)))
+            && self.axes.iter().zip(strides).all(|(axis,stride)| matches!(axis, AxisContrib::Stride(s) if i128::from(*stride) == *s))
     }
 
     /// Structural affine description; gather tables deliberately retain cursor mapping.
@@ -209,15 +214,15 @@ impl CoordinateMap {
             return Err(Error::InvalidCoord("mapping rank mismatch".into()));
         }
 
-        let mut offset = self.base_offset as i128;
+        let mut offset = self.base_offset;
         let mut strides = Vec::with_capacity(self.axes.len());
 
         for axis in &self.axes {
             match axis {
-                AxisContrib::Stride(stride) => strides.push(*stride as i128),
+                AxisContrib::Stride(stride) => strides.push(*stride),
                 AxisContrib::Broadcast(constant) => {
                     offset = offset
-                        .checked_add(*constant as i128)
+                        .checked_add(*constant)
                         .ok_or_else(|| Error::InvalidCoord("mapping offset overflow".into()))?;
                     strides.push(0);
                 }
@@ -231,44 +236,35 @@ impl CoordinateMap {
     pub fn resolve_into(
         &self,
         coord: &[u64],
-        shape: &[usize],
-        strides: &[usize],
-        out: &mut Vec<u64>,
+        shape: &[u64],
+        strides: &[u64],
+        out: &mut Coord,
     ) -> Result<()> {
         validate::validate_coord(&self.shape, coord)?;
         let offset = u64::try_from(self.flat_offset(coord)?)
             .map_err(|_| Error::InvalidCoord("negative linear offset".into()))?;
-        let size = shape
-            .iter()
-            .try_fold(1u64, |n, d| n.checked_mul(*d as u64))
-            .ok_or_else(|| Error::InvalidCoord("mapping size overflow".into()))?;
+        let size = crate::schema::checked_product(shape)?;
         if offset >= size || strides.len() != shape.len() || strides.contains(&0) {
             return Err(Error::InvalidCoord("mapped offset out of bounds".into()));
         }
         out.clear();
-        out.extend(
-            strides
-                .iter()
-                .zip(shape)
-                .map(|(s, d)| (offset / *s as u64) % *d as u64),
-        );
+        out.extend(strides.iter().zip(shape).map(|(s, d)| (offset / *s) % *d));
         Ok(())
     }
 
-    pub fn flat_offset(&self, coord: &[u64]) -> Result<i64> {
+    pub fn flat_offset(&self, coord: &[u64]) -> Result<i128> {
         if coord.len() != self.axes.len() {
             return Err(Error::InvalidCoord(
                 "incorrect number of coordinates".to_string(),
             ));
         }
 
-        let mut k: i64 = self.base_offset;
+        let mut k: i128 = self.base_offset;
 
         for (c, axis) in coord.iter().zip(self.axes.iter()) {
             let delta = match axis {
-                AxisContrib::Stride(s) => i64::try_from(*c)
-                    .ok()
-                    .and_then(|c| c.checked_mul(*s))
+                AxisContrib::Stride(s) => i128::from(*c)
+                    .checked_mul(*s)
                     .ok_or_else(|| Error::InvalidCoord("mapping offset overflow".into()))?,
                 AxisContrib::Broadcast(constant) => *constant,
                 AxisContrib::Gather(offsets) => {
@@ -299,14 +295,14 @@ impl CoordinateMap {
             .iter()
             .zip(expected.iter())
             .all(|pair| match pair {
-                (AxisContrib::Stride(s), e) => *s >= 0 && *s as usize == *e,
+                (AxisContrib::Stride(s), e) => *s == i128::from(*e),
                 _ => false,
             })
     }
 
     pub(crate) fn reshape(self, shape: Shape) -> Result<Self> {
-        let old_size: usize = self.shape.iter().product();
-        let new_size: usize = shape.iter().product();
+        let old_size = schema::checked_product(&self.shape)?;
+        let new_size = schema::checked_product(&shape)?;
         if old_size != new_size {
             return Err(Error::InvalidLayout(
                 "reshape requires an equal number of elements".to_string(),
@@ -325,13 +321,15 @@ impl CoordinateMap {
             base_offset: self.base_offset,
             axes: strides
                 .iter()
-                .map(|&s| AxisContrib::Stride(s as i64))
+                .map(|&s| AxisContrib::Stride(s as i128))
                 .collect(),
             shape,
         })
     }
 
-    pub(crate) fn broadcast(self, shape: TensorViewShape) -> Result<Self> {
+    pub(crate) fn broadcast(self, shape: Shape) -> Result<Self> {
+        schema::validate_shape_dims(&shape)?;
+        schema::checked_product(&shape)?;
         if shape.len() < self.shape.len() {
             return Err(Error::InvalidLayout(format!(
                 "cannot broadcast shape {:?} to a lower rank shape {:?}",
@@ -340,7 +338,7 @@ impl CoordinateMap {
         }
 
         let rank_diff = shape.len() - self.shape.len();
-        let mut axes = SmallVec::with_capacity(shape.len());
+        let mut axes = Vec::with_capacity(shape.len());
         axes.extend(iter::repeat_n(AxisContrib::Broadcast(0), rank_diff));
 
         for (axis_index, (&old_dim, &new_dim)) in
@@ -352,9 +350,9 @@ impl CoordinateMap {
                 )));
             }
 
-            let axis_contrib = if old_dim == 1usize {
+            let axis_contrib = if old_dim == 1u64 {
                 AxisContrib::Broadcast(match &self.axes[axis_index] {
-                    AxisContrib::Stride(_) => 0i64,
+                    AxisContrib::Stride(_) => 0i128,
                     AxisContrib::Broadcast(c) => *c,
                     AxisContrib::Gather(g) => *g.first().ok_or_else(|| {
                         Error::InvalidLayout(format!("axis {axis_index} has an empty gather table"))
@@ -381,7 +379,7 @@ impl CoordinateMap {
             ));
         }
 
-        let mut new_axes = SmallVec::with_capacity(self.axes.len());
+        let mut new_axes = Vec::with_capacity(self.axes.len());
         let mut new_base_offset = self.base_offset;
         let mut new_shape = Shape::with_capacity(self.axes.len());
 
@@ -390,18 +388,22 @@ impl CoordinateMap {
 
             match bound {
                 AxisRange::At(i) => {
-                    new_base_offset += slice_bound_at(current, dim, *i, axis_index)?;
+                    new_base_offset = new_base_offset
+                        .checked_add(slice_bound_at(current, dim, *i, axis_index)?)
+                        .ok_or_else(mapping_overflow)?;
                 }
                 AxisRange::In(start, stop, step) => {
                     let (offset_delta, axis, extent) =
                         slice_bound_in(current, dim, *start, *stop, *step, axis_index)?;
-                    new_base_offset += offset_delta;
+                    new_base_offset = new_base_offset
+                        .checked_add(offset_delta)
+                        .ok_or_else(mapping_overflow)?;
                     new_axes.push(axis);
                     new_shape.push(extent);
                 }
                 AxisRange::Of(indices) => {
                     new_axes.push(slice_bound_of(current, dim, indices, axis_index)?);
-                    new_shape.push(indices.len());
+                    new_shape.push(indices.len() as u64);
                 }
             }
         }
@@ -428,8 +430,9 @@ impl CoordinateMap {
             ));
         }
 
-        let mut seen = vec![false; self.axes.len()];
-        let mut axes = SmallVec::with_capacity(self.axes.len());
+        let mut seen: SmallVec<[bool; PORTABLE_INLINE_RANK]> =
+            SmallVec::from_elem(false, self.axes.len());
+        let mut axes = Vec::with_capacity(self.axes.len());
         let mut shape = Shape::with_capacity(self.axes.len());
 
         for permuted_axis in permutation {
@@ -460,13 +463,16 @@ impl CoordinateMap {
         }
 
         let dim = self.shape[axis];
-        let (offset_delta, new_axis) = flip_axis_contrib(&self.axes[axis], dim);
+        let (offset_delta, new_axis) = flip_axis_contrib(&self.axes[axis], dim)?;
 
         let mut axes = self.axes;
         axes[axis] = new_axis;
 
         Ok(Self {
-            base_offset: self.base_offset + offset_delta,
+            base_offset: self
+                .base_offset
+                .checked_add(offset_delta)
+                .ok_or_else(mapping_overflow)?,
             axes,
             shape: self.shape,
         })
@@ -486,7 +492,7 @@ impl CoordinateMap {
             ));
         }
 
-        let mut remove = vec![false; ndim];
+        let mut remove: SmallVec<[bool; PORTABLE_INLINE_RANK]> = SmallVec::from_elem(false, ndim);
 
         for &axis in axes.iter() {
             if axis >= ndim {
@@ -509,12 +515,14 @@ impl CoordinateMap {
         }
 
         let mut base_offset = self.base_offset;
-        let mut axes_out = SmallVec::with_capacity(ndim - axes.len());
+        let mut axes_out = Vec::with_capacity(ndim - axes.len());
         let mut shape_out = Shape::with_capacity(ndim - axes.len());
 
         for (i, &removed) in remove.iter().enumerate().take(ndim) {
             if removed {
-                base_offset += slice_bound_at(&self.axes[i], 1, 0, i)?;
+                base_offset = base_offset
+                    .checked_add(slice_bound_at(&self.axes[i], 1, 0, i)?)
+                    .ok_or_else(mapping_overflow)?;
             } else {
                 axes_out.push(self.axes[i].clone());
                 shape_out.push(self.shape[i]);
@@ -537,7 +545,8 @@ impl CoordinateMap {
             ));
         }
 
-        let mut insert_before = vec![false; old_ndim];
+        let mut insert_before: SmallVec<[bool; PORTABLE_INLINE_RANK]> =
+            SmallVec::from_elem(false, old_ndim);
 
         for &axis in axes.iter() {
             if axis >= old_ndim {
@@ -573,11 +582,11 @@ impl CoordinateMap {
 
         let contiguous = schema::contiguous_strides(&shape_out)?;
 
-        let axes_out: SmallVec<[AxisContrib; PORTABLE_INLINE_RANK]> = layout
+        let axes_out: Vec<AxisContrib> = layout
             .iter()
             .enumerate()
             .map(|(pos, slot)| match slot {
-                None => AxisContrib::Stride(contiguous[pos] as i64),
+                None => AxisContrib::Stride(contiguous[pos] as i128),
                 Some(i) => self.axes[*i].clone(),
             })
             .collect();
@@ -590,10 +599,8 @@ impl CoordinateMap {
     }
 }
 
-pub fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Vec<usize>> {
-    let axes: Vec<usize> = permutation
-        .map(|axes| axes.into_iter().collect())
-        .unwrap_or_else(|| (0..ndim).rev().collect());
+pub fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Axes> {
+    let axes: Axes = permutation.unwrap_or_else(|| (0..ndim).rev().collect());
 
     if axes.len() != ndim {
         return Err(Error::InvalidLayout(
@@ -604,36 +611,37 @@ pub fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Vec
     Ok(axes)
 }
 
-fn slice_bound_at(
-    current: &AxisContrib,
-    dim: usize,
-    index: usize,
-    axis_index: usize,
-) -> Result<i64> {
+fn slice_bound_at(current: &AxisContrib, dim: u64, index: u64, axis_index: usize) -> Result<i128> {
     if index >= dim {
         return Err(Error::InvalidLayout(format!(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
     match current {
-        AxisContrib::Stride(s) => Ok((index as i64) * s),
+        AxisContrib::Stride(s) => (index as i128).checked_mul(*s).ok_or_else(mapping_overflow),
         AxisContrib::Broadcast(c) => Ok(*c),
-        AxisContrib::Gather(g) => g.get(index).copied().ok_or_else(|| {
-            Error::InvalidLayout(format!(
-                "slice bound at axis {axis_index} out of bounds for gather"
-            ))
-        }),
+        AxisContrib::Gather(g) => g
+            .get(
+                usize::try_from(index)
+                    .map_err(|_| Error::InvalidCoord("gather index exceeds usize".into()))?,
+            )
+            .copied()
+            .ok_or_else(|| {
+                Error::InvalidLayout(format!(
+                    "slice bound at axis {axis_index} out of bounds for gather"
+                ))
+            }),
     }
 }
 
 fn slice_bound_in(
     current: &AxisContrib,
-    dim: usize,
-    start: usize,
-    stop: usize,
-    step: usize,
+    dim: u64,
+    start: u64,
+    stop: u64,
+    step: u64,
     axis_index: usize,
-) -> Result<(i64, AxisContrib, usize)> {
+) -> Result<(i128, AxisContrib, u64)> {
     if step == 0 || start > stop || stop > dim {
         return Err(Error::InvalidLayout(format!(
             "slice bound at axis {axis_index} is out of bounds"
@@ -646,9 +654,26 @@ fn slice_bound_in(
     };
 
     let (offset_delta, axis) = match current {
-        AxisContrib::Stride(s) => ((start as i64) * s, AxisContrib::Stride(s * (step as i64))),
+        AxisContrib::Stride(s) => (
+            (start as i128)
+                .checked_mul(*s)
+                .ok_or_else(mapping_overflow)?,
+            AxisContrib::Stride(s.checked_mul(step as i128).ok_or_else(mapping_overflow)?),
+        ),
         AxisContrib::Broadcast(c) => (0, AxisContrib::Broadcast(*c)),
-        AxisContrib::Gather(g) => (0, AxisContrib::Gather(g.slice(start, step, extent)?)),
+        AxisContrib::Gather(g) => (
+            0,
+            AxisContrib::Gather(
+                g.slice(
+                    usize::try_from(start)
+                        .map_err(|_| Error::InvalidLayout("gather start exceeds usize".into()))?,
+                    usize::try_from(step)
+                        .map_err(|_| Error::InvalidLayout("gather step exceeds usize".into()))?,
+                    usize::try_from(extent)
+                        .map_err(|_| Error::InvalidLayout("gather extent exceeds usize".into()))?,
+                )?,
+            ),
+        ),
     };
 
     Ok((offset_delta, axis, extent))
@@ -656,8 +681,8 @@ fn slice_bound_in(
 
 fn slice_bound_of(
     current: &AxisContrib,
-    dim: usize,
-    indices: &[usize],
+    dim: u64,
+    indices: &[u64],
     axis_index: usize,
 ) -> Result<AxisContrib> {
     if indices.iter().any(|index| *index >= dim) {
@@ -669,36 +694,73 @@ fn slice_bound_of(
         AxisContrib::Broadcast(c) => Ok(AxisContrib::Broadcast(*c)),
         AxisContrib::Stride(s) => {
             // A new explicit selection may allocate one offset per supplied index.
-            let offsets: Vec<i64> = indices.iter().map(|idx| (*idx as i64) * s).collect();
+            let offsets: Vec<i128> = indices
+                .iter()
+                .map(|idx| (*idx as i128).checked_mul(*s).ok_or_else(mapping_overflow))
+                .collect::<Result<_>>()?;
             Ok(AxisContrib::Gather(offsets.into()))
         }
         AxisContrib::Gather(g) => {
-            let offsets = indices
-                .iter()
-                .map(|idx| {
-                    g.get(*idx).copied().ok_or_else(|| {
-                        Error::InvalidLayout(format!(
-                            "slice bound at axis {axis_index} out of bounds for gather"
-                        ))
+            let offsets =
+                indices
+                    .iter()
+                    .map(|idx| {
+                        g.get(usize::try_from(*idx).map_err(|_| {
+                            Error::InvalidCoord("gather index exceeds usize".into())
+                        })?)
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::InvalidLayout(format!(
+                                "slice bound at axis {axis_index} out of bounds for gather"
+                            ))
+                        })
                     })
-                })
-                .collect::<Result<Vec<i64>>>()?;
+                    .collect::<Result<Vec<i128>>>()?;
             Ok(AxisContrib::Gather(offsets.into()))
         }
     }
 }
 
-fn flip_axis_contrib(current: &AxisContrib, dim: usize) -> (i64, AxisContrib) {
-    match current {
-        AxisContrib::Stride(s) => (((dim as i64) - 1) * s, AxisContrib::Stride(-s)),
+fn mapping_overflow() -> Error {
+    Error::InvalidLayout("signed logical mapping overflow".into())
+}
+
+fn flip_axis_contrib(current: &AxisContrib, dim: u64) -> Result<(i128, AxisContrib)> {
+    Ok(match current {
+        AxisContrib::Stride(s) => (
+            (i128::from(dim) - 1)
+                .checked_mul(*s)
+                .ok_or_else(mapping_overflow)?,
+            AxisContrib::Stride(s.checked_neg().ok_or_else(mapping_overflow)?),
+        ),
         AxisContrib::Broadcast(c) => (0, AxisContrib::Broadcast(*c)),
         AxisContrib::Gather(g) => (0, AxisContrib::Gather(g.flipped())),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_mapping_overflow_is_a_structured_error() {
+        let map = CoordinateMap {
+            base_offset: i128::MAX,
+            axes: vec![AxisContrib::Stride(i128::MAX)],
+            shape: smallvec::smallvec![3],
+        };
+        assert!(matches!(map.flat_offset(&[2]), Err(Error::InvalidCoord(_))));
+        assert!(matches!(map.clone().flip(0), Err(Error::InvalidLayout(_))));
+        assert!(matches!(
+            map.clone()
+                .slice(smallvec::smallvec![AxisRange::In(0, 3, 2)]),
+            Err(Error::InvalidLayout(_))
+        ));
+        assert!(matches!(
+            map.slice(smallvec::smallvec![AxisRange::Of(vec![2])]),
+            Err(Error::InvalidLayout(_))
+        ));
+    }
 
     #[test]
     fn gather_transforms_share_the_original_table() {
@@ -750,7 +812,7 @@ mod compact_tests {
                 .unwrap()
                 .is_identity(&shape, &strides)
         );
-        let mut out = Vec::with_capacity(2);
+        let mut out = Coord::with_capacity(2);
         let ptr = out.as_ptr();
 
         for row in 0..3 {
@@ -758,7 +820,7 @@ mod compact_tests {
                 flipped
                     .resolve_into(&[row, col], &shape, &strides, &mut out)
                     .unwrap();
-                assert_eq!(out, vec![row, 3 - col]);
+                assert_eq!(out.as_slice(), &[row, 3 - col]);
                 assert_eq!(out.as_ptr(), ptr);
             }
         }
@@ -769,7 +831,7 @@ mod compact_tests {
             bad.resolve_into(&[0, 0], &shape, &strides, &mut out)
                 .is_err()
         );
-        bad.base_offset = i64::MAX;
+        bad.base_offset = i128::MAX;
         assert!(
             bad.resolve_into(&[2, 3], &shape, &strides, &mut out)
                 .is_err()

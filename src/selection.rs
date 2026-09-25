@@ -1,13 +1,14 @@
 //! Lazy conditional selection over three expression sources.
 
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{ArrayAccess, Axes, NDArrayWhere, Range, Shape};
+use ha_ndarray::{ArrayAccess, NDArrayWhere};
 
 use crate::expression::{self, Batch, Expression};
 use crate::request::{self, BatchRequest};
 use crate::{
-    BoxFuture, Error, Layout, Result, SparseElementStream, TensorElement, TensorGeometry,
-    TensorRead, TensorTransform, TensorViewSemantics, TensorWhere, ValueBlockStream,
+    Axes, BoxFuture, Error, Layout, Range, Result, Shape, SparseElementStream, TensorElement,
+    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, TensorWhere,
+    ValueBlockStream,
 };
 
 /// Read-only selection retaining support from the condition and both branches.
@@ -107,7 +108,7 @@ where
         self.then.dtype()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         self.condition.shape()
     }
 
@@ -148,7 +149,7 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn preferred_requests(&self, shape: &[usize]) -> Result<Option<expression::RequestIterator>> {
+    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
         if let Some(requests) = self.condition.preferred_requests(shape)? {
             return Ok(Some(requests));
         }

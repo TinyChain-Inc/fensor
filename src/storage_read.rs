@@ -1,13 +1,14 @@
 //! Bounded storage plans. Runs preserve request order without mapped coordinate lists.
-//! Every emitted run covers at least one requested element, so both collections
+//! Every run covers requested elements, so groups and the total run count
 //! are bounded by 4096. Affine progressions validate endpoints before any I/O;
 //! coordinate carries and block/key boundaries delimit constant-stride runs.
 //! Coalescing is descriptive only: it neither deduplicates outputs nor caches data.
 
-use crate::expression::MAX_BATCH_ELEMENTS;
+use std::collections::BTreeMap;
+
 use crate::mapping::CoordinateMap;
-use crate::request::{Axis, BatchRequest, RequestKind};
-use crate::schema::BlockPosition;
+use crate::request::{BatchRequest, RequestKind, decode_flat, linear_segments};
+use crate::schema::{BlockPosition, Coord};
 use crate::{Error, Result};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -49,19 +50,17 @@ impl Run {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct PlannedRun {
-    pub block: u64,
-    pub key: Option<[u64; 2]>,
-    pub run: Run,
-}
+// Each logical address owns only its requested runs. Sparse keys include the
+// logical block ID; dense addresses use [0, block]. Physical aliases merge
+// after one lookup per sparse key.
+pub(crate) type LogicalGroups = BTreeMap<[u64; 2], Vec<Run>>;
 
 pub(crate) struct StorageShape<'a> {
-    pub shape: &'a [usize],
-    pub strides: &'a [usize],
-    pub block_shape: &'a [usize],
-    pub block_strides: &'a [usize],
-    pub grid_strides: &'a [usize],
+    pub shape: &'a [u64],
+    pub strides: &'a [u64],
+    pub block_shape: &'a [u64],
+    pub block_strides: &'a [u64],
+    pub grid_strides: &'a [u64],
     pub sparse_axis: Option<usize>,
 }
 
@@ -74,28 +73,30 @@ struct Progression {
 
 // Two rank-sized buffers, reused across all progression boundaries in a request.
 struct Scratch {
-    coord: Vec<usize>,
-    delta: Vec<usize>,
+    coord: Coord,
+    delta: Coord,
 }
 
-// Shared address arithmetic for read planning and scalar/copy writes.
+// Shared address arithmetic for read planning and scalar/copy writes. Coordinates
+// and schema cardinality are validated by callers. The block offset is below the
+// validated storage capacity (at most 4096), so only that offset narrows to usize.
 pub(crate) fn block_position(
-    coord: impl Iterator<Item = usize>,
-    block_shape: &[usize],
-    block_strides: &[usize],
-    grid_strides: &[usize],
+    coord: impl Iterator<Item = u64>,
+    block_shape: &[u64],
+    block_strides: &[u64],
+    grid_strides: &[u64],
 ) -> BlockPosition {
     let mut block_id = 0;
     let mut offset_in_block = 0;
 
     for (i, c) in coord.enumerate() {
-        block_id += (c / block_shape[i]) as u64 * grid_strides[i] as u64;
+        block_id += (c / block_shape[i]) * grid_strides[i];
         offset_in_block += (c % block_shape[i]) * block_strides[i];
     }
 
     BlockPosition {
         block_id,
-        offset_in_block,
+        offset_in_block: offset_in_block as usize,
     }
 }
 
@@ -103,19 +104,17 @@ fn invalid() -> Error {
     Error::InvalidLayout("invalid storage run bounds or arithmetic overflow".into())
 }
 
-fn push_run(runs: &mut Vec<PlannedRun>, next: PlannedRun) {
+fn push_run(runs: &mut Vec<Run>, next: Run) {
     if let Some(previous) = runs.last_mut() {
-        let a = &mut previous.run;
-        let b = &next.run;
+        let a = previous;
+        let b = &next;
         let stride = if a.len == 1 {
             b.offset as i64 - a.offset as i64
         } else {
             a.stride
         };
 
-        if previous.block == next.block
-            && previous.key == next.key
-            && a.output + a.len == b.output
+        if a.output + a.len == b.output
             && (b.len == 1 || b.stride == stride)
             && a.offset as i128 + stride as i128 * a.len as i128 == b.offset as i128
         {
@@ -133,7 +132,7 @@ impl StorageShape<'_> {
         &self,
         request: &BatchRequest,
         mapping: Option<&CoordinateMap>,
-    ) -> Result<Vec<PlannedRun>> {
+    ) -> Result<LogicalGroups> {
         let shape = mapping.map(|m| m.shape.as_slice()).unwrap_or(self.shape);
         request.validate(shape)?;
 
@@ -146,21 +145,32 @@ impl StorageShape<'_> {
             }
         };
 
-        let mut runs = Vec::new();
+        let mut groups = LogicalGroups::new();
+        let block_len = self.block_shape.iter().product::<u64>() as usize;
+        let mut end = 0;
+        let mut emit = |key, run: Run| {
+            run.validate(block_len, request.len())?;
+            if run.output != end {
+                return Err(invalid());
+            }
+            end += run.len;
+            push_run(groups.entry(key).or_default(), run);
+            Ok(())
+        };
         // Rank-sized scratch is reused at progression/block boundaries.
         let mut scratch = Scratch {
-            coord: vec![0; self.shape.len()],
-            delta: vec![0; self.shape.len()],
+            coord: Coord::from_elem(0, self.shape.len()),
+            delta: Coord::from_elem(0, self.shape.len()),
         };
 
         if let Some((offset, strides)) = affine {
             progressions(request, shape, offset, &strides, |progression| {
-                self.split(&mut runs, &mut scratch, progression)
+                self.split(&mut emit, &mut scratch, progression)
             })?;
         } else {
             let mut cursor = request.cursor(shape)?;
-            let mut coord = Vec::new();
-            let mut mapped = Vec::new();
+            let mut coord = Coord::new();
+            let mut mapped = Coord::new();
             let mut output = 0;
 
             while cursor.next_into(&mut coord) {
@@ -173,52 +183,33 @@ impl StorageShape<'_> {
                     &coord
                 };
 
-                for (out, c) in scratch.coord.iter_mut().zip(coord) {
-                    *out = *c as usize;
-                }
-
-                let (block, offset) = self.position(&scratch.coord);
-                push_run(
-                    &mut runs,
-                    PlannedRun {
-                        block,
-                        key: self.key(&scratch.coord, block),
-                        run: Run {
-                            output,
-                            offset,
-                            stride: 0,
-                            len: 1,
-                        },
+                let (block, offset) = self.position(coord);
+                emit(
+                    self.key(coord, block),
+                    Run {
+                        output,
+                        offset,
+                        stride: 0,
+                        len: 1,
                     },
-                );
+                )?;
                 output += 1;
             }
         }
 
-        let block_len = self.block_shape.iter().product();
-        let mut end = 0;
-
-        for planned in &runs {
-            planned.run.validate(block_len, request.len())?;
-            if planned.run.output != end {
-                return Err(invalid());
-            }
-            end += planned.run.len;
-        }
-
-        if end != request.len() || runs.len() > MAX_BATCH_ELEMENTS {
+        if end != request.len() {
             return Err(invalid());
         }
 
         #[cfg(test)]
         crate::read_metrics::record(|m| {
-            m.runs += runs.len();
+            m.runs += groups.values().map(Vec::len).sum::<usize>();
             m.requested += request.len();
         });
-        Ok(runs)
+        Ok(groups)
     }
 
-    fn position(&self, coord: &[usize]) -> (u64, usize) {
+    fn position(&self, coord: &[u64]) -> (u64, usize) {
         let position = block_position(
             coord.iter().copied(),
             self.block_shape,
@@ -228,13 +219,13 @@ impl StorageShape<'_> {
         (position.block_id, position.offset_in_block)
     }
 
-    fn key(&self, coord: &[usize], block: u64) -> Option<[u64; 2]> {
-        self.sparse_axis.map(|axis| [coord[axis] as u64, block])
+    fn key(&self, coord: &[u64], block: u64) -> [u64; 2] {
+        [self.sparse_axis.map_or(0, |axis| coord[axis]), block]
     }
 
     fn split(
         &self,
-        runs: &mut Vec<PlannedRun>,
+        emit: &mut impl FnMut([u64; 2], Run) -> Result<()>,
         scratch: &mut Scratch,
         progression: Progression,
     ) -> Result<()> {
@@ -267,7 +258,7 @@ impl StorageShape<'_> {
         let magnitude = if len == 1 {
             0
         } else {
-            usize::try_from(step.checked_abs().ok_or_else(invalid)?).map_err(|_| invalid())?
+            u64::try_from(step.checked_abs().ok_or_else(invalid)?).map_err(|_| invalid())?
         };
         // Mixed-radix step digits are constant until a carry/borrow. The block
         // boundary limits also prevent coordinate carries inside an emitted run.
@@ -280,20 +271,20 @@ impl StorageShape<'_> {
         while done < len {
             // Endpoints were checked in widened arithmetic. All intermediate
             // offsets lie between them; native division is safe at boundaries.
-            let flat = usize::try_from(start + done as i128 * step).map_err(|_| invalid())?;
+            let flat = u64::try_from(start + done as i128 * step).map_err(|_| invalid())?;
 
             #[cfg(test)]
             crate::read_metrics::record(|m| m.boundary_decodes += 1);
             let mut count = len - done;
             let mut stride = 0i128;
 
-            for (i, c) in coord.iter_mut().enumerate() {
-                *c = (flat / self.strides[i]) % self.shape[i];
+            decode_flat(flat, self.shape, coord)?;
+            for (i, c) in coord.iter().enumerate() {
                 let low = *c / self.block_shape[i] * self.block_shape[i];
                 let high = low + (self.block_shape[i] - 1).min(self.shape[i] - 1 - low);
                 let room = if step < 0 { *c - low } else { high - *c };
                 if let Some(steps) = room.checked_div(delta[i]) {
-                    count = count.min(steps + 1);
+                    count = (count as u64).min(steps.saturating_add(1)) as usize;
                 }
 
                 if self.sparse_axis == Some(i) && delta[i] != 0 {
@@ -308,19 +299,15 @@ impl StorageShape<'_> {
             } else {
                 i64::try_from(stride).map_err(|_| invalid())?
             };
-            push_run(
-                runs,
-                PlannedRun {
-                    block,
-                    key: self.key(coord, block),
-                    run: Run {
-                        output: output + done,
-                        offset,
-                        stride,
-                        len: count,
-                    },
+            emit(
+                self.key(coord, block),
+                Run {
+                    output: output + done,
+                    offset,
+                    stride,
+                    len: count,
                 },
-            );
+            )?;
             done += count;
         }
 
@@ -332,7 +319,7 @@ impl StorageShape<'_> {
 // Selected-axis scans use caller-bounded metadata and preserve duplicates/order.
 fn progressions(
     request: &BatchRequest,
-    shape: &[usize],
+    shape: &[u64],
     offset: i128,
     strides: &[i128],
     mut emit: impl FnMut(Progression) -> Result<()>,
@@ -351,7 +338,7 @@ fn progressions(
     }
 
     let rank = shape.len();
-    let mut coord = vec![0u64; rank];
+    let mut coord = Coord::from_elem(0, rank);
     let flat = |coord: &[u64]| {
         coord.iter().zip(strides).try_fold(offset, |n, (c, s)| {
             s.checked_mul(*c as i128)
@@ -362,24 +349,14 @@ fn progressions(
     match request.kind() {
         RequestKind::Linear { start } => {
             let varying = shape.iter().rposition(|d| *d > 1).unwrap_or(0);
-            let mut done = 0;
-
-            while done < request.len() {
-                let mut index = start + done;
-
-                for (c, d) in coord.iter_mut().zip(shape).rev() {
-                    *c = (index % d) as u64;
-                    index /= d;
-                }
-
-                let len = (request.len() - done).min(shape[varying] - coord[varying] as usize);
+            for (index, output, len) in linear_segments(*start, request.len(), shape[varying])? {
+                decode_flat(index, shape, &mut coord)?;
                 emit(Progression {
-                    output: done,
+                    output,
                     start: flat(&coord)?,
                     step: strides[varying],
                     len,
                 })?;
-                done += len;
             }
         }
         RequestKind::Rectangles(rectangles) => {
@@ -399,17 +376,17 @@ fn progressions(
                 }
 
                 let last = &axes[varying];
-                let segments = axis_segments(last);
 
-                for prefix in 0..rect.len() / last.len() {
+                for prefix in 0..rect.len() / last.len() as usize {
                     let mut index = prefix;
 
                     for (c, axis) in coord[..varying].iter_mut().zip(&axes[..varying]).rev() {
-                        *c = axis.at(index % axis.len());
-                        index /= axis.len();
+                        *c = axis.at(index as u64 % axis.len());
+                        index /= axis.len() as usize;
                     }
 
-                    for &(start, step, len) in &segments {
+                    for (start, step, len) in last.segments() {
+                        let len = len as usize;
                         coord[varying] = start;
                         emit(Progression {
                             output,
@@ -428,51 +405,30 @@ fn progressions(
     Ok(())
 }
 
-fn axis_segments(axis: &Axis) -> Vec<(u64, i128, usize)> {
-    match axis {
-        Axis::Span { start, step, len } => vec![(*start as u64, *step as i128, *len)],
-        Axis::Selected(values) => {
-            let mut segments = Vec::new();
-            let mut i = 0;
-
-            while i < values.len() {
-                let step = values
-                    .get(i + 1)
-                    .map(|v| *v as i128 - values[i] as i128)
-                    .unwrap_or(0);
-                let mut end = i + 1;
-
-                while end < values.len() && values[end] as i128 - values[end - 1] as i128 == step {
-                    end += 1;
-                }
-                segments.push((values[i], step, end - i));
-                i = end;
-            }
-            segments
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use ha_ndarray::{AxisRange, axes, range, shape};
+    use ha_ndarray::{axes, range, shape};
+
+    use crate::AxisRange;
 
     use super::*;
     use crate::mapping::AxisContrib;
-    use crate::request::Cartesian;
+    use crate::request::{Axis, Cartesian};
     use crate::schema::contiguous_strides;
 
     fn compare(storage: &StorageShape<'_>, map: &CoordinateMap, request: BatchRequest) {
         let planned = storage.plan(&request, Some(map)).unwrap();
-        let mut actual = Vec::new();
+        let mut actual = vec![(0, [0, 0], 0); request.len()];
 
-        for p in planned {
-            for i in 0..p.run.len {
-                actual.push((
-                    p.block,
-                    p.key,
-                    (p.run.offset as i128 + i as i128 * p.run.stride as i128) as usize,
-                ));
+        for (key, runs) in planned {
+            for run in runs {
+                for i in 0..run.len {
+                    actual[run.output + i] = (
+                        key[1],
+                        key,
+                        (run.offset as i128 + i as i128 * run.stride as i128) as usize,
+                    );
+                }
             }
         }
 
@@ -482,7 +438,7 @@ mod tests {
             .iter()
             .map(|coord| {
                 let base = map.resolve(coord, storage.shape, storage.strides).unwrap();
-                let base: Vec<_> = base.into_iter().map(|c| c as usize).collect();
+                let base: Vec<_> = base.into_iter().collect();
                 let (id, offset) = storage.position(&base);
                 (id, storage.key(&base, id), offset)
             })
@@ -527,7 +483,7 @@ mod tests {
             identity
                 .clone()
                 .slice(range![
-                    AxisRange::Of(vec![2, 0, 2].into()),
+                    AxisRange::Of(vec![2, 0, 2]),
                     AxisRange::In(0, 5, 1),
                     AxisRange::In(0, 7, 1)
                 ])
@@ -556,20 +512,20 @@ mod tests {
                 };
 
                 for map in &maps {
-                    let size = map.shape.iter().product::<usize>();
+                    let size = map.shape.iter().product::<u64>();
 
                     for start in 0..size {
                         compare(
                             &storage,
                             map,
-                            BatchRequest::linear(start, (size - start).min(13)).unwrap(),
+                            BatchRequest::linear(start, (size - start).min(13) as usize).unwrap(),
                         );
                     }
 
                     let axes = map
                         .shape
                         .iter()
-                        .map(|d| Axis::Selected(vec![(*d - 1) as u64, 0, 0]))
+                        .map(|d| Axis::Selected(vec![(*d - 1), 0, 0]))
                         .collect();
                     compare(
                         &storage,
@@ -604,8 +560,8 @@ mod tests {
 
                 let map = CoordinateMap {
                     base_offset: start,
-                    axes: vec![AxisContrib::Stride(step)].into(),
-                    shape: shape![len as usize],
+                    axes: vec![AxisContrib::Stride(step)],
+                    shape: shape![len as usize as u64],
                 };
                 compare(
                     &storage,
@@ -646,11 +602,12 @@ mod tests {
                 .scope(Default::default(), async {
                     let plan = storage
                         .plan(
-                            &BatchRequest::linear(0, map.shape.iter().product()).unwrap(),
+                            &BatchRequest::linear(0, map.shape.iter().product::<u64>() as usize)
+                                .unwrap(),
                             Some(&map),
                         )
                         .unwrap();
-                    assert_eq!(plan.len(), expected_runs);
+                    assert_eq!(plan.values().map(Vec::len).sum::<usize>(), expected_runs);
                     crate::read_metrics::CURRENT.with(|m| {
                         let m = m.borrow();
                         assert_eq!(m.coordinate_resolutions, 0);
@@ -712,10 +669,10 @@ mod tests {
             sparse_axis: None,
         };
 
-        for (offset, stride) in [(64, 1), (-1, 1), (1, -1), (i64::MAX, i64::MAX)] {
+        for (offset, stride) in [(64, 1), (-1, 1), (1, -1), (i128::MAX, i128::MAX)] {
             let map = CoordinateMap {
                 base_offset: offset,
-                axes: vec![AxisContrib::Stride(stride)].into(),
+                axes: vec![AxisContrib::Stride(stride)],
                 shape: shape![3],
             };
             assert!(

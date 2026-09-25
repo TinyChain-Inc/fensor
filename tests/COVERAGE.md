@@ -1,13 +1,16 @@
 # Regression ownership
 
 Keep broad numerical cases separate from expensive full-consumer parity. Shared
-filesystem scaffolding lives in `common.rs`, imported directly by unit tests.
+filesystem scaffolding lives in `common/mod.rs`, imported directly by unit tests.
 Special codec/error/independent-adapter fixtures remain local to their contracts.
 
 | Contract | Primary coverage |
 |---|---|
+| Logical u64 geometry, inline rank spilling, overflow, large-coordinate persistence | `geometry`; request/mapping/storage-run unit bounds |
 | Matrix shapes, dtypes, operand layouts and backend agreement | `matmul` numerical parity matrix, block streams |
 | Matrix point/sparse/copy/sync/reload parity | Every dtype/layout pair on `(2,3,2)` and `(33,129,35)` |
+| Reduction numerical lengths, operations, axes and keepdims | `reduce` parameterized block/terminal parity |
+| Reduction full consumer/persistence parity | Lengths 7/4097; axis 1 of `[2,3,4]` with both keepdims values; each dtype/layout; dedicated sparse support and slice fixtures |
 | Matrix transforms, batches, nesting, exceptional values and exact bounds | Dedicated `matmul` cases, retained independently |
 | Sparse slice dtype semantics and persistence | `slice_reductions` small f32/f64/u8 fixtures |
 | Multi-node sparse index topology across axes/capacities/shapes | `slice_reductions::indexed_topology` (f32) |
@@ -34,5 +37,8 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 Do not replace topology/pagination tests with dtype permutations, or structural
 assertions with timing thresholds. Ignored benchmarks share fixtures but are not
 ordinary regression tests. [BENCHMARKS.md](../BENCHMARKS.md#measurement-and-reproduction)
-lists all entrypoints, including concurrency/completion streams and copy profiles,
-with smoke instructions and record schemas. Smoke runs are not performance evidence.
+describes the shared workloads, two entrypoints, smoke instructions and record schema. Smoke runs are not performance evidence.
+
+Routine checks use `cargo test`; benchmark harnesses compile only with the
+`benchmarks` feature. See [CONTRIBUTING.md](../CONTRIBUTING.md) for targeted
+checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.

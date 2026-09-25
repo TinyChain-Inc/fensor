@@ -2,7 +2,8 @@
 
 This non-normative file tracks unimplemented work. Current behavior is described
 in the [README](README.md); execution invariants live in [DESIGN.md](DESIGN.md).
-Prioritize additional optimization using the [benchmark methodology](BENCHMARKS.md).
+Prioritize additional optimization using the [benchmark methodology](BENCHMARKS.md),
+preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-collection-ownership).
 
 ## API extensions
 

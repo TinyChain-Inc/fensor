@@ -88,14 +88,19 @@ without sorting or removing duplicates. Checked widened arithmetic validates
 endpoints before I/O. Invalid mappings fail; only unsupported optimization geometry
 selects bounded coordinate mapping.
 
-The planner splits progressions at base-coordinate carries, block boundaries, or
+Storage leaves split progressions at base-coordinate carries, block boundaries, or
 sparse-key changes. Each storage run holds destination start, source-block offset,
 signed stride, and count. At most one run per requested element is retained.
 Gather mappings and explicit requests emit/coalesce singleton runs using the same
 mapping logic and rank-sized scratch, without collecting mapped base coordinates.
 
-The shared reader validates positions, deduplicates actual sparse keys, resolves
-them, and groups runs by physical block, including aliases. Dense reads bypass
+Request cursors, affine leaves, and matrix rows share checked logical decoding and
+lazy segment iteration. Storage owns block/carry splitting; matrix products own
+tile intersection and scattering. Consumers obtain these behaviors through ordinary
+expression delegation, without selecting a planning strategy.
+
+The shared reader validates all positions into bounded logical-address groups before
+I/O. Each sparse key is resolved once; physical aliases merge before block access. Dense reads bypass
 index resolution but use the same borrowing/validation/scatter path. Each needed
 block is borrowed and its full length validated once per bounded request; release
 the guard before awaiting another block. Unit-stride runs copy slices; negative,
@@ -204,3 +209,22 @@ derive 128-position contraction chunks; narrow requests can use up to 4096. Thes
 are derived capacities, not extra configuration. Boundary tests use owning
 constants and adjacent values; numerical and benchmark fixtures retain
 explicit inputs. Structural contract tests are indexed in [coverage ownership](tests/COVERAGE.md).
+
+## Geometry and collection ownership
+
+`Shape` and `Strides` hold `u64` metadata inline through rank eight and spill above
+it. `Axes` comes from ha-ndarray and contains machine-sized axis identifiers.
+Private coordinate scratch uses `Coord`; public coordinate batches remain
+`Vec<Vec<u64>>`. `Range` holds local `AxisRange` bounds with `u64` endpoints and
+steps. Explicit selections are caller-sized vectors, never expanded intervals.
+
+Logical cardinalities are checked and `TensorGeometry::size()` is fallible.
+Signed mapping calculations use checked `i128`, including shared gather offsets.
+Only bounded batch and storage-block dimensions become backend `usize` indices;
+the complete logical shape is never narrowed to construct an ndarray.
+
+Payload and batch collections remain heap-backed with their existing execution
+bounds. Large axis descriptors, affine coefficients, and matrix map keys also
+remain heap-backed to avoid embedding oversized inline arrays in requests and
+futures. SmallVec does not alter the execution bound or promise allocation-free
+operation. See [collection rules](CODE_STYLE.md#collections-and-geometry).

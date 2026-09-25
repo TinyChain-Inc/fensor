@@ -1,39 +1,21 @@
 //! Identical cases for production timing and test-only structural profiling.
 
-use std::time::Instant;
-
 use fensor::{
-    Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
+    AxisRange, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
     TensorUnary, TensorWrite,
 };
-use ha_ndarray::{AxisRange, axes, shape};
+use ha_ndarray::{axes, shape};
 use number_general::DType;
 
-use super::common::{self, FsEntry, counters};
+use super::common;
 
 async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(name: &str, view: &V) {
-    for mode in ["sum", "row", "coordinate"] {
-        for temperature in ["first", "warm"] {
-            counters::reset_traffic();
-            let started = Instant::now();
-            let count = super::observe(name, mode, temperature, async {
-                if mode == "sum" {
-                    std::hint::black_box(view.sum_all().await.unwrap());
-                    1
-                } else {
-                    super::benchmark::consume(view, mode).await
-                }
-            })
-            .await;
-            let traffic = counters::snapshot_traffic();
-            println!(
-                "SLICE,{name},{mode},{temperature},{},{count},{},{}",
-                started.elapsed().as_nanos(),
-                traffic.loads,
-                traffic.saves
-            );
-        }
-    }
+    super::benchmark::streams(
+        &format!("slice_{name}"),
+        view,
+        &["sum", "row", "coordinate"],
+    )
+    .await;
 }
 
 pub async fn run() {
@@ -54,32 +36,23 @@ pub async fn run() {
     for capacity in [1, 7, 31, 128, 4096] {
         for sparse in [false, true] {
             for cache_size in [1_000_000, 32_768] {
-                let (root, _) = common::new_dir("slice_benchmark").await;
-                let cache =
-                    freqfs::Cache::new(cache_size, None, 0, std::time::Duration::from_secs(1));
-                let tensor = Tensor::<FsEntry, f32>::create(
-                    cache.load(root.clone()).unwrap(),
-                    TensorSchema::new(f32::dtype(), shape![32, 129]).unwrap(),
-                    if sparse {
-                        Layout::Sparse { axis: None }
-                    } else {
-                        Layout::Dense
-                    },
+                let (root, tensor) = common::fixture::source(
+                    "slice_benchmark",
+                    shape![32, 129],
+                    common::fixture::layout(sparse),
                     capacity,
+                    cache_size,
+                    (0..32).flat_map(|i| {
+                        (0..129).map(move |j| {
+                            if !sparse || (i * 129 + j) % 97 == 0 {
+                                ((i + j) % 7) as f32 + 0.2
+                            } else {
+                                0.
+                            }
+                        })
+                    }),
                 )
-                .await
-                .unwrap();
-
-                for i in 0..32 {
-                    for j in 0..129 {
-                        if !sparse || (i * 129 + j) % 97 == 0 {
-                            tensor
-                                .write_value(&[i, j], ((i + j) % 7) as f32 + 0.2)
-                                .await
-                                .unwrap();
-                        }
-                    }
-                }
+                .await;
                 tensor.sync().await.unwrap();
                 // Check the complete fixture outside the timed region. In particular,
                 // occupied traversal must not skip entries between index separators.
@@ -133,25 +106,15 @@ pub async fn run() {
     }
 
     for sparse in [false, true] {
-        let (root, dir) = common::new_dir("long_slice_benchmark").await;
-        let tensor = Tensor::<FsEntry, f32>::create(
-            dir,
-            TensorSchema::new(f32::dtype(), shape![2, 8193]).unwrap(),
-            if sparse {
-                Layout::Sparse { axis: None }
-            } else {
-                Layout::Dense
-            },
+        let (root, tensor) = common::fixture::source(
+            "long_slice_benchmark",
+            shape![2, 8193],
+            common::fixture::layout(sparse),
             128,
+            1_000_000,
+            (0..2).flat_map(|_| (0..8193).map(|col| if col % 257 == 0 { 1f32 } else { 0. })),
         )
-        .await
-        .unwrap();
-
-        for row in 0..2 {
-            for col in (0..8193).step_by(257) {
-                tensor.write_value(&[row, col], 1.).await.unwrap();
-            }
-        }
+        .await;
         tensor.sync().await.unwrap();
         let reduced = tensor.view().sum(axes![1], false).await.unwrap();
         assert_eq!(reduced.read_value(&[0]).await.unwrap(), 32.);

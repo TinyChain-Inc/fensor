@@ -10,6 +10,11 @@
 //! filesystem/cache metadata, and independent consumers are separate costs.
 //! Computed views are read-only, and streams are live rather than snapshots.
 //!
+//! Logical geometry uses [`Shape`] and [`Strides`] with `u64` elements; [`Axes`]
+//! contains `usize` axis identifiers. [`Range`] uses fensor's [`AxisRange`].
+//! [`TensorGeometry::size`] checks cardinality overflow and returns `Result<u64>`.
+//! Only bounded buffer dimensions are narrowed for backend evaluation.
+//!
 //! ha-ndarray owns numerical parallelism; fensor owns bounded async concurrency.
 //! The outer consumer uses CPU-limited `buffered` for row-major/sparse/boolean
 //! delivery and `buffer_unordered` for coordinate streams and numeric terminals.
@@ -77,8 +82,8 @@ mod read_metrics;
 #[cfg(test)]
 extern crate self as fensor;
 
-#[cfg(test)]
-mod read_benchmark;
+#[cfg(all(test, feature = "benchmarks"))]
+mod profiling;
 
 pub mod reduce;
 
@@ -97,7 +102,7 @@ mod storage_read;
 mod tensor;
 
 #[cfg(test)]
-#[path = "../tests/common.rs"]
+#[path = "../tests/common/mod.rs"]
 mod test_support;
 
 mod traits;
@@ -110,12 +115,14 @@ mod view;
 
 pub use binary::BinaryView;
 pub use error::{Error, Result};
+pub use ha_ndarray::Axes;
 pub use matmul::MatMulView;
 pub use metadata::TensorMetadata;
 pub use number_general::NumberType;
 pub use reduce::ReduceView;
 pub use schema::{
-    Layout, SparseIndexSchema, SparseTableSchema, TensorSchema, TensorShape, contiguous_strides,
+    AxisRange, Layout, Range, Shape, SparseIndexSchema, SparseTableSchema, Strides, TensorSchema,
+    contiguous_strides,
 };
 pub use selection::WhereView;
 pub use traits::{

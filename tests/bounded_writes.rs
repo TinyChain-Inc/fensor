@@ -1,5 +1,7 @@
-use fensor::{Error, Layout, Tensor, TensorRead, TensorSchema, TensorWrite, TensorWriteBulk};
-use ha_ndarray::{AxisRange, range, shape};
+use fensor::{
+    AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorWrite, TensorWriteBulk,
+};
+use ha_ndarray::{range, shape};
 use number_general::DType;
 
 mod common;
@@ -33,7 +35,7 @@ async fn writes_validate_cardinality_before_mutation() {
             }
         }
         tensor
-            .write_values(range![AxisRange::Of(vec![5, 1, 5].into())], vec![3, 4, 7])
+            .write_values(range![AxisRange::Of(vec![5, 1, 5])], vec![3, 4, 7])
             .await
             .unwrap();
         assert_eq!(tensor.read_value(&[5]).await.unwrap(), 7);

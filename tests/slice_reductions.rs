@@ -5,6 +5,7 @@ use fensor::{
     TensorWrite,
 };
 use ha_ndarray::{axes, shape};
+
 use number_general::DType;
 
 macro_rules! indexed_dtype {
@@ -61,7 +62,7 @@ async fn indexed_topology() {
                 let (root, dir) = common::new_dir("slice_index_nodes").await;
                 let tensor = Tensor::<common::FsEntry, f32>::create(
                     dir,
-                    TensorSchema::new(f32::dtype(), shape![rows, columns]).unwrap(),
+                    TensorSchema::new(f32::dtype(), shape![rows as u64, columns as u64]).unwrap(),
                     Layout::Sparse { axis },
                     capacity,
                 )

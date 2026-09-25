@@ -1,15 +1,16 @@
 //! Bounded reductions over original expression support.
 
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{Axes, NDArrayReduceAll, Number, Range, Real, Shape};
+use ha_ndarray::{NDArrayReduceAll, Number, Real};
 
 use crate::expression::{self, Batch, Expression};
 use crate::mapping::CoordinateMap;
 use crate::request::{self, BatchRequest};
+use crate::schema::Coord;
 use crate::{
-    BoxFuture, Error, Layout, Result, SparseElementStream, TensorElement, TensorGeometry,
-    TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform,
-    TensorViewSemantics, ValueBlockStream,
+    Axes, BoxFuture, Error, Layout, Range, Result, Shape, SparseElementStream, TensorElement,
+    TensorGeometry, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
+    TensorTransform, TensorViewSemantics, ValueBlockStream,
 };
 
 mod sealed {
@@ -247,7 +248,7 @@ pub struct ReduceView<Source, Op> {
     keepdims: bool,
     output_shape: Shape,
     // One stride per output axis, not per output value.
-    output_strides: Vec<usize>,
+    output_strides: crate::Strides,
     mapping: CoordinateMap,
     op: Op,
 }
@@ -276,7 +277,7 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
             output_shape.push(1);
         }
 
-        let output_strides = crate::schema::contiguous_strides(&output_shape)?.to_vec();
+        let output_strides = crate::schema::contiguous_strides(&output_shape)?;
         let mapping = CoordinateMap::identity(output_shape.clone(), &output_strides);
 
         Ok(Self {
@@ -317,7 +318,7 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
                         i
                     };
                     request::Axis::Span {
-                        start: coord[i] as usize,
+                        start: coord[i],
                         step: 1,
                         len: 1,
                     }
@@ -371,7 +372,7 @@ where
         self.source.dtype()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         &self.mapping.shape
     }
 
@@ -412,7 +413,7 @@ where
                 .then(|| Vec::with_capacity(coords.len()));
 
             let mut cursor = coords.cursor(self.shape())?;
-            let mut coord = Vec::new();
+            let mut coord = Coord::new();
             let mut pending = None;
 
             loop {
@@ -423,7 +424,7 @@ where
                 } else {
                     break;
                 };
-                if slice.len() > expression::MAX_BATCH_ELEMENTS {
+                if slice.len() > expression::MAX_BATCH_ELEMENTS as u64 {
                     let mut state = None;
                     let mut requests = self.source.slice_requests(slice)?;
                     // Inner consumers never start buffered streams.
@@ -445,12 +446,13 @@ where
                 let mut lengths = vec![total];
                 let mut rectangles = vec![slice.rectangle()?];
 
-                while total < expression::MAX_BATCH_ELEMENTS && cursor.next_into(&mut coord) {
+                while total < expression::MAX_BATCH_ELEMENTS as u64 && cursor.next_into(&mut coord)
+                {
                     let next = crate::slice::Slice::new(
                         self.source.shape(),
                         self.source_group_axes(&coord)?,
                     )?;
-                    if next.len() > expression::MAX_BATCH_ELEMENTS - total {
+                    if next.len() > expression::MAX_BATCH_ELEMENTS as u64 - total {
                         pending = Some(next);
                         break;
                     }
@@ -473,8 +475,10 @@ where
                         &self.op,
                         &mut state,
                         expression::EvaluatedBatch {
-                            values: input.by_ref().take(len).collect(),
-                            support: masks.as_mut().map(|m| m.by_ref().take(len).collect()),
+                            values: input.by_ref().take(len as usize).collect(),
+                            support: masks
+                                .as_mut()
+                                .map(|m| m.by_ref().take(len as usize).collect()),
                         },
                     )?;
                     if let Some(support) = &mut support {

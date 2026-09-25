@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use ha_ndarray::{AxisRange, axes, range, shape};
+use fensor::AxisRange;
+use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
 use crate::schema::row_major_coords;
@@ -79,7 +80,7 @@ async fn slice_then_resolve() {
     let r = range![
         AxisRange::At(2),
         AxisRange::In(1, 5, 2),
-        AxisRange::Of(shape![0, 3, 4])
+        AxisRange::Of(vec![0, 3, 4])
     ];
     let sliced = view.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 3]);
@@ -157,7 +158,7 @@ async fn gather_slice_then_reshape_rejected() {
     let (root, tensor) =
         create_dense("gather_slice_then_reshape_rejected", shape![6, 4], 1000).await;
     let view = tensor.view();
-    let r = range![AxisRange::Of(shape![0, 2, 4]), AxisRange::In(0, 4, 1)];
+    let r = range![AxisRange::Of(vec![0, 2, 4]), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
     assert!(matches!(
         sliced.reshape(shape![12]),
@@ -286,7 +287,7 @@ async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
     tensor.write_value(&[3, 2, 4], 77.0).await.expect("seed");
     let view = tensor.view();
     let r = range![
-        AxisRange::Of(shape![3]),
+        AxisRange::Of(vec![3]),
         AxisRange::In(0, 5, 1),
         AxisRange::In(0, 6, 1)
     ];
@@ -421,7 +422,7 @@ async fn broadcast_twice_passes_through_existing_broadcast_axis() {
     }
 
     let view = tensor.view();
-    let r = range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)];
+    let r = range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
     let once = sliced
         .broadcast(shape![5, 4])
@@ -436,7 +437,7 @@ async fn broadcast_twice_passes_through_existing_broadcast_axis() {
             for k in 0..4u64 {
                 assert_eq!(
                     twice.flat_offset(&[i, j, k]).expect("offset"),
-                    12 + k as i64,
+                    12 + k as i128,
                     "i={i} j={j} k={k}"
                 );
                 let v = twice.read_value(&[i, j, k]).await.expect("read");
@@ -459,7 +460,7 @@ async fn broadcast_then_transpose_preserves_constant() {
     )
     .await;
     let view = tensor.view();
-    let r = range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)];
+    let r = range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
     let broadcasted = sliced
         .broadcast(shape![5, 4])
@@ -471,7 +472,7 @@ async fn broadcast_then_transpose_preserves_constant() {
         for j in 0..5u64 {
             assert_eq!(
                 transposed.flat_offset(&[k, j]).expect("offset"),
-                12 + k as i64,
+                12 + k as i128,
                 "k={k} j={j}"
             );
         }
@@ -494,7 +495,7 @@ async fn slice_of_after_broadcast_preserves_constant() {
     let broadcasted = view
         .broadcast(shape![3, 4])
         .expect("broadcast must be supported");
-    let r = range![AxisRange::Of(shape![0, 2]), AxisRange::In(0, 4, 1)];
+    let r = range![AxisRange::Of(vec![0, 2]), AxisRange::In(0, 4, 1)];
     let sliced = broadcasted.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 4]);
 
@@ -502,7 +503,7 @@ async fn slice_of_after_broadcast_preserves_constant() {
         for y in 0..4u64 {
             assert_eq!(
                 sliced.flat_offset(&[x, y]).expect("offset"),
-                y as i64,
+                y as i128,
                 "x={x} y={y}"
             );
         }
@@ -557,11 +558,11 @@ async fn flip_on_broadcast_axis_is_noop() {
     let broadcasted = view
         .broadcast(shape![3, 4])
         .expect("broadcast must be supported");
-    let before: Vec<i64> = (0..3u64)
+    let before: Vec<i128> = (0..3u64)
         .map(|x| broadcasted.flat_offset(&[x, 2]).expect("offset"))
         .collect();
     let flipped = broadcasted.flip(0).expect("flip");
-    let after: Vec<i64> = (0..3u64)
+    let after: Vec<i128> = (0..3u64)
         .map(|x| flipped.flat_offset(&[x, 2]).expect("offset"))
         .collect();
     assert_eq!(before, after);
@@ -576,16 +577,16 @@ async fn flip_on_gather_axis_reverses_table() {
         create_dense("flip_on_gather_axis_reverses_table", shape![4, 4], 1000).await;
     let view = tensor.view();
     let gathered = view
-        .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+        .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
-    let before: Vec<i64> = (0..2u64)
+    let before: Vec<i128> = (0..2u64)
         .map(|a| gathered.flat_offset(&[a, 0]).expect("offset"))
         .collect();
     let flipped = gathered.flip(0).expect("flip");
-    let after: Vec<i64> = (0..2u64)
+    let after: Vec<i128> = (0..2u64)
         .map(|a| flipped.flat_offset(&[a, 0]).expect("offset"))
         .collect();
-    let expected: Vec<i64> = before.into_iter().rev().collect();
+    let expected: Vec<i128> = before.into_iter().rev().collect();
     assert_eq!(after, expected);
     cleanup(&root).await;
 }
@@ -651,7 +652,7 @@ async fn at_slice_on_broadcast_axis() {
     assert_eq!(sliced.shape(), &[4]);
 
     for y in 0..4u64 {
-        assert_eq!(sliced.flat_offset(&[y]).expect("offset"), y as i64);
+        assert_eq!(sliced.flat_offset(&[y]).expect("offset"), y as i128);
         let v = sliced.read_value(&[y]).await.expect("read");
         assert_eq!(v, y as f32 * 2.0, "y={y}");
     }
@@ -683,7 +684,7 @@ async fn in_slice_on_broadcast_axis() {
         for y in 0..4u64 {
             assert_eq!(
                 sliced.flat_offset(&[a, y]).expect("offset"),
-                y as i64,
+                y as i128,
                 "a={a} y={y}"
             );
             let v = sliced.read_value(&[a, y]).await.expect("read");
@@ -709,7 +710,7 @@ async fn at_slice_on_gather_axis() {
 
     let view = tensor.view();
     let gathered = view
-        .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+        .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
     assert_eq!(gathered.shape(), &[2, 4]);
     let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
@@ -719,7 +720,7 @@ async fn at_slice_on_gather_axis() {
     for y in 0..4u64 {
         assert_eq!(
             sliced.flat_offset(&[y]).expect("offset"),
-            12 + y as i64,
+            12 + y as i128,
             "y={y}"
         );
         let v = sliced.read_value(&[y]).await.expect("read");
@@ -744,7 +745,7 @@ async fn in_slice_on_gather_axis() {
 
     let view = tensor.view();
     let gathered = view
-        .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+        .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
     let r = range![AxisRange::In(1, 2, 1), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice In on gather axis");
@@ -753,7 +754,7 @@ async fn in_slice_on_gather_axis() {
     for y in 0..4u64 {
         assert_eq!(
             sliced.flat_offset(&[0, y]).expect("offset"),
-            12 + y as i64,
+            12 + y as i128,
             "y={y}"
         );
         let v = sliced.read_value(&[0, y]).await.expect("read");
@@ -782,21 +783,21 @@ async fn of_slice_on_gather_axis() {
 
     let view = tensor.view();
     let gathered = view
-        .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
+        .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
-    let r = range![AxisRange::Of(shape![1, 0]), AxisRange::In(0, 4, 1)];
+    let r = range![AxisRange::Of(vec![1, 0]), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice Of on gather axis");
     assert_eq!(sliced.shape(), &[2, 4]);
 
     for y in 0..4u64 {
         assert_eq!(
             sliced.flat_offset(&[0, y]).expect("offset"),
-            12 + y as i64,
+            12 + y as i128,
             "y={y}"
         );
         assert_eq!(
             sliced.flat_offset(&[1, y]).expect("offset"),
-            4 + y as i64,
+            4 + y as i128,
             "y={y}"
         );
         assert_eq!(
@@ -866,7 +867,7 @@ async fn in_slice_stop_exceeds_dim_rejected() {
 async fn of_slice_out_of_bounds_rejected() {
     let (root, tensor) = create_dense("of_slice_out_of_bounds_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
-    let r = range![AxisRange::Of(shape![0, 5]), AxisRange::In(0, 4, 1)];
+    let r = range![AxisRange::Of(vec![0, 5]), AxisRange::In(0, 4, 1)];
     assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
     cleanup(&root).await;
 }
@@ -919,7 +920,7 @@ async fn squeeze_gather_singleton_folds_offset() {
 
     let view = tensor.view();
     let gathered = view
-        .slice(range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)])
+        .slice(range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
     assert_eq!(gathered.shape(), &[1, 4]);
     let squeezed = gathered
@@ -930,7 +931,7 @@ async fn squeeze_gather_singleton_folds_offset() {
     for y in 0..4u64 {
         assert_eq!(
             squeezed.flat_offset(&[y]).expect("offset"),
-            12 + y as i64,
+            12 + y as i128,
             "y={}",
             y
         );
@@ -958,7 +959,7 @@ async fn squeeze_broadcast_axis_folds_constant() {
     let view = tensor.view();
     let gathered = view
         .slice(range![
-            AxisRange::Of(shape![3]),
+            AxisRange::Of(vec![3]),
             AxisRange::In(0, 5, 1),
             AxisRange::In(0, 6, 1)
         ])
@@ -978,7 +979,7 @@ async fn squeeze_broadcast_axis_folds_constant() {
         for z in 0..6u64 {
             assert_eq!(
                 squeezed.flat_offset(&[y, z]).expect("offset"),
-                90 + 6 * y as i64 + z as i64,
+                90 + 6 * y as i128 + z as i128,
                 "y={y} z={z}"
             );
         }
@@ -1002,7 +1003,7 @@ async fn squeeze_removes_gather_axis_restores_write_through() {
     .await;
     let view = tensor.view();
     let gathered = view
-        .slice(range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)])
+        .slice(range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
     assert!(
         !gathered.supports_write_through(),

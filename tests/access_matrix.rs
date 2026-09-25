@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
-    TensorViewSemantics, TensorWrite, TensorWriteBulk,
+    AxisRange, Error, Layout, Range, Shape, Tensor, TensorArray, TensorGeometry, TensorRead,
+    TensorSchema, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
 };
 use futures::TryStreamExt;
-use ha_ndarray::{AxisRange, Range, Shape, axes, range, shape};
+use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
@@ -681,7 +681,7 @@ mod section_b_transforms {
         let sliced = tensor
             .view()
             .slice(range![
-                AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
+                AxisRange::Of([0u64, 2, 3].to_vec()),
                 AxisRange::In(0, 5, 1),
                 AxisRange::In(0, 6, 1)
             ])
@@ -705,7 +705,7 @@ mod section_b_transforms {
         let sliced = tensor
             .view()
             .slice(range![
-                AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
+                AxisRange::Of([0u64, 2, 3].to_vec()),
                 AxisRange::In(0, 5, 1),
                 AxisRange::In(0, 6, 1)
             ])
@@ -1535,7 +1535,7 @@ mod section_f_view_semantics {
         let gathered = tensor
             .view()
             .slice(range![
-                AxisRange::Of(shape![0, 2]),
+                AxisRange::Of(vec![0, 2]),
                 AxisRange::In(0, 3, 1),
                 AxisRange::In(0, 4, 1)
             ])
@@ -1977,7 +1977,7 @@ mod section_h_persistence {
         let shape = shape![2, 3, 4];
         let max_capacity: usize = 4;
         let schema = schema_f32(shape.clone());
-        let expected_blocks = (shape.iter().product::<usize>() as u64) / (max_capacity as u64);
+        let expected_blocks = shape.iter().product::<u64>() / (max_capacity as u64);
 
         let dir = open_dir(&root).expect("open");
         let _tensor =

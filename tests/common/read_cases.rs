@@ -1,29 +1,16 @@
 //! Shared evaluation-only cases; production timing and test-only profiling use the same inputs.
 
-use std::time::Instant;
-
-use fensor::{TensorMatMul, TensorRead, TensorTransform, TensorUnary};
+use fensor::{
+    TensorMatMul, TensorRead, TensorReduceAll, TensorSparseIndex, TensorTransform, TensorUnary,
+};
 use ha_ndarray::shape;
 
-use super::benchmark::consume;
+use super::benchmark;
 use super::benchmark_source::source;
-use super::common::counters;
 
-async fn measure<V: TensorRead<DType = f32>>(name: &str, view: &V) {
-    for mode in ["row", "coordinate"] {
-        for temperature in ["first", "warm"] {
-            counters::reset_traffic();
-            let start = Instant::now();
-            let count = super::observe(name, mode, temperature, consume(view, mode)).await;
-            let traffic = counters::snapshot_traffic();
-            println!(
-                "READ,{name},{mode},{temperature},{},{count},{},{}",
-                start.elapsed().as_micros(),
-                traffic.loads,
-                traffic.saves
-            );
-        }
-    }
+async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(name: &str, view: &V) {
+    benchmark::streams(name, view, &["row", "coordinate"]).await;
+    benchmark::copy(name, view, 128, 1_000_000).await;
 }
 
 pub async fn run() {
@@ -83,9 +70,9 @@ pub async fn run() {
         &product
             .clone()
             .slice(ha_ndarray::range![
-                ha_ndarray::AxisRange::At(0),
-                ha_ndarray::AxisRange::Of(vec![8, 0, 8, 1].into()),
-                ha_ndarray::AxisRange::In(0, 7, 1)
+                fensor::AxisRange::At(0),
+                fensor::AxisRange::Of(vec![8, 0, 8, 1]),
+                fensor::AxisRange::In(0, 7, 1)
             ])
             .unwrap(),
     )
@@ -103,7 +90,7 @@ pub async fn run() {
         .unwrap()
         .reshape(shape![1024])
         .unwrap()
-        .slice(ha_ndarray::range![ha_ndarray::AxisRange::In(0, 1024, 33)])
+        .slice(ha_ndarray::range![fensor::AxisRange::In(0, 1024, 33)])
         .unwrap();
     measure("diagonal", &diagonal).await;
     let left = source(17, 9, false, 31, 1, 1_000_000).await;
@@ -133,8 +120,8 @@ pub async fn run() {
         &leaf
             .view()
             .slice(ha_ndarray::range![
-                ha_ndarray::AxisRange::In(0, 32, 1),
-                ha_ndarray::AxisRange::In(0, 1, 1)
+                fensor::AxisRange::In(0, 32, 1),
+                fensor::AxisRange::In(0, 1, 1)
             ])
             .unwrap()
             .broadcast(shape![32, 128])
@@ -146,10 +133,17 @@ pub async fn run() {
         &leaf
             .view()
             .slice(ha_ndarray::range![
-                ha_ndarray::AxisRange::Of(vec![31, 0, 31, 4].into()),
-                ha_ndarray::AxisRange::In(0, 128, 1)
+                fensor::AxisRange::Of(vec![31, 0, 31, 4]),
+                fensor::AxisRange::In(0, 128, 1)
             ])
             .unwrap(),
     )
     .await;
+    let alias = source(3, 2, true, 6, 1, 1_000_000).await;
+    let id = alias.lookup_block_id(&[0, 0]).await.unwrap().unwrap();
+    assert!(alias.delete_row(vec![2, 0]).await.unwrap());
+    alias.upsert_block_id(vec![2, 0], id).await.unwrap();
+    assert_eq!(alias.lookup_block_id(&[2, 0]).await.unwrap(), Some(id));
+    alias.sync().await.unwrap();
+    measure("sparse_alias", &alias.view()).await;
 }

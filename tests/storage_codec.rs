@@ -141,6 +141,22 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
         assert_eq!(tbon, metadata);
     }
 
+    // The pre-migration representation already stored u64 dimensions in this tuple.
+    let fixture = (vec![3u64, 4], true, Some(1u64), vec![1u64, 2]);
+    let expected =
+        TensorMetadata::<f32>::new(shape![3, 4], Layout::Sparse { axis: Some(1) }, shape![1, 2])
+            .unwrap();
+    let decoded: TensorMetadata<f32> =
+        tbon::de::try_decode((), tbon::en::encode(&fixture).unwrap())
+            .await
+            .unwrap();
+    assert_eq!(decoded, expected);
+    let encoded: (Vec<u64>, bool, Option<u64>, Vec<u64>) =
+        tbon::de::try_decode((), tbon::en::encode(&expected).unwrap())
+            .await
+            .unwrap();
+    assert_eq!(encoded, fixture);
+
     let malformed = [
         (vec![3u64, 4], false, None, vec![2u64]),
         (vec![3, 4], false, None, vec![0, 2]),

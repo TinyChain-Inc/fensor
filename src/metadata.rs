@@ -1,10 +1,9 @@
 use std::marker::PhantomData;
 
 use destream::{de, en};
-use ha_ndarray::Shape;
 
 use crate::schema::{StorageSchema, TensorSchema};
-use crate::{Error, Layout, Result, TensorElement};
+use crate::{Error, Layout, Result, Shape, TensorElement};
 
 /// Typed filesystem metadata, independent of the byte codec used by the file adapter.
 ///
@@ -27,11 +26,8 @@ impl<T: TensorElement> TensorMetadata<T> {
                 "block shape rank differs from tensor rank".into(),
             ));
         }
-        let capacity = block_shape
-            .iter()
-            .try_fold(1usize, |n, &dim| n.checked_mul(dim))
-            .ok_or_else(|| Error::InvalidSchema("block capacity overflow".into()))?;
-        if capacity == 0 || capacity > crate::schema::MAX_BLOCK_CAPACITY {
+        let capacity = crate::schema::checked_product(&block_shape)?;
+        if capacity == 0 || capacity > crate::schema::MAX_BLOCK_CAPACITY as u64 {
             return Err(Error::InvalidSchema("invalid block capacity".into()));
         }
         StorageSchema::from_block_shape(&shape, layout, block_shape.clone())?;
@@ -65,7 +61,7 @@ impl<T: TensorElement> TensorMetadata<T> {
             + [&self.shape, &self.block_shape]
                 .into_iter()
                 .filter(|s| s.spilled())
-                .map(|s| s.capacity() * std::mem::size_of::<usize>())
+                .map(|s| s.capacity() * std::mem::size_of::<u64>())
                 .sum::<usize>()
     }
 }
@@ -80,15 +76,6 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
         let (shape, sparse, axis, block_shape): (Vec<u64>, bool, Option<u64>, Vec<u64>) =
             <(Vec<u64>, bool, Option<u64>, Vec<u64>) as de::FromStream>::from_stream((), decoder)
                 .await?;
-        let dims = |values: Vec<u64>| -> Result<Shape> {
-            values
-                .into_iter()
-                .map(|v| {
-                    usize::try_from(v)
-                        .map_err(|_| Error::InvalidSchema("dimension exceeds usize".into()))
-                })
-                .collect()
-        };
         let layout = if sparse {
             Layout::Sparse {
                 axis: axis
@@ -101,12 +88,7 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
         } else {
             return Err(de::Error::custom("dense metadata contains a sparse axis"));
         };
-        Self::new(
-            dims(shape).map_err(de::Error::custom)?,
-            layout,
-            dims(block_shape).map_err(de::Error::custom)?,
-        )
-        .map_err(de::Error::custom)
+        Self::new(shape.into(), layout, block_shape.into()).map_err(de::Error::custom)
     }
 }
 
@@ -115,13 +97,6 @@ impl<'en, T: TensorElement> en::ToStream<'en> for TensorMetadata<T> {
         &'en self,
         encoder: E,
     ) -> std::result::Result<E::Ok, E::Error> {
-        let dims = |values: &[usize]| -> std::result::Result<Vec<u64>, E::Error> {
-            values
-                .iter()
-                .copied()
-                .map(|v| u64::try_from(v).map_err(en::Error::custom))
-                .collect()
-        };
         let (sparse, axis) = match self.layout {
             Layout::Dense => (false, None),
             Layout::Sparse { axis } => (
@@ -132,7 +107,12 @@ impl<'en, T: TensorElement> en::ToStream<'en> for TensorMetadata<T> {
             ),
         };
         en::IntoStream::into_stream(
-            (dims(&self.shape)?, sparse, axis, dims(&self.block_shape)?),
+            (
+                self.shape.as_slice(),
+                sparse,
+                axis,
+                self.block_shape.as_slice(),
+            ),
             encoder,
         )
     }

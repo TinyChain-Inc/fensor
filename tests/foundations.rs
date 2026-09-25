@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    Error, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorTransform, TensorWrite,
-    contiguous_strides,
+    AxisRange, Error, Layout, Range, Tensor, TensorGeometry, TensorRead, TensorSchema,
+    TensorTransform, TensorWrite, contiguous_strides,
 };
-use ha_ndarray::{AxisRange, Range, axes, range, shape};
+use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
 mod common;

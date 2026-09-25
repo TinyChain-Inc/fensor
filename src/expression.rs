@@ -48,7 +48,7 @@ where
 {
     /// Supply requests for the consumer's current logical shape, if preferred.
     /// None delegates to another source or the consumer's default linear order.
-    fn preferred_requests(&self, _shape: &[usize]) -> Result<Option<RequestIterator>> {
+    fn preferred_requests(&self, _shape: &[u64]) -> Result<Option<RequestIterator>> {
         Ok(None)
     }
 
@@ -204,7 +204,7 @@ impl<T> EvaluatedBatch<T> {
 pub(crate) fn sparse_elements<T: TensorElement>(
     request: BatchRequest,
     batch: EvaluatedBatch<T>,
-    shape: &[usize],
+    shape: &[u64],
 ) -> Result<impl Iterator<Item = Result<(Vec<u64>, T)>>> {
     batch.validate(request.len())?;
     let coords = request.into_coordinates(shape)?;
@@ -328,7 +328,7 @@ mod tests {
     struct Provider<'a> {
         source: &'a Tensor<crate::test_support::FsEntry, u8>,
         calls: &'a Counter,
-        provide: fn(&[usize]) -> Result<Option<RequestIterator>>,
+        provide: fn(&[u64]) -> Result<Option<RequestIterator>>,
     }
 
     impl TensorGeometry for Provider<'_> {
@@ -338,7 +338,7 @@ mod tests {
             self.source.dtype()
         }
 
-        fn shape(&self) -> &[usize] {
+        fn shape(&self) -> &[u64] {
             self.source.shape()
         }
 
@@ -348,7 +348,7 @@ mod tests {
     }
 
     impl Expression for Provider<'_> {
-        fn preferred_requests(&self, shape: &[usize]) -> Result<Option<RequestIterator>> {
+        fn preferred_requests(&self, shape: &[u64]) -> Result<Option<RequestIterator>> {
             self.calls.increment();
             (self.provide)(shape)
         }
@@ -362,7 +362,7 @@ mod tests {
     async fn request_providers_delegate_once_in_order_and_propagate_errors() {
         use crate::{TensorMath, TensorUnaryBoolean, TensorWhere};
 
-        type Provide = fn(&[usize]) -> Result<Option<RequestIterator>>;
+        type Provide = fn(&[u64]) -> Result<Option<RequestIterator>>;
         let none: Provide = |_| Ok(None);
         let some: Provide = |shape| Ok(Some(Box::new(request::linear_requests(shape)?)));
         let error: Provide = |_| Err(Error::Unsupported("provider failure".into()));

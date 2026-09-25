@@ -40,7 +40,7 @@ where
         self.tensor.dtype()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         self.tensor.shape()
     }
 
@@ -53,7 +53,7 @@ impl<T: TensorElement> Expression for Source<'_, T>
 where
     FsEntry: TensorFileEntry<T>,
 {
-    fn preferred_requests(&self, shape: &[usize]) -> Result<Option<RequestIterator>> {
+    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<RequestIterator>> {
         Ok(Some(Box::new(crate::schema::row_major_coords(shape)?.map(
             |coord| BatchRequest::explicit(vec![coord]).unwrap(),
         ))))
@@ -128,7 +128,7 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
     let (root, dir) = test_support::new_dir("ordered_batches").await;
     let tensor = Tensor::create(
         dir,
-        TensorSchema::new(u8::dtype(), vec![count].into()).unwrap(),
+        TensorSchema::new(u8::dtype(), vec![count as u64].into()).unwrap(),
         Layout::Dense,
         MAX_BATCH_ELEMENTS,
     )
@@ -193,7 +193,7 @@ where
     let (root, dir) = test_support::new_dir(name).await;
     let tensor = Tensor::create(
         dir,
-        TensorSchema::new(T::dtype(), vec![values.len()].into()).unwrap(),
+        TensorSchema::new(T::dtype(), vec![values.len() as u64].into()).unwrap(),
         if sparse {
             Layout::Sparse { axis: None }
         } else {
@@ -356,7 +356,7 @@ where
     if !release_first && num_cpus::get() > 1 {
         futures::future::poll_fn(|cx| {
             assert!(terminal.as_mut().poll(cx).is_pending());
-            if source.completed.read() == (source.shape()[0] - 1) as u64 {
+            if source.completed.read() == (source.shape()[0] - 1) {
                 std::task::Poll::Ready(())
             } else {
                 std::task::Poll::Pending

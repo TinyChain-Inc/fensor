@@ -1,146 +1,96 @@
 # Tensor execution benchmarks
 
-Benchmark harnesses, shared fixtures, instrumentation, and comparison runners
-belong in Git. Generated timings, profiles, logs, and machine-specific provenance
-do not. Keep all outputs under the ignored `benchmarks/results/` directory,
-separate from the Python runners. `git add benchmarks` includes the runners
-without staging local results.
-
-The slice runner defaults to `benchmarks/results/slices/` for its CSV and logs;
-the concurrency runner defaults to `benchmarks/results/concurrency.csv`. Defaults
-are relative to the script location, independent of the working directory.
-`--output` overrides them; relative overrides are resolved from the working
-directory. Choose a separate output file for completion comparisons as shown below.
-
-Execution contracts live in [DESIGN.md](DESIGN.md). Deterministic correctness and
-structural assertions are indexed in [tests/COVERAGE.md](tests/COVERAGE.md).
+Track harnesses and runners, not generated results. All default output paths are
+under ignored `benchmarks/results/`, relative to the runner's location.
+`git add benchmarks` includes code without staging local measurements. Historical
+ignored datasets retain their original schemas; do not append new records to them.
 
 ## Measurement and reproduction
 
-The harnesses use filesystem-backed f32 tensors. Keep source construction,
-initial writes/sync, and fixture assertions outside consumption timing. Measure
-copy-plus-sync separately, including destination creation, updates, and final sync.
+The opt-in `benchmarks` feature compiles two ignored tests which use the same workloads in `tests/common/workloads.rs`:
 
-| Entrypoint | Measurements and fixtures |
-|---|---|
-| `matrix_benchmark` | First/warm coordinate streams and separate copying; square, wide, narrow, batched, transformed, gathered, and nested products |
-| `read_benchmark` | Row-major and coordinate streams; affine storage mapping without a destination |
-| `slice_benchmark` | Terminal sums and both streams; whole/axis, strided, unary, nested, short/long groups |
-| Unit `read_profile`, `slice_profile` | Corresponding cases with test-only structural counters and phase observations |
-| Unit `copy_phase_benchmark` | Initialization, consumption, updates, sync; destination capacities 1/7/31/128/4096 |
-| `concurrency_benchmark` | Coordinate streams and copy-plus-sync; square/wide/narrow products, warm/constrained caches, differing destination capacities |
-| Unit `copy_pipeline_profile` | Copy phases and read/write overlap over a transposed source |
-| `completion_benchmark` | Ordered stream controls, coordinate streams, numeric terminals, and separate copying over geometric/unary/reduction/matrix sources |
+- Integration `benchmark` measures production execution without internal metrics.
+- Unit `profiling::profile` additionally observes task-local read/copy counters.
 
-Fixtures cover dense/sparse layouts, block sizes, cache pressure, and geometric
-transforms. The case definitions in `tests/common/` and each harness are the
-source of truth for inputs. Inspect them before comparing different revisions.
+`FENSOR_BENCH_SUITE` selects `matrix`, `reduction`, `completion`, `pipeline`, `copy`,
+or `all` (default). Matrix cases include storage reads, affine/gather transforms,
+regular/irregular selections, batches, nested products and extreme shapes.
+Reduction cases include short/long groups, axes, strided and nested sources.
+Completion cases compare streams and numeric terminals. Pipeline/copy cases vary
+destination capacity, layout and cache pressure. Workload generators remain the
+source of truth; capacities include 1, 7, 31, 128 and 4096.
 
-Build the same harness against frozen before/after sources with identical
-lockfiles and dependency sources. Use separate target directories, or clean the
-fensor package between builds and retain separately named executables. Never
-substitute a different revision for an unavailable baseline.
+Source construction, writes/sync and fixture assertions precede measurement.
+Row-major streams, coordinate streams, numeric terminals and copy-plus-sync are
+separate operations. Copy timing includes destination tensor initialization and
+final synchronization. Data-directory creation is outside timing.
 
-Run these commands in each respective checkout, changing the target path:
+Freeze before/after sources and dependency identities. Compile identical workload
+code against both versions with separate target directories and lockfiles. If the
+harness changes, apply only its test-only changes to the frozen baseline; retain
+its production source hash. Never substitute another revision for a missing
+baseline. Finish builds before timing, and run comparisons without concurrent tests.
 
 ```sh
 export CC=/usr/bin/cc CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/cc
 export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1
-cargo test --release --test matrix_benchmark --test read_benchmark --test slice_benchmark \
-  --test concurrency_benchmark --test completion_benchmark \
-  --target-dir /tmp/fensor-after --no-run
+cargo test --features benchmarks --release --test benchmark --no-run --target-dir /tmp/fensor-after
+cargo test --features benchmarks --release --lib --no-run --target-dir /tmp/fensor-after
+
+# Arguments are paths to compiled test executables, not target directories.
+python3 benchmarks/compare.py BEFORE_EXECUTABLE AFTER_EXECUTABLE \
+  --before-revision BEFORE_ID --after-revision AFTER_ID --suite matrix --pairs 2
+# Use the library test executables for profiles:
+python3 benchmarks/compare.py BEFORE_LIB AFTER_LIB --entry profiling::profile \
+  --before-revision BEFORE_ID --after-revision AFTER_ID --suite reduction \
+  --output benchmarks/results/reduction-profile.csv
 ```
 
-Finish compilation before timing. Run comparisons sequentially in alternating
-before/after order, without concurrent builds or tests. Use isolated data
-directories and record backend thread counts. The runners exercise one/four
-backend threads; `RAYON_NUM_THREADS` does not change fensor's outer CPU-limited
-async window.
+The runner alternates before/after order, defaults to backend thread counts one
+and four, and validates identical record keys across runs. Optional `--root`
+selects an existing parent for temporary tensor directories, removed after each
+run; it assumes nothing about the underlying filesystem. `--output` overrides the
+CSV path and places raw logs beside it. `RAYON_NUM_THREADS` configures backend
+parallelism, not fensor's outer async concurrency window.
+
+Keep source/dirty-tree and dependency hashes, lockfiles, commands, compiler/runtime,
+cache settings and environment details alongside ignored outputs. The CSV adds
+revision labels, executable SHA-256, before/after identity, thread count and pair.
+Temporary paths alone do not establish reproducible provenance.
+
+## Records and checks
+
+Harness records use `FENSOR,workload,operation,temperature,metric,unit,value`.
+Durations use `ns`; element counts, adapter traffic and structural observations
+use `count`. Profiles report existing request/run/index/borrow/backend counters,
+read phases and copy initialization/consumption/update/overlap. `sync` is reported
+separately within copy-plus-sync. No old-schema compatibility conversion is provided.
 
 ```sh
-# BEFORE_TARGET and AFTER_TARGET contain the separate release builds.
-python3 benchmarks/run_slice_comparison.py BEFORE_TARGET AFTER_TARGET \
-  --root /path/to/benchmark-data --output benchmarks/results/slices --pairs 2
-
-# These arguments are executable paths, not target directories.
-# concurrency_benchmark emits 84 records per full run.
-python3 benchmarks/run_concurrency_comparison.py BEFORE_EXECUTABLE AFTER_EXECUTABLE \
-  --output benchmarks/results/concurrency.csv --pairs 2
-# completion_benchmark emits 208 records per full run.
-python3 benchmarks/run_concurrency_comparison.py BEFORE_EXECUTABLE AFTER_EXECUTABLE \
-  --output benchmarks/results/completion.csv --pairs 2 --expected-records 208
+FENSOR_BENCH_SMOKE=1 cargo test --features benchmarks --test benchmark -- --ignored --nocapture --test-threads=1
+FENSOR_BENCH_SMOKE=1 cargo test --features benchmarks --lib profiling::profile -- --ignored --nocapture --test-threads=1
+python3 -B -m unittest discover -s benchmarks -p 'test_*.py'
 ```
 
-Both runners accept an optional `--root` naming an existing parent directory for
-temporary benchmark data; the default is the system temporary directory. They
-make no assumptions about the storage behind that directory. Temporary data
-directories are removed after each run. The slice runner's `--start-pair` appends
-additional pairs; the concurrency runner's `--focus-wide` selects its focused
-wide/dense fixture.
+Smoke fixtures check wiring, values and schemas, not performance. The runner
+rejects the smoke setting. Adapter traffic totals require an isolated process;
+concurrent correctness tests use local/task-local observations instead.
 
-Keep run provenance alongside the ignored output: source revision and dirty-tree
-hashes, dependency/lockfile identities, executable hashes, exact commands, compiler,
-device/runtime, data directory, cache settings, and thread counts. Temporary paths
-alone do not make a baseline reproducible. Share outputs separately when needed.
+## Interpretation
 
-## Profiles and smoke checks
+Compare structural work separately from wall time. Inclusive nested durations
+must not be summed; copy consumption and updates overlap. Copy overlap measures
+intersecting awaited intervals, not simultaneous CPU execution. Profile timings
+include observation/reporting overhead and must not be compared with uninstrumented
+wall times. Synchronous numerical work remains on the polling thread and uses
+ha-ndarray's backend parallelism.
 
-Adapter traffic counters live in `tests/common/counters.rs`, absent from production
-builds. Reset/snapshot requires an isolated benchmark process and one test thread;
-the ordinary shared adapter is instrumented too. These counters observe codec
-calls, not storage synchronization. Concurrent correctness tests use local or
-task-local observations.
+First/warm reads do not guarantee physical-device cache state. Cached timings and
+codec traffic do not establish disk throughput. Repeat suspected regressions,
+using ordered streams as controls. Tiny blocks and sparse keys can limit run
+formation; sparse contractions scan logical positions, and nested expressions or
+tiles may repeat work. Bounded memory is not a universal performance guarantee.
 
-Run profiles independently of uninstrumented timings, for example:
-
-```sh
-mkdir -p benchmarks/results
-RAYON_NUM_THREADS=4 cargo test --release --lib read_profile -- --ignored --nocapture --test-threads=1 > benchmarks/results/read-profile.log
-RAYON_NUM_THREADS=4 cargo test --release --lib slice_profile -- --ignored --nocapture --test-threads=1 > benchmarks/results/slice-profile.log
-RAYON_NUM_THREADS=4 cargo test --release --lib copy_phase_benchmark -- --ignored --nocapture --test-threads=1 > benchmarks/results/copy-phase.log
-RAYON_NUM_THREADS=4 cargo test --release --lib copy_pipeline_profile -- --ignored --nocapture --test-threads=1 > benchmarks/results/copy-pipeline.log
-```
-
-`FENSOR_BENCH_SMOKE=1` selects small fixtures in matrix/read/slice/concurrency/
-completion benchmarks and read/slice profiles. Copy profiles use fixed fixtures
-even with that variable set. Smoke runs validate wiring and schemas, not performance:
-
-```sh
-FENSOR_BENCH_SMOKE=1 cargo test --test matrix_benchmark --test read_benchmark \
-  --test slice_benchmark --test concurrency_benchmark --test completion_benchmark \
-  -- --ignored --nocapture --test-threads=1
-```
-
-Unset the smoke variable before paired measurements; the comparison runners reject
-it. Do not mix smoke records with measurements.
-
-## Records and interpretation
-
-READ durations are microseconds; SLICE and PIPELINE durations are nanoseconds.
-The slice runner normalizes READ/SLICE to nanoseconds. Copy profiles emit
-`COPY_PHASE` records; the pipeline profile also emits `COPY_OVERLAP` nanoseconds.
-CSV headers and harness format strings define the remaining columns. Numeric
-terminals emit one result, while stream records count consumed tensor elements.
-
-Separate wall time from structural work: requests, coordinate resolutions, index
-entries examined, physical-block borrows, backend calls, and adapter loads/saves.
-Inclusive nested phase timings must not be summed. Copy consumption and update
-durations overlap; overlap is their summed duration minus the enclosing join
-duration, clamped to zero. It measures intersecting awaited intervals, not
-simultaneous CPU execution.
-
-First/warm consumption does not guarantee cold/warm physical-device caches.
-Cached execution timings and adapter codec counts do not establish disk throughput.
-Ordered controls help identify general run-to-run noise. Repeat regressions and
-inspect structural counts before attributing a change to scheduling.
-
-Completion-order consumption can remove delivery stalls yet worsen cache locality
-or copy traffic. Tiny blocks and sparse-key boundaries can prevent useful run
-formation. Sparse matrix contractions still scan logical positions; nested
-expressions and separate tiles may repeat work. Bounded memory does not imply
-sparsity-proportional execution or a universal speedup.
-
-Timing comparisons are observations, not CI thresholds. Keep deterministic
-progress, boundedness, corruption, cancellation, and numerical assertions in tests;
-do not replace them with elapsed-time gates or publish generated result tables in
-project documentation.
+Keep correctness and structural gates in [tests/COVERAGE.md](tests/COVERAGE.md),
+execution contracts in [DESIGN.md](DESIGN.md), and machine-specific measurements
+out of project documentation. Timing thresholds do not belong in ordinary CI.

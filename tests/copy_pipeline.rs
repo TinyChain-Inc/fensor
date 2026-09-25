@@ -41,7 +41,7 @@ impl TensorGeometry for Reader<'_> {
         self.source.dtype()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         self.source.shape()
     }
 

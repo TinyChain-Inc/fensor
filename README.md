@@ -213,6 +213,12 @@ and interpretation](BENCHMARKS.md).
 
 ## Compatibility notes
 
+- Logical geometry now uses `u64`: import `Shape`, `Strides`, `Range`, and
+  `AxisRange` from fensor, and use the re-exported `Axes` for axis identifiers.
+  `TensorGeometry::size()` returns `Result<u64>`. Redundant shape/stride aliases
+  are removed; `TensorView::flat_offset` now returns `Result<i128>`. Adapter
+  coordinate payloads and persisted geometry are unchanged.
+
 - Typed adapter-owned metadata replaces the former version-2 text representation.
   Existing data in that representation requires an explicit adapter migration;
   fensor does not guess formats. There is no fensor dtype-string or whole-tensor codec.

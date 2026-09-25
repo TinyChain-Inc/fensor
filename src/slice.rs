@@ -4,6 +4,7 @@ use futures::{StreamExt, stream::BoxStream};
 
 use crate::expression::MAX_BATCH_ELEMENTS;
 use crate::request::{Axis, BatchRequest, Cartesian};
+use crate::schema::Coord;
 use crate::{Error, Result};
 
 pub(crate) type Requests<'a> = BoxStream<'a, Result<BatchRequest>>;
@@ -11,13 +12,13 @@ pub(crate) type Requests<'a> = BoxStream<'a, Result<BatchRequest>>;
 #[derive(Clone)]
 pub struct Slice {
     // Rank-sized metadata plus caller-supplied explicit selections.
-    shape: Vec<usize>,
+    shape: crate::Shape,
     pub(crate) axes: Vec<Axis>,
-    len: usize,
+    len: u64,
 }
 
 impl Slice {
-    pub(crate) fn new(shape: &[usize], axes: Vec<Axis>) -> Result<Self> {
+    pub(crate) fn new(shape: &[u64], axes: Vec<Axis>) -> Result<Self> {
         if axes.len() != shape.len() {
             return Err(Error::InvalidCoord("slice rank mismatch".into()));
         }
@@ -30,17 +31,17 @@ impl Slice {
             0
         } else {
             axes.iter()
-                .try_fold(1usize, |n, axis| n.checked_mul(axis.len()))
+                .try_fold(1u64, |n, axis| n.checked_mul(axis.len()))
                 .ok_or_else(|| Error::InvalidLayout("slice cardinality overflow".into()))?
         };
         Ok(Self {
-            shape: shape.to_vec(),
+            shape: shape.iter().copied().collect(),
             axes,
             len,
         })
     }
 
-    pub(crate) fn full(shape: &[usize]) -> Result<Self> {
+    pub(crate) fn full(shape: &[u64]) -> Result<Self> {
         crate::schema::validate_shape_dims(shape)?;
         Self::new(
             shape,
@@ -48,7 +49,7 @@ impl Slice {
         )
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> u64 {
         self.len
     }
 
@@ -58,14 +59,14 @@ impl Slice {
 
     pub(crate) fn requests(self) -> SliceRequests {
         let mut capacity = 1;
-        let mut chunks = vec![1; self.axes.len()];
+        let mut chunks = crate::Shape::from_elem(1, self.axes.len());
 
         for (axis, chunk) in self.axes.iter().zip(&mut chunks).rev() {
-            *chunk = axis.len().min(MAX_BATCH_ELEMENTS / capacity);
+            *chunk = axis.len().min(MAX_BATCH_ELEMENTS as u64 / capacity);
             capacity *= (*chunk).max(1);
         }
         SliceRequests {
-            origins: vec![0; self.axes.len()],
+            origins: Coord::from_elem(0, self.axes.len()),
             chunks,
             done: self.len == 0,
             slice: self,
@@ -77,7 +78,7 @@ impl Slice {
     }
 
     /// Clip each axis without changing explicit-selection order or multiplicity.
-    pub(crate) fn intersect(&self, bounds: &[(usize, usize)]) -> Result<Self> {
+    pub(crate) fn intersect(&self, bounds: &[(u64, u64)]) -> Result<Self> {
         if bounds.len() != self.axes.len() || bounds.iter().any(|(lo, hi)| lo > hi) {
             return Err(Error::InvalidCoord(
                 "invalid slice intersection bounds".into(),
@@ -107,7 +108,7 @@ impl Slice {
                     indices
                         .iter()
                         .copied()
-                        .filter(|&i| i >= lo as u64 && i < hi as u64)
+                        .filter(|&i| i >= lo && i < hi)
                         .collect(),
                 ),
             })
@@ -118,8 +119,8 @@ impl Slice {
 
 pub(crate) struct SliceRequests {
     slice: Slice,
-    chunks: Vec<usize>,
-    origins: Vec<usize>,
+    chunks: crate::Shape,
+    origins: Coord,
     done: bool,
 }
 
@@ -143,7 +144,9 @@ impl SliceRequests {
                         step: *step,
                         len,
                     },
-                    Axis::Selected(values) => Axis::Selected(values[origin..origin + len].to_vec()),
+                    Axis::Selected(values) => {
+                        Axis::Selected(values[origin as usize..(origin + len) as usize].to_vec())
+                    }
                 }
             })
             .collect();
@@ -181,7 +184,9 @@ impl std::iter::FusedIterator for SliceRequests {}
 #[cfg(test)]
 mod tests {
     use futures::TryStreamExt;
-    use ha_ndarray::{AxisRange, axes, shape};
+    use ha_ndarray::{axes, shape};
+
+    use crate::AxisRange;
     use number_general::DType;
 
     use super::*;
@@ -252,17 +257,17 @@ mod tests {
         );
         assert!(
             Slice::new(
-                &[usize::MAX],
+                &[u64::MAX],
                 vec![Axis::Span {
                     start: 1,
-                    step: usize::MAX,
+                    step: u64::MAX,
                     len: 2
                 }]
             )
             .is_err()
         );
         assert!(Slice::new(&[3], vec![Axis::Selected(vec![3])]).is_err());
-        assert!(Slice::full(&[usize::MAX, 2]).is_err());
+        assert!(Slice::full(&[u64::MAX, 2]).is_err());
         let slice = Slice::full(&[1_000_000_000, 1_000_000_000]).unwrap();
         let request = slice.requests().next().unwrap();
         assert_eq!(request.len(), MAX_BATCH_ELEMENTS);

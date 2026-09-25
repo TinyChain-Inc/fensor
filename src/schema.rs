@@ -1,25 +1,32 @@
 use std::io;
 
 use b_table::{IndexSchema, Schema};
-use ha_ndarray::{Shape, Strides};
 use number_general::{FloatType, NumberType, UIntType};
 use smallvec::SmallVec;
 
 use crate::{Error, PORTABLE_INLINE_RANK, Result as FResult};
 
-pub type TensorShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
+/// Logical dimensions; inline storage is an optimization, not a rank limit.
+pub type Shape = SmallVec<[u64; PORTABLE_INLINE_RANK]>;
 
-pub type TensorStrides = Strides;
+/// Unsigned logical row-major strides.
+pub type Strides = SmallVec<[u64; PORTABLE_INLINE_RANK]>;
 
-pub(crate) type BlockShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
+// Reusable rank-sized logical coordinate scratch; public payloads remain Vec.
+pub(crate) type Coord = SmallVec<[u64; PORTABLE_INLINE_RANK]>;
 
-pub(crate) type BlockStrides = Strides;
+/// Rank-sized slice metadata. Explicit selections retain caller order and duplicates.
+pub type Range = SmallVec<[AxisRange; PORTABLE_INLINE_RANK]>;
 
-pub(crate) type StorageShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
-
-pub(crate) type StorageStrides = Strides;
-
-pub type TensorViewShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AxisRange {
+    /// Select one coordinate (geometric slicing removes this axis).
+    At(u64),
+    /// Select start..stop with a nonzero step; stop is exclusive.
+    In(u64, u64, u64),
+    /// Caller-owned indices, preserving order and duplicates in geometric slices.
+    Of(Vec<u64>),
+}
 
 /// Maximum tensor values per storage block, independent of execution batches.
 pub const MAX_BLOCK_CAPACITY: usize = 4096;
@@ -36,12 +43,12 @@ const SPARSE_INDEX_ORDER: usize = 16;
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct TensorSchema {
     dtype: NumberType,
-    shape: TensorShape,
-    strides: TensorStrides,
+    shape: Shape,
+    strides: Strides,
 }
 
 impl TensorSchema {
-    pub fn new(dtype: NumberType, shape: TensorShape) -> FResult<Self> {
+    pub fn new(dtype: NumberType, shape: Shape) -> FResult<Self> {
         if !matches!(
             dtype,
             NumberType::UInt(UIntType::U8) | NumberType::Float(FloatType::F32 | FloatType::F64)
@@ -50,7 +57,6 @@ impl TensorSchema {
                 "unsupported tensor dtype: {dtype}"
             )));
         }
-        validate_shape_dims(shape.as_slice())?;
         let strides = contiguous_strides(shape.as_slice())?;
         Ok(Self {
             dtype,
@@ -74,12 +80,12 @@ impl TensorSchema {
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct BlockSchema {
-    pub(crate) shape: BlockShape,
-    pub(crate) strides: BlockStrides,
+    pub(crate) shape: Shape,
+    pub(crate) strides: Strides,
 }
 
 impl BlockSchema {
-    pub(crate) fn new(tensor_shape: &[usize], max_capacity: usize) -> FResult<Self> {
+    pub(crate) fn new(tensor_shape: &[u64], max_capacity: usize) -> FResult<Self> {
         let shape = greedy_block_shape(tensor_shape, max_capacity)?;
         let strides = contiguous_strides(shape.as_slice())?;
         Ok(Self { shape, strides })
@@ -92,26 +98,22 @@ impl BlockSchema {
 /// per call.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct StorageSchema {
-    pub(crate) shape: StorageShape,
+    pub(crate) shape: Shape,
     pub(crate) layout: Layout,
-    pub(crate) strides: StorageStrides,
+    pub(crate) strides: Strides,
     pub(crate) block_schema: BlockSchema,
 }
 
 impl StorageSchema {
     /// Creation path: run the greedy algorithm to pick a block shape.
-    pub(crate) fn new(
-        tensor_shape: &[usize],
-        layout: Layout,
-        max_capacity: usize,
-    ) -> FResult<Self> {
+    pub(crate) fn new(tensor_shape: &[u64], layout: Layout, max_capacity: usize) -> FResult<Self> {
         let block_schema = BlockSchema::new(tensor_shape, max_capacity)?;
         Self::from_block_schema(tensor_shape, layout, block_schema)
     }
 
     /// Load path: block shape already known (persisted) -- no greedy run needed.
     pub(crate) fn from_block_shape(
-        tensor_shape: &[usize],
+        tensor_shape: &[u64],
         layout: Layout,
         block_shape: Shape,
     ) -> FResult<Self> {
@@ -127,7 +129,7 @@ impl StorageSchema {
     }
 
     fn from_block_schema(
-        tensor_shape: &[usize],
+        tensor_shape: &[u64],
         layout: Layout,
         block_schema: BlockSchema,
     ) -> FResult<Self> {
@@ -139,7 +141,7 @@ impl StorageSchema {
             ));
         }
 
-        let shape: StorageShape = tensor_shape
+        let shape: Shape = tensor_shape
             .iter()
             .zip(block_schema.shape.iter())
             .map(|(dim, block_dim)| dim.div_ceil(*block_dim))
@@ -186,11 +188,12 @@ where
     Ok(())
 }
 
-pub fn contiguous_strides(shape: &[usize]) -> FResult<Strides> {
+pub fn contiguous_strides(shape: &[u64]) -> FResult<Strides> {
     validate_shape_dims(shape)?;
 
+    checked_product(shape)?;
     let ndim = shape.len();
-    let mut strides = vec![1usize; ndim];
+    let mut strides = Strides::from_elem(1, ndim);
 
     for i in (0..ndim).rev() {
         if i + 1 < ndim {
@@ -200,10 +203,10 @@ pub fn contiguous_strides(shape: &[usize]) -> FResult<Strides> {
         }
     }
 
-    Ok(strides.into())
+    Ok(strides)
 }
 
-pub fn greedy_block_shape(shape: &[usize], max_capacity: usize) -> FResult<Shape> {
+pub fn greedy_block_shape(shape: &[u64], max_capacity: usize) -> FResult<Shape> {
     validate_shape_dims(shape)?;
 
     if max_capacity == 0 {
@@ -213,8 +216,8 @@ pub fn greedy_block_shape(shape: &[usize], max_capacity: usize) -> FResult<Shape
     }
 
     let ndim = shape.len();
-    let mut block_shape = vec![1usize; ndim];
-    let mut remaining = max_capacity;
+    let mut block_shape = Shape::from_elem(1, ndim);
+    let mut remaining = max_capacity as u64;
 
     for i in (0..ndim).rev() {
         let take = shape[i].min(remaining);
@@ -222,32 +225,32 @@ pub fn greedy_block_shape(shape: &[usize], max_capacity: usize) -> FResult<Shape
         remaining /= take;
     }
 
-    Ok(block_shape.into())
+    Ok(block_shape)
 }
 
-fn checked_product(shape: &[usize]) -> FResult<u64> {
+pub(crate) fn checked_product(shape: &[u64]) -> FResult<u64> {
     shape
         .iter()
-        .try_fold(1u64, |acc, &dim| acc.checked_mul(dim as u64))
-        .ok_or_else(|| Error::InvalidSchema("shape element count overflows usize".to_string()))
+        .try_fold(1u64, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| Error::InvalidSchema("shape element count overflows u64".to_string()))
 }
 
 /// Row-major (C-order) coordinate walk over `shape` for bounded reads and copies.
 pub(crate) struct RowMajorCoords {
-    shape: Vec<usize>,
-    coord: Vec<u64>,
+    shape: Shape,
+    coord: Coord,
     remaining: u64,
 }
 
 /// Stores only the shape and one current coordinate (both rank-sized).
 /// Total size is a counter, never a coordinate allocation.
-pub(crate) fn row_major_coords(shape: &[usize]) -> FResult<RowMajorCoords> {
+pub(crate) fn row_major_coords(shape: &[u64]) -> FResult<RowMajorCoords> {
     validate_shape_dims(shape)?;
     let remaining = checked_product(shape)?;
 
     Ok(RowMajorCoords {
-        shape: shape.to_vec(),
-        coord: vec![0u64; shape.len()],
+        shape: shape.iter().copied().collect(),
+        coord: Coord::from_elem(0, shape.len()),
         remaining,
     })
 }
@@ -268,7 +271,7 @@ impl Iterator for RowMajorCoords {
 
             loop {
                 self.coord[axis] += 1;
-                if (self.coord[axis] as usize) < self.shape[axis] {
+                if self.coord[axis] < self.shape[axis] {
                     break;
                 }
 
@@ -280,7 +283,7 @@ impl Iterator for RowMajorCoords {
             }
         }
 
-        Some(out)
+        Some(out.into_vec())
     }
 }
 
@@ -482,9 +485,9 @@ mod tests {
 
     #[test]
     fn contiguous_strides_overflow() {
-        // strides[1] = shape[2] = usize::MAX (no overflow: 1 * MAX);
-        // strides[0] = strides[1] * shape[1] = MAX * 2 -> overflows usize
-        let err = contiguous_strides(&[3, 2, usize::MAX]).expect_err("overflow should be rejected");
+        // strides[1] = shape[2] = u64::MAX (no overflow: 1 * MAX);
+        // strides[0] = strides[1] * shape[1] = MAX * 2 -> overflows u64
+        let err = contiguous_strides(&[3, 2, u64::MAX]).expect_err("overflow should be rejected");
         assert!(matches!(err, Error::InvalidSchema(_)));
     }
 
@@ -569,9 +572,8 @@ mod tests {
 
     #[test]
     fn tensor_schema_new_computes_strides() {
-        let schema =
-            TensorSchema::new(NumberType::Float(FloatType::F32), vec![4usize, 5, 6].into())
-                .expect("schema");
+        let schema = TensorSchema::new(NumberType::Float(FloatType::F32), vec![4u64, 5, 6].into())
+            .expect("schema");
         assert_eq!(schema.shape().as_slice(), &[4, 5, 6]);
         assert_eq!(schema.strides().as_slice(), &[30, 6, 1]);
     }
@@ -611,7 +613,7 @@ mod tests {
     fn storage_schema_from_block_shape_matches_new() {
         let via_new = StorageSchema::new(&[10], Layout::Dense, 3).expect("via new");
         let via_block_shape =
-            StorageSchema::from_block_shape(&[10], Layout::Dense, vec![3usize].into())
+            StorageSchema::from_block_shape(&[10], Layout::Dense, vec![3u64].into())
                 .expect("via from_block_shape");
         assert_eq!(via_new, via_block_shape);
     }
