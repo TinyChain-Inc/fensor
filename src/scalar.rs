@@ -33,102 +33,72 @@ use crate::{
     UnaryView,
 };
 
-/// Lazy scalar add operation.
-#[derive(Clone, Copy, Debug)]
-pub struct AddScalar<T>(T);
+// Each declaration preserves its explicit dtype bounds and backend operation.
+macro_rules! scalar_op {
+    ($(#[$doc:meta])* $name:ident, $method:ident, $ty:ident: [$($bounds:tt)+] => $output:ty) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug)]
+        pub struct $name<$ty>($ty);
 
-impl<T> sealed::Sealed for AddScalar<T> {}
+        impl<$ty> sealed::Sealed for $name<$ty> {}
 
-impl<T: TensorElement + Real> UnaryOp<T> for AddScalar<T> {
-    type Output = T;
+        impl<$ty: $($bounds)+> UnaryOp<$ty> for $name<$ty> {
+            type Output = $output;
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.add_scalar(self.0)?))
-    }
+            fn apply(
+                &self,
+                array: ArrayAccess<'static, $ty>,
+            ) -> Result<ArrayAccess<'static, Self::Output>> {
+                Ok(ArrayAccess::from(array.$method(self.0)?))
+            }
+        }
+    };
 }
 
-/// Lazy scalar sub operation.
-#[derive(Clone, Copy, Debug)]
-pub struct SubScalar<T>(T);
+scalar_op!(
+    /// Lazy scalar add operation.
+    AddScalar, add_scalar, T: [TensorElement + Real] => T
+);
 
-impl<T> sealed::Sealed for SubScalar<T> {}
+scalar_op!(
+    /// Lazy scalar sub operation.
+    SubScalar, sub_scalar, T: [TensorElement + Real] => T
+);
 
-impl<T: TensorElement + Real> UnaryOp<T> for SubScalar<T> {
-    type Output = T;
+scalar_op!(
+    /// Lazy scalar mul operation.
+    MulScalar, mul_scalar, T: [TensorElement + Real] => T
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.sub_scalar(self.0)?))
-    }
-}
+scalar_op!(
+    /// Lazy scalar div operation.
+    DivScalar, div_scalar, T: [TensorElement + Real] => T
+);
 
-/// Lazy scalar mul operation.
-#[derive(Clone, Copy, Debug)]
-pub struct MulScalar<T>(T);
+scalar_op!(
+    /// Lazy scalar pow operation.
+    PowScalar, pow_scalar, T: [TensorElement + Real] => T
+);
 
-impl<T> sealed::Sealed for MulScalar<T> {}
+scalar_op!(
+    /// Lazy scalar log operation.
+    LogScalar, log_scalar, T: [TensorElement + Float] => T
+);
 
-impl<T: TensorElement + Real> UnaryOp<T> for MulScalar<T> {
-    type Output = T;
+scalar_op!(
+    /// Lazy scalar rem operation.
+    RemScalar, rem_scalar, T: [TensorElement + Real] => T
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.mul_scalar(self.0)?))
-    }
-}
+// Expand only members of the explicit public-trait implementation below.
+macro_rules! scalar_constructor {
+    ($output:ident, $method:ident, $op:ident) => {
+        type $output = UnaryView<Self, $op<Self::DType>>;
 
-/// Lazy scalar div operation.
-#[derive(Clone, Copy, Debug)]
-pub struct DivScalar<T>(T);
-
-impl<T> sealed::Sealed for DivScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for DivScalar<T> {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.div_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar pow operation.
-#[derive(Clone, Copy, Debug)]
-pub struct PowScalar<T>(T);
-
-impl<T> sealed::Sealed for PowScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for PowScalar<T> {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.pow_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar log operation.
-#[derive(Clone, Copy, Debug)]
-pub struct LogScalar<T>(T);
-
-impl<T> sealed::Sealed for LogScalar<T> {}
-
-impl<T: TensorElement + Float> UnaryOp<T> for LogScalar<T> {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.log_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar rem operation.
-#[derive(Clone, Copy, Debug)]
-pub struct RemScalar<T>(T);
-
-impl<T> sealed::Sealed for RemScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for RemScalar<T> {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.rem_scalar(self.0)?))
-    }
+        fn $method(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::$output>> {
+            Box::pin(async move { Ok(UnaryView::new(self.clone(), $op(rhs))) })
+        }
+    };
 }
 
 impl<E> TensorMathScalar for E
@@ -136,42 +106,22 @@ where
     E: Expression + Clone,
     E::DType: TensorElement + Real,
 {
-    type AddOutput = UnaryView<Self, AddScalar<E::DType>>;
+    scalar_constructor!(AddOutput, add_scalar, AddScalar);
 
-    type SubOutput = UnaryView<Self, SubScalar<E::DType>>;
+    scalar_constructor!(SubOutput, sub_scalar, SubScalar);
 
-    type MulOutput = UnaryView<Self, MulScalar<E::DType>>;
+    scalar_constructor!(MulOutput, mul_scalar, MulScalar);
 
-    type DivOutput = UnaryView<Self, DivScalar<E::DType>>;
+    scalar_constructor!(DivOutput, div_scalar, DivScalar);
 
-    type PowOutput = UnaryView<Self, PowScalar<E::DType>>;
+    scalar_constructor!(PowOutput, pow_scalar, PowScalar);
 
     type LogOutput
         = UnaryView<Self, LogScalar<E::DType>>
     where
         E::DType: Float;
 
-    type RemOutput = UnaryView<Self, RemScalar<E::DType>>;
-
-    fn add_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::AddOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), AddScalar(rhs))) })
-    }
-
-    fn sub_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::SubOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), SubScalar(rhs))) })
-    }
-
-    fn mul_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::MulOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), MulScalar(rhs))) })
-    }
-
-    fn div_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::DivOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), DivScalar(rhs))) })
-    }
-
-    fn pow_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::PowOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), PowScalar(rhs))) })
-    }
+    scalar_constructor!(RemOutput, rem_scalar, RemScalar);
 
     fn log_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LogOutput>>
     where
@@ -179,200 +129,79 @@ where
     {
         Box::pin(async move { Ok(UnaryView::new(self.clone(), LogScalar(rhs))) })
     }
-
-    fn rem_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::RemOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), RemScalar(rhs))) })
-    }
 }
 
-/// Lazy scalar eq operation.
-#[derive(Clone, Copy, Debug)]
-pub struct EqScalar<T>(T);
+scalar_op!(
+    /// Lazy scalar eq operation.
+    EqScalar, eq_scalar, T: [TensorElement + Real] => u8
+);
 
-impl<T> sealed::Sealed for EqScalar<T> {}
+scalar_op!(
+    /// Lazy scalar ne operation.
+    NeScalar, ne_scalar, T: [TensorElement + Real] => u8
+);
 
-impl<T: TensorElement + Real> UnaryOp<T> for EqScalar<T> {
-    type Output = u8;
+scalar_op!(
+    /// Lazy scalar gt operation.
+    GtScalar, gt_scalar, T: [TensorElement + Real] => u8
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.eq_scalar(self.0)?))
-    }
-}
+scalar_op!(
+    /// Lazy scalar ge operation.
+    GeScalar, ge_scalar, T: [TensorElement + Real] => u8
+);
 
-/// Lazy scalar ne operation.
-#[derive(Clone, Copy, Debug)]
-pub struct NeScalar<T>(T);
+scalar_op!(
+    /// Lazy scalar lt operation.
+    LtScalar, lt_scalar, T: [TensorElement + Real] => u8
+);
 
-impl<T> sealed::Sealed for NeScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for NeScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.ne_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar gt operation.
-#[derive(Clone, Copy, Debug)]
-pub struct GtScalar<T>(T);
-
-impl<T> sealed::Sealed for GtScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for GtScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.gt_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar ge operation.
-#[derive(Clone, Copy, Debug)]
-pub struct GeScalar<T>(T);
-
-impl<T> sealed::Sealed for GeScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for GeScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.ge_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar lt operation.
-#[derive(Clone, Copy, Debug)]
-pub struct LtScalar<T>(T);
-
-impl<T> sealed::Sealed for LtScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for LtScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.lt_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar le operation.
-#[derive(Clone, Copy, Debug)]
-pub struct LeScalar<T>(T);
-
-impl<T> sealed::Sealed for LeScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for LeScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.le_scalar(self.0)?))
-    }
-}
+scalar_op!(
+    /// Lazy scalar le operation.
+    LeScalar, le_scalar, T: [TensorElement + Real] => u8
+);
 
 impl<E> TensorCompareScalar for E
 where
     E: Expression + Clone,
     E::DType: TensorElement + Real,
 {
-    type EqOutput = UnaryView<Self, EqScalar<E::DType>>;
+    scalar_constructor!(EqOutput, eq_scalar, EqScalar);
 
-    type NeOutput = UnaryView<Self, NeScalar<E::DType>>;
+    scalar_constructor!(NeOutput, ne_scalar, NeScalar);
 
-    type GtOutput = UnaryView<Self, GtScalar<E::DType>>;
+    scalar_constructor!(GtOutput, gt_scalar, GtScalar);
 
-    type GeOutput = UnaryView<Self, GeScalar<E::DType>>;
+    scalar_constructor!(GeOutput, ge_scalar, GeScalar);
 
-    type LtOutput = UnaryView<Self, LtScalar<E::DType>>;
+    scalar_constructor!(LtOutput, lt_scalar, LtScalar);
 
-    type LeOutput = UnaryView<Self, LeScalar<E::DType>>;
-
-    fn eq_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::EqOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), EqScalar(rhs))) })
-    }
-
-    fn ne_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::NeOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), NeScalar(rhs))) })
-    }
-
-    fn gt_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::GtOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), GtScalar(rhs))) })
-    }
-
-    fn ge_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::GeOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), GeScalar(rhs))) })
-    }
-
-    fn lt_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LtOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), LtScalar(rhs))) })
-    }
-
-    fn le_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LeOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), LeScalar(rhs))) })
-    }
+    scalar_constructor!(LeOutput, le_scalar, LeScalar);
 }
 
-/// Lazy scalar and operation.
-#[derive(Clone, Copy, Debug)]
-pub struct AndScalar<T>(T);
+scalar_op!(
+    /// Lazy scalar and operation.
+    AndScalar, and_scalar, T: [TensorElement + Real] => u8
+);
 
-impl<T> sealed::Sealed for AndScalar<T> {}
+scalar_op!(
+    /// Lazy scalar or operation.
+    OrScalar, or_scalar, T: [TensorElement + Real] => u8
+);
 
-impl<T: TensorElement + Real> UnaryOp<T> for AndScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.and_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar or operation.
-#[derive(Clone, Copy, Debug)]
-pub struct OrScalar<T>(T);
-
-impl<T> sealed::Sealed for OrScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for OrScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.or_scalar(self.0)?))
-    }
-}
-
-/// Lazy scalar xor operation.
-#[derive(Clone, Copy, Debug)]
-pub struct XorScalar<T>(T);
-
-impl<T> sealed::Sealed for XorScalar<T> {}
-
-impl<T: TensorElement + Real> UnaryOp<T> for XorScalar<T> {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>> {
-        Ok(ArrayAccess::from(array.xor_scalar(self.0)?))
-    }
-}
+scalar_op!(
+    /// Lazy scalar xor operation.
+    XorScalar, xor_scalar, T: [TensorElement + Real] => u8
+);
 
 impl<E> TensorBooleanScalar for E
 where
     E: Expression + Clone,
     E::DType: TensorElement + Real,
 {
-    type AndOutput = UnaryView<Self, AndScalar<E::DType>>;
+    scalar_constructor!(AndOutput, and_scalar, AndScalar);
 
-    type OrOutput = UnaryView<Self, OrScalar<E::DType>>;
+    scalar_constructor!(OrOutput, or_scalar, OrScalar);
 
-    type XorOutput = UnaryView<Self, XorScalar<E::DType>>;
-
-    fn and_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::AndOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), AndScalar(rhs))) })
-    }
-
-    fn or_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::OrOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), OrScalar(rhs))) })
-    }
-
-    fn xor_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::XorOutput>> {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), XorScalar(rhs))) })
-    }
+    scalar_constructor!(XorOutput, xor_scalar, XorScalar);
 }

@@ -2,12 +2,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt, TryStreamExt};
-use ha_ndarray::{Axes, Range, Shape};
 use number_general::NumberType;
 
 use crate::schema::Layout;
-use crate::validate;
-use crate::{Error, Result, TensorSchema};
+use crate::{Axes, Error, Range, Result, Shape, TensorSchema, validate};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -19,14 +17,15 @@ pub trait TensorGeometry: Send + Sync {
 
     fn layout(&self) -> Layout;
 
-    fn shape(&self) -> &[usize];
+    fn shape(&self) -> &[u64];
 
     fn ndim(&self) -> usize {
         self.shape().len()
     }
 
-    fn size(&self) -> usize {
-        self.shape().iter().product()
+    /// Checked logical cardinality, independent of the machine-sized batch buffers.
+    fn size(&self) -> Result<u64> {
+        crate::schema::checked_product(self.shape())
     }
 }
 
@@ -34,7 +33,7 @@ pub trait TensorGeometry: Send + Sync {
 pub trait TensorArray: TensorGeometry {
     fn schema(&self) -> &TensorSchema;
 
-    fn strides(&self) -> &[usize];
+    fn strides(&self) -> &[u64];
 
     fn schema_dtype(&self) -> NumberType {
         self.schema().dtype()
@@ -48,6 +47,16 @@ pub type SparseElementStream<'a, ET> =
 /// Bounded batches of values in logical row-major order, independent of storage tiling.
 pub type ValueBlockStream<'a, T> = Pin<Box<dyn Stream<Item = Result<Vec<T>>> + Send + 'a>>;
 
+/// Coordinate-bearing bounded blocks, in implementation-selected order.
+/// Successful complete consumption visits every logical coordinate exactly once,
+/// including zero-valued coordinates. Built-in readers deliver completed batches
+/// without input-order error precedence; dropping a stream cancels pending work.
+/// Coordinates and values have equal length within the
+/// [execution limit](https://github.com/TinyChain-Inc/fensor/blob/main/DESIGN.md#bound-and-policy-constants).
+/// Each call is independent.
+pub type CoordinateBlockStream<'a, T> =
+    Pin<Box<dyn Stream<Item = Result<(Vec<Vec<u64>>, Vec<T>)>> + Send + 'a>>;
+
 /// Async value reads aligned with ndarray coordinate semantics.
 pub trait TensorRead: TensorGeometry {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>>;
@@ -58,13 +67,51 @@ pub trait TensorRead: TensorGeometry {
         Ok(futures::stream::iter(batches)
             .map(move |coords| async move {
                 let mut values = Vec::with_capacity(coords.len());
+
                 for coord in coords {
                     values.push(self.read_value(&coord).await?);
                 }
+
                 Ok(values)
             })
             .buffered(num_cpus::get().max(1))
             .boxed())
+    }
+
+    /// Read all logical coordinates in bounded blocks, without promising row-major order.
+    /// Exactly-once coverage is an implementer's contract, not globally tracked state.
+    fn read_coordinate_blocks(&self) -> Result<CoordinateBlockStream<'_, Self::DType>> {
+        let coords = crate::schema::row_major_coords(self.shape())?;
+        let blocks = self.read_blocks()?;
+        Ok(
+            futures::stream::try_unfold((coords, blocks), |(mut coords, mut blocks)| async move {
+                let Some(values) = blocks.try_next().await? else {
+                    if coords.next().is_some() {
+                        return Err(Error::InvalidLayout(
+                            "reader returned fewer values than its shape".into(),
+                        ));
+                    }
+                    return Ok(None);
+                };
+                if values.len() > crate::expression::MAX_BATCH_ELEMENTS {
+                    return Err(Error::InvalidLayout(format!(
+                        "coordinate block: expected at most {} values, got {}",
+                        crate::expression::MAX_BATCH_ELEMENTS,
+                        values.len()
+                    )));
+                }
+
+                let selected: Vec<_> = coords.by_ref().take(values.len()).collect();
+                if selected.len() != values.len() {
+                    return Err(Error::InvalidLayout(
+                        "reader returned more values than its shape".into(),
+                    ));
+                }
+
+                Ok(Some(((selected, values), (coords, blocks))))
+            })
+            .boxed(),
+        )
     }
 
     fn read_sparse_elements_in_order<'a>(
@@ -209,11 +256,15 @@ pub trait TensorViewSemantics: TensorGeometry {
 /// Unary tensor math operations.
 pub trait TensorUnary: TensorGeometry + Sized {
     type ExpOutput: TensorRead<DType = Self::DType>;
+
     type LnOutput: TensorRead<DType = Self::DType>;
+
     type RoundOutput: TensorRead<DType = Self::DType>;
 
     fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>>;
+
     fn ln(&self) -> BoxFuture<'_, Result<Self::LnOutput>>;
+
     fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>;
 }
 
@@ -240,20 +291,26 @@ pub trait TensorUnaryBoolean: TensorGeometry + Sized {
 /// ```
 /// use fensor::{Result, Tensor, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
 /// use freqfs::DirLock;
-/// async fn mask<S, D>(tensor: &Tensor<S, f32>, dir: DirLock<D>) -> Result<Tensor<D, u8>>
+/// async fn mask<S, D>(
+///     tensor: &Tensor<S, f32>,
+///     dir: DirLock<D>,
+///     max_capacity: usize,
+/// ) -> Result<Tensor<D, u8>>
 /// where
 ///     S: TensorFileEntry<f32>,
 ///     D: TensorFileEntry<u8>,
 /// {
 ///     let mask = tensor.view().is_nan().await?.not().await?.clone();
-///     Tensor::copy_from(dir, &mask, 4096).await
+///     Tensor::copy_from(dir, &mask, max_capacity).await
 /// }
 /// ```
 pub trait TensorNumeric: TensorGeometry + Sized {
     type IsNanOutput: TensorRead<DType = u8>;
+
     type IsInfOutput: TensorRead<DType = u8>;
 
     fn is_nan(&self) -> BoxFuture<'_, Result<Self::IsNanOutput>>;
+
     fn is_inf(&self) -> BoxFuture<'_, Result<Self::IsInfOutput>>;
 }
 
@@ -268,6 +325,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// async fn widen<Source, Destination>(
 ///     source: &Tensor<Source, f32>,
 ///     dir: DirLock<Destination>,
+///     max_capacity: usize,
 /// ) -> Result<Tensor<Destination, f64>>
 /// where
 ///     Source: TensorFileEntry<f32>,
@@ -275,7 +333,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// {
 ///     let view = source.view();
 ///     let cast = TensorCast::<f64>::cast(&view).await?;
-///     Tensor::copy_from(dir, &cast, 4096).await
+///     Tensor::copy_from(dir, &cast, max_capacity).await
 /// }
 /// ```
 ///
@@ -303,21 +361,35 @@ pub trait TensorAbs: TensorGeometry + Sized {
 /// Elementwise trigonometry, evaluated lazily over source support.
 pub trait TensorTrig: TensorGeometry + Sized {
     type SinOutput: TensorRead<DType = Self::DType>;
+
     type AsinOutput: TensorRead<DType = Self::DType>;
+
     type SinhOutput: TensorRead<DType = Self::DType>;
+
     type CosOutput: TensorRead<DType = Self::DType>;
+
     type AcosOutput: TensorRead<DType = Self::DType>;
+
     type CoshOutput: TensorRead<DType = Self::DType>;
+
     type TanOutput: TensorRead<DType = Self::DType>;
+
     type AtanOutput: TensorRead<DType = Self::DType>;
+
     type TanhOutput: TensorRead<DType = Self::DType>;
 
     fn sin(&self) -> BoxFuture<'_, Result<Self::SinOutput>>;
+
     fn asin(&self) -> BoxFuture<'_, Result<Self::AsinOutput>>;
+
     fn sinh(&self) -> BoxFuture<'_, Result<Self::SinhOutput>>;
+
     fn cos(&self) -> BoxFuture<'_, Result<Self::CosOutput>>;
+
     fn acos(&self) -> BoxFuture<'_, Result<Self::AcosOutput>>;
+
     fn cosh(&self) -> BoxFuture<'_, Result<Self::CoshOutput>>;
+
     fn tan(&self) -> BoxFuture<'_, Result<Self::TanOutput>>;
 
     fn atan(&self) -> BoxFuture<'_, Result<Self::AtanOutput>>;
@@ -331,10 +403,15 @@ where
     Rhs: TensorGeometry<DType = Self::DType>,
 {
     type AddOutput: TensorRead<DType = Self::DType>;
+
     type SubOutput: TensorRead<DType = Self::DType>;
+
     type MulOutput: TensorRead<DType = Self::DType>;
+
     type DivOutput: TensorRead<DType = Self::DType>;
+
     type PowOutput: TensorRead<DType = Self::DType>;
+
     type LogOutput: TensorRead<DType = Self::DType>
     where
         Self::DType: ha_ndarray::Float;
@@ -538,6 +615,10 @@ pub trait TensorReduce: TensorGeometry {
 
 /// Terminal reductions over retained source support, not implicit sparse zeros.
 /// Empty support gives sum=0 and product=1; extrema return an error.
+/// Built-in expressions accumulate batches in completion order. Floating results
+/// may depend on scheduling within ha-ndarray's aggregate contract, including
+/// permitted extreme-range differences. The first observed error cancels pending
+/// evaluation; errors have no input-order precedence. Extrema do not short-circuit.
 pub trait TensorReduceAll: TensorRead {
     fn sum_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
 
@@ -557,19 +638,24 @@ pub trait TensorReduceBoolean: TensorRead {
     fn any(&self) -> BoxFuture<'_, Result<bool>>;
 }
 
-/// Matrix/tensor contraction operations.
-pub trait TensorMatMul: TensorArray + Sized {
-    fn matmul_output_shape(&self, rhs: &Self) -> Result<Shape> {
+/// Lazy matrix multiplication with matching dtypes and explicit batch broadcasting.
+///
+/// Shapes must be `[..., M, K]` and `[..., K, N]`, with identical batch dimensions
+/// and rank at least two. The output is `[..., M, N]`; shape/size errors are
+/// rejected before construction. Use transforms to broadcast explicitly.
+/// Sparse output support unions both operands across contraction positions,
+/// retaining supported zero results. See [`crate::MatMulView`] for composition.
+pub trait TensorMatMul<Rhs = Self>: TensorGeometry
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type Output: TensorRead<DType = Self::DType>;
+
+    fn matmul_output_shape(&self, rhs: &Rhs) -> Result<Shape> {
         validate::matmul_output_shape(self.shape(), rhs.shape())
     }
 
-    fn matmul<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "matmul is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn matmul<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::Output>>;
 }
 
 /// Batch coordinates without expanding the remaining logical range.
@@ -611,7 +697,7 @@ pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
     let mut range = range;
 
     for axis in &mut range {
-        if let ha_ndarray::AxisRange::Of(indices) = axis {
+        if let crate::AxisRange::Of(indices) = axis {
             indices.sort_unstable();
             indices.dedup();
         }

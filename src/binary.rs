@@ -1,15 +1,14 @@
 //! Typed, read-only elementwise expressions over two sources.
 
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{
-    ArrayAccess, Axes, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, Range, Real, Shape,
-};
+use ha_ndarray::{ArrayAccess, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, Real};
 
 use crate::expression::{self, Batch, Expression};
+use crate::request::{self, BatchRequest};
 use crate::traits::{BoxFuture, SparseElementStream, ValueBlockStream};
 use crate::{
-    Error, Layout, Result, TensorBoolean, TensorCompare, TensorElement, TensorGeometry, TensorMath,
-    TensorRead, TensorTransform, TensorViewSemantics,
+    Axes, Error, Layout, Range, Result, Shape, TensorBoolean, TensorCompare, TensorElement,
+    TensorGeometry, TensorMath, TensorRead, TensorTransform, TensorViewSemantics,
 };
 
 mod sealed {
@@ -119,130 +118,73 @@ impl<L: crate::TensorGeometry, R: crate::TensorGeometry, O> BinaryView<L, R, O> 
     }
 }
 
-/// Elementwise add.
-#[derive(Clone, Copy, Debug)]
-pub struct Add;
+// Each declaration preserves its explicit dtype bounds and backend operation.
+macro_rules! binary_op {
+    ($(#[$doc:meta])* $name:ident, $method:ident, $ty:ident: [$($bounds:tt)+] => $output:ty) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug)]
+        pub struct $name;
 
-impl sealed::Sealed for Add {}
+        impl sealed::Sealed for $name {}
 
-impl<T: TensorElement> BinaryOp<T> for Add {
-    type Output = T;
+        impl<$ty: $($bounds)+> BinaryOp<$ty> for $name {
+            type Output = $output;
 
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(left.add(right)?))
-    }
+            fn apply(
+                &self,
+                left: ArrayAccess<'static, $ty>,
+                right: ArrayAccess<'static, $ty>,
+            ) -> Result<ArrayAccess<'static, Self::Output>> {
+                Ok(ArrayAccess::from(left.$method(right)?))
+            }
+        }
+    };
 }
 
-/// Elementwise sub.
-#[derive(Clone, Copy, Debug)]
-pub struct Sub;
+binary_op!(
+    /// Elementwise add.
+    Add, add, T: [TensorElement] => T
+);
 
-impl sealed::Sealed for Sub {}
+binary_op!(
+    /// Elementwise sub.
+    Sub, sub, T: [TensorElement] => T
+);
 
-impl<T: TensorElement> BinaryOp<T> for Sub {
-    type Output = T;
+binary_op!(
+    /// Elementwise mul.
+    Mul, mul, T: [TensorElement] => T
+);
 
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(left.sub(right)?))
-    }
-}
+binary_op!(
+    /// Elementwise div.
+    Div, div, T: [TensorElement] => T
+);
 
-/// Elementwise mul.
-#[derive(Clone, Copy, Debug)]
-pub struct Mul;
+binary_op!(
+    /// Elementwise pow.
+    Pow, pow, T: [TensorElement] => T
+);
 
-impl sealed::Sealed for Mul {}
+binary_op!(
+    /// Elementwise log.
+    Log, log, T: [TensorElement + Float] => T
+);
 
-impl<T: TensorElement> BinaryOp<T> for Mul {
-    type Output = T;
+binary_op!(
+    /// Elementwise rem.
+    Rem, rem, T: [TensorElement + Real] => T
+);
 
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(left.mul(right)?))
-    }
-}
+// Expand only members of the explicit public-trait implementation below.
+macro_rules! binary_constructor {
+    ($output:ident, $method:ident, $op:ident, $rhs:ty) => {
+        type $output = BinaryView<Self, $rhs, $op>;
 
-/// Elementwise div.
-#[derive(Clone, Copy, Debug)]
-pub struct Div;
-
-impl sealed::Sealed for Div {}
-
-impl<T: TensorElement> BinaryOp<T> for Div {
-    type Output = T;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(left.div(right)?))
-    }
-}
-
-/// Elementwise pow.
-#[derive(Clone, Copy, Debug)]
-pub struct Pow;
-
-impl sealed::Sealed for Pow {}
-
-impl<T: TensorElement> BinaryOp<T> for Pow {
-    type Output = T;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(left.pow(right)?))
-    }
-}
-
-/// Elementwise log.
-#[derive(Clone, Copy, Debug)]
-pub struct Log;
-
-impl sealed::Sealed for Log {}
-
-impl<T: TensorElement + Float> BinaryOp<T> for Log {
-    type Output = T;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(left.log(right)?))
-    }
-}
-
-/// Elementwise rem.
-#[derive(Clone, Copy, Debug)]
-pub struct Rem;
-
-impl sealed::Sealed for Rem {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Rem {
-    type Output = T;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(left.rem(right)?))
-    }
+        fn $method<'a>(&'a self, rhs: &'a $rhs) -> BoxFuture<'a, Result<Self::$output>> {
+            Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), $op) })
+        }
+    };
 }
 
 impl<L, R> TensorMath<R> for L
@@ -251,46 +193,28 @@ where
     R: Expression<DType = L::DType> + Clone,
     L::DType: TensorElement + Real,
 {
-    type AddOutput = BinaryView<Self, R, Add>;
-    type SubOutput = BinaryView<Self, R, Sub>;
-    type MulOutput = BinaryView<Self, R, Mul>;
-    type DivOutput = BinaryView<Self, R, Div>;
-    type PowOutput = BinaryView<Self, R, Pow>;
+    binary_constructor!(AddOutput, add, Add, R);
+
+    binary_constructor!(SubOutput, sub, Sub, R);
+
+    binary_constructor!(MulOutput, mul, Mul, R);
+
+    binary_constructor!(DivOutput, div, Div, R);
+
+    binary_constructor!(PowOutput, pow, Pow, R);
+
     type LogOutput
         = BinaryView<Self, R, Log>
     where
         L::DType: Float;
-    type RemOutput = BinaryView<Self, R, Rem>;
 
-    fn add<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::AddOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Add) })
-    }
-
-    fn sub<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::SubOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Sub) })
-    }
-
-    fn mul<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::MulOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Mul) })
-    }
-
-    fn div<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::DivOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Div) })
-    }
-
-    fn pow<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::PowOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Pow) })
-    }
+    binary_constructor!(RemOutput, rem, Rem, R);
 
     fn log<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LogOutput>>
     where
         L::DType: Float,
     {
         Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Log) })
-    }
-
-    fn rem<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::RemOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Rem) })
     }
 }
 
@@ -307,7 +231,7 @@ where
         <Self::DType as number_general::DType>::dtype()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         self.left.shape()
     }
 
@@ -342,7 +266,14 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
-    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
+        match self.left.preferred_requests(shape)? {
+            Some(requests) => Ok(Some(requests)),
+            None => self.right.preferred_requests(shape),
+        }
+    }
+
+    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             let left = self.left.build(coords).await?;
             let right = self.right.build(coords).await?;
@@ -364,18 +295,24 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
+    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
+        expression::coordinate_blocks(self)
+    }
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
-                .await?
-                .values[0])
+            Ok(
+                expression::evaluate_batch(self, &BatchRequest::point(coord))
+                    .await?
+                    .values[0],
+            )
         })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = crate::schema::row_major_coords(self.shape())?;
+        let coords = request::linear_requests(self.shape())?;
 
-        Ok(expression::evaluated_batches(self, coords)
+        Ok(expression::ordered_batches(self, coords)
             .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
@@ -388,18 +325,18 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::evaluated_batches(self, coords)
-                .map_ok(|(coords, values)| {
-                    futures::stream::iter(
-                        coords
-                            .into_iter()
-                            .zip(values.values)
-                            .filter(|(_, value)| *value != Self::DType::default())
-                            .map(Ok),
-                    )
-                })
-                .try_flatten()
-                .boxed())
+            Ok(
+                expression::ordered_batches(self, request::explicit_requests(coords))
+                    .and_then(move |(coords, values)| async move {
+                        Ok(futures::stream::iter(expression::sparse_elements(
+                            coords,
+                            values,
+                            self.shape(),
+                        )?))
+                    })
+                    .try_flatten()
+                    .boxed(),
+            )
         })
     }
 }
@@ -468,113 +405,35 @@ where
     }
 }
 
-/// Elementwise eq operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Eq;
+binary_op!(
+    /// Elementwise eq operation returning zero or one.
+    Eq, eq, T: [TensorElement + Real] => u8
+);
 
-impl sealed::Sealed for Eq {}
+binary_op!(
+    /// Elementwise ne operation returning zero or one.
+    Ne, ne, T: [TensorElement + Real] => u8
+);
 
-impl<T: TensorElement + Real> BinaryOp<T> for Eq {
-    type Output = u8;
+binary_op!(
+    /// Elementwise gt operation returning zero or one.
+    Gt, gt, T: [TensorElement + Real] => u8
+);
 
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.eq(right)?))
-    }
-}
+binary_op!(
+    /// Elementwise ge operation returning zero or one.
+    Ge, ge, T: [TensorElement + Real] => u8
+);
 
-/// Elementwise ne operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Ne;
+binary_op!(
+    /// Elementwise lt operation returning zero or one.
+    Lt, lt, T: [TensorElement + Real] => u8
+);
 
-impl sealed::Sealed for Ne {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Ne {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.ne(right)?))
-    }
-}
-
-/// Elementwise gt operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Gt;
-
-impl sealed::Sealed for Gt {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Gt {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.gt(right)?))
-    }
-}
-
-/// Elementwise ge operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Ge;
-
-impl sealed::Sealed for Ge {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Ge {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.ge(right)?))
-    }
-}
-
-/// Elementwise lt operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Lt;
-
-impl sealed::Sealed for Lt {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Lt {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.lt(right)?))
-    }
-}
-
-/// Elementwise le operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Le;
-
-impl sealed::Sealed for Le {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Le {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.le(right)?))
-    }
-}
+binary_op!(
+    /// Elementwise le operation returning zero or one.
+    Le, le, T: [TensorElement + Real] => u8
+);
 
 impl<L, R> TensorCompare<R> for L
 where
@@ -582,96 +441,33 @@ where
     R: Expression<DType = L::DType> + Clone,
     L::DType: TensorElement + Real,
 {
-    type EqOutput = BinaryView<Self, R, Eq>;
+    binary_constructor!(EqOutput, eq, Eq, R);
 
-    type NeOutput = BinaryView<Self, R, Ne>;
+    binary_constructor!(NeOutput, ne, Ne, R);
 
-    type GtOutput = BinaryView<Self, R, Gt>;
+    binary_constructor!(GtOutput, gt, Gt, R);
 
-    type GeOutput = BinaryView<Self, R, Ge>;
+    binary_constructor!(GeOutput, ge, Ge, R);
 
-    type LtOutput = BinaryView<Self, R, Lt>;
+    binary_constructor!(LtOutput, lt, Lt, R);
 
-    type LeOutput = BinaryView<Self, R, Le>;
-
-    fn eq<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::EqOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Eq) })
-    }
-
-    fn ne<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::NeOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Ne) })
-    }
-
-    fn gt<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::GtOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Gt) })
-    }
-
-    fn ge<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::GeOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Ge) })
-    }
-
-    fn lt<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LtOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Lt) })
-    }
-
-    fn le<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LeOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Le) })
-    }
+    binary_constructor!(LeOutput, le, Le, R);
 }
 
-/// Elementwise and operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct And;
+binary_op!(
+    /// Elementwise and operation returning zero or one.
+    And, and, T: [TensorElement + Real] => u8
+);
 
-impl sealed::Sealed for And {}
+binary_op!(
+    /// Elementwise or operation returning zero or one.
+    Or, or, T: [TensorElement + Real] => u8
+);
 
-impl<T: TensorElement + Real> BinaryOp<T> for And {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.and(right)?))
-    }
-}
-
-/// Elementwise or operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Or;
-
-impl sealed::Sealed for Or {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Or {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.or(right)?))
-    }
-}
-
-/// Elementwise xor operation returning zero or one.
-#[derive(Clone, Copy, Debug)]
-pub struct Xor;
-
-impl sealed::Sealed for Xor {}
-
-impl<T: TensorElement + Real> BinaryOp<T> for Xor {
-    type Output = u8;
-
-    fn apply(
-        &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(left.xor(right)?))
-    }
-}
+binary_op!(
+    /// Elementwise xor operation returning zero or one.
+    Xor, xor, T: [TensorElement + Real] => u8
+);
 
 impl<L, R> TensorBoolean<R> for L
 where
@@ -679,21 +475,9 @@ where
     R: Expression<DType = L::DType> + Clone,
     L::DType: TensorElement + Real,
 {
-    type AndOutput = BinaryView<Self, R, And>;
+    binary_constructor!(AndOutput, and, And, R);
 
-    type OrOutput = BinaryView<Self, R, Or>;
+    binary_constructor!(OrOutput, or, Or, R);
 
-    type XorOutput = BinaryView<Self, R, Xor>;
-
-    fn and<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::AndOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), And) })
-    }
-
-    fn or<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::OrOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Or) })
-    }
-
-    fn xor<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::XorOutput>> {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Xor) })
-    }
+    binary_constructor!(XorOutput, xor, Xor, R);
 }

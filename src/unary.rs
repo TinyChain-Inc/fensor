@@ -4,12 +4,12 @@ use std::marker::PhantomData;
 
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{
-    ArrayAccess, Axes, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayTrig, NDArrayUnary,
-    NDArrayUnaryBoolean, Range, Shape,
+    ArrayAccess, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayTrig, NDArrayUnary,
+    NDArrayUnaryBoolean,
 };
 
-use crate::Result;
 use crate::expression::{self, Batch, Expression};
+use crate::request::{self, BatchRequest};
 use crate::schema::Layout;
 use crate::tensor::TensorElement;
 use crate::traits::{
@@ -17,6 +17,7 @@ use crate::traits::{
     TensorRead, TensorTransform, TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics,
     ValueBlockStream,
 };
+use crate::{Axes, Range, Result, Shape};
 
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -32,227 +33,107 @@ pub trait UnaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>>;
 }
 
-/// Elementwise exponentiation.
-#[derive(Clone, Copy, Debug)]
-pub struct Exp;
+// Each declaration preserves its explicit dtype bounds and backend operation.
+macro_rules! unary_op {
+    ($(#[$doc:meta])* $name:ident, $method:ident, $ty:ident: [$($bounds:tt)+] => $output:ty) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug)]
+        pub struct $name;
 
-/// Elementwise natural logarithm.
-#[derive(Clone, Copy, Debug)]
-pub struct Ln;
+        impl sealed::Sealed for $name {}
 
-/// Elementwise rounding.
-#[derive(Clone, Copy, Debug)]
-pub struct Round;
+        impl<$ty: $($bounds)+> UnaryOp<$ty> for $name {
+            type Output = $output;
 
-impl sealed::Sealed for Exp {}
-impl sealed::Sealed for Ln {}
-impl sealed::Sealed for Round {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Exp {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.exp()?))
-    }
+            fn apply(
+                &self,
+                array: ArrayAccess<'static, $ty>,
+            ) -> Result<ArrayAccess<'static, Self::Output>> {
+                Ok(ArrayAccess::from(array.$method()?))
+            }
+        }
+    };
 }
 
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Ln {
-    type Output = T;
+unary_op!(
+    /// Elementwise exponentiation.
+    Exp, exp, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.ln()?))
-    }
-}
+unary_op!(
+    /// Elementwise natural logarithm.
+    Ln, ln, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-impl<T: TensorElement + ha_ndarray::Float + ha_ndarray::Real> UnaryOp<T> for Round {
-    type Output = T;
+unary_op!(
+    /// Elementwise rounding.
+    Round, round, T: [TensorElement + ha_ndarray::Float + ha_ndarray::Real] => T
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.round()?))
-    }
-}
+unary_op!(
+    /// Elementwise absolute value.
+    Abs, abs, T: [TensorElement + ha_ndarray::Number<Abs = T>] => T
+);
 
-/// Elementwise absolute value.
-#[derive(Clone, Copy, Debug)]
-pub struct Abs;
+unary_op!(
+    /// Elementwise sine.
+    Sin, sin, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-impl sealed::Sealed for Abs {}
+unary_op!(
+    /// Elementwise inverse sine.
+    Asin, asin, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-impl<T: TensorElement + ha_ndarray::Number<Abs = T>> UnaryOp<T> for Abs {
-    type Output = T;
+unary_op!(
+    /// Elementwise hyperbolic sine.
+    Sinh, sinh, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.abs()?))
-    }
-}
+unary_op!(
+    /// Elementwise cosine.
+    Cos, cos, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-/// Elementwise sine.
-#[derive(Clone, Copy, Debug)]
-pub struct Sin;
+unary_op!(
+    /// Elementwise inverse cosine.
+    Acos, acos, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-impl sealed::Sealed for Sin {}
+unary_op!(
+    /// Elementwise hyperbolic cosine.
+    Cosh, cosh, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Sin {
-    type Output = T;
+unary_op!(
+    /// Elementwise tangent.
+    Tan, tan, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.sin()?))
-    }
-}
+unary_op!(
+    /// Elementwise inverse tangent.
+    Atan, atan, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-/// Elementwise inverse sine.
-#[derive(Clone, Copy, Debug)]
-pub struct Asin;
+unary_op!(
+    /// Elementwise hyperbolic tangent.
+    Tanh, tanh, T: [TensorElement + ha_ndarray::Float] => T
+);
 
-impl sealed::Sealed for Asin {}
+unary_op!(
+    /// Elementwise logical negation, returning 0 or 1.
+    Not, not, T: [TensorElement] => u8
+);
 
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Asin {
-    type Output = T;
+unary_op!(
+    /// Elementwise NaN detection, returning 0 or 1.
+    IsNan, is_nan, T: [TensorElement + ha_ndarray::Float] => u8
+);
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.asin()?))
-    }
-}
-
-/// Elementwise hyperbolic sine.
-#[derive(Clone, Copy, Debug)]
-pub struct Sinh;
-
-impl sealed::Sealed for Sinh {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Sinh {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.sinh()?))
-    }
-}
-
-/// Elementwise cosine.
-#[derive(Clone, Copy, Debug)]
-pub struct Cos;
-
-impl sealed::Sealed for Cos {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Cos {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.cos()?))
-    }
-}
-
-/// Elementwise inverse cosine.
-#[derive(Clone, Copy, Debug)]
-pub struct Acos;
-
-impl sealed::Sealed for Acos {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Acos {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.acos()?))
-    }
-}
-
-/// Elementwise hyperbolic cosine.
-#[derive(Clone, Copy, Debug)]
-pub struct Cosh;
-
-impl sealed::Sealed for Cosh {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Cosh {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.cosh()?))
-    }
-}
-
-/// Elementwise tangent.
-#[derive(Clone, Copy, Debug)]
-pub struct Tan;
-
-impl sealed::Sealed for Tan {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Tan {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.tan()?))
-    }
-}
-
-/// Elementwise inverse tangent.
-#[derive(Clone, Copy, Debug)]
-pub struct Atan;
-
-impl sealed::Sealed for Atan {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Atan {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.atan()?))
-    }
-}
-
-/// Elementwise hyperbolic tangent.
-#[derive(Clone, Copy, Debug)]
-pub struct Tanh;
-
-impl sealed::Sealed for Tanh {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Tanh {
-    type Output = T;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.tanh()?))
-    }
-}
-
-/// Elementwise logical negation, returning 0 or 1.
-#[derive(Clone, Copy, Debug)]
-pub struct Not;
-
-impl sealed::Sealed for Not {}
-
-impl<T: TensorElement> UnaryOp<T> for Not {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(array.not()?))
-    }
-}
-
-/// Elementwise NaN detection, returning 0 or 1.
-#[derive(Clone, Copy, Debug)]
-pub struct IsNan;
-
-impl sealed::Sealed for IsNan {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for IsNan {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(array.is_nan()?))
-    }
-}
-
-/// Elementwise infinity detection, returning 0 or 1.
-#[derive(Clone, Copy, Debug)]
-pub struct IsInf;
-
-impl sealed::Sealed for IsInf {}
-
-impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for IsInf {
-    type Output = u8;
-
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, u8>> {
-        Ok(ArrayAccess::from(array.is_inf()?))
-    }
-}
+unary_op!(
+    /// Elementwise infinity detection, returning 0 or 1.
+    IsInf, is_inf, T: [TensorElement + ha_ndarray::Float] => u8
+);
 
 /// Element-type conversion; currently only `Cast<f64>` on f32 is supported.
 #[derive(Clone, Copy, Debug)]
@@ -308,41 +189,27 @@ impl<S, O> UnaryView<S, O> {
     }
 }
 
+// Expand only members of the explicit public-trait implementation below.
+macro_rules! unary_constructor {
+    ($output:ident, $method:ident, $op:ident) => {
+        type $output = UnaryView<Self, $op>;
+
+        fn $method(&self) -> BoxFuture<'_, Result<Self::$output>> {
+            Box::pin(async move { Ok(UnaryView::new(self.clone(), $op)) })
+        }
+    };
+}
+
 impl<E> TensorUnary for E
 where
     E: Expression + Clone,
     E::DType: TensorElement + ha_ndarray::Float + ha_ndarray::Real,
 {
-    type ExpOutput = UnaryView<Self, Exp>;
-    type LnOutput = UnaryView<Self, Ln>;
-    type RoundOutput = UnaryView<Self, Round>;
+    unary_constructor!(ExpOutput, exp, Exp);
 
-    fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Exp,
-            })
-        })
-    }
+    unary_constructor!(LnOutput, ln, Ln);
 
-    fn ln(&self) -> BoxFuture<'_, Result<Self::LnOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Ln,
-            })
-        })
-    }
-
-    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Round,
-            })
-        })
-    }
+    unary_constructor!(RoundOutput, round, Round);
 }
 
 impl<E> TensorUnaryBoolean for E
@@ -350,16 +217,7 @@ where
     E: Expression + Clone,
     E::DType: TensorElement,
 {
-    type Output = UnaryView<Self, Not>;
-
-    fn not(&self) -> BoxFuture<'_, Result<Self::Output>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Not,
-            })
-        })
-    }
+    unary_constructor!(Output, not, Not);
 }
 
 impl<E> TensorNumeric for E
@@ -367,26 +225,9 @@ where
     E: Expression + Clone,
     E::DType: TensorElement + ha_ndarray::Float,
 {
-    type IsNanOutput = UnaryView<Self, IsNan>;
-    type IsInfOutput = UnaryView<Self, IsInf>;
+    unary_constructor!(IsNanOutput, is_nan, IsNan);
 
-    fn is_nan(&self) -> BoxFuture<'_, Result<Self::IsNanOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: IsNan,
-            })
-        })
-    }
-
-    fn is_inf(&self) -> BoxFuture<'_, Result<Self::IsInfOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: IsInf,
-            })
-        })
-    }
+    unary_constructor!(IsInfOutput, is_inf, IsInf);
 }
 
 impl<E> TensorCast<f64> for E
@@ -410,16 +251,7 @@ where
     E: Expression + Clone,
     E::DType: TensorElement + ha_ndarray::Number<Abs = E::DType>,
 {
-    type Output = UnaryView<Self, Abs>;
-
-    fn abs(&self) -> BoxFuture<'_, Result<Self::Output>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Abs,
-            })
-        })
-    }
+    unary_constructor!(Output, abs, Abs);
 }
 
 impl<E> TensorTrig for E
@@ -427,96 +259,23 @@ where
     E: Expression + Clone,
     E::DType: TensorElement + ha_ndarray::Float,
 {
-    type SinOutput = UnaryView<Self, Sin>;
-    type AsinOutput = UnaryView<Self, Asin>;
-    type SinhOutput = UnaryView<Self, Sinh>;
-    type CosOutput = UnaryView<Self, Cos>;
-    type AcosOutput = UnaryView<Self, Acos>;
-    type CoshOutput = UnaryView<Self, Cosh>;
-    type TanOutput = UnaryView<Self, Tan>;
-    type AtanOutput = UnaryView<Self, Atan>;
-    type TanhOutput = UnaryView<Self, Tanh>;
+    unary_constructor!(SinOutput, sin, Sin);
 
-    fn sin(&self) -> BoxFuture<'_, Result<Self::SinOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Sin,
-            })
-        })
-    }
+    unary_constructor!(AsinOutput, asin, Asin);
 
-    fn asin(&self) -> BoxFuture<'_, Result<Self::AsinOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Asin,
-            })
-        })
-    }
+    unary_constructor!(SinhOutput, sinh, Sinh);
 
-    fn sinh(&self) -> BoxFuture<'_, Result<Self::SinhOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Sinh,
-            })
-        })
-    }
+    unary_constructor!(CosOutput, cos, Cos);
 
-    fn cos(&self) -> BoxFuture<'_, Result<Self::CosOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Cos,
-            })
-        })
-    }
+    unary_constructor!(AcosOutput, acos, Acos);
 
-    fn acos(&self) -> BoxFuture<'_, Result<Self::AcosOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Acos,
-            })
-        })
-    }
+    unary_constructor!(CoshOutput, cosh, Cosh);
 
-    fn cosh(&self) -> BoxFuture<'_, Result<Self::CoshOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Cosh,
-            })
-        })
-    }
+    unary_constructor!(TanOutput, tan, Tan);
 
-    fn tan(&self) -> BoxFuture<'_, Result<Self::TanOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Tan,
-            })
-        })
-    }
+    unary_constructor!(AtanOutput, atan, Atan);
 
-    fn atan(&self) -> BoxFuture<'_, Result<Self::AtanOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Atan,
-            })
-        })
-    }
-
-    fn tanh(&self) -> BoxFuture<'_, Result<Self::TanhOutput>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Tanh,
-            })
-        })
-    }
+    unary_constructor!(TanhOutput, tanh, Tanh);
 }
 
 impl<S, O> TensorGeometry for UnaryView<S, O>
@@ -530,10 +289,12 @@ where
     fn dtype(&self) -> number_general::NumberType {
         <Self::DType as number_general::DType>::dtype()
     }
+
     fn layout(&self) -> Layout {
         self.source.layout()
     }
-    fn shape(&self) -> &[usize] {
+
+    fn shape(&self) -> &[u64] {
         self.source.shape()
     }
 }
@@ -547,6 +308,7 @@ where
     fn is_base_tensor(&self) -> bool {
         false
     }
+
     fn supports_write_through(&self) -> bool {
         false
     }
@@ -558,18 +320,24 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
+    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
+        expression::coordinate_blocks(self)
+    }
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
-                .await?
-                .values[0])
+            Ok(
+                expression::evaluate_batch(self, &BatchRequest::point(coord))
+                    .await?
+                    .values[0],
+            )
         })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = crate::schema::row_major_coords(self.shape())?;
+        let coords = request::linear_requests(self.shape())?;
 
-        Ok(expression::evaluated_batches(self, coords)
+        Ok(expression::ordered_batches(self, coords)
             .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
@@ -582,18 +350,18 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::evaluated_batches(self, coords)
-                .map_ok(|(coords, values)| {
-                    futures::stream::iter(
-                        coords
-                            .into_iter()
-                            .zip(values.values)
-                            .filter(|(_, value)| *value != Self::DType::default())
-                            .map(Ok),
-                    )
-                })
-                .try_flatten()
-                .boxed())
+            Ok(
+                expression::ordered_batches(self, request::explicit_requests(coords))
+                    .and_then(move |(coords, values)| async move {
+                        Ok(futures::stream::iter(expression::sparse_elements(
+                            coords,
+                            values,
+                            self.shape(),
+                        )?))
+                    })
+                    .try_flatten()
+                    .boxed(),
+            )
         })
     }
 }
@@ -610,36 +378,42 @@ where
             op: self.op,
         })
     }
+
     fn broadcast(self, shape: Shape) -> Result<Self> {
         Ok(Self {
             source: self.source.broadcast(shape)?,
             op: self.op,
         })
     }
+
     fn flip(self, axis: usize) -> Result<Self> {
         Ok(Self {
             source: self.source.flip(axis)?,
             op: self.op,
         })
     }
+
     fn slice(self, range: Range) -> Result<Self> {
         Ok(Self {
             source: self.source.slice(range)?,
             op: self.op,
         })
     }
+
     fn squeeze(self, axes: Axes) -> Result<Self> {
         Ok(Self {
             source: self.source.squeeze(axes)?,
             op: self.op,
         })
     }
+
     fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
         Ok(Self {
             source: self.source.transpose(permutation)?,
             op: self.op,
         })
     }
+
     fn unsqueeze(self, axes: Axes) -> Result<Self> {
         Ok(Self {
             source: self.source.unsqueeze(axes)?,
@@ -654,7 +428,15 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
-    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
+        self.source.slice_requests(slice)
+    }
+
+    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
+        self.source.preferred_requests(shape)
+    }
+
+    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             let source = self.source.build(coords).await?;
             Batch {

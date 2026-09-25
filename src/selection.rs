@@ -1,12 +1,14 @@
 //! Lazy conditional selection over three expression sources.
 
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{ArrayAccess, Axes, NDArrayWhere, Range, Shape};
+use ha_ndarray::{ArrayAccess, NDArrayWhere};
 
 use crate::expression::{self, Batch, Expression};
+use crate::request::{self, BatchRequest};
 use crate::{
-    BoxFuture, Error, Layout, Result, SparseElementStream, TensorElement, TensorGeometry,
-    TensorRead, TensorTransform, TensorViewSemantics, TensorWhere, ValueBlockStream,
+    Axes, BoxFuture, Error, Layout, Range, Result, Shape, SparseElementStream, TensorElement,
+    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, TensorWhere,
+    ValueBlockStream,
 };
 
 /// Read-only selection retaining support from the condition and both branches.
@@ -106,7 +108,7 @@ where
         self.then.dtype()
     }
 
-    fn shape(&self) -> &[usize] {
+    fn shape(&self) -> &[u64] {
         self.condition.shape()
     }
 
@@ -147,7 +149,17 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
+        if let Some(requests) = self.condition.preferred_requests(shape)? {
+            return Ok(Some(requests));
+        }
+        match self.then.preferred_requests(shape)? {
+            Some(requests) => Ok(Some(requests)),
+            None => self.or_else.preferred_requests(shape),
+        }
+    }
+
+    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             let condition = self.condition.build(coords).await?;
             let then = self.then.build(coords).await?;
@@ -173,18 +185,24 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
+    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
+        expression::coordinate_blocks(self)
+    }
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
-                .await?
-                .values[0])
+            Ok(
+                expression::evaluate_batch(self, &BatchRequest::point(coord))
+                    .await?
+                    .values[0],
+            )
         })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = crate::schema::row_major_coords(self.shape())?;
+        let coords = request::linear_requests(self.shape())?;
 
-        Ok(expression::evaluated_batches(self, coords)
+        Ok(expression::ordered_batches(self, coords)
             .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
@@ -197,18 +215,18 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::evaluated_batches(self, coords)
-                .map_ok(|(coords, values)| {
-                    futures::stream::iter(
-                        coords
-                            .into_iter()
-                            .zip(values.values)
-                            .filter(|(_, value)| *value != Self::DType::default())
-                            .map(Ok),
-                    )
-                })
-                .try_flatten()
-                .boxed())
+            Ok(
+                expression::ordered_batches(self, request::explicit_requests(coords))
+                    .and_then(move |(coords, values)| async move {
+                        Ok(futures::stream::iter(expression::sparse_elements(
+                            coords,
+                            values,
+                            self.shape(),
+                        )?))
+                    })
+                    .try_flatten()
+                    .boxed(),
+            )
         })
     }
 }

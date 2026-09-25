@@ -2,14 +2,14 @@
 
 use fensor::unary::UnaryOp;
 use fensor::{
-    Error, Layout, Tensor, TensorCast, TensorElement, TensorFileEntry, TensorGeometry,
+    AxisRange, Error, Layout, Tensor, TensorCast, TensorElement, TensorFileEntry, TensorGeometry,
     TensorNumeric, TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorView,
     TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
-    Array, ArrayAccess, AxisRange, Buffer, NDArrayNumeric, NDArrayRead, NDArrayUnaryBoolean, axes,
-    range, shape,
+    Array, ArrayAccess, Buffer, NDArrayNumeric, NDArrayRead, NDArrayUnaryBoolean, axes, range,
+    shape,
 };
 use number_general::{FloatType, NumberType, UIntType};
 
@@ -35,7 +35,10 @@ where
     }
     if matches!(view.layout(), Layout::Sparse { .. }) {
         let rows: Vec<_> = view
-            .read_sparse_elements_in_order(range![AxisRange::In(0, expected.len(), 1)], axes![0])
+            .read_sparse_elements_in_order(
+                range![AxisRange::In(0, expected.len() as u64, 1)],
+                axes![0],
+            )
             .await
             .unwrap()
             .try_collect()
@@ -71,8 +74,11 @@ macro_rules! float_predicates {
                 ];
                 let tensor = Tensor::<FsEntry, $t>::create(
                     dir,
-                    TensorSchema::new(<$t as number_general::DType>::dtype(), shape![input.len()])
-                        .unwrap(),
+                    TensorSchema::new(
+                        <$t as number_general::DType>::dtype(),
+                        shape![input.len() as u64],
+                    )
+                    .unwrap(),
                     layout,
                     2,
                 )

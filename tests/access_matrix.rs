@@ -4,31 +4,26 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
-    TensorViewSemantics, TensorWrite, TensorWriteBulk,
+    AxisRange, Error, Layout, Range, Shape, Tensor, TensorArray, TensorGeometry, TensorRead,
+    TensorSchema, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
 };
 use futures::TryStreamExt;
-use ha_ndarray::{AxisRange, Range, Shape, axes, range, shape};
+use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 
-fn dense_schema_f32(shape: Shape) -> TensorSchema {
-    TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema")
-}
-
-fn sparse_schema_f32(shape: Shape) -> TensorSchema {
+fn schema_f32(shape: Shape) -> TensorSchema {
     TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema")
 }
 
 async fn create_dense(
     name: &str,
     shape: Shape,
-    block_shape: Shape,
+    max_capacity: usize,
 ) -> (PathBuf, Tensor<FsEntry, f32>, TensorSchema) {
     let (root, dir) = new_dir(name).await;
-    let schema = dense_schema_f32(shape);
-    let max_capacity = block_shape.iter().product::<usize>().max(1);
+    let schema = schema_f32(shape);
     let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone(), Layout::Dense, max_capacity)
         .await
         .expect("create dense");
@@ -38,12 +33,11 @@ async fn create_dense(
 async fn create_sparse(
     name: &str,
     shape: Shape,
-    block_shape: Shape,
+    max_capacity: usize,
     axis: Option<usize>,
 ) -> (PathBuf, Tensor<FsEntry, f32>, TensorSchema) {
     let (root, dir) = new_dir(name).await;
-    let schema = sparse_schema_f32(shape);
-    let max_capacity = block_shape.iter().product::<usize>().max(1);
+    let schema = schema_f32(shape);
     let tensor =
         Tensor::<FsEntry, f32>::create(dir, schema.clone(), Layout::Sparse { axis }, max_capacity)
             .await
@@ -69,6 +63,7 @@ where
 
 fn transpose_range(range: &Range, permutation: &[usize]) -> Range {
     let mut remapped = Vec::with_capacity(permutation.len());
+
     for axis in permutation {
         remapped.push(range[*axis].clone());
     }
@@ -84,7 +79,7 @@ mod section_a_access_parity {
 
     #[tokio::test]
     async fn dense_read_write_value_roundtrip() {
-        let (root, tensor, _) = create_dense("a_dense_rw", shape![2, 3, 4], shape![1, 1, 2]).await;
+        let (root, tensor, _) = create_dense("a_dense_rw", shape![2, 3, 4], 2).await;
 
         for coord in iter_coords(tensor.shape()) {
             tensor
@@ -104,7 +99,7 @@ mod section_a_access_parity {
     #[tokio::test]
     async fn sparse_read_write_value_roundtrip() {
         let (root, tensor, _schema) =
-            create_sparse("a_sparse_rw", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+            create_sparse("a_sparse_rw", shape![2, 3, 4], 4, Some(1)).await;
 
         // Default-valued reads should return T::default() without materializing blocks.
         for coord in iter_coords(tensor.shape()) {
@@ -140,10 +135,9 @@ mod section_a_access_parity {
 
     #[tokio::test]
     async fn dense_sparse_parity_after_writes() {
-        let (dense_root, dense, _) =
-            create_dense("a_par_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (dense_root, dense, _) = create_dense("a_par_dense", shape![2, 3, 4], 4).await;
         let (sparse_root, sparse, _) =
-            create_sparse("a_par_sparse", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+            create_sparse("a_par_sparse", shape![2, 3, 4], 4, Some(1)).await;
 
         let writes: HashMap<Vec<u64>, f32> = [
             (vec![0u64, 0, 0], 1.0),
@@ -174,13 +168,15 @@ mod section_a_access_parity {
 
     #[tokio::test]
     async fn rank_one_tensor_read_write() {
-        let (dense_root, dense, _) = create_dense("a_rank_one_d", shape![4], shape![2]).await;
+        let (dense_root, dense, _) = create_dense("a_rank_one_d", shape![4], 2).await;
+
         for i in 0..4u64 {
             dense
                 .write_value(&[i], i as f32 + 1.0)
                 .await
                 .expect("dense write");
         }
+
         for i in 0..4u64 {
             let v = dense.read_value(&[i]).await.expect("dense read");
             assert_eq!(v, i as f32 + 1.0, "dense coord [{}]", i);
@@ -188,13 +184,14 @@ mod section_a_access_parity {
         cleanup(&dense_root).await;
 
         let (sparse_none_root, sparse_none, _) =
-            create_sparse("a_rank_one_sn", shape![4], shape![2], None).await;
+            create_sparse("a_rank_one_sn", shape![4], 2, None).await;
         for i in 0..4u64 {
             sparse_none
                 .write_value(&[i], i as f32 + 1.0)
                 .await
                 .expect("sparse_none write");
         }
+
         for i in 0..4u64 {
             let v = sparse_none
                 .read_value(&[i])
@@ -204,14 +201,15 @@ mod section_a_access_parity {
         }
         cleanup(&sparse_none_root).await;
 
-        let (sparse_root, sparse, _) =
-            create_sparse("a_rank_one_s", shape![4], shape![2], Some(0)).await;
+        let (sparse_root, sparse, _) = create_sparse("a_rank_one_s", shape![4], 2, Some(0)).await;
+
         for i in 0..4u64 {
             sparse
                 .write_value(&[i], i as f32 + 1.0)
                 .await
                 .expect("sparse write");
         }
+
         for i in 0..4u64 {
             let v = sparse.read_value(&[i]).await.expect("sparse read");
             assert_eq!(v, i as f32 + 1.0, "sparse coord [{}]", i);
@@ -221,8 +219,7 @@ mod section_a_access_parity {
 
     #[tokio::test]
     async fn boundary_coordinates_dense_and_sparse() {
-        let (dense_root, dense, _) =
-            create_dense("a_boundary_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (dense_root, dense, _) = create_dense("a_boundary_dense", shape![2, 3, 4], 4).await;
 
         dense
             .write_value(&[0, 0, 0], 1.0)
@@ -261,13 +258,8 @@ mod section_a_access_parity {
 
         cleanup(&dense_root).await;
 
-        let (sparse_root, sparse, _) = create_sparse(
-            "a_boundary_sparse",
-            shape![2, 3, 4],
-            shape![1, 1, 4],
-            Some(1),
-        )
-        .await;
+        let (sparse_root, sparse, _) =
+            create_sparse("a_boundary_sparse", shape![2, 3, 4], 4, Some(1)).await;
 
         sparse
             .write_value(&[0, 0, 0], 1.0)
@@ -323,8 +315,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn slice_then_read_dense() {
-        let (root, tensor, _) =
-            create_dense("b_slice_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_slice_dense", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let r: Range = range![
@@ -347,7 +338,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn transpose_then_read_dense() {
-        let (root, tensor, _) = create_dense("b_tx_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_tx_dense", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let perm = axes![2, 0, 1];
@@ -355,15 +346,18 @@ mod section_b_transforms {
         assert_eq!(transposed.shape(), &[4, 2, 3]);
 
         let mut inverse = vec![0usize; perm.len()];
+
         for (i, axis) in perm.iter().enumerate() {
             inverse[*axis] = i;
         }
 
         for t_coord in iter_coords(transposed.shape()) {
             let mut src = vec![0u64; t_coord.len()];
+
             for old_axis in 0..t_coord.len() {
                 src[old_axis] = t_coord[inverse[old_axis]];
             }
+
             let expected = tensor.read_value(&src).await.expect("read original");
             let actual = transposed.read_value(&t_coord).await.expect("read tx");
             assert_eq!(actual, expected, "coord {:?}", t_coord);
@@ -374,7 +368,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn reshape_then_read_dense() {
-        let (root, tensor, _) = create_dense("b_reshape", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_reshape", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let reshaped = tensor.view().reshape(shape![6, 4]).expect("reshape");
@@ -402,8 +396,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn transpose_then_read_sparse() {
-        let (root, tensor, _) =
-            create_sparse("b_tx_sparse", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+        let (root, tensor, _) = create_sparse("b_tx_sparse", shape![2, 3, 4], 4, Some(1)).await;
         seed_values(&tensor).await;
 
         let perm = axes![1, 2, 0];
@@ -411,15 +404,18 @@ mod section_b_transforms {
         assert_eq!(transposed.shape(), &[3, 4, 2]);
 
         let mut inverse = vec![0usize; perm.len()];
+
         for (i, axis) in perm.iter().enumerate() {
             inverse[*axis] = i;
         }
 
         for t_coord in iter_coords(transposed.shape()) {
             let mut src = vec![0u64; t_coord.len()];
+
             for old_axis in 0..t_coord.len() {
                 src[old_axis] = t_coord[inverse[old_axis]];
             }
+
             let expected = tensor.read_value(&src).await.expect("orig");
             let actual = transposed.read_value(&t_coord).await.expect("tx");
             assert_eq!(actual, expected, "sparse tx coord {:?}", t_coord);
@@ -430,8 +426,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn slice_then_read_sparse() {
-        let (root, tensor, _) =
-            create_sparse("b_slice_sparse", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+        let (root, tensor, _) = create_sparse("b_slice_sparse", shape![2, 3, 4], 4, Some(1)).await;
         seed_values(&tensor).await;
 
         let r: Range = range![
@@ -453,8 +448,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn chained_transpose_slice_consistency_dense() {
-        let (root, tensor, _) =
-            create_dense("b_chain_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_chain_dense", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let perm = axes![2, 0, 1];
@@ -480,6 +474,7 @@ mod section_b_transforms {
             .expect("slice");
 
         assert_eq!(left.shape(), right.shape());
+
         for coord in iter_coords(left.shape()) {
             let l = left.read_value(&coord).await.expect("left");
             let r_v = right.read_value(&coord).await.expect("right");
@@ -491,8 +486,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn chained_transpose_slice_consistency_sparse() {
-        let (root, tensor, _) =
-            create_sparse("b_chain_sparse", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+        let (root, tensor, _) = create_sparse("b_chain_sparse", shape![2, 3, 4], 4, Some(1)).await;
         seed_values(&tensor).await;
 
         let perm = axes![2, 0, 1];
@@ -518,6 +512,7 @@ mod section_b_transforms {
             .expect("slice");
 
         assert_eq!(left.shape(), right.shape());
+
         for coord in iter_coords(left.shape()) {
             let l = left.read_value(&coord).await.expect("left");
             let r_v = right.read_value(&coord).await.expect("right");
@@ -529,8 +524,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn chained_slice_transpose_slice_dense() {
-        let (root, tensor, _) =
-            create_dense("b_chain3_dense", shape![4, 4, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_chain3_dense", shape![4, 4, 4], 4).await;
         seed_values(&tensor).await;
 
         let s1: Range = range![
@@ -567,8 +561,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn reshape_over_transformed_view_rejected() {
-        let (root, tensor, _) =
-            create_dense("b_reshape_view", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_reshape_view", shape![2, 3, 4], 4).await;
 
         let sliced = tensor
             .view()
@@ -587,7 +580,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn slice_axis_range_at() {
-        let (root, tensor, _) = create_dense("b_at_dense", shape![3, 4, 5], shape![1, 1, 5]).await;
+        let (root, tensor, _) = create_dense("b_at_dense", shape![3, 4, 5], 5).await;
         seed_values(&tensor).await;
 
         let sliced = tensor
@@ -608,8 +601,7 @@ mod section_b_transforms {
         }
         cleanup(&root).await;
 
-        let (root, tensor, _) =
-            create_sparse("b_at_sparse", shape![3, 4, 5], shape![1, 1, 5], Some(0)).await;
+        let (root, tensor, _) = create_sparse("b_at_sparse", shape![3, 4, 5], 5, Some(0)).await;
         seed_values(&tensor).await;
 
         let sliced = tensor
@@ -633,8 +625,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn slice_axis_range_in_with_step_gt_one() {
-        let (root, tensor, _) =
-            create_dense("b_step2_dense", shape![4, 6, 8], shape![1, 1, 8]).await;
+        let (root, tensor, _) = create_dense("b_step2_dense", shape![4, 6, 8], 8).await;
         seed_values(&tensor).await;
 
         let sliced = tensor
@@ -655,8 +646,7 @@ mod section_b_transforms {
         }
         cleanup(&root).await;
 
-        let (root, tensor, _) =
-            create_sparse("b_step2_sparse", shape![4, 6, 8], shape![1, 1, 8], Some(1)).await;
+        let (root, tensor, _) = create_sparse("b_step2_sparse", shape![4, 6, 8], 8, Some(1)).await;
         seed_values(&tensor).await;
 
         let sliced = tensor
@@ -685,14 +675,13 @@ mod section_b_transforms {
     async fn slice_axis_range_of_gather() {
         let src_indices: &[u64] = &[0, 2, 3];
 
-        let (root, tensor, _) =
-            create_dense("b_gather_dense", shape![4, 5, 6], shape![1, 1, 6]).await;
+        let (root, tensor, _) = create_dense("b_gather_dense", shape![4, 5, 6], 6).await;
         seed_values(&tensor).await;
 
         let sliced = tensor
             .view()
             .slice(range![
-                AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
+                AxisRange::Of([0u64, 2, 3].to_vec()),
                 AxisRange::In(0, 5, 1),
                 AxisRange::In(0, 6, 1)
             ])
@@ -710,14 +699,13 @@ mod section_b_transforms {
         }
         cleanup(&root).await;
 
-        let (root, tensor, _) =
-            create_sparse("b_gather_sparse", shape![4, 5, 6], shape![1, 1, 6], Some(0)).await;
+        let (root, tensor, _) = create_sparse("b_gather_sparse", shape![4, 5, 6], 6, Some(0)).await;
         seed_values(&tensor).await;
 
         let sliced = tensor
             .view()
             .slice(range![
-                AxisRange::Of([0usize, 2, 3].iter().copied().collect()),
+                AxisRange::Of([0u64, 2, 3].to_vec()),
                 AxisRange::In(0, 5, 1),
                 AxisRange::In(0, 6, 1)
             ])
@@ -738,8 +726,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn degenerate_slice_empty_axis() {
-        let (root, tensor, _) =
-            create_dense("b_empty_axis", shape![4, 5, 6], shape![1, 1, 6]).await;
+        let (root, tensor, _) = create_dense("b_empty_axis", shape![4, 5, 6], 6).await;
 
         // In(2, 2, 1) produces extent = 0 on axis 0. The schema rejects zero-dim
         // shapes, so slice must return an error rather than panic.
@@ -755,7 +742,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn transpose_identity_permutation_is_noop() {
-        let (root, tensor, _) = create_dense("b_id_perm", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_id_perm", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let transposed = tensor
@@ -775,7 +762,7 @@ mod section_b_transforms {
 
     #[tokio::test]
     async fn two_simultaneous_views_from_same_tensor() {
-        let (root, tensor, _) = create_dense("b_two_views", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("b_two_views", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let r: Range = range![
@@ -793,6 +780,7 @@ mod section_b_transforms {
         assert_eq!(right.shape(), &[4, 2, 3]);
 
         let mut inverse = vec![0usize; perm.len()];
+
         for (i, axis) in perm.iter().enumerate() {
             inverse[*axis] = i;
         }
@@ -806,9 +794,11 @@ mod section_b_transforms {
 
         for t_coord in iter_coords(right.shape()) {
             let mut src = vec![0u64; t_coord.len()];
+
             for old_axis in 0..t_coord.len() {
                 src[old_axis] = t_coord[inverse[old_axis]];
             }
+
             let expected = tensor.read_value(&src).await.expect("read original");
             let actual = right.read_value(&t_coord).await.expect("read transposed");
             assert_eq!(actual, expected, "right coord {:?}", t_coord);
@@ -829,7 +819,8 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn broadcast_repeats_size_one_axis() {
-        let (root, tensor, _) = create_dense("c_broadcast", shape![1, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c_broadcast", shape![1, 3, 4], 4).await;
+
         for b in 0..3u64 {
             for c in 0..4u64 {
                 tensor
@@ -862,7 +853,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn flip_axis_reverses_indexing() {
-        let (root, tensor, _) = create_dense("c_flip", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c_flip", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let flipped = tensor.view().flip(2).expect("flip must be supported");
@@ -879,8 +870,8 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn squeeze_removes_size_one_axes() {
-        let (root, tensor, _) =
-            create_dense("c_squeeze", shape![1, 3, 1, 4], shape![1, 1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c_squeeze", shape![1, 3, 1, 4], 4).await;
+
         for b in 0..3u64 {
             for c in 0..4u64 {
                 tensor
@@ -908,7 +899,8 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn unsqueeze_inserts_size_one_axes() {
-        let (root, tensor, _) = create_dense("c_unsqueeze", shape![3, 4], shape![1, 4]).await;
+        let (root, tensor, _) = create_dense("c_unsqueeze", shape![3, 4], 4).await;
+
         for b in 0..3u64 {
             for c in 0..4u64 {
                 tensor
@@ -939,8 +931,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn squeeze_non_size_one_axis_rejected() {
-        let (root, tensor, _) =
-            create_dense("c_squeeze_bad", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c_squeeze_bad", shape![2, 3, 4], 4).await;
         let err = tensor
             .view()
             .squeeze(axes![1])
@@ -955,13 +946,8 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn squeeze_removes_size_one_axes_sparse() {
-        let (root, tensor, _) = create_sparse(
-            "c_squeeze_sparse",
-            shape![1, 3, 1, 4],
-            shape![1, 1, 1],
-            Some(0),
-        )
-        .await;
+        let (root, tensor, _) =
+            create_sparse("c_squeeze_sparse", shape![1, 3, 1, 4], 1, Some(0)).await;
         seed_values(&tensor).await;
 
         let squeezed = tensor
@@ -981,13 +967,8 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn unsqueeze_inserts_size_one_axes_sparse() {
-        let (root, tensor, _) = create_sparse(
-            "c_unsqueeze_sparse",
-            shape![2, 3, 4],
-            shape![1, 1, 4],
-            Some(0),
-        )
-        .await;
+        let (root, tensor, _) =
+            create_sparse("c_unsqueeze_sparse", shape![2, 3, 4], 4, Some(0)).await;
         seed_values(&tensor).await;
 
         let unsqueezed = tensor
@@ -1012,8 +993,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn squeeze_duplicate_axis_rejected() {
-        let (root, tensor, _) =
-            create_dense("c_squeeze_dup", shape![2, 3, 4], shape![1, 1, 1]).await;
+        let (root, tensor, _) = create_dense("c_squeeze_dup", shape![2, 3, 4], 1).await;
         let err = tensor
             .view()
             .squeeze(axes![1, 1])
@@ -1025,8 +1005,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn squeeze_axis_out_of_bounds_rejected() {
-        let (root, tensor, _) =
-            create_dense("c_squeeze_oob", shape![2, 3, 4], shape![1, 1, 1]).await;
+        let (root, tensor, _) = create_dense("c_squeeze_oob", shape![2, 3, 4], 1).await;
         let err = tensor
             .view()
             .squeeze(axes![5])
@@ -1038,7 +1017,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn unsqueeze_duplicate_axis_rejected() {
-        let (root, tensor, _) = create_dense("c_unsqueeze_dup", shape![3, 4], shape![1, 1]).await;
+        let (root, tensor, _) = create_dense("c_unsqueeze_dup", shape![3, 4], 1).await;
         let err = tensor
             .view()
             .unsqueeze(axes![0, 0])
@@ -1050,7 +1029,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn unsqueeze_axis_out_of_bounds_rejected() {
-        let (root, tensor, _) = create_dense("c_unsqueeze_oob", shape![3, 4], shape![1, 1]).await;
+        let (root, tensor, _) = create_dense("c_unsqueeze_oob", shape![3, 4], 1).await;
         // For rank-2 tensor, valid axes are 0,1 only
         let err2 = tensor
             .view()
@@ -1070,8 +1049,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn squeeze_empty_axes_rejected() {
-        let (root, tensor, _) =
-            create_dense("c_squeeze_empty", shape![3, 1, 4], shape![1, 1, 1]).await;
+        let (root, tensor, _) = create_dense("c_squeeze_empty", shape![3, 1, 4], 1).await;
         let err = tensor
             .view()
             .squeeze(axes![])
@@ -1083,7 +1061,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn unsqueeze_empty_axes_rejected() {
-        let (root, tensor, _) = create_dense("c_unsqueeze_empty", shape![3, 4], shape![1, 1]).await;
+        let (root, tensor, _) = create_dense("c_unsqueeze_empty", shape![3, 4], 1).await;
         let err = tensor
             .view()
             .unsqueeze(axes![])
@@ -1095,7 +1073,7 @@ mod section_c_new_transforms {
 
     #[tokio::test]
     async fn squeeze_all_axes_rejected() {
-        let (root, tensor, _) = create_dense("c_squeeze_all", shape![1, 1], shape![1, 1]).await;
+        let (root, tensor, _) = create_dense("c_squeeze_all", shape![1, 1], 1).await;
         let err = tensor
             .view()
             .squeeze(axes![0, 1])
@@ -1116,8 +1094,7 @@ mod section_c2_squeeze_unsqueeze_chains {
     #[tokio::test]
     async fn chained_slice_then_squeeze_vs_squeeze_then_slice() {
         // shape [2,1,3,4] (size-1 axis at original position 1)
-        let (root, tensor, _) =
-            create_dense("c2_slice_squeeze", shape![2, 1, 3, 4], shape![1, 1, 1]).await;
+        let (root, tensor, _) = create_dense("c2_slice_squeeze", shape![2, 1, 3, 4], 1).await;
         seed_values(&tensor).await;
 
         // Path (a): slice then squeeze
@@ -1143,6 +1120,7 @@ mod section_c2_squeeze_unsqueeze_chains {
             .expect("slice");
 
         assert_eq!(squeezed_a.shape(), sliced_b.shape());
+
         for coord in iter_coords(squeezed_a.shape()) {
             let v_a = squeezed_a.read_value(&coord).await.expect("read a");
             let v_b = sliced_b.read_value(&coord).await.expect("read b");
@@ -1155,8 +1133,7 @@ mod section_c2_squeeze_unsqueeze_chains {
     async fn chained_unsqueeze_then_transpose_dense() {
         // shape [2,3,4], .unsqueeze(axes![1]) -> [2,1,3,4]
         // then .transpose(Some(axes![0,3,1,2])) -> [2,4,1,3]
-        let (root, tensor, _) =
-            create_dense("c2_unsqueeze_transpose", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c2_unsqueeze_transpose", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let unsqueezed = tensor.view().unsqueeze(axes![1]).expect("unsqueeze");
@@ -1184,8 +1161,7 @@ mod section_c2_squeeze_unsqueeze_chains {
     async fn chained_unsqueeze_then_flip_is_noop_on_new_axis() {
         // shape [2,3,4], .unsqueeze(axes![1]) -> [2,1,3,4]
         // then .flip(1) (flip the new size-1 axis, which is a no-op)
-        let (root, tensor, _) =
-            create_dense("c2_unsqueeze_flip", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c2_unsqueeze_flip", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let unsqueezed = tensor.view().unsqueeze(axes![1]).expect("unsqueeze");
@@ -1204,8 +1180,7 @@ mod section_c2_squeeze_unsqueeze_chains {
     async fn chained_unsqueeze_then_broadcast() {
         // shape [2,3,4], .unsqueeze(axes![0]) -> [1,2,3,4]
         // then .broadcast([5,2,3,4]) (broadcast new axis from 1 to 5)
-        let (root, tensor, _) =
-            create_dense("c2_unsqueeze_broadcast", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c2_unsqueeze_broadcast", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let unsqueezed = tensor.view().unsqueeze(axes![0]).expect("unsqueeze");
@@ -1231,8 +1206,7 @@ mod section_c2_squeeze_unsqueeze_chains {
     async fn chained_squeeze_then_reshape_dense() {
         // shape [1,3,4], .squeeze(axes![0]) -> [3,4]
         // then .reshape([12])
-        let (root, tensor, _) =
-            create_dense("c2_squeeze_reshape", shape![1, 3, 4], shape![1, 1]).await;
+        let (root, tensor, _) = create_dense("c2_squeeze_reshape", shape![1, 3, 4], 1).await;
         seed_values(&tensor).await;
 
         let squeezed = tensor.view().squeeze(axes![0]).expect("squeeze");
@@ -1256,8 +1230,7 @@ mod section_c2_squeeze_unsqueeze_chains {
     async fn chained_unsqueeze_then_reshape_dense() {
         // shape [2,3,4], .unsqueeze(axes![0]) -> [1,2,3,4]
         // then .reshape([24])
-        let (root, tensor, _) =
-            create_dense("c2_unsqueeze_reshape", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("c2_unsqueeze_reshape", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let unsqueezed = tensor.view().unsqueeze(axes![0]).expect("unsqueeze");
@@ -1281,13 +1254,8 @@ mod section_c2_squeeze_unsqueeze_chains {
     #[tokio::test]
     async fn squeeze_then_unsqueeze_round_trip_sparse() {
         // sparse shape [3,1,4], squeeze axis 1 then unsqueeze back
-        let (root, tensor, _) = create_sparse(
-            "c2_squeeze_unsqueeze_sparse",
-            shape![3, 1, 4],
-            shape![1, 1],
-            Some(0),
-        )
-        .await;
+        let (root, tensor, _) =
+            create_sparse("c2_squeeze_unsqueeze_sparse", shape![3, 1, 4], 1, Some(0)).await;
         seed_values(&tensor).await;
 
         let squeezed = tensor.view().squeeze(axes![1]).expect("squeeze");
@@ -1315,8 +1283,7 @@ mod section_d_bulk_io {
 
     #[tokio::test]
     async fn collect_dense_range_stream() {
-        let (root, tensor, _) =
-            create_dense("d_read_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("d_read_dense", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let values = tensor
@@ -1337,6 +1304,7 @@ mod section_d_bulk_io {
             .collect::<Vec<_>>();
 
         assert_eq!(values.len(), 24);
+
         for (idx, coord) in iter_coords(tensor.shape()).enumerate() {
             assert_eq!(values[idx], encode_value(&coord), "coord {:?}", coord);
         }
@@ -1346,8 +1314,7 @@ mod section_d_bulk_io {
 
     #[tokio::test]
     async fn collect_sparse_range_stream_includes_implicit_zeros() {
-        let (root, tensor, _) =
-            create_sparse("d_read_sparse", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+        let (root, tensor, _) = create_sparse("d_read_sparse", shape![2, 3, 4], 4, Some(1)).await;
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("write");
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("write");
 
@@ -1370,6 +1337,7 @@ mod section_d_bulk_io {
 
         assert_eq!(values.len(), 24);
         let mut nonzero = 0;
+
         for v in &values {
             if *v != 0.0 {
                 nonzero += 1;
@@ -1382,7 +1350,7 @@ mod section_d_bulk_io {
 
     #[tokio::test]
     async fn collect_full_stream_row_major() {
-        let (root, tensor, _) = create_dense("d_read_all", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("d_read_all", shape![2, 3, 4], 4).await;
         seed_values(&tensor).await;
 
         let values = tensor
@@ -1405,10 +1373,10 @@ mod section_d_bulk_io {
 
     #[tokio::test]
     async fn write_values_round_trips() {
-        let (root, tensor, _) =
-            create_dense("d_write_vals", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("d_write_vals", shape![2, 3, 4], 4).await;
 
         let mut buf = Vec::with_capacity(24);
+
         for coord in iter_coords(tensor.shape()) {
             buf.push(encode_value(&coord));
         }
@@ -1435,12 +1403,12 @@ mod section_d_bulk_io {
 
     #[tokio::test]
     async fn fill_writes_default_then_nonzero() {
-        let (root, tensor, _) =
-            create_sparse("d_fill", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+        let (root, tensor, _) = create_sparse("d_fill", shape![2, 3, 4], 4, Some(1)).await;
 
         tensor.fill(0.0).await.expect("fill default supported");
 
         tensor.fill(1.0).await.expect("fill nonzero supported");
+
         for coord in iter_coords(tensor.shape()) {
             let v = tensor.read_value(&coord).await.expect("read");
             assert_eq!(v, 1.0, "coord {:?}", coord);
@@ -1451,10 +1419,9 @@ mod section_d_bulk_io {
 
     #[tokio::test]
     async fn write_tensor_dense_to_sparse() {
-        let (dense_root, dense, _) =
-            create_dense("d_wt_dense", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (dense_root, dense, _) = create_dense("d_wt_dense", shape![2, 3, 4], 4).await;
         let (sparse_root, sparse, _) =
-            create_sparse("d_wt_sparse", shape![2, 3, 4], shape![1, 1, 4], Some(1)).await;
+            create_sparse("d_wt_sparse", shape![2, 3, 4], 4, Some(1)).await;
         seed_values(&dense).await;
 
         sparse
@@ -1486,7 +1453,7 @@ mod section_f_view_semantics {
 
     #[tokio::test]
     async fn is_base_tensor_true_only_for_identity_view() {
-        let (root, tensor, _) = create_dense("f_is_base", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("f_is_base", shape![2, 3, 4], 4).await;
 
         assert!(tensor.view().is_base_tensor(), "fresh tensor is the base");
 
@@ -1511,8 +1478,7 @@ mod section_f_view_semantics {
 
     #[tokio::test]
     async fn supports_write_through_true_for_slice_and_transpose() {
-        let (root, tensor, _) =
-            create_dense("f_writethrough", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("f_writethrough", shape![2, 3, 4], 4).await;
 
         let sliced = tensor
             .view()
@@ -1538,7 +1504,7 @@ mod section_f_view_semantics {
 
     #[tokio::test]
     async fn write_through_rejected_for_broadcast() {
-        let (root, tensor, _) = create_dense("f_no_wt", shape![1, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("f_no_wt", shape![1, 3, 4], 4).await;
         let broadcasted = match tensor.view().broadcast(shape![2, 3, 4]) {
             Ok(b) => b,
             Err(_) => {
@@ -1565,12 +1531,11 @@ mod section_f_view_semantics {
 
     #[tokio::test]
     async fn write_through_rejected_for_gather_slice() {
-        let (root, tensor, _) =
-            create_dense("f_no_wt_gather", shape![4, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("f_no_wt_gather", shape![4, 3, 4], 4).await;
         let gathered = tensor
             .view()
             .slice(range![
-                AxisRange::Of(shape![0, 2]),
+                AxisRange::Of(vec![0, 2]),
                 AxisRange::In(0, 3, 1),
                 AxisRange::In(0, 4, 1)
             ])
@@ -1592,8 +1557,7 @@ mod section_f_view_semantics {
 
     #[tokio::test]
     async fn reshape_view_writeability_documented() {
-        let (root, tensor, _) =
-            create_dense("f_reshape_view", shape![2, 3, 4], shape![1, 1, 4]).await;
+        let (root, tensor, _) = create_dense("f_reshape_view", shape![2, 3, 4], 4).await;
 
         // Reshape over identity is fine.
         let reshaped = tensor.view().reshape(shape![6, 4]).expect("reshape ok");
@@ -1624,8 +1588,7 @@ mod section_g_sparse_iteration {
 
     #[tokio::test]
     async fn in_order_iteration_matches_base_order() {
-        let (root, tensor, _) =
-            create_sparse("g_in_order", shape![2, 3, 4], shape![1, 1, 4], Some(0)).await;
+        let (root, tensor, _) = create_sparse("g_in_order", shape![2, 3, 4], 4, Some(0)).await;
 
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
@@ -1656,8 +1619,7 @@ mod section_g_sparse_iteration {
 
     #[tokio::test]
     async fn in_order_iteration_with_partial_range() {
-        let (root, tensor, _) =
-            create_sparse("g_partial", shape![2, 3, 4], shape![1, 1, 4], Some(0)).await;
+        let (root, tensor, _) = create_sparse("g_partial", shape![2, 3, 4], 4, Some(0)).await;
 
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
@@ -1685,8 +1647,7 @@ mod section_g_sparse_iteration {
 
     #[tokio::test]
     async fn incompatible_order_returns_structured_error() {
-        let (root, tensor, _) =
-            create_sparse("g_bad_order", shape![2, 3, 4], shape![1, 1, 4], Some(0)).await;
+        let (root, tensor, _) = create_sparse("g_bad_order", shape![2, 3, 4], 4, Some(0)).await;
 
         let err = match tensor
             .read_sparse_elements_in_order(
@@ -1721,8 +1682,7 @@ mod section_g_sparse_iteration {
 
     #[tokio::test]
     async fn in_order_iteration_over_sliced_view() {
-        let (root, tensor, _) =
-            create_sparse("g_sliced", shape![4, 3, 4], shape![1, 1, 4], Some(0)).await;
+        let (root, tensor, _) = create_sparse("g_sliced", shape![4, 3, 4], 4, Some(0)).await;
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
         tensor.write_value(&[1, 0, 0], 2.0).await.expect("w");
         tensor.write_value(&[2, 0, 0], 3.0).await.expect("w");
@@ -1774,7 +1734,7 @@ mod section_h_persistence {
     async fn dense_full_roundtrip_reload() {
         let root = common::unique_tmp_dir("h_dense_reload");
         tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = dense_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         {
             let dir = open_dir(&root).expect("open");
@@ -1794,6 +1754,7 @@ mod section_h_persistence {
         let dir2 = open_dir(&root).expect("reopen");
         let loaded = Tensor::<FsEntry, f32>::load(dir2).await.expect("reload");
         assert_eq!(schema, *loaded.schema());
+
         for coord in iter_coords(loaded.shape()) {
             let v = loaded.read_value(&coord).await.expect("read");
             assert_eq!(v, encode_value(&coord), "post-reload coord {:?}", coord);
@@ -1806,7 +1767,7 @@ mod section_h_persistence {
     async fn sparse_full_roundtrip_reload() {
         let root = common::unique_tmp_dir("h_sparse_reload");
         tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = sparse_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         {
             let dir = open_dir(&root).expect("open");
@@ -1850,7 +1811,7 @@ mod section_h_persistence {
     async fn metadata_file_missing_fails_closed() {
         let root = common::unique_tmp_dir("h_meta_missing");
         tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = dense_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         {
             let dir = open_dir(&root).expect("open");
@@ -1886,7 +1847,7 @@ mod section_h_persistence {
     async fn metadata_file_tampered_fails_closed() {
         let root = common::unique_tmp_dir("h_meta_tampered");
         tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = dense_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         {
             let dir = open_dir(&root).expect("open");
@@ -1917,7 +1878,7 @@ mod section_h_persistence {
     #[tokio::test]
     async fn sparse_index_points_to_missing_block_on_read() {
         let (root, dir) = new_dir("h_index_orphan").await;
-        let schema = sparse_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         let tensor = Tensor::<FsEntry, f32>::create(
             dir.clone(),
@@ -1964,7 +1925,7 @@ mod section_h_persistence {
     #[tokio::test]
     async fn dense_block_missing_on_read_fails_closed() {
         let (root, dir) = new_dir("h_dense_block_missing").await;
-        let schema = dense_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
             .await
@@ -1990,6 +1951,7 @@ mod section_h_persistence {
         blocks_dir.sync().await.expect("sync deleted block");
 
         let mut saw_io_error = false;
+
         for coord in iter_coords(&[2, 3, 4]) {
             if let Err(err) = tensor.read_value(&coord).await {
                 assert!(matches!(err, Error::Io(_)), "got {err:?}");
@@ -2013,9 +1975,9 @@ mod section_h_persistence {
         let root = common::unique_tmp_dir("h_dense_all_blocks");
         tokio::fs::create_dir(&root).await.expect("mkdir");
         let shape = shape![2, 3, 4];
-        let max_capacity: usize = 4; // matches the original block_shape![1, 1, 4]'s product
-        let schema = dense_schema_f32(shape.clone());
-        let expected_blocks = (shape.iter().product::<usize>() as u64) / (max_capacity as u64);
+        let max_capacity: usize = 4;
+        let schema = schema_f32(shape.clone());
+        let expected_blocks = shape.iter().product::<u64>() / (max_capacity as u64);
 
         let dir = open_dir(&root).expect("open");
         let _tensor =
@@ -2052,7 +2014,7 @@ mod section_h_persistence {
     async fn sparse_create_has_no_blocks_only_metadata_on_disk() {
         let root = common::unique_tmp_dir("h_sparse_no_blocks");
         tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = sparse_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         let dir = open_dir(&root).expect("open");
         let _tensor = Tensor::<FsEntry, f32>::create(
@@ -2086,7 +2048,7 @@ mod section_h_persistence {
     async fn unrecognized_metadata_rejected_on_reload() {
         let root = common::unique_tmp_dir("h_meta_version");
         tokio::fs::create_dir(&root).await.expect("mkdir");
-        let schema = dense_schema_f32(shape![2, 3, 4]);
+        let schema = schema_f32(shape![2, 3, 4]);
 
         {
             let dir = open_dir(&root).expect("open");

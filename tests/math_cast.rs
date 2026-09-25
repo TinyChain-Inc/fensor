@@ -2,13 +2,13 @@
 
 use fensor::unary::Cast;
 use fensor::{
-    Layout, Tensor, TensorArray, TensorCast, TensorRead, TensorSchema, TensorTransform, TensorTrig,
-    TensorUnary, TensorView, TensorWrite, UnaryView,
+    AxisRange, Layout, Tensor, TensorArray, TensorCast, TensorRead, TensorSchema, TensorTransform,
+    TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
-    Array, ArrayAccess, AxisRange, Buffer, NDArrayCast, NDArrayRead, NDArrayTrig, NDArrayUnary,
-    axes, range, shape,
+    Array, ArrayAccess, Buffer, NDArrayCast, NDArrayRead, NDArrayTrig, NDArrayUnary, axes, range,
+    shape,
 };
 use number_general::{FloatType, NumberType};
 
@@ -42,7 +42,11 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     ];
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
-        TensorSchema::new(NumberType::Float(FloatType::F32), shape![input.len()]).unwrap(),
+        TensorSchema::new(
+            NumberType::Float(FloatType::F32),
+            shape![input.len() as u64],
+        )
+        .unwrap(),
         Layout::Dense,
         3,
     )

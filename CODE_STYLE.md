@@ -35,3 +35,39 @@ the line above the statement.
 Each crate’s `CONTRIBUTING.md` should point back to this doc and only mention
 extra rules (e.g., feature-flag patterns, generated code) so cross-crate
 consistency remains automatic.
+
+## Collections and geometry
+
+- Use `Shape`, `Strides`, and the private `Coord` for small rank-sized `u64`
+  metadata. Reuse `ha_ndarray::Axes` for `usize` axis identifiers and permutations.
+  Their `PORTABLE_INLINE_RANK` capacity is an allocation optimization, not a rank limit.
+- Use `Range` for rank-sized slice bounds; explicit `AxisRange::Of` selections own
+  `Vec<u64>` and preserve order and duplicates. Shared gather tables retain `Arc`.
+- Use `Vec` for values, support masks, batches, runs, scatter lists, public
+  coordinate payloads, and adapter buffers. Prefer slices when borrowing and
+  arrays for fixed-cardinality structures such as sparse keys.
+- Keep large axis descriptors, signed affine coefficient vectors, and matrix map
+  keys heap-backed. Inline capacity would enlarge containing requests, map nodes,
+  and async futures; rank-sized alone is not sufficient reason to use `SmallVec`.
+- Logical dimensions, unsigned strides, coordinates, cardinalities, and traversal
+  positions use `u64`. Ranks, axes, allocation lengths, and buffer offsets use
+  `usize`. Narrow only after checking the relevant bounded allocation or index.
+  Signed logical mappings use checked `i128`; block-local signed strides retain
+  their bounded representation.
+
+## Local operation macros
+
+Private `macro_rules!` macros may generate mechanically identical operation
+declarations and constructor members inside explicit trait implementations. Keep
+public trait declarations, behavioral control flow, and unusual bounds directly
+readable. Preserve each operation's documentation and explicit backend mapping;
+do not introduce an operation registry or generate execution implementations.
+
+## Numeric limits
+
+Name independent bounds and policies at their owning implementation. Derive
+dependent capacities rather than adding duplicate constants. Internal comments
+refer to the owner; public documentation links to DESIGN.md's bound table, which
+records current values. Boundary tests use the owning constant and adjacent
+values where accessible; explicit numerical and benchmark fixtures retain their
+inputs. Do not expose private limits solely for documentation or tests.
