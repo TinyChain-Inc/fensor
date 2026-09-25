@@ -1,62 +1,62 @@
 # fensor Agent Notes
 
-`fensor` is a filesystem-backed tensor storage primitive. Keep it minimal,
-non-transactional, and explicit about supported/unsupported behavior.
+`fensor` is a filesystem-backed tensor primitive. Keep it minimal,
+non-transactional, and explicit about supported and unsupported behavior.
 
-## Core constraints
+## Implementation constraints
 
-- `fensor` is not a transaction manager. Do not add commit, rollback, or
-  finalize semantics here; callers may layer their own lifecycle policy.
-- Fail closed on corruption. No fallback recovery paths for malformed metadata
-  or data files.
-- Keep one obvious code path per feature. Prefer general primitives over
-  special-case branches.
-- For tensor behavior surfaced by traits (`TensorRead`, `TensorWrite`,
-  `TensorTransform`, `TensorBlockStore`, `TensorSparseIndex`), keep the
-  canonical implementation in the trait methods themselves. Avoid parallel
-  `*_impl` forwarding layers that create a second path to inspect/debug.
+- Follow [DESIGN.md](DESIGN.md) for bounded requests, mapping, slice traversal,
+  matrix execution, and destination writes. Preserve supported geometric paths;
+  do not merge distinct data representations merely to reduce line counts.
+- Keep one canonical implementation in each owning trait method. Avoid parallel
+  `*_impl` forwarding layers, execution registries, and convenience traits.
+- Delegate behavior through expression APIs, not strategy enums, equivalent flags,
+  or type probes. Request providers return actual iterators; precedence and error
+  propagation must be explicit. Enums may represent genuine data alternatives.
+- Expression construction is lazy even when asynchronous. Consumers may evaluate
+  bounded intermediates in memory but never persist them implicitly. Reads and
+  terminal reductions create no result storage. Source-cache spill is separate.
+- Only outer consumers buffer batches. Preserve the public stream orders,
+  completion-order numeric terminals, boolean short-circuit/error boundaries,
+  and sequential destination updates. Add no tasks or nested worker pools.
+- Do not add transaction lifecycle, recovery, or codec policy. Malformed metadata
+  and blocks fail closed; callers own cleanup, durability, and transactions.
 
 ## Bounded execution
 
 Tensor execution must not allocate values, coordinates, support masks, or
 partial-result collections proportional to total tensor size, output size, or
 reduction-group size. Coordinates must be generated lazily and consumed in
-bounded batches. Each collection must have an identifiable bound. Only the outer
-consumer may introduce concurrent batches.
+bounded batches. Each collection must have an identifiable bound.
 
-Rank-sized metadata and caller-supplied values or explicit index selections are
-separate, documented memory costs. They must not justify expanding implicit
-ranges or collecting execution results. Filesystem/cache metadata remains subject
-to its own limits; this contract is not a total-process memory guarantee.
+Rank-sized metadata, caller-owned values/explicit selections, filesystem/cache
+metadata, and independent consumers are separate costs, not permission to collect
+implicit ranges. This is not a total-process memory guarantee. Keep the bounds
+and their owners documented in [DESIGN.md](DESIGN.md#bound-and-policy-constants).
+No whole-result collectors or whole-index compaction APIs.
 
-- Execution batches contain at most 4096 elements; storage block capacity is a
-  separate bound. Validate batch lengths before evaluation and after consumption.
-- Do not add whole-result collection helpers or whole-index compaction. Callers
-  may explicitly collect streams; bounded compaction is future work.
-- Preserve explicit selection order and duplicates. Slicing or reversing an
-  existing gather table must share its storage rather than copy its entries.
+## Semantics and validation
 
-## Tensor semantics
+- Preserve one writable base and constrained geometric write-through. Computed
+  views remain read-only; numerical definitions belong to ha-ndarray.
+- Keep support independent of intermediate values; copying establishes a new
+  sparse support boundary. Preserve ordered sparse-read rejection and scalar
+  zero-write lifecycle behavior.
+- Shapes/coordinates use `u64` at schema/wire boundaries; runtime axes use
+  `usize`. Centralize conversions. Preserve adapter-owned payload typing.
+- Validate batch sizes and support lengths before evaluation/combination and
+  after consumption. Keep errors structured; no debug-only safety checks.
+- Keep counters test-only and isolated from storage synchronization. Use local
+  or task-local observations for concurrent correctness tests.
 
-- Preserve base/view semantics: one writable base tensor with trait-compatible
-  views and explicit write-through constraints.
-- Canonical numeric typing rule:
-  - shape dimensions and coordinate payloads are `u64` at schema/wire boundaries,
-  - axis identifiers and axis indexing are `usize` in runtime structs and APIs.
-  Keep conversions centralized at schema/stream boundaries.
-- Sparse behavior must be deterministic and documented:
-  - ordered iteration support boundaries,
-  - structured errors for incompatible order,
-  - explicit zero-write lifecycle policy.
-- Keep dense/sparse parity where operations are supported; unsupported cases
-  must return structured errors.
+## Documentation and tests
 
-## Docs and testing
-
-- Update `README.md` and `ROADMAP.md` when behavior contracts change.
-- Keep tests focused on critical paths and parity gates:
-  - access parity,
-  - transform composition,
-  - sparse lifecycle,
-  - persistence/reload semantics.
-- Follow shared code style from [`CODE_STYLE.md`](./CODE_STYLE.md).
+Follow [CODE_STYLE.md](CODE_STYLE.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+Update the owning contract when behavior changes: README for public use, DESIGN
+for execution invariants, ROADMAP for unfinished work. Link rather than repeat
+implementation history. Keep benchmark code and methodology in Git; write generated
+measurements, logs, and provenance under ignored `benchmarks/results/`. Do not
+publish result tables in project documentation or delete local evidence as cleanup.
+Benchmark runners accept data directories without classifying the underlying storage.
+Use [tests/COVERAGE.md](tests/COVERAGE.md) to retain critical parity, persistence,
+corruption, cancellation, and structural bounds without duplicating permutations.

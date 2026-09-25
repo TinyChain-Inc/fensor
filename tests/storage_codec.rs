@@ -1,11 +1,12 @@
 //! The file-entry adapter chooses the byte codec and preserves payload types.
+
 use std::io;
 use std::path::Path;
 
 use fensor::{
-    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorGeometry, TensorMath,
-    TensorMathScalar, TensorMetadata, TensorRead, TensorReduce, TensorReduceAll, TensorSchema,
-    TensorWhere, TensorWrite,
+    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorGeometry, TensorMatMul,
+    TensorMath, TensorMathScalar, TensorMetadata, TensorRead, TensorReduce, TensorReduceAll,
+    TensorSchema, TensorTransform, TensorWhere, TensorWrite,
 };
 
 use freqfs::{Cache, FileLoad, FileSave};
@@ -29,6 +30,7 @@ where
         Self(FsEntry::from(value))
     }
 }
+
 impl<F> AsType<F> for JsonEntry
 where
     FsEntry: AsType<F>,
@@ -36,13 +38,16 @@ where
     fn into_type(self) -> Option<F> {
         self.0.into_type()
     }
+
     fn as_type(&self) -> Option<&F> {
         self.0.as_type()
     }
+
     fn as_type_mut(&mut self) -> Option<&mut F> {
         self.0.as_type_mut()
     }
 }
+
 impl FileLoad for JsonEntry {
     async fn load(_: &Path, file: tokio::fs::File, _: std::fs::Metadata) -> io::Result<Self> {
         destream_json::de::read_from((), file)
@@ -51,14 +56,17 @@ impl FileLoad for JsonEntry {
             .map_err(io::Error::other)
     }
 }
+
 impl FileSave for JsonEntry {
     async fn save(&self, file: &mut tokio::fs::File) -> io::Result<u64> {
         let mut stream = destream_json::en::encode(&self.0).map_err(io::Error::other)?;
         let mut size = 0;
+
         while let Some(chunk) = stream.try_next().await.map_err(io::Error::other)? {
             file.write_all(&chunk).await?;
             size += chunk.len() as u64;
         }
+
         Ok(size)
     }
 }
@@ -132,6 +140,7 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
         assert_eq!(json, metadata);
         assert_eq!(tbon, metadata);
     }
+
     let malformed = [
         (vec![3u64, 4], false, None, vec![2u64]),
         (vec![3, 4], false, None, vec![0, 2]),
@@ -139,12 +148,65 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
         (vec![3, 4], false, Some(0), vec![1, 2]),
         (vec![3, 4], false, None, vec![4096, 2]),
     ];
+
     for value in malformed {
         let decoded: Result<TensorMetadata<f32>, _> =
             destream_json::de::try_decode((), destream_json::en::encode(&value).unwrap()).await;
 
         assert!(decoded.is_err());
     }
+}
+
+#[tokio::test]
+async fn reload_rejects_out_of_bounds_sparse_axis() {
+    let root = common::unique_tmp_dir("json_invalid_axis");
+    tokio::fs::create_dir(&root).await.unwrap();
+    {
+        let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
+        let tensor = Tensor::<JsonEntry, f32>::create(
+            cache.load(root.clone()).unwrap(),
+            TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![3, 4]).unwrap(),
+            Layout::Sparse { axis: Some(1) },
+            2,
+        )
+        .await
+        .unwrap();
+        tensor.write_value(&[1, 2], 7.).await.unwrap();
+        tensor.sync().await.unwrap();
+    }
+
+    let metadata = root.join("blocks").join("metadata");
+    // Preserve the adapter envelope and valid geometry; corrupt only the axis.
+    let original = tokio::fs::read(&metadata).await.unwrap();
+    let malformed = (2u8, (vec![3u64, 4], true, Some(2u64), vec![1u64, 2]));
+    let mut bytes = Vec::new();
+    let mut encoded = destream_json::en::encode(&malformed).unwrap();
+
+    while let Some(chunk) = encoded.try_next().await.unwrap() {
+        bytes.extend_from_slice(&chunk);
+    }
+    tokio::fs::write(&metadata, &bytes).await.unwrap();
+    {
+        let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
+        let error = Tensor::<JsonEntry, f32>::load(cache.load(root.clone()).unwrap())
+            .await
+            .err()
+            .expect("invalid persisted axis must fail closed");
+        // Decoding is owned by the adapter and reaches fensor as an I/O error.
+        assert!(matches!(error, fensor::Error::Io(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("sparse axis hint out of bounds"),
+            "{error}"
+        );
+    }
+    assert_eq!(tokio::fs::read(&metadata).await.unwrap(), bytes);
+    tokio::fs::write(&metadata, original).await.unwrap();
+    let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
+    let tensor = Tensor::<JsonEntry, f32>::load(cache.load(root.clone()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(tensor.read_value(&[1, 2]).await.unwrap(), 7.);
+    common::cleanup(&root).await;
 }
 
 // A binary expression can borrow sources with different adapters and block shapes.
@@ -242,4 +304,14 @@ async fn conditional_sources_and_output_use_independent_codecs() {
     let (_, dir) = common::new_dir("reduced_independent_codec").await;
     let reduced_copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &reduced, 1).await.unwrap();
     assert_eq!(reduced_copy.read_value(&[0]).await.unwrap(), 6.);
+    let matrix = a
+        .view()
+        .reshape(ha_ndarray::shape![1, 5])
+        .unwrap()
+        .matmul(&b.view().reshape(ha_ndarray::shape![5, 1]).unwrap())
+        .await
+        .unwrap();
+    let (_, dir) = common::new_dir("matmul_independent_codec").await;
+    let product: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &matrix, 1).await.unwrap();
+    assert_eq!(product.read_value(&[0, 0]).await.unwrap(), 0.);
 }

@@ -1,4 +1,5 @@
 //! Coordinate mapping shared by geometric storage and reduction views.
+
 use std::{iter, sync::Arc};
 
 use ha_ndarray::{Axes, AxisRange, Range, Shape};
@@ -19,6 +20,44 @@ pub(crate) enum AxisContrib {
     Stride(i64),
     Gather(GatherOffsets),
     Broadcast(i64),
+}
+
+/// A separable forward slice: base coordinates are fixed or advance on one axis.
+/// This metadata is rank-sized; unsupported affine reshapes retain logical reads.
+pub(crate) struct StorageSlice {
+    pub(crate) origins: Vec<usize>,
+    pub(crate) axes: Vec<(usize, usize)>,
+}
+
+impl StorageSlice {
+    pub(crate) fn identity(shape: &[usize]) -> Self {
+        Self {
+            origins: vec![0; shape.len()],
+            axes: (0..shape.len()).map(|i| (i, 1)).collect(),
+        }
+    }
+
+    pub(crate) fn bounds(&self, regions: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
+        for (base, (&origin, &(lo, hi))) in self.origins.iter().zip(regions).enumerate() {
+            if !self.axes.iter().any(|(axis, _)| *axis == base) && !(lo..hi).contains(&origin) {
+                return None;
+            }
+        }
+
+        Some(
+            self.axes
+                .iter()
+                .map(|&(base, step)| {
+                    let (lo, hi) = regions[base];
+                    let origin = self.origins[base];
+                    (
+                        lo.saturating_sub(origin).div_ceil(step),
+                        hi.saturating_sub(origin).div_ceil(step),
+                    )
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Caller-selection-sized metadata. Slices and reversals share the table.
@@ -48,6 +87,7 @@ impl GatherOffsets {
         if index >= self.len {
             return None;
         }
+
         let delta = index.checked_mul(self.step)?;
         if self.reversed {
             self.start.checked_sub(delta)
@@ -103,6 +143,44 @@ impl GatherOffsets {
 }
 
 impl CoordinateMap {
+    pub(crate) fn storage_slice(
+        &self,
+        shape: &[usize],
+        strides: &[usize],
+    ) -> Result<Option<StorageSlice>> {
+        let mut origins = Vec::new();
+        self.resolve_into(&vec![0; self.shape.len()], shape, strides, &mut origins)?;
+        let origins: Vec<_> = origins.into_iter().map(|v| v as usize).collect();
+        let mut axes: Vec<(usize, usize)> = Vec::with_capacity(self.axes.len());
+
+        for (contribution, &dim) in self.axes.iter().zip(&self.shape) {
+            let AxisContrib::Stride(stride) = contribution else {
+                return Ok(None);
+            };
+            let Ok(stride) = usize::try_from(*stride) else {
+                return Ok(None);
+            };
+            if stride == 0 {
+                return Ok(None);
+            }
+
+            let base = (0..shape.len()).rev().find(|&base| {
+                !axes.iter().any(|(axis, _)| *axis == base)
+                    && stride.is_multiple_of(strides[base])
+                    && (stride / strides[base])
+                        .checked_mul(dim - 1)
+                        .and_then(|delta| origins[base].checked_add(delta))
+                        .is_some_and(|last| last < shape[base])
+            });
+            let Some(base) = base else {
+                return Ok(None);
+            };
+            axes.push((base, stride / strides[base]));
+        }
+
+        Ok(Some(StorageSlice { origins, axes }))
+    }
+
     pub fn identity(shape: Shape, strides: &[usize]) -> Self {
         Self {
             base_offset: 0,
@@ -115,18 +193,66 @@ impl CoordinateMap {
     }
 
     pub fn resolve(&self, coord: &[u64], shape: &[usize], strides: &[usize]) -> Result<Vec<u64>> {
-        validate::validate_coord(&self.shape, coord)?;
-        let offset = self.flat_offset(coord)?;
-        if offset < 0 {
-            return Err(Error::InvalidCoord("negative linear offset".into()));
+        let mut out = Vec::new();
+        self.resolve_into(coord, shape, strides, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn is_identity(&self, shape: &[usize], strides: &[usize]) -> bool {
+        self.base_offset == 0 && self.shape.as_slice() == shape && self.axes.len() == strides.len()
+            && self.axes.iter().zip(strides).all(|(axis,stride)| matches!(axis, AxisContrib::Stride(s) if i64::try_from(*stride).ok() == Some(*s)))
+    }
+
+    /// Structural affine description; gather tables deliberately retain cursor mapping.
+    pub(crate) fn affine(&self) -> Result<Option<(i128, Vec<i128>)>> {
+        if self.axes.len() != self.shape.len() {
+            return Err(Error::InvalidCoord("mapping rank mismatch".into()));
         }
-        let coord: Vec<_> = strides
+
+        let mut offset = self.base_offset as i128;
+        let mut strides = Vec::with_capacity(self.axes.len());
+
+        for axis in &self.axes {
+            match axis {
+                AxisContrib::Stride(stride) => strides.push(*stride as i128),
+                AxisContrib::Broadcast(constant) => {
+                    offset = offset
+                        .checked_add(*constant as i128)
+                        .ok_or_else(|| Error::InvalidCoord("mapping offset overflow".into()))?;
+                    strides.push(0);
+                }
+                AxisContrib::Gather(_) => return Ok(None),
+            }
+        }
+
+        Ok(Some((offset, strides)))
+    }
+
+    pub fn resolve_into(
+        &self,
+        coord: &[u64],
+        shape: &[usize],
+        strides: &[usize],
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        validate::validate_coord(&self.shape, coord)?;
+        let offset = u64::try_from(self.flat_offset(coord)?)
+            .map_err(|_| Error::InvalidCoord("negative linear offset".into()))?;
+        let size = shape
             .iter()
-            .zip(shape)
-            .map(|(s, d)| (offset as u64 / *s as u64) % *d as u64)
-            .collect();
-        validate::validate_coord(shape, &coord)?;
-        Ok(coord)
+            .try_fold(1u64, |n, d| n.checked_mul(*d as u64))
+            .ok_or_else(|| Error::InvalidCoord("mapping size overflow".into()))?;
+        if offset >= size || strides.len() != shape.len() || strides.contains(&0) {
+            return Err(Error::InvalidCoord("mapped offset out of bounds".into()));
+        }
+        out.clear();
+        out.extend(
+            strides
+                .iter()
+                .zip(shape)
+                .map(|(s, d)| (offset / *s as u64) % *d as u64),
+        );
+        Ok(())
     }
 
     pub fn flat_offset(&self, coord: &[u64]) -> Result<i64> {
@@ -137,18 +263,25 @@ impl CoordinateMap {
         }
 
         let mut k: i64 = self.base_offset;
+
         for (c, axis) in coord.iter().zip(self.axes.iter()) {
-            k += match axis {
-                AxisContrib::Stride(s) => (*c as i64) * s,
+            let delta = match axis {
+                AxisContrib::Stride(s) => i64::try_from(*c)
+                    .ok()
+                    .and_then(|c| c.checked_mul(*s))
+                    .ok_or_else(|| Error::InvalidCoord("mapping offset overflow".into()))?,
                 AxisContrib::Broadcast(constant) => *constant,
                 AxisContrib::Gather(offsets) => {
                     let i = usize::try_from(*c)
-                        .map_err(|_| Error::InvalidCoord("coord overflows usize".to_string()))?;
+                        .map_err(|_| Error::InvalidCoord("coord overflows usize".into()))?;
                     *offsets.get(i).ok_or_else(|| {
-                        Error::InvalidCoord("coord out of bounds for gather".to_string())
+                        Error::InvalidCoord("coord out of bounds for gather".into())
                     })?
                 }
             };
+            k = k
+                .checked_add(delta)
+                .ok_or_else(|| Error::InvalidCoord("mapping offset overflow".into()))?;
         }
 
         Ok(k)
@@ -158,6 +291,7 @@ impl CoordinateMap {
         if self.axes.len() != self.shape.len() {
             return false;
         }
+
         let Ok(expected) = schema::contiguous_strides(&self.shape) else {
             return false;
         };
@@ -178,6 +312,7 @@ impl CoordinateMap {
                 "reshape requires an equal number of elements".to_string(),
             ));
         }
+
         if !self.is_c_contiguous() {
             return Err(Error::Unsupported(
                 "reshape requires a C-contiguous view; copy the tensor before reshaping \
@@ -352,6 +487,7 @@ impl CoordinateMap {
         }
 
         let mut remove = vec![false; ndim];
+
         for &axis in axes.iter() {
             if axis >= ndim {
                 return Err(Error::InvalidLayout(format!(
@@ -402,6 +538,7 @@ impl CoordinateMap {
         }
 
         let mut insert_before = vec![false; old_ndim];
+
         for &axis in axes.iter() {
             if axis >= old_ndim {
                 return Err(Error::InvalidLayout(format!(
@@ -569,6 +706,7 @@ mod tests {
         let sliced = original.slice(1, 2, 3).unwrap();
         let flipped = sliced.flipped();
         let nested = flipped.slice(1, 1, 2).unwrap();
+
         for view in [&sliced, &flipped, &nested] {
             assert!(Arc::ptr_eq(&original.offsets, &view.offsets));
         }
@@ -589,6 +727,52 @@ mod tests {
                 .get(0)
                 .unwrap(),
             2
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn identity_is_structural_and_mapping_reuses_scratch() {
+        let shape = ha_ndarray::shape![3, 4];
+        let strides = schema::contiguous_strides(&shape).unwrap();
+        let map = CoordinateMap::identity(shape.clone(), &strides);
+        assert!(map.is_identity(&shape, &strides));
+        let flipped = map.clone().flip(1).unwrap();
+        assert!(!flipped.is_identity(&shape, &strides));
+        assert!(
+            flipped
+                .clone()
+                .flip(1)
+                .unwrap()
+                .is_identity(&shape, &strides)
+        );
+        let mut out = Vec::with_capacity(2);
+        let ptr = out.as_ptr();
+
+        for row in 0..3 {
+            for col in 0..4 {
+                flipped
+                    .resolve_into(&[row, col], &shape, &strides, &mut out)
+                    .unwrap();
+                assert_eq!(out, vec![row, 3 - col]);
+                assert_eq!(out.as_ptr(), ptr);
+            }
+        }
+
+        let mut bad = map;
+        bad.base_offset = 12;
+        assert!(
+            bad.resolve_into(&[0, 0], &shape, &strides, &mut out)
+                .is_err()
+        );
+        bad.base_offset = i64::MAX;
+        assert!(
+            bad.resolve_into(&[2, 3], &shape, &strides, &mut out)
+                .is_err()
         );
     }
 }

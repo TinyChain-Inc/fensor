@@ -1,96 +1,13 @@
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use b_table::Node;
-use destream::{de, en};
-use freqfs::Cache;
 use ha_ndarray::{AxisRange, axes, range, shape};
 use number_general::{FloatType, NumberType};
-use safecast::as_type;
 
 use crate::schema::row_major_coords;
+use crate::test_support::{FsEntry as TestFE, cleanup, new_dir};
 use crate::{Error, Layout, Tensor, TensorSchema};
 
 use super::*;
-
-#[derive(Clone, Debug)]
-enum TestFE {
-    Node(Node<u64>),
-    F32(Vec<f32>),
-    MetadataF32(crate::TensorMetadata<f32>),
-}
-impl<'en> en::ToStream<'en> for TestFE {
-    fn to_stream<E: en::Encoder<'en>>(
-        &'en self,
-        encoder: E,
-    ) -> std::result::Result<E::Ok, E::Error> {
-        match self {
-            Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
-            Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
-            Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
-        }
-    }
-}
-struct TestFEVisitor;
-impl de::Visitor for TestFEVisitor {
-    type Value = TestFE;
-    fn expecting() -> &'static str {
-        "a typed filesystem entry"
-    }
-    async fn visit_seq<A: de::SeqAccess>(
-        self,
-        mut seq: A,
-    ) -> std::result::Result<Self::Value, A::Error> {
-        let entry = match seq.expect_next::<u8>(()).await? {
-            0 => TestFE::Node(seq.expect_next(()).await?),
-            1 => TestFE::F32(seq.expect_next(()).await?),
-            2 => TestFE::MetadataF32(seq.expect_next(()).await?),
-            tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
-        };
-        if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-            return Err(de::Error::custom("unexpected entry field"));
-        }
-        Ok(entry)
-    }
-}
-impl de::FromStream for TestFE {
-    type Context = ();
-    async fn from_stream<D: de::Decoder>(
-        _: (),
-        decoder: &mut D,
-    ) -> std::result::Result<Self, D::Error> {
-        decoder.decode_seq(TestFEVisitor).await
-    }
-}
-as_type!(TestFE, Node, Node<u64>);
-as_type!(TestFE, F32, Vec<f32>);
-as_type!(TestFE, MetadataF32, crate::TensorMetadata<f32>);
-
-fn unique_tmp_dir(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    path.push(format!("fensor_view_tests_{name}_{unique}"));
-    path
-}
-
-fn open_dir(root: &Path) -> io::Result<freqfs::DirLock<TestFE>> {
-    let cache = Cache::<TestFE>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
-    cache.load(root.to_path_buf())
-}
-
-async fn new_dir(name: &str) -> (PathBuf, freqfs::DirLock<TestFE>) {
-    let root = unique_tmp_dir(name);
-    tokio::fs::create_dir(&root).await.expect("create tmp dir");
-    let dir = open_dir(&root).expect("load tmp dir");
-    (root, dir)
-}
-
-async fn cleanup(root: &Path) {
-    let _ = tokio::fs::remove_dir_all(root).await;
-}
 
 async fn create_dense(
     name: &str,
@@ -380,6 +297,7 @@ async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
         .expect("broadcast must be supported");
     assert_eq!(broadcasted.flat_offset(&[0, 2, 4]).expect("offset"), 106);
     assert_eq!(broadcasted.flat_offset(&[6, 2, 4]).expect("offset"), 106);
+
     for k in 0..7u64 {
         let v = broadcasted
             .read_value(&[k, 2, 4])
@@ -471,6 +389,7 @@ async fn broadcast_expands_middle_or_trailing_axis_with_rank_increase() {
     assert_eq!(broadcasted.shape(), &[2, 3, 5, 4]);
     assert_eq!(broadcasted.flat_offset(&[1, 2, 3, 2]).expect("offset"), 10);
     assert_eq!(broadcasted.flat_offset(&[0, 2, 0, 2]).expect("offset"), 10);
+
     for i in 0..2u64 {
         for k in 0..5u64 {
             let v = broadcasted.read_value(&[i, 2, k, 2]).await.expect("read");
@@ -493,12 +412,14 @@ async fn broadcast_twice_passes_through_existing_broadcast_axis() {
         1000,
     )
     .await;
+
     for k in 0..4u64 {
         tensor
             .write_value(&[3, k], k as f32 * 1.5)
             .await
             .expect("seed");
     }
+
     let view = tensor.view();
     let r = range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
@@ -509,6 +430,7 @@ async fn broadcast_twice_passes_through_existing_broadcast_axis() {
         .broadcast(shape![2, 5, 4])
         .expect("second broadcast must be supported");
     assert_eq!(twice.shape(), &[2, 5, 4]);
+
     for i in 0..2u64 {
         for j in 0..5u64 {
             for k in 0..4u64 {
@@ -544,6 +466,7 @@ async fn broadcast_then_transpose_preserves_constant() {
         .expect("broadcast must be supported");
     let transposed = broadcasted.transpose(Some(axes![1, 0])).expect("transpose");
     assert_eq!(transposed.shape(), &[4, 5]);
+
     for k in 0..4u64 {
         for j in 0..5u64 {
             assert_eq!(
@@ -574,6 +497,7 @@ async fn slice_of_after_broadcast_preserves_constant() {
     let r = range![AxisRange::Of(shape![0, 2]), AxisRange::In(0, 4, 1)];
     let sliced = broadcasted.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 4]);
+
     for x in 0..2u64 {
         for y in 0..4u64 {
             assert_eq!(
@@ -710,12 +634,14 @@ async fn at_slice_on_broadcast_axis() {
     // At(1) on that Broadcast axis contributes 0 regardless of index, and the axis is dropped
     // flat_offset([y]) = y
     let (root, tensor) = create_dense("at_slice_on_broadcast_axis", shape![1, 4], 1000).await;
+
     for c in 0..4u64 {
         tensor
             .write_value(&[0, c], c as f32 * 2.0)
             .await
             .expect("seed");
     }
+
     let view = tensor.view();
     let broadcasted = view
         .broadcast(shape![3, 4])
@@ -723,6 +649,7 @@ async fn at_slice_on_broadcast_axis() {
     let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
     let sliced = broadcasted.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[4]);
+
     for y in 0..4u64 {
         assert_eq!(sliced.flat_offset(&[y]).expect("offset"), y as i64);
         let v = sliced.read_value(&[y]).await.expect("read");
@@ -736,12 +663,14 @@ async fn in_slice_on_broadcast_axis() {
     // [1,4] -> broadcast to [5,4]: axis 0 becomes Broadcast(0)
     // In(1,4,1) on that Broadcast axis stays Broadcast(0) with extent 3, still independent of index
     let (root, tensor) = create_dense("in_slice_on_broadcast_axis", shape![1, 4], 1000).await;
+
     for c in 0..4u64 {
         tensor
             .write_value(&[0, c], c as f32 * 2.0)
             .await
             .expect("seed");
     }
+
     let view = tensor.view();
     let broadcasted = view
         .broadcast(shape![5, 4])
@@ -749,6 +678,7 @@ async fn in_slice_on_broadcast_axis() {
     let r = range![AxisRange::In(1, 4, 1), AxisRange::In(0, 4, 1)];
     let sliced = broadcasted.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[3, 4]);
+
     for a in 0..3u64 {
         for y in 0..4u64 {
             assert_eq!(
@@ -769,12 +699,14 @@ async fn at_slice_on_gather_axis() {
     // At(1) on that Gather axis selects g[1]=12 (base row 3) and drops the axis
     // flat_offset([y]) = 12 + y
     let (root, tensor) = create_dense("at_slice_on_gather_axis", shape![4, 4], 1000).await;
+
     for y in 0..4u64 {
         tensor
             .write_value(&[3, y], y as f32 * 3.0)
             .await
             .expect("seed");
     }
+
     let view = tensor.view();
     let gathered = view
         .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
@@ -783,6 +715,7 @@ async fn at_slice_on_gather_axis() {
     let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice At on gather axis");
     assert_eq!(sliced.shape(), &[4]);
+
     for y in 0..4u64 {
         assert_eq!(
             sliced.flat_offset(&[y]).expect("offset"),
@@ -801,12 +734,14 @@ async fn in_slice_on_gather_axis() {
     // In(1,2,1) on that Gather axis selects g[1]=12 (base row 3) via a sub-range, extent 1
     // flat_offset([0,y]) = 12 + y
     let (root, tensor) = create_dense("in_slice_on_gather_axis", shape![4, 4], 1000).await;
+
     for y in 0..4u64 {
         tensor
             .write_value(&[3, y], y as f32 * 3.0)
             .await
             .expect("seed");
     }
+
     let view = tensor.view();
     let gathered = view
         .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
@@ -814,6 +749,7 @@ async fn in_slice_on_gather_axis() {
     let r = range![AxisRange::In(1, 2, 1), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice In on gather axis");
     assert_eq!(sliced.shape(), &[1, 4]);
+
     for y in 0..4u64 {
         assert_eq!(
             sliced.flat_offset(&[0, y]).expect("offset"),
@@ -832,6 +768,7 @@ async fn of_slice_on_gather_axis() {
     // Of([1,0]) on that Gather axis reorders: new Gather([12,4]) (picks g[1] then g[0])
     // flat_offset([0,y]) = 12+y (base row 3), flat_offset([1,y]) = 4+y (base row 1)
     let (root, tensor) = create_dense("of_slice_on_gather_axis", shape![4, 4], 1000).await;
+
     for y in 0..4u64 {
         tensor
             .write_value(&[1, y], y as f32 * 5.0)
@@ -842,6 +779,7 @@ async fn of_slice_on_gather_axis() {
             .await
             .expect("seed row3");
     }
+
     let view = tensor.view();
     let gathered = view
         .slice(range![AxisRange::Of(shape![1, 3]), AxisRange::In(0, 4, 1)])
@@ -849,6 +787,7 @@ async fn of_slice_on_gather_axis() {
     let r = range![AxisRange::Of(shape![1, 0]), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice Of on gather axis");
     assert_eq!(sliced.shape(), &[2, 4]);
+
     for y in 0..4u64 {
         assert_eq!(
             sliced.flat_offset(&[0, y]).expect("offset"),
@@ -977,6 +916,7 @@ async fn squeeze_gather_singleton_folds_offset() {
             .await
             .expect("seed");
     }
+
     let view = tensor.view();
     let gathered = view
         .slice(range![AxisRange::Of(shape![3]), AxisRange::In(0, 4, 1)])
@@ -1043,54 +983,9 @@ async fn squeeze_broadcast_axis_folds_constant() {
             );
         }
     }
+
     let v = squeezed.read_value(&[2, 4]).await.expect("read");
     assert_eq!(v, 77.0);
-    cleanup(&root).await;
-}
-
-#[tokio::test]
-async fn squeeze_empty_axes_rejected() {
-    let (root, tensor) = create_dense("squeeze_empty_axes_rejected", shape![3, 1, 4], 1000).await;
-    let view = tensor.view();
-    assert!(matches!(
-        view.squeeze(axes![]),
-        Err(Error::InvalidLayout(_))
-    ));
-    cleanup(&root).await;
-}
-
-#[tokio::test]
-async fn squeeze_all_axes_rejected() {
-    let (root, tensor) = create_dense("squeeze_all_axes_rejected", shape![1, 1], 1000).await;
-    let view = tensor.view();
-    assert!(matches!(
-        view.squeeze(axes![0, 1]),
-        Err(Error::InvalidLayout(_))
-    ));
-    cleanup(&root).await;
-}
-
-#[tokio::test]
-async fn squeeze_duplicate_axis_rejected() {
-    let (root, tensor) =
-        create_dense("squeeze_duplicate_axis_rejected", shape![1, 3, 1, 4], 1000).await;
-    let view = tensor.view();
-    assert!(matches!(
-        view.squeeze(axes![0, 0]),
-        Err(Error::InvalidLayout(_))
-    ));
-    cleanup(&root).await;
-}
-
-#[tokio::test]
-async fn squeeze_axis_out_of_bounds_rejected() {
-    let (root, tensor) =
-        create_dense("squeeze_axis_out_of_bounds_rejected", shape![3, 4], 1000).await;
-    let view = tensor.view();
-    assert!(matches!(
-        view.squeeze(axes![5]),
-        Err(Error::InvalidLayout(_))
-    ));
     cleanup(&root).await;
 }
 
@@ -1208,46 +1103,6 @@ async fn unsqueeze_before_first_middle_and_last_original_axis() {
 }
 
 #[tokio::test]
-async fn unsqueeze_empty_axes_rejected() {
-    let (root, tensor) = create_dense("unsqueeze_empty_axes_rejected", shape![3, 4], 1000).await;
-    let view = tensor.view();
-    assert!(matches!(
-        view.unsqueeze(axes![]),
-        Err(Error::InvalidLayout(_))
-    ));
-    cleanup(&root).await;
-}
-
-#[tokio::test]
-async fn unsqueeze_duplicate_axis_rejected() {
-    let (root, tensor) =
-        create_dense("unsqueeze_duplicate_axis_rejected", shape![3, 4], 1000).await;
-    let view = tensor.view();
-    assert!(matches!(
-        view.unsqueeze(axes![0, 0]),
-        Err(Error::InvalidLayout(_))
-    ));
-    cleanup(&root).await;
-}
-
-#[tokio::test]
-async fn unsqueeze_axis_out_of_bounds_rejected() {
-    let (root, tensor) =
-        create_dense("unsqueeze_axis_out_of_bounds_rejected", shape![3, 4], 1000).await;
-    let view = tensor.view();
-    // shape is rank 2, so valid axes are 0,1 only
-    assert!(matches!(
-        view.clone().unsqueeze(axes![2]),
-        Err(Error::InvalidLayout(_))
-    ));
-    assert!(matches!(
-        view.unsqueeze(axes![3]),
-        Err(Error::InvalidLayout(_))
-    ));
-    cleanup(&root).await;
-}
-
-#[tokio::test]
 async fn unsqueeze_write_through_roundtrip() {
     // shape [3,4], .unsqueeze(axes![0]) -> shape [1,3,4]
     // write_value at [0,1,2] should write to [1,2] on base tensor
@@ -1290,6 +1145,7 @@ async fn squeeze_then_unsqueeze_round_trip() {
 
     // Verify flat_offset matches for all coordinates
     let coords = row_major_coords(&shape).expect("coords");
+
     for c in coords {
         assert_eq!(
             restored.flat_offset(&c).expect("restored offset"),
@@ -1323,6 +1179,7 @@ async fn unsqueeze_then_squeeze_round_trip() {
 
     // Verify flat_offset matches for all coordinates
     let coords = row_major_coords(&shape).expect("coords");
+
     for c in coords {
         assert_eq!(
             restored.flat_offset(&c).expect("restored offset"),
@@ -1332,29 +1189,4 @@ async fn unsqueeze_then_squeeze_round_trip() {
         );
     }
     cleanup(&root).await;
-}
-
-impl freqfs::FileLoad for TestFE {
-    async fn load(
-        _: &std::path::Path,
-        file: tokio::fs::File,
-        _: std::fs::Metadata,
-    ) -> std::io::Result<Self> {
-        tbon::de::read_from((), file)
-            .await
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-}
-impl freqfs::FileSave for TestFE {
-    async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
-        use futures::TryStreamExt;
-        use tokio::io::AsyncWriteExt;
-        let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
-        let mut size = 0;
-        while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
-            file.write_all(&chunk).await?;
-            size += chunk.len() as u64;
-        }
-        Ok(size)
-    }
 }

@@ -1,335 +1,227 @@
 # fensor
-A filesystem-backed `Tensor` data structure featuring support for dense and sparse indexing
 
-## Data Integrity Policy
+Filesystem-backed tensors with dense and sparse storage, lazy arithmetic, and
+bounded streaming execution.
 
-`fensor` is fail-closed on corruption.
+## Composition and consumption
 
-- `fensor` does not attempt to repair, recover, or auto-heal corrupted metadata or tensor data.
-- If metadata or data is malformed, inconsistent, or unreadable, operations must return a structured error with a clear message.
-- Recovery workflows (restore/rebuild/migration) are external operational concerns, not `fensor` runtime behavior.
+Chaining operations constructs typed view descriptions, following ha-ndarray's
+composition model. Awaiting a view-construction method does not evaluate or
+persist its result. Import the relevant operation traits to use their methods.
+The [checked crate example](src/lib.rs) composes matrix multiplication, scalar
+addition, and exponentiation, then consumes coordinate-bearing batches without
+creating result storage.
 
-## Storage and data types
+`Tensor<FE, T>` owns storage; `tensor.view()` creates a geometric `TensorView`.
+Unary, binary, conditional, reduction, and matrix expressions remain lazy and
+read-only. Computed views implement neither `TensorWrite` nor `TensorArray`;
+geometric views retain constrained write-through access. View descriptions can
+be cloned without requiring the filesystem adapter to implement `Clone`.
 
-fensor requires `destream` for typed serialization, but selects no byte codec.
-Filesystem adapters implement `freqfs::FileLoad` and `FileSave` for their entry
-type. freqfs saves and reloads that same entry, then checks the requested payload
-through `AsType`. An adapter can use JSON, TBON, or another destream codec.
-freqfs supplies no codec adapters or blanket I/O implementations. The test suite
-uses explicit caller-owned TBON and JSON adapters.
+Elementwise chains build nested ha-ndarray expressions over each batch.
+Reductions and matrix products introduce bounded **in-memory evaluation
+boundaries**, retaining batches, tiles, or accumulators. They never persist
+computed intermediates. This does not promise a single fused backend operation:
+nested expressions can recompute values, and source reads/cache spill can do I/O.
 
-Adapters support `Vec<T>`, `b_table::Node<u64>`, and `TensorMetadata<T>`.
-`TensorMetadata<T>` contains logical shape, layout, and block shape. Its destream
-representation contains geometry only; **the adapter must preserve the Rust
-payload type across reloads**, for example with distinct tagged entry variants
-for f32, f64, and u8 blocks and metadata. Decoding the same untagged metadata as
-whichever `T` was requested does not meet this contract. The adapter also owns
-format versioning and compatibility. fensor validates geometry and block lengths.
+`Tensor::copy_from(dir, &expression, max_capacity).await?` explicitly creates
+independent filesystem storage. Copying is never necessary between operations.
+The destination adapter can differ from the source adapter and must support the
+output dtype. `max_capacity` limits storage-block capacity; it does not select an
+exact block shape. Sparse copies omit final zeros and reset the axis hint to `None`.
 
-This replaces the former version-2 text metadata. Existing storage needs an
-explicit adapter migration; fensor does not guess formats or fall back on errors.
+## Supported operations
 
-There is no public whole-tensor wire codec. Applications can consume
-`TensorRead::read_blocks` or `read_sparse_elements_in_order` to define transfer
-formats, and use `Tensor::copy_from` to construct independent filesystem storage.
+Stored types are `u8`, `f32`, and `f64`; u8 accepts the full range 0–255. Schema
+and geometry metadata use number-general's `NumberType`, re-exported by fensor.
+`TensorGeometry::DType` names the Rust element type; `dtype()` returns its class.
+Unsupported or abstract number classes are rejected during schema construction.
 
-Before dropping and reopening a tensor, call `tensor.sync().await?` to write its
-blocks and publish its current sparse index root. Syncing only the containing
-`DirLock` does not publish an in-memory index root. Exclude concurrent tensor
-writes during synchronization. This writes to filesystem buffers; callers own
-subsequent durable directory synchronization and any transaction policy.
+| Trait | Operations | Input → output |
+|---|---|---|
+| `TensorUnary` | `exp`, `ln`, `round` | f32/f64 → same dtype |
+| `TensorAbs` | `abs` | u8/f32/f64 → same dtype |
+| `TensorTrig` | `sin`, `asin`, `sinh`, `cos`, `acos`, `cosh`, `tan`, `atan`, `tanh` | f32/f64 → same dtype |
+| `TensorCast<f64>` | `cast` | f32 → f64 |
+| `TensorUnaryBoolean` | `not` | u8/f32/f64 → u8 |
+| `TensorNumeric` | `is_nan`, `is_inf` | f32/f64 → u8 |
+| `TensorMath`, `TensorMathScalar` | `add`, `sub`, `mul`, `div`, `pow`, `rem`; `_scalar` variants | Matching u8/f32/f64 → same dtype |
+| `TensorMath`, `TensorMathScalar` | `log`, `log_scalar` (value, base) | Matching f32/f64 → same dtype |
+| `TensorCompare`, `TensorCompareScalar` | `eq`, `ne`, `gt`, `ge`, `lt`, `le`; `_scalar` variants | Matching u8/f32/f64 → u8 |
+| `TensorBoolean`, `TensorBooleanScalar` | `and`, `or`, `xor`; `_scalar` variants | Matching u8/f32/f64 → u8 |
+| `TensorWhere` | `condition.cond(&then, &or_else)` | u8 condition; matching branches → branch dtype |
+| `TensorReduceAll` | `sum_all`, `product_all`, `min_all`, `max_all` | u8/f32/f64 → scalar of same dtype |
+| `TensorReduceBoolean` | `all`, `any` | u8/f32/f64 → bool |
+| `TensorReduce` | `sum`, `product`, `min`, `max` | u8/f32/f64 → lazy view of same dtype |
+| `TensorMatMul` | `matmul` | Matching u8/f32/f64 → same dtype |
 
-Use `Tensor<FE, u8>`, `Tensor<FE, f32>`, or `Tensor<FE, f64>` directly. Schema and
-geometry dtype metadata use `number_general::NumberType` (also re-exported by
-fensor), for example `NumberType::Float(FloatType::F32)` or
-`NumberType::UInt(UIntType::U8)`. Unsupported and abstract number classes are
-rejected when constructing a schema. `TensorElement` uses number-general's
-primitive `DType` trait rather than maintaining its own dtype constants.
-The associated `TensorGeometry::DType` still names the Rust element type;
-`dtype()` returns its `NumberType` class.
+Arithmetic methods borrow operands and are asynchronous. Elementwise tensor
+operands must have identical shapes and dtypes; scalar arguments match the source
+dtype. Broadcasting and casts are explicit. Only f32-to-f64 casting is supported;
+operations before and after that cast execute in their respective dtypes.
+Unary composition nests sources, for example
+`UnaryView<UnaryView<Source, Round>, Exp>`. Public operation markers live in
+`unary`, `binary`, `scalar`, and `reduce`.
 
-There is no fensor dtype string codec. u8 stores all values from 0 to 255.
+`TensorTransform` provides reshape, broadcast, flip, slice, squeeze, transpose,
+and unsqueeze, returning `Self` subject to geometric validation. Elementwise
+transforms preserve operation order. Reduction and matrix output transforms map
+the output geometry instead of moving through the aggregate. Rank-zero views
+cannot be streamed or copied. Empty-dimension tensor storage is unsupported.
 
-## Lazy math and bounded reads
+Numerical rules belong to [ha-ndarray](../ha-ndarray/NUMERICS.md). In particular,
+u8 arithmetic wraps and integer division/remainder by zero return zero. Floats
+retain backend NaN, infinity, signed-zero, and underflow behavior without domain
+clamping. Logical operations return exactly u8 0/1: zero is false, and nonzero
+values, including NaN, are true. Comparisons follow IEEE unordered-NaN rules.
+Backend validation status belongs to ha-ndarray, not this crate's test results.
 
-`tensor.view().exp().await?`, `ln`, and `round` build reusable expressions over
-`ha-ndarray` arrays. `TensorView` contains only coordinate geometry;
-`UnaryView<Source, Op>` contains its immediate source and one typed operation.
-`fensor::unary::{Exp, Ln, Round}` name the sealed operation types:
-`round().exp()` produces `UnaryView<UnaryView<Source, Round>, Exp>`, following
-`ha-ndarray`'s nested-access structure. `TensorUnary` uses
-`ExpOutput`, `LnOutput`, and `RoundOutput` associated types while preserving the
-borrowed `.exp().await?` call syntax. No `FE: Clone` bound is needed to clone
-geometric, unary, or binary view descriptions.
+## Sparse support
 
-`TensorAbs` adds `abs`; `TensorTrig` adds `sin`, `asin`, `sinh`, `cos`, `acos`,
-`cosh`, `tan`, `atan`, and `tanh` for both f32 and f64. Import these traits alongside
-`TensorUnary` to compose operations, for example
-`tensor.view().abs().await?.sin().await?.round().await?`. Their sealed operation
-markers are exported through `fensor::unary`, and every operation returns another
-nested, read-only `UnaryView`. Absolute value preserves the stored dtype;
-trigonometric methods have a distinct associated output type for each operation.
+Dense leaves support every coordinate; sparse leaves support stored nonzero
+values. Expressions carry support independently of current numerical values.
+Final zeros are omitted only from sparse output. Copying into sparse storage
+establishes a new support boundary from stored nonzeros.
 
-`TensorCast<f64>` adds lazy f32-to-f64 conversion. Import `TensorCast` and call
-`tensor.view().cast().await?`, or use `TensorCast::<f64>::cast(&view).await?` to
-name the target explicitly. The result is `UnaryView<Source, Cast<f64>>`; operations
-before the cast execute in f32 and operations after it execute in f64. Widening
-follows ha-ndarray conversion behavior, preserving finite f32 values exactly,
-signed zero, infinities, and NaN classification (not a NaN payload guarantee).
-Other casts are not yet supported.
+| Expression | Retained support |
+|---|---|
+| Unary, cast, scalar operation | Source support |
+| Binary arithmetic, comparison, boolean | Union of both sources |
+| Conditional | Union of condition and both branches |
+| Axis reduction | Output group supported when any input in that group is supported |
+| Matrix product | Output supported when either operand is supported at any contraction position |
 
-Boolean operations return u8 views with values 0 or 1:
+Unsupported child values contribute zero before their parent operation. Unary
+and scalar operations do not populate implicit zeros, even for `exp`, `cos`,
+`add_scalar(1)`, or `eq_scalar(0)`. A populated `0.2` under `round().exp()` yields
+`1`; an implicit zero stays absent. Copying `round()` first loses that support.
+Direct sparse `not` emits no populated output, while `is_nan().not()` retains
+ones for finite nonzero values and infinities. Intermediate false results retain
+support just as intermediate numeric zeros do.
 
-| Trait | Operations | Inputs |
-| --- | --- | --- |
-| `TensorUnaryBoolean` | `not` | u8, f32, f64 |
-| `TensorNumeric` | `is_nan`, `is_inf` | f32, f64 |
+Binary expressions are sparse only when both operands are sparse. For sparse
+`a`, `(a - a).exp()` is one on a's support and absent elsewhere; dividing the
+retained zeros by themselves yields NaN only on that support. A conditional is
+sparse only when all three inputs are sparse. An absent condition selects the
+else branch; an unselected branch still contributes support. Both branches are
+evaluated, so corruption in either branch propagates.
 
-For example, `tensor.view().is_nan().await?.not().await?` constructs a nested
-mask expression. Dense `not` returns 1 for either signed zero and 0 for nonzeros,
-including NaN and infinity. Numeric predicates follow ha-ndarray's classification.
-All predicate views are read-only and use the same bounded consumers as numeric views.
+Ordered sparse reads support logical row-major order, including transformed
+views, and reject other orders with `UnsupportedSparseIterationOrder`. They
+scan the selected logical range, sorting and deduplicating explicit selections
+for this reader only. Geometric slicing retains selection order and duplicates.
+Full-range ordered sparse reads still scale with logical size, not stored support.
+Eligible numeric reductions can use occupied-index traversal instead; see
+[slice traversal](DESIGN.md#slices-and-reductions).
 
-Sparse predicates preserve original nonzero source support. Implicit zeros stay
-absent even for `not`, so direct sparse `not` produces no populated output. A
-chain `is_nan().not()` produces ones for finite nonzero values (and infinities),
-while NaNs and implicit zeros produce zero. False intermediate results retain
-support until the final consumer. Materializing between predicates drops those
-zeros: `is_nan()` materialized before `not()` therefore behaves differently from
-the unmaterialized sparse chain. No implicit densification is performed.
+## Reductions and matrix products
 
-### Binary arithmetic
+Stored tensors support terminal reductions directly; axis reductions start from
+a view, for example `tensor.view().sum(axes![1], false).await?`. Axes are sorted
+and deduplicated, and invalid axes fail at construction. Empty axes reduce
+singleton groups. `keepdims` retains reduced dimensions at extent one; removing
+every axis produces `[1]`.
 
-`TensorMath<Rhs>` constructs read-only `BinaryView<Left, Right, Op>` descriptions.
-Operation markers are exported through `fensor::binary`.
+Sparse reductions exclude implicit zeros but include supported intermediate zeros.
+An empty axis group stays absent for every operation, including product and
+extrema. Whole-tensor empty-support results are sum `0`, product `1`, `all=true`,
+and `any=false`; `min_all` and `max_all` return `Error::Unsupported`. Consequently,
+sparse reductions can differ from reductions over equivalent dense values.
 
-| Methods | Operand and result types |
-| --- | --- |
-| `add`, `sub`, `mul`, `div`, `pow`, `rem` | matching f32, f64, or u8 |
-| `log` (left value, right base) | matching f32 or f64 |
+Boolean terminals stop after a decisive consumed batch. Errors in that batch or
+earlier propagate; later errors may remain unobserved and prefetched reads may
+already have started. Numeric terminals consume all batches, including extrema.
 
-Use `left.view().add(&right.view()).await?`; either operand can also be a
-computed view. Shapes must match at construction. Broadcasting is explicit:
-`left.view().add(&right.view().broadcast(shape![2, 3])?).await?`.
-Use the existing explicit f32-to-f64 cast when needed.
+Matrix multiplication requires rank ≥2, equal batch dimensions, and matching
+contraction dimensions: `[..., M, K] @ [..., K, N] -> [..., M, N]`. Use explicit
+broadcasting or casts to align operands. Products compose with every expression
+family, including nested products. A supported row times an absent sparse column
+has supported zero outputs; `exp()` can turn those into ones. A wholly absent row
+and column remain absent. Supported zero-times-infinity can produce NaN and must
+not be skipped. Floating results obey the backend aggregate accuracy contract,
+not bitwise equivalence to a multiply/reduce expression.
 
-u8 addition, subtraction, multiplication, and exponentiation wrap modulo 256.
-u8 division and remainder by zero return zero. Float results follow ha-ndarray,
-including NaN, infinity, signed zero, gradual underflow, and cast behavior as
-specified in [ha-ndarray's numerical contract](../ha-ndarray/NUMERICS.md).
-fensor delegates numerical evaluation to that backend; its source-support rules
-below are a separate storage/expression contract.
-Backend validation uses certified MPFR/MPC references and exact aggregate
-references. Native and CPU-OpenCL results do not replace ha-ndarray's pending
-actual-GPU conformance gate.
+## Streams, bounds, and concurrency
 
-Binary support is the union of its operands' source support. Dense leaves support
-every coordinate; sparse leaves support their original nonzero values. Unary
-nodes preserve that support, including intermediate zeros. Unsupported child
-coordinates are masked to zero with lazy ndarray selections before the parent
-operation. A binary view is sparse (with no axis hint) only when both operands
-are sparse; otherwise it is dense.
+| Consumer | Delivery order |
+|---|---|
+| `read_blocks()` | Logical row-major values |
+| `read_sparse_elements_in_order()` | Requested supported row-major sparse order |
+| `read_coordinate_blocks()` | Completion-dependent batches of paired coordinates/values |
+| Whole-tensor numeric terminals | Accumulate batches in completion order |
+| Boolean terminals | Logical order with short-circuiting |
 
-For sparse `a`, `(a - a).exp()` returns one on a's support and zero elsewhere.
-Dividing those retained zero results by themselves yields NaN on that support,
-but coordinates absent from both inputs remain absent. These rules apply to
-all seven operations, including power and logarithm. Final zeros are omitted
-from sparse output; copying to storage establishes a new support boundary.
+A successful complete coordinate stream visits every logical coordinate exactly
+once, including zeros. Its default adapter pairs row-major values with coordinates;
+built-in expressions can generate tiled requests. Request traversal is distinct
+from batch delivery order. Each stream is independent and live, not a snapshot.
+Concurrent source writes are not isolated. Dropping a stream cancels pending work.
 
-Chaining does not read data or write intermediate tensors.
-Consumers read each batch directly from the geometric leaves, recursively construct
-one ndarray expression through nested unary and binary views, and evaluate only its
-final result. `UnaryOp<Input>::Output` and its input dtype are independent,
-so a cast does not require an intermediate buffer. Intermediate views do not
-evaluate buffers or filter sparse support.
-Backend execution and fusion remain `ha-ndarray`'s responsibility.
-`TensorElement` extends `ha-ndarray::Number`; the supported stored types remain
-`u8`, `f32`, and `f64`.
+**ha-ndarray owns numerical parallelism; fensor owns bounded async concurrency.**
+The outer consumer keeps at most `num_cpus::get().max(1)` batch futures in flight,
+using `buffered` for ordered consumers and `buffer_unordered` otherwise. Inner
+evaluation adds no buffered streams. Synchronous backend calls run on the polling
+thread and may use ha-ndarray's workers; `async move` does not create CPU parallelism.
 
-`TensorRead::read_blocks()` returns logical row-major batches of values,
-independent of physical storage tiling. Each call creates a fresh stream with
-at most 4096 elements per batch and `num_cpus::get().max(1)` concurrent batches,
-using `StreamExt::buffered` to preserve ordering. No work is spawned
-in the background by a read stream: a stalled consumer stops further polling,
-and dropping the stream drops pending reads. Independent streams can be consumed
-concurrently, and recompute their own results; they do not share a mutable cursor.
-These are live views, not snapshots: concurrent source writes are not isolated.
+Numeric terminal accumulation can depend on read scheduling, including extreme
+overflow/underflow differences permitted by ha-ndarray's aggregate contract.
+Wrapping integers, NaN extrema, signed-zero rules, and empty-support identities
+are preserved. Unordered consumers promise no input-order error precedence.
+Numeric terminals return the first observed error and drop pending evaluation.
 
-Direct reads, block streams, and `Tensor::copy_from` evaluate the same expression.
-`Tensor::copy_from(dir, &expression, max_capacity).await?` constructs independent
-filesystem-backed storage from any `TensorRead`, including base tensors, geometric
-views, and computed views. Evaluation happens implicitly as the constructor
-consumes bounded batches; views have no separate materialization method.
-`max_capacity` controls destination storage blocks independently. The destination
-file-entry type must support the output dtype and may differ from the source's.
-Encoded and copied schemas use the expression's output dtype, with existing
-formats unchanged. Sparse copies reset the axis hint to `None` and omit final zeros.
-Source read and destination write errors propagate; cleanup of partial output
-remains the caller's responsibility. Readers returning too many or too few values
-for their shape return a structured layout error.
+Execution batches contain at most 4096 elements. Values, coordinates, masks, and
+partial-result collections must not scale with total tensor, output, or reduction
+group size. Caller-supplied values and explicit indices, rank-sized metadata,
+cache/filesystem metadata, and independent consumers are separate memory costs.
+This is not a total-process memory guarantee. The [execution design](DESIGN.md)
+defines the bounds and private traversal mechanics. Callers may explicitly collect
+streams when they want an in-memory result; fensor offers no whole-result collector.
 
-The elementwise API also supports these trait families:
+## Storage, synchronization, and errors
 
-| Trait | Operations | Inputs | Output |
-| --- | --- | --- | --- |
-| `TensorMathScalar` | `add_scalar`, `sub_scalar`, `mul_scalar`, `div_scalar`, `pow_scalar`, `rem_scalar` | f32, f64, u8 | Same dtype |
-| `TensorMathScalar` | `log_scalar` | f32, f64 | Same dtype |
-| `TensorCompare`, `TensorCompareScalar` | `eq`, `ne`, `gt`, `ge`, `lt`, `le`, and `_scalar` variants | Matching f32, f64, or u8 | u8 |
-| `TensorBoolean`, `TensorBooleanScalar` | `and`, `or`, `xor`, and `_scalar` variants | Matching f32, f64, or u8 | u8 |
-| `TensorWhere` | `cond(&then, &or_else)` | u8 condition; matching branch dtypes | Branch dtype |
+Filesystem adapters implement `freqfs::FileLoad`/`FileSave` and expose `Vec<T>`,
+`b_table::Node<u64>`, and `TensorMetadata<T>` through `AsType`. fensor requires
+destream but prescribes no byte codec or whole-tensor transfer format. JSON and
+TBON adapters are exercised in tests; applications own their format choices.
 
-All methods borrow their operands and return lazy views asynchronously. For example:
+Metadata encodes geometry only. The adapter must preserve the Rust payload type
+across reloads, for example with distinct tagged block/metadata variants per dtype.
+Decoding untagged metadata as whichever dtype was requested violates this contract.
+Adapters own format versions and migrations; fensor validates geometry and block
+lengths and fails closed on malformed input, without recovery or repair paths.
 
-```rust,ignore
-let adjusted = tensor.view().add_scalar(1.0).await?;
-let condition = adjusted.gt_scalar(0.0).await?;
-let result = condition.cond(&adjusted, &other.view()).await?;
-let stored = Tensor::copy_from(dir, &result, max_capacity).await?;
-```
+Call `tensor.sync().await?` before dropping and reopening storage. It writes blocks
+and publishes the current sparse index root; syncing only the containing directory
+does not publish that in-memory root. Exclude concurrent writes during sync.
+Callers own subsequent durable directory synchronization and transaction policy.
+fensor provides no commit, rollback, or isolation semantics.
 
-Scalar parameters have the source dtype and are stored in sealed operations on
-`UnaryView`. `BinaryView` comparisons and booleans produce u8 without storing an
-intermediate tensor. `WhereView` retains its condition and both branches. Shapes
-must match; broadcasting and the existing f32-to-f64 cast remain explicit.
-`TensorMathScalar` now uses per-operation associated read outputs instead of its
-previous unimplemented storage-returning interface.
+Copying groups bounded destination updates and overlaps one update with one source
+lookahead using `try_join!`, without spawning tasks. Destination batches remain
+sequential. Validation/error handling is non-transactional: failures propagate and
+can leave partial output, with no guaranteed write prefix or concurrent-error
+precedence. Synchronization and cleanup remain caller responsibilities.
 
-Boolean operations are logical, not bitwise: zero is false and every nonzero
-value, including NaN, is true. Results are exactly 0 or 1. Comparisons follow
-ha-ndarray's IEEE rules, including unordered NaNs and equality of signed zeros.
+The freqfs cache accounts for block payload bytes and applies admission backpressure
+through eviction/spill. Configure cache capacity, minimum free disk space, and
+admission wait in freqfs; oversized files, exhausted admission deadlines, and disk
+failures return I/O errors. Bounded execution does not eliminate logical sparse
+contraction scans, repeated nested evaluation, or cache-sensitive read amplification.
+Completion-order copying can worsen cache locality and increase adapter traffic;
+fewer delivery stalls do not guarantee faster copying. See [benchmark methodology
+and interpretation](BENCHMARKS.md).
 
-Scalar operations preserve source support: sparse `add_scalar(1)` and
-`eq_scalar(0)` do not populate implicit zeros. Tensor comparisons and booleans
-retain the union of both sources, including intermediate false results.
-Conditional selection retains the union of its condition and both branches;
-absent condition values select the else branch. An unselected branch can retain
-support for a later operation even when the selected value is zero. Selection
-is sparse only when all three inputs are sparse. Both branches are read, so
-errors in an unselected branch propagate. Copying into storage ends this original
-support contract and establishes support from the stored nonzero values.
+## Compatibility notes
 
-`UnaryView`, `BinaryView`, `WhereView`, and `ReduceView` do not implement `TensorWrite`, so writes through a computed view
-are rejected at compile time. Geometric views retain their existing write-through
-constraints. `TensorTransform` still returns `Self`: transforms update the
-geometric leaves and retain typed operation order. Slicing and transposition compose with
-expressions on both dense and sparse tensors. Scalar (rank-zero) views cannot
-be streamed or copied and return a structured schema error.
+- Typed adapter-owned metadata replaces the former version-2 text representation.
+  Existing data in that representation requires an explicit adapter migration;
+  fensor does not guess formats. There is no fensor dtype-string or whole-tensor codec.
+- Use `Tensor<FE, T>` and `NumberType` directly; per-dtype tensor aliases are removed.
+- Computed views have no `materialize` method; use `Tensor::copy_from` explicitly.
+  Scalar and axis-reduction traits return per-operation associated read outputs.
+- `TensorReadBulk`, `read_all`, `read_values`, and `Tensor::compact_sparse` are removed
+  without forwarding aliases. Consume streams explicitly. `TensorWriteBulk` still
+  accepts caller-owned buffers and validates cardinality before mutation.
 
-Sparse unary operations act only on nonzero source values; implicit zeros remain
-zero, even for `exp`, `ln`, `cos`, `acos`, and `cosh`. Thus a populated `0.2`
-under `round().cos()` yields `1`, while an implicit zero stays absent. Operations
-preserve backend NaN and infinity results without domain clamping. A chain retains
-its original input support across casts and until
-consumption: a populated `0.2` produces `1` under `round().exp()`, while an absent
-coordinate stays zero. Materializing `round()` first drops that zero from sparse
-support, so a subsequent `exp()` on the stored result leaves it zero. A final
-zero is omitted from sparse output. New sparse materializations reset the axis
-hint to `None`. Ordered sparse reads support logical row-major order, including
-transformed views, and reject other orders with `UnsupportedSparseIterationOrder`.
-They scan only the selected logical range in bounded batches, with explicit index
-selections sorted and deduplicated. Full-range reads still scale with logical size,
-not stored support; very sparse, large shapes can therefore be slow. Index-driven
-traversal remains future work.
-
-Filesystem blocks are charged to the `freqfs` cache by their payload byte size.
-Point reads borrow cached blocks and point writes modify them in place, avoiding
-whole-block copies. With local `freqfs` 0.13, cache admission awaits eviction and
-spill; an oversized file, exhausted admission deadline, or disk failure returns
-an I/O error. Configure the cache size, minimum free disk space, and admission
-wait when constructing `freqfs::Cache`.
-
-## Bounded execution contract
-
-Tensor execution must not allocate values, coordinates, support masks, or
-partial-result collections proportional to total tensor size, output size, or
-reduction-group size. Coordinates must be generated lazily and consumed in
-bounded batches. Each collection must have an identifiable bound. Only the outer
-consumer may introduce concurrent batches.
-
-Rank-sized metadata and caller-supplied values or explicit index selections are
-separate, documented memory costs. They must not justify expanding implicit
-ranges or collecting execution results. Filesystem/cache metadata remains subject
-to its own limits; this contract is not a total-process memory guarantee.
-
-Execution batches contain at most 4096 elements, independently of the storage
-block-capacity limit. Coordinate counts, ndarray expression sizes, evaluated
-values, and support masks are checked at the evaluation boundary. Support masks
-are checked before union/filter operations. Nested reductions consume source
-batches without starting additional concurrent streams.
-
-Remaining allocations have explicit bounds: shapes and strides scale with rank;
-coordinate buffers scale with batch size times rank; expression temporaries and
-support masks scale with batch size and expression size; each active reduction
-group retains one accumulator. Cache contents, filesystem/index metadata, and
-independent concurrent consumers require separate budgeting.
-
-`AxisRange::Of` retains metadata proportional to explicitly supplied indices,
-including order and duplicates. Creating a new explicit selection may allocate
-one offset per supplied index. Slices and reversals of existing gather tables
-share their storage, while interval ranges remain compact descriptors.
-
-**API change:** `TensorReadBulk`, `read_all`, `read_values`, and
-`Tensor::compact_sparse` have been removed. There are no compatibility aliases
-or collecting replacements. Callers can explicitly collect `read_blocks()`;
-for a geometric range, slice a view and consume its stream. Collecting output
-is the caller's memory decision. Bounded compaction remains future work.
-`TensorWriteBulk::write_values` still accepts a caller-owned vector, validates
-range cardinality before any writes, and iterates coordinates lazily.
-`Tensor::copy_from` remains a bounded filesystem-backed consumer. Storage block
-reads may copy one validated block, never a whole tensor.
-
-## Reductions
-
-`TensorReduceAll` provides asynchronous `sum_all`, `product_all`, `min_all`, and
-`max_all` on stored tensors and expressions. `TensorReduceBoolean` provides
-`all` and `any`. `TensorReduce` constructs lazy `ReduceView<Source, Op>` values
-with `sum`, `product`, `min`, and `max`, each taking axes and `keepdims`:
-
-```rust,ignore
-let rows = tensor.view().sum(axes![1], false).await?;
-let columns = rows.transpose(None)?;
-let total = columns.sum_all().await?;
-let stored = Tensor::copy_from(dir, &columns, max_capacity).await?;
-```
-
-These operations support f32, f64, and u8 without changing accumulator or output
-dtype. The previously unimplemented axis trait now returns per-operation
-associated read outputs instead of storage. Axes are sorted and deduplicated;
-invalid axes fail during construction. Empty axes reduce singleton groups.
-`keepdims` retains reduced axes at extent one; removing every axis produces `[1]`,
-following ha-ndarray. Reduction views support elementwise composition, nested
-reductions, copying, and geometric transforms, but cannot be written through.
-Transforms after reduction address reduced outputs, not source axes.
-
-Sparse reductions consume **retained source support**, excluding implicit zeros.
-A supported `0.2` followed by `round()` still contributes zero, including to
-products, extrema, and `all`. Dense reductions include every coordinate. Thus
-reducing a sparse tensor can differ from reducing its dense equivalent.
-
-An axis group with no supported inputs remains absent for every operation,
-including product and extrema. A supported group whose result is zero retains
-support for subsequent expressions; only sparse output removes final zeros.
-Copying into storage establishes support from the stored nonzero values.
-Whole-tensor empty-support results are sum `0`, product `1`, `all=true`, and
-`any=false`; `min_all` and `max_all` return `Error::Unsupported`.
-
-Boolean reductions short-circuit after a decisive consumed batch. Errors in that
-batch or earlier propagate, while later errors may remain unobserved; prefetched
-reads may already have started. Dropping the remaining stream cancels pending
-consumption. Numeric reductions consume the complete selected domain.
-
-A reduction is an evaluation boundary. Each source batch contains at most 4096
-coordinates; support is retained alongside evaluated values. Supported values
-are reduced by ha-ndarray and partial results combined using its scalar rules.
-Only one partial accumulator is retained per active group. The outer consumer
-provides CPU-limited ordered concurrency; nested reductions start no buffered
-streams. Output groups are processed sequentially within each output batch.
-No whole-group or whole-output allocation is needed unless the caller collects
-an entire stream. Results remain live rather than snapshots.
-
-Sparse range reads visit only selected output groups, but must scan their source
-coordinates. A small output range can therefore require a large source scan.
-Index-driven traversal and block-oriented I/O remain future work. Floating
-reductions follow ha-ndarray's aggregate accuracy contract, not bitwise equality
-across evaluation orders. u8 accumulation wraps; extrema propagate NaNs and
-preserve the specified signed-zero behavior. Persistent formats are unchanged.
+See [remaining work](ROADMAP.md), [execution design](DESIGN.md),
+[benchmark reproduction](BENCHMARKS.md), and [test ownership](tests/COVERAGE.md).

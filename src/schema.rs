@@ -8,17 +8,27 @@ use smallvec::SmallVec;
 use crate::{Error, PORTABLE_INLINE_RANK, Result as FResult};
 
 pub type TensorShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
+
 pub type TensorStrides = Strides;
 
 pub(crate) type BlockShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
+
 pub(crate) type BlockStrides = Strides;
 
 pub(crate) type StorageShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
+
 pub(crate) type StorageStrides = Strides;
 
 pub type TensorViewShape = SmallVec<[usize; PORTABLE_INLINE_RANK]>;
 
+/// Maximum tensor values per storage block, independent of execution batches.
 pub const MAX_BLOCK_CAPACITY: usize = 4096;
+
+/// Sparse-index leaf size in bytes, as required by b_table::BTreeSchema.
+const SPARSE_INDEX_BLOCK_BYTES: usize = 4096;
+
+/// Sparse-index B-tree node order; independent of tensor block capacity.
+const SPARSE_INDEX_ORDER: usize = 16;
 
 /// Base tensor identity: dtype + fixed logical shape + fixed contiguous
 /// strides. Held by `Tensor`, never mutated after creation -- the *current*
@@ -255,11 +265,13 @@ impl Iterator for RowMajorCoords {
 
         if self.remaining > 0 {
             let mut axis = self.shape.len() - 1;
+
             loop {
                 self.coord[axis] += 1;
                 if (self.coord[axis] as usize) < self.shape[axis] {
                     break;
                 }
+
                 self.coord[axis] = 0;
                 if axis == 0 {
                     break;
@@ -285,10 +297,11 @@ impl SparseIndexSchema {
 
 impl b_table::BTreeSchema for SparseIndexSchema {
     type Error = io::Error;
+
     type Value = u64;
 
     fn block_size(&self) -> usize {
-        4096
+        SPARSE_INDEX_BLOCK_BYTES
     }
 
     fn len(&self) -> usize {
@@ -296,7 +309,7 @@ impl b_table::BTreeSchema for SparseIndexSchema {
     }
 
     fn order(&self) -> usize {
-        16
+        SPARSE_INDEX_ORDER
     }
 
     fn validate_key(
@@ -343,8 +356,11 @@ impl Default for SparseTableSchema {
 
 impl Schema for SparseTableSchema {
     type Id = String;
+
     type Error = io::Error;
+
     type Value = u64;
+
     type Index = SparseIndexSchema;
 
     fn key(&self) -> &[Self::Id] {

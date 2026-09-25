@@ -1,5 +1,6 @@
-use crate::{Error, Result};
 use ha_ndarray::{AxisRange, Range, Shape};
+
+use crate::{Error, Result};
 
 pub(crate) fn validate_coord(shape: &[usize], coord: &[u64]) -> Result<()> {
     if coord.len() != shape.len() {
@@ -7,6 +8,7 @@ pub(crate) fn validate_coord(shape: &[usize], coord: &[u64]) -> Result<()> {
             "incorrect number of coordinates".to_string(),
         ));
     }
+
     for (i, (c, dim)) in coord.iter().zip(shape.iter()).enumerate() {
         let c = usize::try_from(*c)
             .map_err(|_| Error::InvalidCoord(format!("coordinate at axis {i} overflows usize")))?;
@@ -16,6 +18,7 @@ pub(crate) fn validate_coord(shape: &[usize], coord: &[u64]) -> Result<()> {
             )));
         }
     }
+
     Ok(())
 }
 
@@ -34,6 +37,14 @@ pub fn matmul_output_shape(left: &[usize], right: &[usize]) -> Result<Shape> {
         return Err(Error::InvalidLayout(format!(
             "invalid dimensions for matrix multiply: left={left:?}, right={right:?} (expected rank >= 2)"
         )));
+    }
+
+    for shape in [left, right] {
+        crate::schema::validate_shape_dims(shape)?;
+        shape
+            .iter()
+            .try_fold(1usize, |size, dim| size.checked_mul(*dim))
+            .ok_or_else(|| Error::InvalidLayout("matrix input size overflow".into()))?;
     }
 
     let l_inner = left[left.len() - 1];
@@ -56,6 +67,10 @@ pub fn matmul_output_shape(left: &[usize], right: &[usize]) -> Result<Shape> {
     out.extend(l_batch.iter().copied());
     out.push(left[left.len() - 2]);
     out.push(right[right.len() - 1]);
+    out.iter()
+        .try_fold(1usize, |size, dim| size.checked_mul(*dim))
+        .ok_or_else(|| Error::InvalidLayout("matrix output size overflow".into()))?;
+
     Ok(out)
 }
 
@@ -66,7 +81,9 @@ pub(crate) fn iter_range_coords(shape: &[usize], range: &Range) -> Result<RangeC
             "range rank must match tensor rank".into(),
         ));
     }
+
     let mut lengths = Vec::with_capacity(range.len());
+
     for (axis, (bound, &dim)) in range.iter().zip(shape).enumerate() {
         let invalid =
             || Error::InvalidLayout(format!("range bound at axis {axis} is out of bounds"));
@@ -80,6 +97,7 @@ pub(crate) fn iter_range_coords(shape: &[usize], range: &Range) -> Result<RangeC
         };
         lengths.push(len);
     }
+
     let remaining = lengths
         .iter()
         .try_fold(1usize, |n, &len| n.checked_mul(len))
@@ -118,10 +136,12 @@ impl Iterator for RangeCoords {
     }
 
     type Item = Vec<u64>;
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
+
         let out = self
             .coord
             .iter()
@@ -139,9 +159,11 @@ impl Iterator for RangeCoords {
                 if self.coord[axis] < self.lengths[axis] {
                     break;
                 }
+
                 self.coord[axis] = 0;
             }
         }
+
         Some(out)
     }
 }

@@ -10,6 +10,7 @@ use ha_ndarray::{
 
 use crate::Result;
 use crate::expression::{self, Batch, Expression};
+use crate::request::{self, BatchRequest};
 use crate::schema::Layout;
 use crate::tensor::TensorElement;
 use crate::traits::{
@@ -45,7 +46,9 @@ pub struct Ln;
 pub struct Round;
 
 impl sealed::Sealed for Exp {}
+
 impl sealed::Sealed for Ln {}
+
 impl sealed::Sealed for Round {}
 
 impl<T: TensorElement + ha_ndarray::Float> UnaryOp<T> for Exp {
@@ -314,7 +317,9 @@ where
     E::DType: TensorElement + ha_ndarray::Float + ha_ndarray::Real,
 {
     type ExpOutput = UnaryView<Self, Exp>;
+
     type LnOutput = UnaryView<Self, Ln>;
+
     type RoundOutput = UnaryView<Self, Round>;
 
     fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>> {
@@ -368,6 +373,7 @@ where
     E::DType: TensorElement + ha_ndarray::Float,
 {
     type IsNanOutput = UnaryView<Self, IsNan>;
+
     type IsInfOutput = UnaryView<Self, IsInf>;
 
     fn is_nan(&self) -> BoxFuture<'_, Result<Self::IsNanOutput>> {
@@ -428,13 +434,21 @@ where
     E::DType: TensorElement + ha_ndarray::Float,
 {
     type SinOutput = UnaryView<Self, Sin>;
+
     type AsinOutput = UnaryView<Self, Asin>;
+
     type SinhOutput = UnaryView<Self, Sinh>;
+
     type CosOutput = UnaryView<Self, Cos>;
+
     type AcosOutput = UnaryView<Self, Acos>;
+
     type CoshOutput = UnaryView<Self, Cosh>;
+
     type TanOutput = UnaryView<Self, Tan>;
+
     type AtanOutput = UnaryView<Self, Atan>;
+
     type TanhOutput = UnaryView<Self, Tanh>;
 
     fn sin(&self) -> BoxFuture<'_, Result<Self::SinOutput>> {
@@ -530,9 +544,11 @@ where
     fn dtype(&self) -> number_general::NumberType {
         <Self::DType as number_general::DType>::dtype()
     }
+
     fn layout(&self) -> Layout {
         self.source.layout()
     }
+
     fn shape(&self) -> &[usize] {
         self.source.shape()
     }
@@ -547,6 +563,7 @@ where
     fn is_base_tensor(&self) -> bool {
         false
     }
+
     fn supports_write_through(&self) -> bool {
         false
     }
@@ -558,18 +575,24 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
+    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
+        expression::coordinate_blocks(self)
+    }
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
-                .await?
-                .values[0])
+            Ok(
+                expression::evaluate_batch(self, &BatchRequest::point(coord))
+                    .await?
+                    .values[0],
+            )
         })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = crate::schema::row_major_coords(self.shape())?;
+        let coords = request::linear_requests(self.shape())?;
 
-        Ok(expression::evaluated_batches(self, coords)
+        Ok(expression::ordered_batches(self, coords)
             .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
@@ -582,18 +605,18 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::evaluated_batches(self, coords)
-                .map_ok(|(coords, values)| {
-                    futures::stream::iter(
-                        coords
-                            .into_iter()
-                            .zip(values.values)
-                            .filter(|(_, value)| *value != Self::DType::default())
-                            .map(Ok),
-                    )
-                })
-                .try_flatten()
-                .boxed())
+            Ok(
+                expression::ordered_batches(self, request::explicit_requests(coords))
+                    .and_then(move |(coords, values)| async move {
+                        Ok(futures::stream::iter(expression::sparse_elements(
+                            coords,
+                            values,
+                            self.shape(),
+                        )?))
+                    })
+                    .try_flatten()
+                    .boxed(),
+            )
         })
     }
 }
@@ -610,36 +633,42 @@ where
             op: self.op,
         })
     }
+
     fn broadcast(self, shape: Shape) -> Result<Self> {
         Ok(Self {
             source: self.source.broadcast(shape)?,
             op: self.op,
         })
     }
+
     fn flip(self, axis: usize) -> Result<Self> {
         Ok(Self {
             source: self.source.flip(axis)?,
             op: self.op,
         })
     }
+
     fn slice(self, range: Range) -> Result<Self> {
         Ok(Self {
             source: self.source.slice(range)?,
             op: self.op,
         })
     }
+
     fn squeeze(self, axes: Axes) -> Result<Self> {
         Ok(Self {
             source: self.source.squeeze(axes)?,
             op: self.op,
         })
     }
+
     fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
         Ok(Self {
             source: self.source.transpose(permutation)?,
             op: self.op,
         })
     }
+
     fn unsqueeze(self, axes: Axes) -> Result<Self> {
         Ok(Self {
             source: self.source.unsqueeze(axes)?,
@@ -654,7 +683,15 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
-    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
+        self.source.slice_requests(slice)
+    }
+
+    fn preferred_requests(&self, shape: &[usize]) -> Result<Option<expression::RequestIterator>> {
+        self.source.preferred_requests(shape)
+    }
+
+    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             let source = self.source.build(coords).await?;
             Batch {

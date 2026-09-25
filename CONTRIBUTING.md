@@ -11,9 +11,17 @@ scope and a short rationale.
 Before submitting:
 
 1. Run `cargo fmt`.
-2. Run `cargo clippy --all-targets --all-features`.
-3. Run targeted tests (at minimum `cargo test --manifest-path deps/fensor/Cargo.toml --tests`).
+2. Run `cargo clippy --all-targets --all-features -- -D warnings`.
+3. From this crate's root, run `cargo test --all-targets --all-features` and
+   `cargo test --doc --all-features`. Documentation-only changes need doctests,
+   formatting, and link/diff checks; numerical benchmarks are not required.
 4. Follow style guidance in [`CODE_STYLE.md`](./CODE_STYLE.md).
+
+Keep documentation with its owner: README describes public use, [DESIGN.md](DESIGN.md)
+owns execution invariants, and ROADMAP tracks unfinished work. Version benchmark
+code and the [methodology](BENCHMARKS.md), but keep generated outputs in ignored
+`benchmarks/results/`; use [test ownership](tests/COVERAGE.md)
+to avoid duplicating regression permutations.
 
 ## Licensing
 

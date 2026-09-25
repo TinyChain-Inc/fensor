@@ -22,3 +22,7 @@ target
 
 # Cargo
 Cargo.lock
+
+# Benchmark code is versioned; generated measurements and provenance stay local.
+/benchmarks/results/
+/.slice-benchmark-*/

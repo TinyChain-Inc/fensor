@@ -6,6 +6,7 @@ use ha_ndarray::{
 };
 
 use crate::expression::{self, Batch, Expression};
+use crate::request::{self, BatchRequest};
 use crate::traits::{BoxFuture, SparseElementStream, ValueBlockStream};
 use crate::{
     Error, Layout, Result, TensorBoolean, TensorCompare, TensorElement, TensorGeometry, TensorMath,
@@ -252,10 +253,15 @@ where
     L::DType: TensorElement + Real,
 {
     type AddOutput = BinaryView<Self, R, Add>;
+
     type SubOutput = BinaryView<Self, R, Sub>;
+
     type MulOutput = BinaryView<Self, R, Mul>;
+
     type DivOutput = BinaryView<Self, R, Div>;
+
     type PowOutput = BinaryView<Self, R, Pow>;
+
     type LogOutput
         = BinaryView<Self, R, Log>
     where
@@ -342,7 +348,14 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
-    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn preferred_requests(&self, shape: &[usize]) -> Result<Option<expression::RequestIterator>> {
+        match self.left.preferred_requests(shape)? {
+            Some(requests) => Ok(Some(requests)),
+            None => self.right.preferred_requests(shape),
+        }
+    }
+
+    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             let left = self.left.build(coords).await?;
             let right = self.right.build(coords).await?;
@@ -364,18 +377,24 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
+    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
+        expression::coordinate_blocks(self)
+    }
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
-                .await?
-                .values[0])
+            Ok(
+                expression::evaluate_batch(self, &BatchRequest::point(coord))
+                    .await?
+                    .values[0],
+            )
         })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = crate::schema::row_major_coords(self.shape())?;
+        let coords = request::linear_requests(self.shape())?;
 
-        Ok(expression::evaluated_batches(self, coords)
+        Ok(expression::ordered_batches(self, coords)
             .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
@@ -388,18 +407,18 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::evaluated_batches(self, coords)
-                .map_ok(|(coords, values)| {
-                    futures::stream::iter(
-                        coords
-                            .into_iter()
-                            .zip(values.values)
-                            .filter(|(_, value)| *value != Self::DType::default())
-                            .map(Ok),
-                    )
-                })
-                .try_flatten()
-                .boxed())
+            Ok(
+                expression::ordered_batches(self, request::explicit_requests(coords))
+                    .and_then(move |(coords, values)| async move {
+                        Ok(futures::stream::iter(expression::sparse_elements(
+                            coords,
+                            values,
+                            self.shape(),
+                        )?))
+                    })
+                    .try_flatten()
+                    .boxed(),
+            )
         })
     }
 }

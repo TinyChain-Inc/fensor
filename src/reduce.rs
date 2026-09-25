@@ -1,10 +1,11 @@
 //! Bounded reductions over original expression support.
+
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{Axes, AxisRange, NDArrayReduceAll, Number, Range, Real, Shape};
+use ha_ndarray::{Axes, NDArrayReduceAll, Number, Range, Real, Shape};
 
 use crate::expression::{self, Batch, Expression};
 use crate::mapping::CoordinateMap;
-use crate::traits::coordinate_batches;
+use crate::request::{self, BatchRequest};
 use crate::{
     BoxFuture, Error, Layout, Result, SparseElementStream, TensorElement, TensorGeometry,
     TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform,
@@ -113,6 +114,8 @@ fn accumulate<T: TensorElement, O: ReduceOp<T>>(
     let values = batch.populated()?;
 
     if !values.is_empty() {
+        #[cfg(test)]
+        crate::read_metrics::record(|m| m.reduction_calls += 1);
         let partial = op.partial(values)?;
         *state = Some(match *state {
             Some(previous) => O::combine(previous, partial),
@@ -129,8 +132,12 @@ where
     E::DType: TensorElement,
     O: ReduceOp<E::DType>,
 {
-    let coords = crate::schema::row_major_coords(source.shape())?;
-    let mut batches = expression::evaluated_batches(source, coords);
+    let requests = source.slice_requests(crate::slice::Slice::full(source.shape())?)?;
+    // Numeric aggregates allow evaluation-order differences. Consume completed
+    // batches immediately; boolean terminals retain logical ordered delivery.
+    let batches =
+        expression::evaluation_futures(source, requests).buffer_unordered(num_cpus::get().max(1));
+    futures::pin_mut!(batches);
     let mut state = None;
 
     while let Some((_, batch)) = batches.try_next().await? {
@@ -169,8 +176,10 @@ where
 {
     fn all(&self) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
-            let coords = crate::schema::row_major_coords(self.shape())?;
-            let mut batches = expression::evaluated_batches(self, coords);
+            // Logical batches preserve which errors precede a decisive value;
+            // occupied-region traversal could change those short-circuit boundaries.
+            let coords = request::linear_requests(self.shape())?;
+            let mut batches = expression::ordered_batches(self, coords);
 
             while let Some((_, batch)) = batches.try_next().await? {
                 if batch.populated()?.into_iter().any(|v| v == E::DType::ZERO) {
@@ -184,8 +193,10 @@ where
 
     fn any(&self) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
-            let coords = crate::schema::row_major_coords(self.shape())?;
-            let mut batches = expression::evaluated_batches(self, coords);
+            // Logical batches preserve which errors precede a decisive value;
+            // occupied-region traversal could change those short-circuit boundaries.
+            let coords = request::linear_requests(self.shape())?;
+            let mut batches = expression::ordered_batches(self, coords);
 
             while let Some((_, batch)) = batches.try_next().await? {
                 if batch.populated()?.into_iter().any(|v| v != E::DType::ZERO) {
@@ -250,7 +261,9 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
         if axes.iter().any(|axis| *axis >= source.ndim()) {
             return Err(Error::InvalidLayout("reduction axis out of bounds".into()));
         }
+
         let mut output_shape: Shape = source.shape().into();
+
         for &axis in axes.iter().rev() {
             if keepdims {
                 output_shape[axis] = 1;
@@ -258,9 +271,11 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
                 output_shape.remove(axis);
             }
         }
+
         if output_shape.is_empty() {
             output_shape.push(1);
         }
+
         let output_strides = crate::schema::contiguous_strides(&output_shape)?.to_vec();
         let mapping = CoordinateMap::identity(output_shape.clone(), &output_strides);
 
@@ -276,19 +291,23 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
     }
 
     // One descriptor per source axis; even a huge group is enumerated lazily.
-    fn source_group_coords(&self, coord: &[u64]) -> Result<crate::validate::RangeCoords> {
+    fn source_group_axes(&self, coord: &[u64]) -> Result<Vec<request::Axis>> {
         let coord = self
             .mapping
             .resolve(coord, &self.output_shape, &self.output_strides)?;
         let mut next = 0;
-        let range = self
+        let axes = self
             .source
             .shape()
             .iter()
             .enumerate()
             .map(|(axis, dim)| {
                 if self.axes.contains(&axis) {
-                    AxisRange::In(0, *dim, 1)
+                    request::Axis::Span {
+                        start: 0,
+                        step: 1,
+                        len: *dim,
+                    }
                 } else {
                     let i = if self.keepdims {
                         axis
@@ -297,12 +316,16 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
                         next += 1;
                         i
                     };
-                    AxisRange::At(coord[i] as usize)
+                    request::Axis::Span {
+                        start: coord[i] as usize,
+                        step: 1,
+                        len: 1,
+                    }
                 }
             })
             .collect();
 
-        crate::validate::iter_range_coords(self.source.shape(), &range)
+        Ok(axes)
     }
 }
 
@@ -381,29 +404,89 @@ where
     S::DType: TensorElement,
     O: ReduceOp<S::DType>,
 {
-    fn build<'a>(&'a self, coords: &'a [Vec<u64>]) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             // Output buffers are bounded by the current evaluation batch.
             let mut values = Vec::with_capacity(coords.len());
-            let mut support = Vec::with_capacity(coords.len());
+            let mut support = matches!(self.layout(), Layout::Sparse { .. })
+                .then(|| Vec::with_capacity(coords.len()));
 
-            for coord in coords {
-                let mut state = None;
-                // No buffered stream here: only the outer consumer starts concurrent batches.
-                for source_coords in coordinate_batches(self.source_group_coords(coord)?) {
-                    let batch = expression::evaluate_batch(&self.source, &source_coords).await?;
-                    accumulate::<_, O>(&self.op, &mut state, batch)?;
+            let mut cursor = coords.cursor(self.shape())?;
+            let mut coord = Vec::new();
+            let mut pending = None;
+
+            loop {
+                let slice = if let Some(slice) = pending.take() {
+                    slice
+                } else if cursor.next_into(&mut coord) {
+                    crate::slice::Slice::new(self.source.shape(), self.source_group_axes(&coord)?)?
+                } else {
+                    break;
+                };
+                if slice.len() > expression::MAX_BATCH_ELEMENTS {
+                    let mut state = None;
+                    let mut requests = self.source.slice_requests(slice)?;
+                    // Inner consumers never start buffered streams.
+                    while let Some(request) = requests.try_next().await? {
+                        let batch = expression::evaluate_batch(&self.source, &request).await?;
+                        accumulate::<_, O>(&self.op, &mut state, batch)?;
+                    }
+
+                    if let Some(support) = &mut support {
+                        support.push(u8::from(state.is_some()));
+                    }
+                    values.push(state.unwrap_or(S::DType::ZERO));
+                    continue;
                 }
-                support.push(u8::from(state.is_some()));
-                values.push(state.unwrap_or(S::DType::ZERO));
+
+                // Complete small groups share a storage read; lengths and rectangles
+                // contain at most 4096 entries, independent of the output size.
+                let mut total = slice.len();
+                let mut lengths = vec![total];
+                let mut rectangles = vec![slice.rectangle()?];
+
+                while total < expression::MAX_BATCH_ELEMENTS && cursor.next_into(&mut coord) {
+                    let next = crate::slice::Slice::new(
+                        self.source.shape(),
+                        self.source_group_axes(&coord)?,
+                    )?;
+                    if next.len() > expression::MAX_BATCH_ELEMENTS - total {
+                        pending = Some(next);
+                        break;
+                    }
+                    total += next.len();
+                    lengths.push(next.len());
+                    rectangles.push(next.rectangle()?);
+                }
+
+                let batch = expression::evaluate_batch(
+                    &self.source,
+                    &BatchRequest::rectangles(rectangles)?,
+                )
+                .await?;
+                let mut input = batch.values.into_iter();
+                let mut masks = batch.support.map(Vec::into_iter);
+
+                for len in lengths {
+                    let mut state = None;
+                    accumulate::<_, O>(
+                        &self.op,
+                        &mut state,
+                        expression::EvaluatedBatch {
+                            values: input.by_ref().take(len).collect(),
+                            support: masks.as_mut().map(|m| m.by_ref().take(len).collect()),
+                        },
+                    )?;
+                    if let Some(support) = &mut support {
+                        support.push(u8::from(state.is_some()));
+                    }
+                    values.push(state.unwrap_or(S::DType::ZERO));
+                }
             }
 
             Ok(Batch {
                 array: expression::batch_array(values)?,
-                support: match self.layout() {
-                    Layout::Dense => None,
-                    Layout::Sparse { .. } => Some(support),
-                },
+                support,
             })
         })
     }
@@ -417,16 +500,18 @@ where
 {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            Ok(expression::evaluate_batch(self, &[coord.to_vec()])
-                .await?
-                .values[0])
+            Ok(
+                expression::evaluate_batch(self, &BatchRequest::point(coord))
+                    .await?
+                    .values[0],
+            )
         })
     }
 
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = crate::schema::row_major_coords(self.shape())?;
+        let coords = request::linear_requests(self.shape())?;
 
-        Ok(expression::evaluated_batches(self, coords)
+        Ok(expression::ordered_batches(self, coords)
             .map_ok(|(_, batch)| batch.values)
             .boxed())
     }
@@ -439,18 +524,18 @@ where
         Box::pin(async move {
             let coords = crate::traits::sparse_coords(self, range, requested_order)?;
 
-            Ok(expression::evaluated_batches(self, coords)
-                .map_ok(|(coords, values)| {
-                    futures::stream::iter(
-                        coords
-                            .into_iter()
-                            .zip(values.values)
-                            .filter(|(_, value)| *value != Self::DType::default())
-                            .map(Ok),
-                    )
-                })
-                .try_flatten()
-                .boxed())
+            Ok(
+                expression::ordered_batches(self, request::explicit_requests(coords))
+                    .and_then(move |(coords, values)| async move {
+                        Ok(futures::stream::iter(expression::sparse_elements(
+                            coords,
+                            values,
+                            self.shape(),
+                        )?))
+                    })
+                    .try_flatten()
+                    .boxed(),
+            )
         })
     }
 }

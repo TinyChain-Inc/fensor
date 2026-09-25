@@ -1,17 +1,21 @@
+use std::collections::BTreeMap;
 use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
 
 use b_table::{TableLock, collate::Collator};
 use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
-use futures::TryStreamExt as _;
+use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::Range;
+
 #[cfg(test)]
 use number_general::FloatType;
 use number_general::NumberType;
 use safecast::AsType;
 
 use crate::error::{Error, Result};
+use crate::mapping::CoordinateMap;
+use crate::request::BatchRequest;
 use crate::schema::{
     BlockPosition, Layout, MAX_BLOCK_CAPACITY, SparseIndexSchema, SparseTableSchema, StorageSchema,
     TensorSchema,
@@ -24,7 +28,9 @@ use crate::view::TensorView;
 use crate::{TensorMetadata, validate};
 
 const BLOCKS: &str = "blocks";
+
 const INDEX: &str = "index";
+
 const METADATA: &str = "metadata";
 
 pub trait TensorElement:
@@ -42,7 +48,9 @@ pub trait TensorElement:
 }
 
 impl TensorElement for u8 {}
+
 impl TensorElement for f32 {}
+
 impl TensorElement for f64 {}
 
 pub trait TensorFileEntry<T: TensorElement>:
@@ -72,6 +80,9 @@ where
 // ---------------------------------------------------------------------------
 // Private storage structs
 // ---------------------------------------------------------------------------
+
+// At most one position per bounded request; each block is borrowed once.
+type ReadGroups = BTreeMap<u64, Vec<crate::storage_read::Run>>;
 
 struct DenseStorage<FE> {
     blocks: DirLock<FE>,
@@ -191,12 +202,21 @@ where
     /// Evaluation is driven by reads; no intermediate tensor is created. The
     /// destination uses the reader's dtype and shape. Sparse output resets the
     /// axis hint to `None` and omits zeros. Errors propagate, leaving cleanup of
-    /// partial destination storage to the caller.
+    /// partial destination storage to the caller. Coordinate-bearing blocks may be
+    /// unordered; bounds, lengths, and total count are checked. Exactly-once coverage
+    /// is the source contract, without a whole-output duplicate detector.
+    /// Updates are grouped by destination block within each bounded incoming batch;
+    /// no block guard or computed result cache is retained across batches. Failures
+    /// may leave partial output without a guaranteed update prefix or rollback.
+    /// One destination update overlaps one source lookahead; neither spawns work.
+    /// Dropping the copy cancels both futures. Concurrent failures have no promised
+    /// precedence. The source retains its own bounded buffering in addition to the
+    /// current block and at most one completed lookahead block.
     pub async fn copy_from<R>(dir: DirLock<FE>, source: &R, max_capacity: usize) -> Result<Self>
     where
         R: TensorRead<DType = T> + ?Sized,
     {
-        let mut blocks = source.read_blocks()?;
+        let mut blocks = source.read_coordinate_blocks()?;
         let schema = TensorSchema::new(
             <T as number_general::DType>::dtype(),
             source.shape().to_vec().into(),
@@ -205,24 +225,87 @@ where
             Layout::Dense => Layout::Dense,
             Layout::Sparse { .. } => Layout::Sparse { axis: None },
         };
+
+        #[cfg(test)]
+        let initialized = std::time::Instant::now();
         let output = Self::create(dir, schema, layout, max_capacity).await?;
-        let mut coords = crate::schema::row_major_coords(source.shape())?;
-        while let Some(values) = blocks.try_next().await? {
-            for value in values {
-                let coord = coords.next().ok_or_else(|| {
+
+        #[cfg(test)]
+        copy_metrics::record(|m| m.initialize += initialized.elapsed());
+        let expected = source
+            .shape()
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(*d))
+            .ok_or_else(|| Error::InvalidLayout("copy size overflow".into()))?;
+        let mut received = 0usize;
+
+        #[cfg(test)]
+        let consumed = std::time::Instant::now();
+        let mut next = blocks.try_next().await?;
+
+        #[cfg(test)]
+        copy_metrics::record(|m| m.consume += consumed.elapsed());
+
+        while let Some((coords, values)) = next {
+            if coords.len() != values.len() || values.len() > crate::expression::MAX_BATCH_ELEMENTS
+            {
+                return Err(Error::InvalidLayout(format!(
+                    "copy block: expected equal coordinate/value lengths at most {}, got {} and {}",
+                    crate::expression::MAX_BATCH_ELEMENTS,
+                    coords.len(),
+                    values.len()
+                )));
+            }
+            received = received
+                .checked_add(values.len())
+                .filter(|n| *n <= expected)
+                .ok_or_else(|| {
                     Error::InvalidLayout("reader returned more values than its shape".into())
                 })?;
-                if matches!(layout, Layout::Sparse { .. }) && value == T::default() {
-                    continue;
+            #[cfg(test)]
+            let joined = std::time::Instant::now();
+            #[cfg(test)]
+            let (mut update_time, mut consume_time) = Default::default();
+
+            // One writer, one lookahead, and no background task. Polling next lets
+            // the source's existing ordered window progress while storage waits.
+            let update = async {
+                #[cfg(test)]
+                let started = std::time::Instant::now();
+                let result = output.write_copy_batch(&coords, values).await;
+                #[cfg(test)]
+                {
+                    update_time = started.elapsed();
                 }
-                output.write_value(&coord, value).await?;
-            }
+                result
+            };
+            let consume = async {
+                #[cfg(test)]
+                let started = std::time::Instant::now();
+                let result = blocks.try_next().await;
+                #[cfg(test)]
+                {
+                    consume_time = started.elapsed();
+                }
+                result
+            };
+            let ((), following) = futures::try_join!(update, consume)?;
+            next = following;
+
+            #[cfg(test)]
+            copy_metrics::record(|m| {
+                m.update += update_time;
+                m.consume += consume_time;
+                m.overlap += (update_time + consume_time).saturating_sub(joined.elapsed());
+            });
         }
-        if coords.next().is_some() {
+
+        if received != expected {
             return Err(Error::InvalidLayout(
                 "reader returned fewer values than its shape".into(),
             ));
         }
+
         Ok(output)
     }
 
@@ -252,21 +335,12 @@ where
     }
 
     pub(crate) fn block_position_from_base_coord(&self, base_coord: &[u64]) -> BlockPosition {
-        let block_shape = self.block_shape();
-        let block_strides = self.block_strides();
-        let grid_strides = self.grid_strides();
-
-        let mut block_id: u64 = 0;
-        let mut offset_in_block: usize = 0;
-        for (i, coord) in base_coord.iter().enumerate() {
-            let block_dim = block_shape[i] as u64;
-            block_id += (coord / block_dim) * grid_strides[i] as u64;
-            offset_in_block += ((coord % block_dim) as usize) * block_strides[i];
-        }
-        BlockPosition {
-            block_id,
-            offset_in_block,
-        }
+        crate::storage_read::block_position(
+            base_coord.iter().map(|c| *c as usize),
+            self.block_shape(),
+            self.block_strides(),
+            self.grid_strides(),
+        )
     }
 
     pub(crate) fn block_shape(&self) -> &[usize] {
@@ -304,11 +378,13 @@ where
         }
 
         let num_blocks = self.num_blocks();
+
         for block_id in 0..num_blocks {
             if !self.block_exists(block_id).await {
                 self.write_block(block_id, self.default_block()).await?;
             }
         }
+
         Ok(())
     }
 
@@ -317,11 +393,28 @@ where
         blocks.get_file(&block_id.to_string()).is_some()
     }
 
-    async fn write_value_to_block(
+    // Updates retain input order and contain at most one execution batch.
+    // Validate every offset before changing any value in this storage block.
+    fn apply_block_updates(&self, block: &mut [T], updates: &[(usize, usize, T)]) -> Result<()> {
+        if block.len() != self.block_len() {
+            return Err(Error::InvalidLayout("invalid stored block length".into()));
+        }
+
+        for &(_, offset, _) in updates {
+            validate::ensure_offset_in_bounds(offset, block.len())?;
+        }
+
+        for &(_, offset, value) in updates {
+            block[offset] = value;
+        }
+
+        Ok(())
+    }
+
+    async fn write_block_updates(
         &self,
         block_id: u64,
-        offset_in_block: usize,
-        value: T,
+        updates: &[(usize, usize, T)],
     ) -> Result<()> {
         let file = {
             let blocks = self.storage.blocks().read().await;
@@ -331,11 +424,74 @@ where
                 .ok_or_else(|| Error::from(IoError::new(ErrorKind::NotFound, "Missing block")))?
         };
         let mut block = file.write::<Vec<T>>().await?;
-        if block.len() != self.block_len() {
-            return Err(Error::InvalidLayout("invalid stored block length".into()));
+        self.apply_block_updates(&mut block, updates)?;
+
+        #[cfg(test)]
+        copy_metrics::record(|m| m.block_updates += 1);
+        Ok(())
+    }
+
+    /// Only copying uses this grouped path: sparse zeros are omitted, not deletions.
+    /// Maps retain at most 4096 positions/values, never another coordinate list.
+    async fn write_copy_batch(&self, coords: &[Vec<u64>], values: Vec<T>) -> Result<()> {
+        if coords.len() != values.len() || values.len() > crate::expression::MAX_BATCH_ELEMENTS {
+            return Err(Error::InvalidLayout("invalid copy batch lengths".into()));
         }
-        validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-        block[offset_in_block] = value;
+
+        for coord in coords {
+            validate::validate_coord(self.shape(), coord)?;
+        }
+
+        let mut groups: BTreeMap<u64, Vec<(usize, usize, T)>> = BTreeMap::new();
+        let mut sparse: BTreeMap<[u64; 2], Vec<(usize, usize, T)>> = BTreeMap::new();
+
+        for (order, (coord, value)) in coords.iter().zip(values).enumerate() {
+            let position = self.block_position_from_base_coord(coord);
+            match self.layout() {
+                Layout::Dense => groups.entry(position.block_id).or_default().push((
+                    order,
+                    position.offset_in_block,
+                    value,
+                )),
+                Layout::Sparse { .. } if value != T::ZERO => {
+                    let axis = sparse_axis_for_layout(self.layout());
+                    sparse
+                        .entry([coord[axis], position.block_id])
+                        .or_default()
+                        .push((order, position.offset_in_block, value));
+                }
+                Layout::Sparse { .. } => {}
+            }
+        }
+
+        for (key, updates) in sparse {
+            #[cfg(test)]
+            copy_metrics::record(|m| m.sparse_lookups += 1);
+            if let Some(id) = self.lookup_block_id(&key).await? {
+                groups.entry(id).or_default().extend(updates);
+            } else {
+                let id = rand::random();
+                let mut block = self.default_block();
+                self.apply_block_updates(&mut block, &updates)?;
+                self.write_block(id, block).await?;
+                self.upsert_block_id(key.to_vec(), id).await?;
+
+                #[cfg(test)]
+                copy_metrics::record(|m| {
+                    m.groups += 1;
+                    m.block_updates += 1;
+                });
+            }
+        }
+
+        #[cfg(test)]
+        copy_metrics::record(|m| m.groups += groups.len());
+
+        for (id, mut updates) in groups {
+            updates.sort_unstable_by_key(|(order, _, _)| *order);
+            self.write_block_updates(id, &updates).await?;
+        }
+
         Ok(())
     }
 
@@ -353,9 +509,310 @@ where
         blocks.delete(&block_id.to_string()).await;
     }
 
+    /// Resolve one bounded request into physical blocks and scatter positions.
+    async fn resolve_read_groups(
+        &self,
+        request: &BatchRequest,
+        mapping: Option<&CoordinateMap>,
+    ) -> Result<ReadGroups> {
+        #[cfg(test)]
+        let mapping_time = crate::read_metrics::Timer::new(|m| &mut m.mapping);
+        let storage = crate::storage_read::StorageShape {
+            shape: self.shape(),
+            strides: self.strides(),
+            block_shape: self.block_shape(),
+            block_strides: self.block_strides(),
+            grid_strides: self.grid_strides(),
+            sparse_axis: matches!(self.layout(), Layout::Sparse { .. })
+                .then(|| sparse_axis_for_layout(self.layout())),
+        };
+        let positions = storage.plan(request, mapping)?;
+
+        #[cfg(test)]
+        drop(mapping_time);
+
+        #[cfg(test)]
+        let _index_time = crate::read_metrics::Timer::new(|m| &mut m.index);
+
+        // Both maps contain at most one entry per coordinate in this batch.
+        let mut lookups = BTreeMap::new();
+        let mut groups = ReadGroups::new();
+
+        for crate::storage_read::PlannedRun {
+            block: block_id,
+            key,
+            run,
+        } in positions
+        {
+            let id = match key {
+                None => Some(block_id),
+                Some(key) => {
+                    if let Some(id) = lookups.get(&key) {
+                        *id
+                    } else {
+                        #[cfg(test)]
+                        crate::read_metrics::record(|m| m.lookups += 1);
+                        let id = self.lookup_block_id(&key).await?;
+                        lookups.insert(key, id);
+                        id
+                    }
+                }
+            };
+            if let Some(id) = id {
+                groups.entry(id).or_default().push(run);
+            }
+        }
+
+        Ok(groups)
+    }
+
+    /// Borrow each needed block once; all requests and results fit one execution batch.
+    pub(crate) async fn read_batch(
+        &self,
+        request: &BatchRequest,
+        mapping: Option<&CoordinateMap>,
+    ) -> Result<Vec<T>> {
+        let groups = self.resolve_read_groups(request, mapping).await?;
+
+        let mut values = vec![T::ZERO; request.len()];
+
+        for (id, positions) in groups {
+            #[cfg(test)]
+            let access_time = crate::read_metrics::Timer::new(|m| &mut m.access);
+            let file = {
+                let blocks = self.storage.blocks().read().await;
+                blocks.get_file(&id.to_string()).cloned().ok_or_else(|| {
+                    Error::from(IoError::new(ErrorKind::NotFound, "Block is missing"))
+                })?
+            };
+
+            let block = file.read::<Vec<T>>().await?;
+            if block.len() != self.block_len() {
+                return Err(Error::InvalidLayout("invalid stored block length".into()));
+            }
+
+            #[cfg(test)]
+            drop(access_time);
+
+            #[cfg(test)]
+            crate::read_metrics::record(|m| {
+                m.borrows += 1;
+                m.borrowed += block.len();
+            });
+
+            #[cfg(test)]
+            let _scatter_time = crate::read_metrics::Timer::new(|m| &mut m.scatter);
+
+            for run in positions {
+                run.scatter(&block, &mut values)?;
+            }
+
+            // This block guard is released before the next block is awaited.
+        }
+
+        Ok(values)
+    }
+
     pub(crate) fn sparse_key(&self, coords: &[u64], block_offset: u64) -> Vec<u64> {
-        let axis = sparse_axis_for_layout(self.layout(), coords.len());
+        let axis = sparse_axis_for_layout(self.layout());
         vec![coords[axis], block_offset]
+    }
+
+    /// Read at most one execution batch of index keys, releasing all index guards
+    /// before returning. Two prefix ranges resume strictly after the previous key.
+    async fn slice_index_page(
+        &self,
+        last: Option<[u64; 2]>,
+        lo: usize,
+        hi: usize,
+    ) -> Result<Vec<[u64; 2]>> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        #[cfg(test)]
+        let _index_time = crate::read_metrics::Timer::new(|m| &mut m.index);
+
+        let mut ranges = Vec::with_capacity(2);
+        if let Some([coord, block]) = last {
+            ranges.push(
+                [
+                    ("coord".to_string(), b_table::ColumnRange::Eq(coord)),
+                    (
+                        "block_offset".to_string(),
+                        b_table::ColumnRange::In((Excluded(block), Unbounded)),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        }
+
+        if last.is_none_or(|[coord, _]| coord < hi as u64) {
+            let lower = last.map_or(Included(lo as u64), |[coord, _]| Excluded(coord));
+            ranges.push(
+                [(
+                    "coord".to_string(),
+                    b_table::ColumnRange::In((lower, Included(hi as u64))),
+                )]
+                .into_iter()
+                .collect(),
+            );
+        }
+
+        let columns = ["coord".to_string(), "block_offset".to_string()];
+        let sparse_axis = sparse_axis_for_layout(self.layout());
+        let mut keys = Vec::new(); // At most 4096 fixed-size keys, never an entire index.
+        let table = self.sparse_index()?.read().await;
+
+        for range in ranges {
+            // Ordered row streaming descends to leaves between internal separators.
+            let mut rows = table.rows(range, &columns, false, Some(&columns)).await?;
+
+            while let Some(row) = rows.try_next().await? {
+                if row.len() != 2
+                    || row[0] >= self.shape()[sparse_axis] as u64
+                    || row[1] >= self.num_blocks()
+                {
+                    return Err(Error::InvalidLayout(
+                        "invalid sparse slice index key".into(),
+                    ));
+                }
+                keys.push([row[0], row[1]]);
+
+                #[cfg(test)]
+                crate::read_metrics::record(|m| m.index_entries += 1);
+                if keys.len() == crate::expression::MAX_BATCH_ELEMENTS {
+                    return Ok(keys);
+                }
+            }
+        }
+
+        Ok(keys)
+    }
+
+    /// Numeric consumers visit occupied regions in storage order. One bounded
+    /// key page and one request's rectangles are retained, with no index guards.
+    pub(crate) fn storage_slice_requests(
+        &self,
+        slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<crate::slice::Requests<'_>> {
+        if slice.len() <= crate::expression::MAX_BATCH_ELEMENTS
+            || matches!(self.layout(), Layout::Dense)
+        {
+            return Ok(slice.stream());
+        }
+
+        let mapping =
+            mapping.unwrap_or_else(|| crate::mapping::StorageSlice::identity(self.shape()));
+        let sparse_axis = sparse_axis_for_layout(self.layout());
+        let (lo, hi) = if let Some((axis, &(_, step))) = mapping
+            .axes
+            .iter()
+            .enumerate()
+            .find(|(_, (base, _))| *base == sparse_axis)
+        {
+            let selection = &slice.axes[axis];
+            let (first, last) = match selection {
+                crate::request::Axis::Span { .. } => {
+                    (selection.at(0), selection.at(selection.len() - 1))
+                }
+                crate::request::Axis::Selected(values) => (
+                    *values.iter().min().expect("nonempty slice"),
+                    *values.iter().max().expect("nonempty slice"),
+                ),
+            };
+            (
+                mapping.origins[sparse_axis] + first as usize * step,
+                mapping.origins[sparse_axis] + last as usize * step,
+            )
+        } else {
+            (mapping.origins[sparse_axis], mapping.origins[sparse_axis])
+        };
+
+        struct Cursor {
+            last: Option<[u64; 2]>,
+            keys: std::vec::IntoIter<[u64; 2]>,
+            pending: Option<crate::slice::SliceRequests>,
+            // At most one bounded rectangle which did not fit the current batch.
+            overflow: Option<crate::request::Cartesian>,
+            done: bool,
+        }
+
+        let cursor = Cursor {
+            last: None,
+            keys: Vec::new().into_iter(),
+            pending: None,
+            overflow: None,
+            done: false,
+        };
+        Ok(futures::stream::try_unfold(
+            (cursor, slice, mapping),
+            move |(mut cursor, slice, mapping)| async move {
+                let mut rectangles = Vec::new();
+                let mut len = 0;
+
+                loop {
+                    if let Some(rectangle) = cursor.overflow.take().or_else(|| {
+                        cursor
+                            .pending
+                            .as_mut()
+                            .and_then(crate::slice::SliceRequests::next_rectangle)
+                    }) {
+                        if rectangle.len() > crate::expression::MAX_BATCH_ELEMENTS - len {
+                            cursor.overflow = Some(rectangle);
+                            break;
+                        }
+                        len += rectangle.len();
+                        rectangles.push(rectangle);
+                        if len == crate::expression::MAX_BATCH_ELEMENTS {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if cursor.keys.len() == 0 && !cursor.done {
+                        let keys = self.slice_index_page(cursor.last, lo, hi).await?;
+                        cursor.done = keys.len() < crate::expression::MAX_BATCH_ELEMENTS;
+                        cursor.keys = keys.into_iter();
+                    }
+
+                    let Some(row) = cursor.keys.next() else {
+                        break;
+                    };
+                    cursor.last = Some(row);
+                    let mut bounds = Vec::with_capacity(self.ndim());
+
+                    for axis in 0..self.ndim() {
+                        let grid = (row[1] as usize / self.grid_strides()[axis])
+                            % self.storage.storage_schema().shape[axis];
+                        let start = grid * self.block_shape()[axis];
+                        let end = start + self.block_shape()[axis].min(self.shape()[axis] - start);
+                        bounds.push((start, end));
+                    }
+
+                    let coord = row[0] as usize;
+                    if !(bounds[sparse_axis].0..bounds[sparse_axis].1).contains(&coord) {
+                        return Err(Error::InvalidLayout(
+                            "sparse slice key disagrees with its grid block".into(),
+                        ));
+                    }
+                    bounds[sparse_axis] = (coord, coord + 1);
+                    if let Some(bounds) = mapping.bounds(&bounds) {
+                        cursor.pending = Some(slice.intersect(&bounds)?.requests());
+                    }
+                }
+
+                if rectangles.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some((
+                        BatchRequest::rectangles(rectangles)?,
+                        (cursor, slice, mapping),
+                    )))
+                }
+            },
+        )
+        .boxed())
     }
 
     async fn lookup_sparse_block_for_coord(
@@ -473,6 +930,7 @@ where
         self.schema.strides()
     }
 }
+
 // ---------------------------------------------------------------------------
 // TensorRead impls
 // ---------------------------------------------------------------------------
@@ -481,40 +939,19 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
+    fn read_blocks(&self) -> Result<crate::ValueBlockStream<'_, Self::DType>> {
+        let requests = crate::request::linear_requests(self.shape())?;
+        Ok(crate::expression::ordered_batches(self, requests)
+            .map_ok(|(_, batch)| batch.values)
+            .boxed())
+    }
+
+    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
+        crate::expression::coordinate_blocks(self)
+    }
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            validate::validate_coord(self.schema.shape(), coord)?;
-
-            let BlockPosition {
-                block_id: block_grid_id,
-                offset_in_block,
-            } = self.block_position_from_base_coord(coord);
-
-            let block_id = match self.layout() {
-                Layout::Dense => Some(block_grid_id),
-                Layout::Sparse { .. } => {
-                    self.lookup_sparse_block_for_coord(coord, block_grid_id)
-                        .await?
-                }
-            };
-
-            let Some(id) = block_id else {
-                return Ok(T::default());
-            };
-
-            let file = {
-                let blocks = self.storage.blocks().read().await;
-                blocks.get_file(&id.to_string()).cloned().ok_or_else(|| {
-                    Error::from(IoError::new(ErrorKind::NotFound, "Block is missing"))
-                })?
-            };
-            let block = file.read::<Vec<T>>().await?;
-            if block.len() != self.block_len() {
-                return Err(Error::InvalidLayout("invalid stored block length".into()));
-            }
-            validate::ensure_offset_in_bounds(offset_in_block, block.len())?;
-            Ok(block[offset_in_block])
-        })
+        Box::pin(async move { Ok(self.read_batch(&BatchRequest::point(coord), None).await?[0]) })
     }
 }
 
@@ -545,13 +982,14 @@ where
                         self.write_block(block_grid_id, self.default_block())
                             .await?;
                     }
-                    self.write_value_to_block(block_grid_id, offset_in_block, value)
+
+                    self.write_block_updates(block_grid_id, &[(0, offset_in_block, value)])
                         .await
                 }
                 Layout::Sparse { .. } => {
                     match self.plan_sparse_write(coord, block_grid_id, value).await? {
                         SparseWriteAction::Write(block_id) => {
-                            self.write_value_to_block(block_id, offset_in_block, value)
+                            self.write_block_updates(block_id, &[(0, offset_in_block, value)])
                                 .await
                         }
                         SparseWriteAction::DeleteRow(block_id) => {
@@ -567,7 +1005,7 @@ where
                             self.write_block(block_id, self.default_block()).await?;
                             let key = self.sparse_key(coord, block_grid_id);
                             self.upsert_block_id(key, block_id).await?;
-                            self.write_value_to_block(block_id, offset_in_block, value)
+                            self.write_block_updates(block_id, &[(0, offset_in_block, value)])
                                 .await?;
                             Ok(())
                         }
@@ -598,6 +1036,7 @@ where
                 if guard.len() != self.block_len() {
                     return Err(Error::InvalidLayout("invalid stored block length".into()));
                 }
+
                 Ok(Some(guard.clone()))
             } else {
                 Ok(None)
@@ -612,6 +1051,7 @@ where
                     "block length must match storage schema".into(),
                 ));
             }
+
             let file = {
                 let blocks = self.storage.blocks().read().await;
                 blocks.get_file(&block_id.to_string()).cloned()
@@ -703,9 +1143,11 @@ where
                     values.len()
                 )));
             }
+
             for (coord, value) in coords.zip(values) {
                 self.write_value(&coord, value).await?;
             }
+
             Ok(())
         })
     }
@@ -722,12 +1164,14 @@ where
                     self.shape()
                 )));
             }
+
             for coord in
                 validate::iter_range_coords(self.shape(), &validate::full_range(self.shape()))?
             {
                 let value = other.read_value(&coord).await?;
                 self.write_value(&coord, value).await?;
             }
+
             Ok(())
         })
     }
@@ -739,6 +1183,7 @@ where
             {
                 self.write_value(&coord, value).await?;
             }
+
             Ok(())
         })
     }
@@ -777,15 +1222,17 @@ where
             .create_file(METADATA.to_string(), metadata, size)
             .await?;
     }
+
     Ok(())
 }
 
-pub(crate) fn sparse_axis_for_layout(layout: Layout, ndim: usize) -> usize {
-    let axis = match layout {
+/// Creation and metadata loading validate axis bounds through StorageSchema.
+/// Call only with a stored tensor's validated layout; never substitute another axis.
+fn sparse_axis_for_layout(layout: Layout) -> usize {
+    match layout {
         Layout::Sparse { axis } => axis.unwrap_or(0),
         Layout::Dense => 0,
-    };
-    axis.min(ndim.saturating_sub(1))
+    }
 }
 
 fn validate_tensor_dtype<T: TensorElement>(dtype: NumberType) -> Result<()> {
@@ -796,6 +1243,7 @@ fn validate_tensor_dtype<T: TensorElement>(dtype: NumberType) -> Result<()> {
             <T as number_general::DType>::dtype(),
         )));
     }
+
     Ok(())
 }
 
@@ -819,162 +1267,28 @@ mod sparse_axis_tests {
     use super::*;
 
     #[test]
-    fn sparse_axis_none_defaults_to_zero() {
-        assert_eq!(sparse_axis_for_layout(Layout::Sparse { axis: None }, 3), 0);
-    }
-
-    #[test]
-    fn sparse_axis_some_selects_given_axis() {
-        assert_eq!(
-            sparse_axis_for_layout(Layout::Sparse { axis: Some(1) }, 3),
-            1
-        );
-        assert_eq!(
-            sparse_axis_for_layout(Layout::Sparse { axis: Some(2) }, 3),
-            2
-        );
-    }
-
-    #[test]
-    fn sparse_axis_none_and_some_zero_are_equivalent() {
-        assert_eq!(
-            sparse_axis_for_layout(Layout::Sparse { axis: None }, 3),
-            sparse_axis_for_layout(Layout::Sparse { axis: Some(0) }, 3),
-        );
-    }
-
-    #[test]
-    fn sparse_axis_dense_is_always_zero() {
-        assert_eq!(sparse_axis_for_layout(Layout::Dense, 3), 0);
-    }
-
-    #[test]
-    fn sparse_axis_clamps_to_last_axis_when_out_of_range() {
-        // `sparse_key` receives `coords.len()` as `ndim`, which is always the
-        // tensor's own rank -- axis selection must never index past it.
-        assert_eq!(
-            sparse_axis_for_layout(Layout::Sparse { axis: Some(5) }, 3),
-            2
-        );
+    fn validated_layout_selects_its_axis() {
+        for (layout, expected) in [
+            (Layout::Dense, 0),
+            (Layout::Sparse { axis: None }, 0),
+            (Layout::Sparse { axis: Some(0) }, 0),
+            (Layout::Sparse { axis: Some(1) }, 1),
+            (Layout::Sparse { axis: Some(2) }, 2),
+        ] {
+            assert_eq!(sparse_axis_for_layout(layout), expected);
+        }
     }
 }
 
 #[cfg(test)]
 mod sparse_lifecycle_tests {
-    use std::io;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
-    use b_table::Node;
-    use destream::{de, en};
-    use freqfs::Cache;
     use ha_ndarray::{Shape, shape};
-    use safecast::as_type;
+
+    use crate::test_support::{FsEntry as TestFE, cleanup, new_dir, open_dir};
 
     use super::*;
-
-    #[derive(Clone, Debug)]
-    enum TestFE {
-        Node(Node<u64>),
-        F32(Vec<f32>),
-        MetadataF32(crate::TensorMetadata<f32>),
-    }
-    impl<'en> en::ToStream<'en> for TestFE {
-        fn to_stream<E: en::Encoder<'en>>(
-            &'en self,
-            encoder: E,
-        ) -> std::result::Result<E::Ok, E::Error> {
-            match self {
-                Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
-                Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
-                Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
-            }
-        }
-    }
-    struct TestFEVisitor;
-    impl de::Visitor for TestFEVisitor {
-        type Value = TestFE;
-        fn expecting() -> &'static str {
-            "a typed filesystem entry"
-        }
-        async fn visit_seq<A: de::SeqAccess>(
-            self,
-            mut seq: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            let entry = match seq.expect_next::<u8>(()).await? {
-                0 => TestFE::Node(seq.expect_next(()).await?),
-                1 => TestFE::F32(seq.expect_next(()).await?),
-                2 => TestFE::MetadataF32(seq.expect_next(()).await?),
-                tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
-            };
-            if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-                return Err(de::Error::custom("unexpected entry field"));
-            }
-            Ok(entry)
-        }
-    }
-    impl de::FromStream for TestFE {
-        type Context = ();
-        async fn from_stream<D: de::Decoder>(
-            _: (),
-            decoder: &mut D,
-        ) -> std::result::Result<Self, D::Error> {
-            decoder.decode_seq(TestFEVisitor).await
-        }
-    }
-
-    impl freqfs::FileLoad for TestFE {
-        async fn load(
-            _: &std::path::Path,
-            file: tokio::fs::File,
-            _: std::fs::Metadata,
-        ) -> std::io::Result<Self> {
-            tbon::de::read_from((), file)
-                .await
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        }
-    }
-    impl freqfs::FileSave for TestFE {
-        async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
-            use futures::TryStreamExt;
-            use tokio::io::AsyncWriteExt;
-            let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
-            let mut size = 0;
-            while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
-                file.write_all(&chunk).await?;
-                size += chunk.len() as u64;
-            }
-            Ok(size)
-        }
-    }
-    as_type!(TestFE, Node, Node<u64>);
-    as_type!(TestFE, F32, Vec<f32>);
-    as_type!(TestFE, MetadataF32, crate::TensorMetadata<f32>);
-
-    fn unique_tmp_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        path.push(format!("fensor_sparse_lifecycle_{name}_{unique}"));
-        path
-    }
-
-    fn open_dir(root: &Path) -> io::Result<DirLock<TestFE>> {
-        let cache = Cache::<TestFE>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
-        cache.load(root.to_path_buf())
-    }
-
-    async fn new_dir(name: &str) -> (PathBuf, DirLock<TestFE>) {
-        let root = unique_tmp_dir(name);
-        tokio::fs::create_dir(&root).await.expect("create tmp dir");
-        let dir = open_dir(&root).expect("load tmp dir");
-        (root, dir)
-    }
-
-    async fn cleanup(root: &Path) {
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
 
     async fn create_sparse(
         name: &str,
@@ -997,6 +1311,40 @@ mod sparse_lifecycle_tests {
             .lookup_sparse_block_for_coord(coord, block_id)
             .await
             .expect("lookup")
+    }
+
+    #[tokio::test]
+    async fn slice_index_pages_resume_within_and_between_coordinates() {
+        use crate::TensorReduceAll;
+
+        let entries = crate::expression::MAX_BATCH_ELEMENTS + 1;
+
+        for axis in [None, Some(1)] {
+            let (root, tensor) = create_sparse("slice_pages", shape![1, entries], 1, axis).await;
+
+            for col in 0..entries as u64 {
+                tensor.write_value(&[0, col], 1.).await.unwrap();
+            }
+
+            let hi = if axis.is_none() { 0 } else { entries - 1 };
+            let first = tensor.slice_index_page(None, 0, hi).await.unwrap();
+            assert_eq!(first.len(), crate::expression::MAX_BATCH_ELEMENTS);
+            let second = tensor
+                .slice_index_page(first.last().copied(), 0, hi)
+                .await
+                .unwrap();
+            assert_eq!(second.len(), 1);
+            assert!(first.last().unwrap() < second.first().unwrap());
+            assert!(
+                tensor
+                    .slice_index_page(second.last().copied(), 0, hi)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(tensor.sum_all().await.unwrap(), entries as f32);
+            cleanup(&root).await;
+        }
     }
 
     #[tokio::test]
@@ -1075,16 +1423,407 @@ mod sparse_lifecycle_tests {
 
         cleanup(&root).await;
     }
+
     #[tokio::test]
     async fn oversized_evaluation_is_rejected_before_reading_coordinates() {
         let (root, tensor) = create_sparse("batch_bound", shape![1], 1, None).await;
         let coords = vec![vec![99]; crate::expression::MAX_BATCH_ELEMENTS + 1];
-        let error = crate::expression::evaluate_batch(&tensor, &coords)
-            .await
-            .err()
-            .unwrap();
+        let error = BatchRequest::explicit(coords).err().unwrap();
+        let _ = tensor;
         assert!(matches!(error, Error::InvalidLayout(_)));
         assert!(error.to_string().contains("coordinate batch"));
         cleanup(&root).await;
     }
+
+    #[tokio::test]
+    async fn storage_batches_group_blocks_and_preserve_order() {
+        for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
+            let (root, dir) = new_dir("read_groups").await;
+            let schema =
+                TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 4]).unwrap();
+            let tensor = Tensor::<TestFE, f32>::create(dir, schema, layout, 4)
+                .await
+                .unwrap();
+            tensor.write_value(&[0, 0], 2.).await.unwrap();
+            tensor.write_value(&[0, 3], 3.).await.unwrap();
+            tensor.write_value(&[1, 1], 4.).await.unwrap();
+
+            let coords = vec![vec![1, 1], vec![0, 3], vec![0, 0], vec![0, 3]];
+            let groups = tensor
+                .resolve_read_groups(&BatchRequest::explicit(coords.clone()).unwrap(), None)
+                .await
+                .unwrap();
+            assert_eq!(groups.len(), 2);
+            assert_eq!(
+                groups.values().flatten().map(|run| run.len).sum::<usize>(),
+                coords.len()
+            );
+            assert!(groups.values().any(|positions| {
+                positions
+                    .iter()
+                    .flat_map(|run| {
+                        (0..run.len).map(move |i| {
+                            (
+                                run.output + i,
+                                (run.offset as i128 + i as i128 * run.stride as i128) as usize,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    == vec![(1, 3), (2, 0), (3, 3)]
+            }));
+            assert_eq!(
+                tensor
+                    .read_batch(&BatchRequest::explicit(coords.clone()).unwrap(), None)
+                    .await
+                    .unwrap(),
+                vec![4., 3., 2., 3.]
+            );
+            assert!(
+                tensor
+                    .read_batch(&BatchRequest::point(&[2, 0]), None)
+                    .await
+                    .is_err()
+            );
+            assert!(BatchRequest::explicit(vec![vec![0, 0]; 4097]).is_err());
+
+            // Validate the entire borrowed block, even for one selected value.
+            let id = *groups.keys().next().unwrap();
+            let file = tensor
+                .storage
+                .blocks()
+                .read()
+                .await
+                .get_file(&id.to_string())
+                .unwrap()
+                .clone();
+            file.write::<Vec<f32>>().await.unwrap().pop();
+            assert!(matches!(
+                tensor
+                    .read_batch(&BatchRequest::explicit(coords.clone()).unwrap(), None)
+                    .await,
+                Err(Error::InvalidLayout(_))
+            ));
+            cleanup(&root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_affine_requests_fail_before_storage_io() {
+        let (root, tensor) = create_sparse("invalid_affine", shape![2, 4], 4, None).await;
+        let mut map = CoordinateMap::identity(shape![2, 4], tensor.strides());
+        map.base_offset = -1;
+        crate::read_metrics::CURRENT
+            .scope(Default::default(), async {
+                assert!(matches!(
+                    tensor
+                        .read_batch(&BatchRequest::linear(0, 8).unwrap(), Some(&map))
+                        .await,
+                    Err(Error::InvalidCoord(_))
+                ));
+                crate::read_metrics::CURRENT.with(|m| {
+                    let m = m.borrow();
+                    assert_eq!((m.lookups, m.borrows), (0, 0));
+                });
+            })
+            .await;
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn storage_batch_uses_sparse_keys_not_grid_block_ids() {
+        let (root, tensor) = create_sparse("batch_keys", shape![3, 2], 6, Some(0)).await;
+        tensor.write_value(&[0, 0], 2.).await.unwrap();
+        tensor.write_value(&[2, 1], 3.).await.unwrap();
+
+        let coords = vec![vec![0, 0], vec![1, 0], vec![2, 1], vec![0, 0]];
+        assert!(
+            coords
+                .iter()
+                .all(|coord| tensor.block_position_from_base_coord(coord).block_id == 0)
+        );
+        let groups = tensor
+            .resolve_read_groups(&BatchRequest::explicit(coords.clone()).unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups.values().flatten().map(|run| run.len).sum::<usize>(),
+            3
+        );
+        assert_eq!(
+            tensor
+                .read_batch(&BatchRequest::explicit(coords.clone()).unwrap(), None)
+                .await
+                .unwrap(),
+            vec![2., 0., 3., 2.]
+        );
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn dense_matrix_products_have_no_output_support_mask() {
+        use crate::{TensorMatMul, TensorTransform};
+        let (root, dir) = new_dir("dense_matrix_support").await;
+        let dense = Tensor::<TestFE, f32>::create(
+            dir,
+            TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 2]).unwrap(),
+            Layout::Dense,
+            2,
+        )
+        .await
+        .unwrap();
+        let (sparse_root, sparse) =
+            create_sparse("sparse_matrix_support", shape![2, 2], 2, None).await;
+        let left = dense.view().matmul(&sparse.view()).await.unwrap();
+        let right = sparse
+            .view()
+            .matmul(&dense.view().transpose(None).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            crate::expression::Expression::build(&left, &BatchRequest::point(&[0, 0]))
+                .await
+                .unwrap()
+                .support
+                .is_none()
+        );
+        assert!(
+            crate::expression::Expression::build(&right, &BatchRequest::point(&[0, 0]))
+                .await
+                .unwrap()
+                .support
+                .is_none()
+        );
+        cleanup(&root).await;
+        cleanup(&sparse_root).await;
+    }
+
+    #[derive(Clone)]
+    struct CompactSource<'a>(&'a Tensor<TestFE, f32>);
+
+    impl TensorGeometry for CompactSource<'_> {
+        type DType = f32;
+
+        fn dtype(&self) -> NumberType {
+            self.0.dtype()
+        }
+
+        fn shape(&self) -> &[usize] {
+            self.0.shape()
+        }
+
+        fn layout(&self) -> Layout {
+            self.0.layout()
+        }
+    }
+
+    impl crate::expression::Expression for CompactSource<'_> {
+        fn build<'a>(
+            &'a self,
+            request: &'a BatchRequest,
+        ) -> BoxFuture<'a, Result<crate::expression::Batch<f32>>> {
+            Box::pin(async move {
+                assert!(matches!(
+                    request.kind(),
+                    crate::request::RequestKind::Rectangles(_)
+                ));
+                self.0.view().build(request).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_requests_survive_elementwise_composition() {
+        use crate::{TensorCompareScalar, TensorMath, TensorUnary, TensorWhere};
+        let (root, tensor) = create_sparse("compact_composition", shape![2, 2], 2, None).await;
+        tensor.write_value(&[1, 1], 2.).await.unwrap();
+        let source = CompactSource(&tensor);
+        let values = source.round().await.unwrap().add(&source).await.unwrap();
+        let condition = values.gt_scalar(0.).await.unwrap();
+        let selected = condition.cond(&values, &source).await.unwrap();
+        let request = BatchRequest::rectangles(vec![
+            crate::request::Cartesian::new(vec![
+                crate::request::Axis::range(0, 2),
+                crate::request::Axis::range(0, 2),
+            ])
+            .unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            crate::expression::evaluate_batch(&selected, &request)
+                .await
+                .unwrap()
+                .values,
+            vec![0., 0., 0., 4.]
+        );
+
+        // An invalid mapped position is rejected before any data/index read.
+        let mut mapping = crate::mapping::CoordinateMap::identity(shape![2, 2], tensor.strides());
+        mapping.base_offset = 4;
+        assert!(matches!(
+            tensor.read_batch(&request, Some(&mapping)).await,
+            Err(Error::InvalidCoord(_))
+        ));
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn copy_batches_group_physical_blocks_and_sparse_keys() {
+        for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
+            let (root, dir) = new_dir("copy_groups").await;
+            let tensor = Tensor::<TestFE, f32>::create(
+                dir.clone(),
+                TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 4]).unwrap(),
+                layout,
+                8,
+            )
+            .await
+            .unwrap();
+            let coords = vec![vec![1, 3], vec![0, 2], vec![1, 1], vec![0, 0]];
+            let expected = if matches!(layout, Layout::Dense) {
+                1
+            } else {
+                2
+            };
+            copy_metrics::CURRENT
+                .scope(Default::default(), async {
+                    for _ in 0..2 {
+                        tensor
+                            .write_copy_batch(&coords, vec![3., 2., 1., 4.])
+                            .await
+                            .unwrap();
+                    }
+                    copy_metrics::CURRENT.with(|m| {
+                        let m = m.borrow();
+                        assert_eq!(m.groups, 2 * expected);
+                        assert_eq!(m.block_updates, 2 * expected);
+                        assert_eq!(m.sparse_lookups, if expected == 1 { 0 } else { 4 });
+                    });
+                })
+                .await;
+            for (coord, value) in coords.iter().zip([3., 2., 1., 4.]) {
+                assert_eq!(tensor.read_value(coord).await.unwrap(), value);
+            }
+            tensor.sync().await.unwrap();
+            drop(tensor);
+            drop(dir);
+            let loaded = Tensor::<TestFE, f32>::load(open_dir(&root).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(loaded.read_value(&[1, 3]).await.unwrap(), 3.);
+            cleanup(&root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_batches_coalesce_existing_physical_blocks() {
+        let (root, tensor) = create_sparse("copy_physical", shape![2, 4], 8, None).await;
+        tensor.write_value(&[0, 0], 1.).await.unwrap();
+        let id = tensor.lookup_block_id(&[0, 0]).await.unwrap().unwrap();
+        tensor.upsert_block_id(vec![1, 0], id).await.unwrap();
+        copy_metrics::CURRENT
+            .scope(Default::default(), async {
+                tensor
+                    .write_copy_batch(&[vec![1, 1], vec![0, 1], vec![1, 1]], vec![2., 3., 4.])
+                    .await
+                    .unwrap();
+                copy_metrics::CURRENT.with(|m| {
+                    let m = m.borrow();
+                    assert_eq!((m.groups, m.block_updates, m.sparse_lookups), (1, 1, 2));
+                });
+            })
+            .await;
+        assert_eq!(tensor.read_value(&[1, 1]).await.unwrap(), 4.);
+        assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), 3.);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn copy_batch_rejects_invalid_input_and_corrupt_blocks() {
+        let (root, dir) = new_dir("copy_invalid").await;
+        let tensor = Tensor::<TestFE, f32>::create(
+            dir.clone(),
+            TensorSchema::new(NumberType::Float(FloatType::F32), shape![4]).unwrap(),
+            Layout::Dense,
+            4,
+        )
+        .await
+        .unwrap();
+
+        for (coords, values) in [
+            (vec![vec![0], vec![4]], vec![1., 2.]),
+            (vec![vec![0]], vec![]),
+            (vec![vec![0]; 4097], vec![1.; 4097]),
+        ] {
+            assert!(tensor.write_copy_batch(&coords, values).await.is_err());
+            assert_eq!(tensor.read_value(&[0]).await.unwrap(), 0.);
+        }
+
+        let mut block = vec![0.; 4];
+        assert!(
+            tensor
+                .apply_block_updates(&mut block, &[(0, 0, 1.), (1, 4, 2.)])
+                .is_err()
+        );
+        assert_eq!(block, vec![0.; 4]);
+        let blocks = dir.read().await.get_dir(BLOCKS).unwrap().clone();
+        let file = blocks.read().await.get_file("0").unwrap().clone();
+        file.write::<Vec<f32>>().await.unwrap().pop();
+        assert!(tensor.write_copy_batch(&[vec![0]], vec![1.]).await.is_err());
+        assert_eq!(*file.read::<Vec<f32>>().await.unwrap(), vec![0.; 3]);
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sparse_copy_zeros_do_not_create_storage() {
+        let (root, tensor) = create_sparse("copy_zeros", shape![2, 4], 8, None).await;
+        copy_metrics::CURRENT
+            .scope(Default::default(), async {
+                tensor
+                    .write_copy_batch(&[vec![0, 0], vec![1, 1]], vec![0., -0.])
+                    .await
+                    .unwrap();
+                copy_metrics::CURRENT.with(|m| {
+                    let m = m.borrow();
+                    assert_eq!((m.groups, m.block_updates, m.sparse_lookups), (0, 0, 0));
+                });
+            })
+            .await;
+        assert!(tensor.lookup_block_id(&[0, 0]).await.unwrap().is_none());
+        assert!(tensor.lookup_block_id(&[1, 0]).await.unwrap().is_none());
+        assert_eq!(tensor.storage.blocks().read().await.files().count(), 1); // metadata only
+        cleanup(&root).await;
+    }
 }
+
+// Task-local counters cannot mix observations from concurrent test fixtures.
+// No instrumentation or configuration is present in production builds.
+#[cfg(test)]
+mod copy_metrics {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    #[derive(Default, Debug)]
+    pub(super) struct Metrics {
+        pub initialize: Duration,
+        pub consume: Duration,
+        pub update: Duration,
+        pub overlap: Duration,
+        pub groups: usize,
+        pub block_updates: usize,
+        pub sparse_lookups: usize,
+    }
+
+    tokio::task_local! {
+        pub(super) static CURRENT: RefCell<Metrics>;
+    }
+
+    pub(super) fn record(update: impl FnOnce(&mut Metrics)) {
+        let _ = CURRENT.try_with(|metrics| update(&mut metrics.borrow_mut()));
+    }
+}
+
+#[cfg(test)]
+#[path = "tensor/copy_benchmark.rs"]
+mod copy_benchmark;

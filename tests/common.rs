@@ -7,13 +7,15 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use b_table::Node;
 use destream::{de, en};
 use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
 use freqfs::{Cache, DirLock};
 use safecast::as_type;
+
+#[path = "common/counters.rs"]
+pub mod counters;
 
 #[derive(Clone, Debug)]
 pub enum FsEntry {
@@ -25,6 +27,7 @@ pub enum FsEntry {
     MetadataU8(fensor::TensorMetadata<u8>),
     MetadataF64(fensor::TensorMetadata<f64>),
 }
+
 impl<'en> en::ToStream<'en> for FsEntry {
     fn to_stream<E: en::Encoder<'en>>(
         &'en self,
@@ -41,12 +44,16 @@ impl<'en> en::ToStream<'en> for FsEntry {
         }
     }
 }
+
 struct FsEntryVisitor;
+
 impl de::Visitor for FsEntryVisitor {
     type Value = FsEntry;
+
     fn expecting() -> &'static str {
         "a typed filesystem entry"
     }
+
     async fn visit_seq<A: de::SeqAccess>(
         self,
         mut seq: A,
@@ -61,14 +68,18 @@ impl de::Visitor for FsEntryVisitor {
             6 => FsEntry::MetadataF64(seq.expect_next(()).await?),
             tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
         };
+
         if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
             return Err(de::Error::custom("unexpected entry field"));
         }
+
         Ok(entry)
     }
 }
+
 impl de::FromStream for FsEntry {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(
         _: (),
         decoder: &mut D,
@@ -76,6 +87,7 @@ impl de::FromStream for FsEntry {
         decoder.decode_seq(FsEntryVisitor).await
     }
 }
+
 as_type!(FsEntry, Node, Node<u64>);
 as_type!(FsEntry, F32, Vec<f32>);
 as_type!(FsEntry, MetadataF32, fensor::TensorMetadata<f32>);
@@ -91,8 +103,8 @@ pub fn unique_tmp_dir(name: &str) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     // Wall-clock timestamps alone can collide between concurrent tests.
-    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-    let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+    static NEXT_DIR: counters::Counter = counters::Counter::new();
+    let sequence = NEXT_DIR.increment();
     let process = std::process::id();
     path.push(format!("fensor_test_{name}_{unique}_{process}_{sequence}"));
     path
@@ -146,20 +158,24 @@ impl Iterator for CoordIter {
         if self.remaining == 0 {
             return None;
         }
+
         let out = self.coord.clone();
         self.remaining -= 1;
 
         if self.remaining > 0 {
             let mut axis = self.shape.len() - 1;
+
             loop {
                 self.coord[axis] += 1;
                 if (self.coord[axis] as usize) < self.shape[axis] {
                     break;
                 }
+
                 self.coord[axis] = 0;
                 axis -= 1;
             }
         }
+
         Some(out)
     }
 }
@@ -197,21 +213,26 @@ impl freqfs::FileLoad for FsEntry {
         file: tokio::fs::File,
         _: std::fs::Metadata,
     ) -> std::io::Result<Self> {
+        counters::record_load();
         tbon::de::read_from((), file)
             .await
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 }
+
 impl freqfs::FileSave for FsEntry {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
+        counters::record_save();
         use futures::TryStreamExt;
         use tokio::io::AsyncWriteExt;
         let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
         let mut size = 0;
+
         while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
             file.write_all(&chunk).await?;
             size += chunk.len() as u64;
         }
+
         Ok(size)
     }
 }
