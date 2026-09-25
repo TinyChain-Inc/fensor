@@ -9,14 +9,16 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
 
 - Casts beyond f32-to-f64, additional integer/complex dtypes, and their storage
   adapters and conformance tests. f32, f64, and u8 storage already exist.
-- Matrix-specific unary operations and other remaining ha-ndarray operations,
-  reusing typed expressions and bounded consumers rather than a separate executor.
+- Construction/composition APIs such as constants, ranges, random generation,
+  stacking and concatenation, reusing bounded expressions and consumers.
 
 ## Sparse traversal
 
 - Index-driven ordered sparse reads through geometric transforms. Current public
   sparse streams scan the selected logical range; eligible numeric reductions
   already enumerate occupied storage regions.
+- Indexed sparse diagonal traversal; current diagonal reads select bounded
+  coordinates and full scans remain proportional to logical diagonal length.
 - Coordinated occupied-source traversal for binary, conditional, and aggregate
   expression sources, preserving union support and corruption/error contracts.
 - Sparse matrix algorithms that skip empty contraction intervals without losing

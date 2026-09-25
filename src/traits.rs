@@ -638,6 +638,21 @@ pub trait TensorReduceBoolean: TensorRead {
     fn any(&self) -> BoxFuture<'_, Result<bool>>;
 }
 
+/// Matrix geometry for the final two axes; stored tensors use `.view()`.
+/// Construction is lazy, including when awaited.
+pub trait TensorMatrixUnary: TensorGeometry {
+    type TransposeOutput: TensorRead<DType = Self::DType>;
+
+    type DiagOutput: TensorRead<DType = Self::DType>;
+
+    /// Swap the final two axes, preserving batch axes and existing write constraints.
+    fn mt(&self) -> BoxFuture<'_, Result<Self::TransposeOutput>>;
+
+    /// Extract square matrix diagonals: `[..., N, N]` becomes `[..., N]`.
+    /// Only selected source coordinates contribute support.
+    fn diag(&self) -> BoxFuture<'_, Result<Self::DiagOutput>>;
+}
+
 /// Lazy matrix multiplication with matching dtypes and explicit batch broadcasting.
 ///
 /// Shapes must be `[..., M, K]` and `[..., K, N]`, with identical batch dimensions

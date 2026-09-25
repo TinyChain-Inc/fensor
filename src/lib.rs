@@ -75,6 +75,8 @@ mod mapping;
 
 mod matmul;
 
+mod matrix;
+
 mod metadata;
 
 #[cfg(test)]
@@ -118,6 +120,7 @@ pub use binary::BinaryView;
 pub use error::{Error, Result};
 pub use ha_ndarray::Axes;
 pub use matmul::MatMulView;
+pub use matrix::DiagView;
 pub use metadata::TensorMetadata;
 pub use number_general::NumberType;
 pub use reduce::ReduceView;
@@ -129,10 +132,11 @@ pub use selection::WhereView;
 pub use traits::{
     BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray,
     TensorBlockStore, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
-    TensorCompareScalar, TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorNumeric,
-    TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorSparseIndex,
-    TensorTransform, TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics, TensorWhere,
-    TensorWrite, TensorWriteBulk, ValueBlockStream,
+    TensorCompareScalar, TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar,
+    TensorMatrixUnary, TensorNumeric, TensorRead, TensorReduce, TensorReduceAll,
+    TensorReduceBoolean, TensorSparseIndex, TensorTransform, TensorTrig, TensorUnary,
+    TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite, TensorWriteBulk,
+    ValueBlockStream,
 };
 
 pub use tensor::{Tensor, TensorElement, TensorFileEntry};

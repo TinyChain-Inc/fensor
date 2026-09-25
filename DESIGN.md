@@ -107,6 +107,13 @@ the guard before awaiting another block. Unit-stride runs copy slices; negative,
 zero, and other strides use the shared scatter loop. No whole block is cloned.
 Absent sparse entries yield zero; missing dense or malformed blocks return errors.
 
+Matrix diagonal projection maps each bounded output request to correlated source
+coordinates using reusable rank-sized scratch and one explicit request. It calls
+its source's expression builder directly, preserving lazy numerical work and
+support without another evaluator or concurrency boundary. Output transforms use
+the existing coordinate map. Diagonals use logical slice traversal; matrix
+transpose delegates to the existing final-axis permutation.
+
 ## Slices and reductions
 
 A validated slice retains source rank and compact axis descriptors, checking rank,

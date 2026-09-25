@@ -7,6 +7,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Contract | Primary coverage |
 |---|---|
 | Logical u64 geometry, inline rank spilling, overflow, large-coordinate persistence | `geometry`; request/mapping/storage-run unit bounds |
+| Matrix transpose/diagonal dtype and consumer parity, output transforms, support, huge selected reads, corruption, cache pressure, cancellation and write constraints | `matrix_unary`; matrix unit request/support counters; diagonal doctests |
 | Matrix shapes, dtypes, operand layouts and backend agreement | `matmul` numerical parity matrix, block streams |
 | Matrix point/sparse/copy/sync/reload parity | Every dtype/layout pair on `(2,3,2)` and `(33,129,35)` |
 | Reduction numerical lengths, operations, axes and keepdims | `reduce` parameterized block/terminal parity |

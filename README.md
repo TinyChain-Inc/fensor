@@ -53,6 +53,7 @@ Unsupported or abstract number classes are rejected during schema construction.
 | `TensorReduceAll` | `sum_all`, `product_all`, `min_all`, `max_all` | u8/f32/f64 → scalar of same dtype |
 | `TensorReduceBoolean` | `all`, `any` | u8/f32/f64 → bool |
 | `TensorReduce` | `sum`, `product`, `min`, `max` | u8/f32/f64 → lazy view of same dtype |
+| `TensorMatrixUnary` | `mt`, `diag` | u8/f32/f64 → same dtype |
 | `TensorMatMul` | `matmul` | Matching u8/f32/f64 → same dtype |
 
 Arithmetic methods borrow operands and are asynchronous. Elementwise tensor
@@ -114,7 +115,7 @@ Full-range ordered sparse reads still scale with logical size, not stored suppor
 Eligible numeric reductions can use occupied-index traversal instead; see
 [slice traversal](DESIGN.md#slices-and-reductions).
 
-## Reductions and matrix products
+## Reductions and matrix operations
 
 Stored tensors support terminal reductions directly; axis reductions start from
 a view, for example `tensor.view().sum(axes![1], false).await?`. Axes are sorted
@@ -140,6 +141,21 @@ has supported zero outputs; `exp()` can turn those into ones. A wholly absent ro
 and column remain absent. Supported zero-times-infinity can produce NaN and must
 not be skipped. Floating results obey the backend aggregate accuracy contract,
 not bitwise equivalence to a multiply/reduce expression.
+
+Matrix-unary operations also require rank ≥2. `mt()` swaps the final two axes,
+leaving batch axes and existing geometric write constraints intact. `diag()`
+requires square final dimensions and returns a read-only view of shape
+`[..., N]` from `[..., N, N]`:
+
+```rust,ignore
+let diagonal = tensor.view().mt().await?.diag().await?;
+```
+
+Only diagonal source coordinates contribute support, including supported
+intermediate zeros; off-diagonal values do not populate the result. Transforms
+on a diagonal view address its output, and further operations remain lazy.
+Selected reads visit the requested diagonal coordinates; a complete sparse scan
+still scales with logical diagonal length. Neither operation persists results.
 
 ## Streams, bounds, and concurrency
 
