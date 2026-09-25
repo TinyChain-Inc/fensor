@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use fensor::{
-    DType, Error, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorTransform,
-    TensorWrite, contiguous_strides,
+    AxisRange, Error, Layout, Range, Tensor, TensorGeometry, TensorRead, TensorSchema,
+    TensorTransform, TensorWrite, contiguous_strides,
 };
-use ha_ndarray::{AxisRange, Range, axes, range, shape};
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType};
 
 mod common;
 
@@ -13,7 +14,8 @@ use common::{FsEntry, cleanup, iter_coords, new_dir};
 
 async fn create_tensor(name: &str, layout: Layout) -> (PathBuf, Tensor<FsEntry, f32>) {
     let (root, dir) = new_dir(name).await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 3, 4]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3, 4]).expect("schema");
     // Keep blocks small so reads and transforms cross storage boundaries.
     let tensor = Tensor::create(dir, schema, layout, 4)
         .await
@@ -33,6 +35,7 @@ async fn seed_values(tensor: &Tensor<FsEntry, f32>) {
 
 fn transpose_range(range: &Range, permutation: &[usize]) -> Range {
     let mut remapped = Vec::with_capacity(permutation.len());
+
     for axis in permutation {
         remapped.push(range[*axis].clone());
     }
@@ -79,12 +82,14 @@ async fn standalone_transpose_arbitrary_permutation() {
     assert_eq!(transposed.shape(), &[4, 2, 3]);
 
     let mut inverse = vec![0usize; perm.len()];
+
     for (i, axis) in perm.iter().enumerate() {
         inverse[*axis] = i;
     }
 
     for t_coord in iter_coords(transposed.shape()) {
         let mut src = vec![0u64; t_coord.len()];
+
         for old_axis in 0..t_coord.len() {
             src[old_axis] = t_coord[inverse[old_axis]];
         }
@@ -237,7 +242,8 @@ async fn dense_sparse_parity_for_supported_operations() {
 #[tokio::test]
 async fn public_create_rejects_invalid_sparse_axis_hint() {
     let (root, dir) = common::new_dir("invalid_sparse_axis").await;
-    let schema = TensorSchema::new(DType::F32, shape![2, 3]).expect("schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3]).expect("schema");
     let result = fensor::Tensor::<common::FsEntry, f32>::create(
         dir,
         schema,
@@ -260,37 +266,25 @@ fn public_schema_contiguous_strides_match_expected() {
     );
 }
 
-#[tokio::test]
-async fn sparse_incompatible_order_error_is_structured() {
-    let (root, tensor) =
-        create_tensor("incompatible_sparse_order", Layout::Sparse { axis: None }).await;
+#[test]
+fn temporary_directory_names_are_unique_across_threads() {
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..32)
+                    .map(|_| common::unique_tmp_dir("parallel_names"))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
 
-    let err = match tensor
-        .read_sparse_elements_in_order(
-            range![
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 3, 1),
-                AxisRange::In(0, 4, 1)
-            ],
-            axes![2, 0, 1],
-        )
-        .await
-    {
-        Ok(_) => panic!("expected unsupported sparse order"),
-        Err(err) => err,
-    };
+    let mut names = std::collections::HashSet::new();
 
-    match err {
-        Error::UnsupportedSparseIterationOrder {
-            requested_order,
-            base_order,
-            hint: _,
-        } => {
-            assert_eq!(requested_order, vec![2, 0, 1]);
-            assert_eq!(base_order, vec![0, 1, 2]);
+    for worker in workers {
+        for name in worker.join().unwrap() {
+            assert!(names.insert(name), "temporary directory name collision");
         }
-        other => panic!("unexpected error variant: {other}"),
     }
 
-    cleanup(&root).await;
+    assert_eq!(names.len(), 256);
 }

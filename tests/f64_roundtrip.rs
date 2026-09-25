@@ -1,8 +1,9 @@
 mod common;
 
 use common::{FsEntry, new_dir};
-use fensor::{DType, Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite};
+use fensor::{Tensor, TensorArray, TensorRead, TensorSchema, TensorWrite};
 use ha_ndarray::shape;
+use number_general::{FloatType, NumberType};
 use std::io;
 
 use crate::common::create_dense_tensor;
@@ -11,7 +12,8 @@ use crate::common::create_dense_tensor;
 async fn filesystem_tensor_f64_write_read_roundtrip() -> io::Result<()> {
     let (root, dir) = new_dir("f64_roundtrip").await;
 
-    let schema = TensorSchema::new(DType::F64, shape![2, 2]).expect("valid schema");
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F64), shape![2, 2]).expect("valid schema");
 
     let tensor = create_dense_tensor::<f64>(dir.clone(), schema.clone()).await;
 

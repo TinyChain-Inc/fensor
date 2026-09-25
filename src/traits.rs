@@ -1,12 +1,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use futures::Stream;
-use ha_ndarray::{Axes, Range, Shape};
+use futures::{Stream, StreamExt, TryStreamExt};
+use number_general::NumberType;
 
-use crate::schema::{DType, Layout};
-use crate::validate;
-use crate::{Error, Result, TensorSchema};
+use crate::schema::Layout;
+use crate::{Axes, Error, Range, Result, Shape, TensorSchema, validate};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -14,18 +13,19 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait TensorGeometry: Send + Sync {
     type DType: Copy + Send + Sync + 'static;
 
-    fn dtype(&self) -> Self::DType;
+    fn dtype(&self) -> NumberType;
 
     fn layout(&self) -> Layout;
 
-    fn shape(&self) -> &[usize];
+    fn shape(&self) -> &[u64];
 
     fn ndim(&self) -> usize {
         self.shape().len()
     }
 
-    fn size(&self) -> usize {
-        self.shape().iter().product()
+    /// Checked logical cardinality, independent of the machine-sized batch buffers.
+    fn size(&self) -> Result<u64> {
+        crate::schema::checked_product(self.shape())
     }
 }
 
@@ -33,9 +33,9 @@ pub trait TensorGeometry: Send + Sync {
 pub trait TensorArray: TensorGeometry {
     fn schema(&self) -> &TensorSchema;
 
-    fn strides(&self) -> &[usize];
+    fn strides(&self) -> &[u64];
 
-    fn schema_dtype(&self) -> DType {
+    fn schema_dtype(&self) -> NumberType {
         self.schema().dtype()
     }
 }
@@ -44,43 +44,101 @@ pub trait TensorArray: TensorGeometry {
 pub type SparseElementStream<'a, ET> =
     Pin<Box<dyn Stream<Item = Result<(Vec<u64>, ET)>> + Send + 'a>>;
 
+/// Bounded batches of values in logical row-major order, independent of storage tiling.
+pub type ValueBlockStream<'a, T> = Pin<Box<dyn Stream<Item = Result<Vec<T>>> + Send + 'a>>;
+
+/// Coordinate-bearing bounded blocks, in implementation-selected order.
+/// Successful complete consumption visits every logical coordinate exactly once,
+/// including zero-valued coordinates. Built-in readers deliver completed batches
+/// without input-order error precedence; dropping a stream cancels pending work.
+/// Coordinates and values have equal length within the
+/// [execution limit](https://github.com/TinyChain-Inc/fensor/blob/main/DESIGN.md#bound-and-policy-constants).
+/// Each call is independent.
+pub type CoordinateBlockStream<'a, T> =
+    Pin<Box<dyn Stream<Item = Result<(Vec<Vec<u64>>, Vec<T>)>> + Send + 'a>>;
+
 /// Async value reads aligned with ndarray coordinate semantics.
 pub trait TensorRead: TensorGeometry {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>>;
 
+    /// Each call constructs an independent, demand-driven stream; no tensor-sized buffer.
+    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
+        let batches = coordinate_batches(crate::schema::row_major_coords(self.shape())?);
+        Ok(futures::stream::iter(batches)
+            .map(move |coords| async move {
+                let mut values = Vec::with_capacity(coords.len());
+
+                for coord in coords {
+                    values.push(self.read_value(&coord).await?);
+                }
+
+                Ok(values)
+            })
+            .buffered(num_cpus::get().max(1))
+            .boxed())
+    }
+
+    /// Read all logical coordinates in bounded blocks, without promising row-major order.
+    /// Exactly-once coverage is an implementer's contract, not globally tracked state.
+    fn read_coordinate_blocks(&self) -> Result<CoordinateBlockStream<'_, Self::DType>> {
+        let coords = crate::schema::row_major_coords(self.shape())?;
+        let blocks = self.read_blocks()?;
+        Ok(
+            futures::stream::try_unfold((coords, blocks), |(mut coords, mut blocks)| async move {
+                let Some(values) = blocks.try_next().await? else {
+                    if coords.next().is_some() {
+                        return Err(Error::InvalidLayout(
+                            "reader returned fewer values than its shape".into(),
+                        ));
+                    }
+                    return Ok(None);
+                };
+                if values.len() > crate::expression::MAX_BATCH_ELEMENTS {
+                    return Err(Error::InvalidLayout(format!(
+                        "coordinate block: expected at most {} values, got {}",
+                        crate::expression::MAX_BATCH_ELEMENTS,
+                        values.len()
+                    )));
+                }
+
+                let selected: Vec<_> = coords.by_ref().take(values.len()).collect();
+                if selected.len() != values.len() {
+                    return Err(Error::InvalidLayout(
+                        "reader returned more values than its shape".into(),
+                    ));
+                }
+
+                Ok(Some(((selected, values), (coords, blocks))))
+            })
+            .boxed(),
+        )
+    }
+
     fn read_sparse_elements_in_order<'a>(
         &'a self,
-        _range: Range,
+        range: Range,
         requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        let base_order = (0..self.ndim()).collect::<Vec<_>>();
-        let requested_order = requested_order.into_iter().collect::<Vec<_>>();
-
+    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>>
+    where
+        Self::DType: Default + PartialEq,
+    {
         Box::pin(async move {
-            Err(Error::UnsupportedSparseIterationOrder {
-                requested_order,
-                base_order,
-                hint: "materialize or perform external sort for incompatible order".to_string(),
-            })
-        })
-    }
-}
+            let coords = sparse_coords(self, range, requested_order)?;
+            let elements = futures::stream::iter(coordinate_batches(coords))
+                .map(move |coords| async move {
+                    let mut elements = Vec::new();
 
-/// Bulk/contiguous read semantics for tensor backends.
-pub trait TensorReadBulk: TensorRead {
-    fn read_values<'a>(&'a self, _range: Range) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "bulk read is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
-
-    fn read_all<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "read_all is not implemented for this tensor backend".to_string(),
-            ))
+                    for coord in coords {
+                        let value = self.read_value(&coord).await?;
+                        if value != Self::DType::default() {
+                            elements.push((coord, value));
+                        }
+                    }
+                    Ok::<_, Error>(futures::stream::iter(elements.into_iter().map(Ok)))
+                })
+                .buffered(num_cpus::get().max(1))
+                .try_flatten();
+            Ok(elements.boxed())
         })
     }
 }
@@ -91,7 +149,8 @@ pub trait TensorWrite: TensorGeometry {
     -> BoxFuture<'a, Result<()>>;
 }
 
-/// Bulk/contiguous write semantics for tensor backends.
+/// Bulk writes consume caller-owned values without collecting their coordinates.
+/// The caller budgets the supplied buffer; tensor-to-tensor writes and fill iterate lazily.
 pub trait TensorWriteBulk: TensorWrite {
     fn write_values<'a>(
         &'a self,
@@ -158,7 +217,8 @@ pub trait TensorTransform: TensorGeometry + Sized {
     }
 }
 
-/// Async block-level storage primitives used by higher-level tensor accessors.
+/// Async storage-block access, bounded by validated storage block capacity.
+/// A block is not a whole-tensor collection.
 pub trait TensorBlockStore: Send + Sync {
     type Block: Clone + Send + Sync + 'static;
 
@@ -194,250 +254,469 @@ pub trait TensorViewSemantics: TensorGeometry {
 }
 
 /// Unary tensor math operations.
-pub trait TensorUnary: TensorArray + Sized {
-    fn exp<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "exp is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+pub trait TensorUnary: TensorGeometry + Sized {
+    type ExpOutput: TensorRead<DType = Self::DType>;
 
-    fn ln<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "ln is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type LnOutput: TensorRead<DType = Self::DType>;
 
-    fn round<'a>(&'a self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "round is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type RoundOutput: TensorRead<DType = Self::DType>;
+
+    fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>>;
+
+    fn ln(&self) -> BoxFuture<'_, Result<Self::LnOutput>>;
+
+    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>;
+}
+
+/// Logical negation evaluated only on original support for sparse tensors.
+pub trait TensorUnaryBoolean: TensorGeometry + Sized {
+    type Output: TensorRead<DType = u8>;
+
+    fn not(&self) -> BoxFuture<'_, Result<Self::Output>>;
+}
+
+/// Floating-point predicates returning u8 masks.
+///
+/// Predicate outputs cannot themselves be used as floating-point inputs:
+///
+/// ```compile_fail,E0277
+/// use fensor::{Tensor, TensorFileEntry, TensorNumeric};
+/// async fn unsupported<FE: TensorFileEntry<u8>>(tensor: &Tensor<FE, u8>) {
+///     let _ = TensorNumeric::is_nan(&tensor.view()).await;
+/// }
+/// ```
+///
+/// Source and destination adapters need only support their respective dtypes:
+///
+/// ```
+/// use fensor::{Result, Tensor, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
+/// use freqfs::DirLock;
+/// async fn mask<S, D>(
+///     tensor: &Tensor<S, f32>,
+///     dir: DirLock<D>,
+///     max_capacity: usize,
+/// ) -> Result<Tensor<D, u8>>
+/// where
+///     S: TensorFileEntry<f32>,
+///     D: TensorFileEntry<u8>,
+/// {
+///     let mask = tensor.view().is_nan().await?.not().await?.clone();
+///     Tensor::copy_from(dir, &mask, max_capacity).await
+/// }
+/// ```
+pub trait TensorNumeric: TensorGeometry + Sized {
+    type IsNanOutput: TensorRead<DType = u8>;
+
+    type IsInfOutput: TensorRead<DType = u8>;
+
+    fn is_nan(&self) -> BoxFuture<'_, Result<Self::IsNanOutput>>;
+
+    fn is_inf(&self) -> BoxFuture<'_, Result<Self::IsInfOutput>>;
+}
+
+/// Lazy element-type conversion. Currently supports f32 to f64.
+///
+/// The destination storage adapter need only support the output dtype:
+///
+/// ```
+/// use fensor::{Result, Tensor, TensorCast, TensorFileEntry};
+/// use freqfs::DirLock;
+///
+/// async fn widen<Source, Destination>(
+///     source: &Tensor<Source, f32>,
+///     dir: DirLock<Destination>,
+///     max_capacity: usize,
+/// ) -> Result<Tensor<Destination, f64>>
+/// where
+///     Source: TensorFileEntry<f32>,
+///     Destination: TensorFileEntry<f64>,
+/// {
+///     let view = source.view();
+///     let cast = TensorCast::<f64>::cast(&view).await?;
+///     Tensor::copy_from(dir, &cast, max_capacity).await
+/// }
+/// ```
+///
+/// Narrowing is not supported:
+///
+/// ```compile_fail,E0277
+/// use fensor::{Tensor, TensorCast, TensorFileEntry};
+/// async fn narrow<FE: TensorFileEntry<f64>>(source: &Tensor<FE, f64>) {
+///     let _ = TensorCast::<f32>::cast(&source.view()).await;
+/// }
+/// ```
+pub trait TensorCast<To: crate::TensorElement>: TensorGeometry + Sized {
+    type Output: TensorRead<DType = To>;
+
+    fn cast(&self) -> BoxFuture<'_, Result<Self::Output>>;
+}
+
+/// Elementwise absolute value preserving the stored element type.
+pub trait TensorAbs: TensorGeometry + Sized {
+    type Output: TensorRead<DType = Self::DType>;
+
+    fn abs(&self) -> BoxFuture<'_, Result<Self::Output>>;
+}
+
+/// Elementwise trigonometry, evaluated lazily over source support.
+pub trait TensorTrig: TensorGeometry + Sized {
+    type SinOutput: TensorRead<DType = Self::DType>;
+
+    type AsinOutput: TensorRead<DType = Self::DType>;
+
+    type SinhOutput: TensorRead<DType = Self::DType>;
+
+    type CosOutput: TensorRead<DType = Self::DType>;
+
+    type AcosOutput: TensorRead<DType = Self::DType>;
+
+    type CoshOutput: TensorRead<DType = Self::DType>;
+
+    type TanOutput: TensorRead<DType = Self::DType>;
+
+    type AtanOutput: TensorRead<DType = Self::DType>;
+
+    type TanhOutput: TensorRead<DType = Self::DType>;
+
+    fn sin(&self) -> BoxFuture<'_, Result<Self::SinOutput>>;
+
+    fn asin(&self) -> BoxFuture<'_, Result<Self::AsinOutput>>;
+
+    fn sinh(&self) -> BoxFuture<'_, Result<Self::SinhOutput>>;
+
+    fn cos(&self) -> BoxFuture<'_, Result<Self::CosOutput>>;
+
+    fn acos(&self) -> BoxFuture<'_, Result<Self::AcosOutput>>;
+
+    fn cosh(&self) -> BoxFuture<'_, Result<Self::CoshOutput>>;
+
+    fn tan(&self) -> BoxFuture<'_, Result<Self::TanOutput>>;
+
+    fn atan(&self) -> BoxFuture<'_, Result<Self::AtanOutput>>;
+
+    fn tanh(&self) -> BoxFuture<'_, Result<Self::TanhOutput>>;
 }
 
 /// Elementwise tensor math operations.
-pub trait TensorMath: TensorArray + Sized {
-    fn add<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "add is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+pub trait TensorMath<Rhs = Self>: TensorGeometry + Sized
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type AddOutput: TensorRead<DType = Self::DType>;
 
-    fn div<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "div is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type SubOutput: TensorRead<DType = Self::DType>;
 
-    fn log<'a>(&'a self, _base: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "log is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type MulOutput: TensorRead<DType = Self::DType>;
 
-    fn mul<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "mul is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type DivOutput: TensorRead<DType = Self::DType>;
 
-    fn pow<'a>(&'a self, _exp: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "pow is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type PowOutput: TensorRead<DType = Self::DType>;
 
-    fn sub<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sub is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type LogOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Float;
+    type RemOutput: TensorRead<DType = Self::DType>;
 
-    fn rem<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "rem is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn add<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::AddOutput>>;
+
+    fn sub<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::SubOutput>>;
+
+    fn mul<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::MulOutput>>;
+
+    fn div<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::DivOutput>>;
+
+    fn pow<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::PowOutput>>;
+
+    fn log<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LogOutput>>
+    where
+        Self::DType: ha_ndarray::Float;
+
+    fn rem<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::RemOutput>>;
 }
 
-/// Elementwise tensor math operations with scalar arguments.
-pub trait TensorMathScalar: TensorArray + Sized {
-    fn add_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "add_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Lazy elementwise arithmetic with scalar arguments.
+///
+/// Scalars preserve the source's support: implicit sparse zeros stay absent even
+/// when the operation would map zero to a nonzero value. Arithmetic follows
+/// ha-ndarray's numerical contract, including wrapping u8 operations.
+pub trait TensorMathScalar: TensorGeometry {
+    type AddOutput: TensorRead<DType = Self::DType>;
 
-    fn div_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "div_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type SubOutput: TensorRead<DType = Self::DType>;
 
-    fn log_scalar<'a>(&'a self, _base: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "log_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type MulOutput: TensorRead<DType = Self::DType>;
 
-    fn mul_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "mul_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type DivOutput: TensorRead<DType = Self::DType>;
 
-    fn pow_scalar<'a>(&'a self, _exp: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "pow_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type PowOutput: TensorRead<DType = Self::DType>;
 
-    fn rem_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "rem_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type LogOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Float;
 
-    fn sub_scalar<'a>(&'a self, _rhs: Self::DType) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sub_scalar is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type RemOutput: TensorRead<DType = Self::DType>;
+
+    fn add_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::AddOutput>>;
+
+    fn sub_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::SubOutput>>;
+
+    fn mul_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::MulOutput>>;
+
+    fn div_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::DivOutput>>;
+
+    fn pow_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::PowOutput>>;
+
+    fn log_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LogOutput>>
+    where
+        Self::DType: ha_ndarray::Float;
+
+    fn rem_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::RemOutput>>;
 }
 
-/// Axis-wise tensor reductions.
-pub trait TensorReduce: TensorArray + Sized {
-    fn max<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "max reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Lazy elementwise comparisons returning exactly zero or one.
+///
+/// Operands must have matching shapes and dtypes. Sparse expressions retain the
+/// union of original source support; comparisons do not populate absent values.
+/// Floating comparisons follow IEEE unordered-NaN and signed-zero rules.
+pub trait TensorCompare<Rhs = Self>: TensorGeometry
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type EqOutput: TensorRead<DType = u8>;
 
-    fn min<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "min reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type NeOutput: TensorRead<DType = u8>;
 
-    fn product<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "product reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type GtOutput: TensorRead<DType = u8>;
 
-    fn sum<'a>(&'a self, _axes: Axes, _keepdims: bool) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sum reduction is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type GeOutput: TensorRead<DType = u8>;
+
+    type LtOutput: TensorRead<DType = u8>;
+
+    type LeOutput: TensorRead<DType = u8>;
+
+    fn eq<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::EqOutput>>;
+
+    fn ne<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::NeOutput>>;
+
+    fn gt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GtOutput>>;
+
+    fn ge<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GeOutput>>;
+
+    fn lt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LtOutput>>;
+
+    fn le<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LeOutput>>;
 }
 
-/// Scalar tensor reductions.
-pub trait TensorReduceAll: TensorArray {
-    fn max_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "max_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Lazy elementwise comparisons with scalar arguments, returning zero or one.
+///
+/// Source support is preserved: comparing implicit sparse zeros to zero does
+/// not populate them.
+pub trait TensorCompareScalar: TensorGeometry {
+    type EqOutput: TensorRead<DType = u8>;
 
-    fn min_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "min_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type NeOutput: TensorRead<DType = u8>;
 
-    fn product_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "product_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type GtOutput: TensorRead<DType = u8>;
 
-    fn sum_all<'a>(&'a self) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "sum_all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type GeOutput: TensorRead<DType = u8>;
+
+    type LtOutput: TensorRead<DType = u8>;
+
+    type LeOutput: TensorRead<DType = u8>;
+
+    fn eq_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::EqOutput>>;
+
+    fn ne_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::NeOutput>>;
+
+    fn gt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GtOutput>>;
+
+    fn ge_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GeOutput>>;
+
+    fn lt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LtOutput>>;
+
+    fn le_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LeOutput>>;
 }
 
-/// Boolean scalar tensor reductions.
-pub trait TensorReduceBoolean: TensorArray {
-    fn all<'a>(&'a self) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "all is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+/// Lazy elementwise logical operations returning exactly zero or one.
+///
+/// Zero is false; nonzero values, including NaN, are true. These are not bitwise
+/// operations. Shapes and dtypes must match; sparse support is their union.
+pub trait TensorBoolean<Rhs = Self>: TensorGeometry
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type AndOutput: TensorRead<DType = u8>;
 
-    fn any<'a>(&'a self) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "any is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    type OrOutput: TensorRead<DType = u8>;
+
+    type XorOutput: TensorRead<DType = u8>;
+
+    fn and<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::AndOutput>>;
+
+    fn or<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::OrOutput>>;
+
+    fn xor<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::XorOutput>>;
 }
 
-/// Matrix/tensor contraction operations.
-pub trait TensorMatMul: TensorArray + Sized {
-    fn matmul_output_shape(&self, rhs: &Self) -> Result<Shape> {
+/// Lazy elementwise logical operations with scalar arguments.
+///
+/// Zero is false and nonzero is true, including NaN. Results are zero or one;
+/// scalars do not add support to implicit sparse coordinates.
+pub trait TensorBooleanScalar: TensorGeometry {
+    type AndOutput: TensorRead<DType = u8>;
+
+    type OrOutput: TensorRead<DType = u8>;
+
+    type XorOutput: TensorRead<DType = u8>;
+
+    fn and_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::AndOutput>>;
+
+    fn or_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::OrOutput>>;
+
+    fn xor_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::XorOutput>>;
+}
+
+/// Lazy selection with union-of-source-support semantics.
+///
+/// A zero condition selects `or_else`; any nonzero condition selects `then`.
+/// All shapes must match and branch dtypes must match. Both branches are read,
+/// including an unselected branch, and their errors propagate. Sparse support
+/// is the union of the condition and both branches, independent of selection.
+pub trait TensorWhere<Then, Else>: TensorGeometry<DType = u8>
+where
+    Then: TensorGeometry,
+    Else: TensorGeometry<DType = Then::DType>,
+{
+    type Output: TensorRead<DType = Then::DType>;
+
+    fn cond<'a>(&'a self, then: &'a Then, or_else: &'a Else)
+    -> BoxFuture<'a, Result<Self::Output>>;
+}
+
+/// Lazy axis reductions over retained source support, including intermediate zeros.
+/// Empty sparse groups remain absent. Axes are sorted and deduplicated.
+pub trait TensorReduce: TensorGeometry {
+    type SumOutput: TensorRead<DType = Self::DType>;
+
+    type ProductOutput: TensorRead<DType = Self::DType>;
+
+    type MinOutput: TensorRead<DType = Self::DType>;
+
+    type MaxOutput: TensorRead<DType = Self::DType>;
+
+    fn sum(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::SumOutput>>;
+
+    fn product(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::ProductOutput>>;
+
+    fn min(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MinOutput>>;
+
+    fn max(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MaxOutput>>;
+}
+
+/// Terminal reductions over retained source support, not implicit sparse zeros.
+/// Empty support gives sum=0 and product=1; extrema return an error.
+/// Built-in expressions accumulate batches in completion order. Floating results
+/// may depend on scheduling within ha-ndarray's aggregate contract, including
+/// permitted extreme-range differences. The first observed error cancels pending
+/// evaluation; errors have no input-order precedence. Extrema do not short-circuit.
+pub trait TensorReduceAll: TensorRead {
+    fn sum_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
+
+    fn product_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
+
+    fn min_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
+
+    fn max_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
+}
+
+/// Short-circuit boolean reductions over retained source support.
+/// Empty support gives all=true and any=false. Errors after a decisive batch
+/// may remain unobserved; dropping the remaining stream cancels pending work.
+pub trait TensorReduceBoolean: TensorRead {
+    fn all(&self) -> BoxFuture<'_, Result<bool>>;
+
+    fn any(&self) -> BoxFuture<'_, Result<bool>>;
+}
+
+/// Matrix geometry for the final two axes; stored tensors use `.view()`.
+/// Construction is lazy, including when awaited.
+pub trait TensorMatrixUnary: TensorGeometry {
+    type TransposeOutput: TensorRead<DType = Self::DType>;
+
+    type DiagOutput: TensorRead<DType = Self::DType>;
+
+    /// Swap the final two axes, preserving batch axes and existing write constraints.
+    fn mt(&self) -> BoxFuture<'_, Result<Self::TransposeOutput>>;
+
+    /// Extract square matrix diagonals: `[..., N, N]` becomes `[..., N]`.
+    /// Only selected source coordinates contribute support.
+    fn diag(&self) -> BoxFuture<'_, Result<Self::DiagOutput>>;
+}
+
+/// Lazy matrix multiplication with matching dtypes and explicit batch broadcasting.
+///
+/// Shapes must be `[..., M, K]` and `[..., K, N]`, with identical batch dimensions
+/// and rank at least two. The output is `[..., M, N]`; shape/size errors are
+/// rejected before construction. Use transforms to broadcast explicitly.
+/// Sparse output support unions both operands across contraction positions,
+/// retaining supported zero results. See [`crate::MatMulView`] for composition.
+pub trait TensorMatMul<Rhs = Self>: TensorGeometry
+where
+    Rhs: TensorGeometry<DType = Self::DType>,
+{
+    type Output: TensorRead<DType = Self::DType>;
+
+    fn matmul_output_shape(&self, rhs: &Rhs) -> Result<Shape> {
         validate::matmul_output_shape(self.shape(), rhs.shape())
     }
 
-    fn matmul<'a>(&'a self, _rhs: &'a Self) -> BoxFuture<'a, Result<Self>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "matmul is not implemented for this tensor backend".to_string(),
-            ))
-        })
+    fn matmul<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::Output>>;
+}
+
+/// Batch coordinates without expanding the remaining logical range.
+pub(crate) fn coordinate_batches(
+    mut coords: impl Iterator<Item = Vec<u64>>,
+) -> impl Iterator<Item = Vec<Vec<u64>>> {
+    std::iter::from_fn(move || {
+        let batch: Vec<_> = coords
+            .by_ref()
+            .take(crate::expression::MAX_BATCH_ELEMENTS)
+            .collect();
+        (!batch.is_empty()).then_some(batch)
+    })
+}
+
+pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
+    tensor: &V,
+    range: Range,
+    requested_order: Axes,
+) -> Result<validate::RangeCoords> {
+    let base_order: Vec<_> = (0..tensor.ndim()).collect();
+
+    if requested_order.as_slice() != base_order.as_slice() {
+        return Err(Error::UnsupportedSparseIterationOrder {
+            requested_order: requested_order.to_vec(),
+            base_order,
+            hint: "materialize or perform external sort for incompatible order".into(),
+        });
     }
+
+    if !matches!(tensor.layout(), Layout::Sparse { .. }) {
+        return Err(Error::Unsupported(
+            "sparse iteration requires sparse layout".into(),
+        ));
+    }
+
+    crate::schema::validate_shape_dims(tensor.shape())?;
+    // Sparse ranges select a set of coordinates, independent of selection order.
+    let mut range = range;
+
+    for axis in &mut range {
+        if let crate::AxisRange::Of(indices) = axis {
+            indices.sort_unstable();
+            indices.dedup();
+        }
+    }
+
+    validate::iter_range_coords(tensor.shape(), &range)
 }

@@ -22,3 +22,10 @@ target
 
 # Cargo
 Cargo.lock
+
+# Benchmark code is versioned; generated measurements and provenance stay local.
+/benchmarks/results/
+/.slice-benchmark-*/
+
+# Python benchmark runner bytecode
+/benchmarks/__pycache__/
