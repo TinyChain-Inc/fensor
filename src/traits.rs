@@ -714,6 +714,29 @@ pub trait TensorMatrixUnary: TensorGeometry {
     fn diag(&self) -> BoxFuture<'_, Result<Self::DiagOutput>>;
 }
 
+/// Lazy conjugate transpose of the final two axes, preserving batch axes.
+#[cfg(feature = "complex")]
+pub trait TensorMatrixUnaryComplex: TensorGeometry {
+    type HermitianOutput: TensorRead<DType = Self::DType>;
+
+    fn mh(&self) -> BoxFuture<'_, Result<Self::HermitianOutput>>;
+}
+
+/// Bounded, unnormalized last-axis Fourier transforms of complex expressions.
+///
+/// Construction rejects axes exceeding the execution batch limit. Point reads
+/// evaluate the complete corresponding axis group. Any supported input makes
+/// every frequency in that group supported; an empty sparse group stays absent.
+#[cfg(feature = "complex")]
+pub trait TensorFourier: TensorGeometry {
+    type FftOutput: TensorRead<DType = Self::DType>;
+    type IfftOutput: TensorRead<DType = Self::DType>;
+
+    fn fft(&self) -> BoxFuture<'_, Result<Self::FftOutput>>;
+
+    fn ifft(&self) -> BoxFuture<'_, Result<Self::IfftOutput>>;
+}
+
 /// Lazy matrix multiplication with matching dtypes and explicit batch broadcasting.
 ///
 /// Shapes must be `[..., M, K]` and `[..., K, N]`, with identical batch dimensions

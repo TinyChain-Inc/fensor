@@ -7,9 +7,9 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
 
 ## API extensions
 
-- Fourier transforms and conjugate-transpose convenience. All twelve concrete
-  backend dtypes, casts between them, and complex elementwise projections are
-  supported; complex types are opt-in.
+- Fourier transforms beyond the bounded axis-length limit, and frequency shifting
+  after auditing backend shift semantics. Bounded last-axis/2D transforms and
+  conjugate transpose are supported with the optional complex feature.
 - Construction/composition APIs such as constants, ranges, random generation,
   stacking and concatenation, reusing bounded expressions and consumers.
 

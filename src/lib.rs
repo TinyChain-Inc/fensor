@@ -112,12 +112,17 @@ mod traits;
 
 pub mod unary;
 
+#[cfg(feature = "complex")]
+pub mod fft;
+
 mod validate;
 
 mod view;
 
 pub use binary::BinaryView;
 pub use error::{Error, Result};
+#[cfg(feature = "complex")]
+pub use fft::FourierView;
 pub use ha_ndarray::Axes;
 #[cfg(feature = "complex")]
 pub use ha_ndarray::complex;
@@ -131,8 +136,6 @@ pub use schema::{
     contiguous_strides,
 };
 pub use selection::WhereView;
-#[cfg(feature = "complex")]
-pub use traits::TensorComplex;
 pub use traits::{
     BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray,
     TensorBlockStore, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
@@ -142,6 +145,8 @@ pub use traits::{
     TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite, TensorWriteBulk,
     ValueBlockStream,
 };
+#[cfg(feature = "complex")]
+pub use traits::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};
 
 pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 pub use unary::UnaryView;

@@ -46,6 +46,11 @@ checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
 
 ## Concrete dtype coverage
 
+- `fourier` owns complex conjugate transpose, independent forward/inverse Fourier
+  expectations, propagated round-trip bounds, consumer parity, sparse group support,
+  output transforms, corruption and axis-limit rejection. Fourier unit tests own
+  complete-group packing, duplicate scatter, and dense support-mask omission.
+
 - `dtype_storage`: all concrete dtypes in dense/sparse storage, spill/reload,
   write-through, zero lifecycle, copy persistence, malformed blocks, and typed
   metadata mismatch, concrete tensor/view/schema classes, typed metadata shape,

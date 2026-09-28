@@ -58,6 +58,8 @@ Unsupported or abstract number classes are rejected during schema construction.
 | `TensorReduceBoolean` | `all`, `any` | Any supported dtype → bool |
 | `TensorReduce` | `sum`, `product`; `min`, `max` | Any supported dtype; extrema require real inputs → same dtype |
 | `TensorMatrixUnary` | `mt`, `diag` | Any supported dtype → same dtype |
+| `TensorMatrixUnaryComplex` | `mh` | Complex → same dtype |
+| `TensorFourier`; `fft::fft2`, `fft::ifft2` | Last-axis and final-two-axis Fourier transforms | Complex → same dtype; bounded axis lengths |
 | `TensorMatMul` | `matmul` | Matching supported dtypes → same dtype |
 
 Arithmetic methods borrow operands and are asynchronous. Elementwise tensor
@@ -166,6 +168,20 @@ intermediate zeros; off-diagonal values do not populate the result. Transforms
 on a diagonal view address its output, and further operations remain lazy.
 Selected reads visit the requested diagonal coordinates; a complete sparse scan
 still scales with logical diagonal length. Neither operation persists results.
+
+With the `complex` feature, `mh()` composes matrix transpose and conjugation.
+`fft()` and `ifft()` transform each last-axis group independently;
+`fensor::fft::fft2(&view)` and `ifft2(&view)` compose transforms over the final
+two axes. All are lazy and read-only. Transforms are unnormalized: inverse after
+forward scales by the axis length, or the product of both lengths for 2D.
+
+Each transformed axis must fit the execution limit in the
+[bound table](DESIGN.md#bound-and-policy-constants); construction rejects longer
+axes. Even a point read evaluates a complete axis group. Sparse absent inputs
+contribute zero, while any supported input supports every frequency in its group,
+including results that cancel to zero. Completely empty groups remain absent.
+Nested and 2D transforms may recompute groups; bounded memory does not imply
+optimal transform throughput.
 
 ## Streams, bounds, and concurrency
 

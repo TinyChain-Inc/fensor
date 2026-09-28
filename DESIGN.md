@@ -27,6 +27,19 @@ cache, shared cursor, or expression registry is part of execution.
 
 ## Requests and evaluation
 
+Fourier views are bounded evaluation boundaries like reductions and matrix
+products. Each transformed axis is capped at `MAX_BATCH_ELEMENTS`; complete
+axis groups pack into requests within that same limit. Request-sized group keys
+and scatter positions retain output order and duplicates. Source packs execute
+sequentially inside the outer consumer, using the shared evaluator and backend
+buffer FFT. Backend planning and scratch allocations are bounded by the capped
+transform size, separately from fensor's input/output batches.
+
+Output transforms map back to original Fourier groups. Sparse group support is
+the union of input support, independent of numerical results. Two-dimensional
+transforms compose these boundaries; nested evaluation can recompute earlier
+groups and has no result cache or intermediate files.
+
 The private expression contract accepts one `BatchRequest` containing at most
 `MAX_BATCH_ELEMENTS` logical elements:
 
@@ -203,7 +216,7 @@ do not couple independent bounds.
 
 | Meaning | Owner / constant | Current value |
 |---|---|---:|
-| Execution elements | `expression::MAX_BATCH_ELEMENTS` | 4096 |
+| Execution elements / Fourier axis length | `expression::MAX_BATCH_ELEMENTS` | 4096 |
 | Sparse-index page entries | `tensor::SPARSE_INDEX_PAGE_ENTRIES` | 4096 |
 | Values per storage block | `schema::MAX_BLOCK_CAPACITY` | 4096 |
 | Sparse-index leaf bytes | `schema::SPARSE_INDEX_BLOCK_BYTES` | 4096 |
