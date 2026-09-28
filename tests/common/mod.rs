@@ -2,6 +2,8 @@
 //!
 //! Provides an `FsEntry` adapter for `freqfs::Cache`, a unique-tmpdir helper,
 //! and a small `iter_coords` walker reused by the access-layer test matrix.
+//! Payload tags and complex component pairs belong to this adapter only. Complex
+//! encoding's temporary pair vector is bounded by the stored block's capacity.
 
 #![allow(dead_code)]
 
@@ -18,6 +20,8 @@ pub mod counters;
 
 pub mod fixture;
 
+pub mod numbers;
+
 #[derive(Clone, Debug)]
 pub enum FsEntry {
     Node(Node<u64>),
@@ -27,6 +31,28 @@ pub enum FsEntry {
     F64(Vec<f64>),
     MetadataU8(fensor::TensorMetadata<u8>),
     MetadataF64(fensor::TensorMetadata<f64>),
+    U16(Vec<u16>),
+    MetadataU16(fensor::TensorMetadata<u16>),
+    U32(Vec<u32>),
+    MetadataU32(fensor::TensorMetadata<u32>),
+    U64(Vec<u64>),
+    MetadataU64(fensor::TensorMetadata<u64>),
+    I8(Vec<i8>),
+    MetadataI8(fensor::TensorMetadata<i8>),
+    I16(Vec<i16>),
+    MetadataI16(fensor::TensorMetadata<i16>),
+    I32(Vec<i32>),
+    MetadataI32(fensor::TensorMetadata<i32>),
+    I64(Vec<i64>),
+    MetadataI64(fensor::TensorMetadata<i64>),
+    #[cfg(feature = "complex")]
+    C32(Vec<fensor::complex::Complex32>),
+    #[cfg(feature = "complex")]
+    MetadataC32(fensor::TensorMetadata<fensor::complex::Complex32>),
+    #[cfg(feature = "complex")]
+    C64(Vec<fensor::complex::Complex64>),
+    #[cfg(feature = "complex")]
+    MetadataC64(fensor::TensorMetadata<fensor::complex::Complex64>),
 }
 
 impl<'en> en::ToStream<'en> for FsEntry {
@@ -35,6 +61,34 @@ impl<'en> en::ToStream<'en> for FsEntry {
         encoder: E,
     ) -> std::result::Result<E::Ok, E::Error> {
         match self {
+            Self::U16(value) => en::IntoStream::into_stream((7u8, value), encoder),
+            Self::MetadataU16(value) => en::IntoStream::into_stream((8u8, value), encoder),
+            Self::U32(value) => en::IntoStream::into_stream((9u8, value), encoder),
+            Self::MetadataU32(value) => en::IntoStream::into_stream((10u8, value), encoder),
+            Self::U64(value) => en::IntoStream::into_stream((11u8, value), encoder),
+            Self::MetadataU64(value) => en::IntoStream::into_stream((12u8, value), encoder),
+            Self::I8(value) => en::IntoStream::into_stream((13u8, value), encoder),
+            Self::MetadataI8(value) => en::IntoStream::into_stream((14u8, value), encoder),
+            Self::I16(value) => en::IntoStream::into_stream((15u8, value), encoder),
+            Self::MetadataI16(value) => en::IntoStream::into_stream((16u8, value), encoder),
+            Self::I32(value) => en::IntoStream::into_stream((17u8, value), encoder),
+            Self::MetadataI32(value) => en::IntoStream::into_stream((18u8, value), encoder),
+            Self::I64(value) => en::IntoStream::into_stream((19u8, value), encoder),
+            Self::MetadataI64(value) => en::IntoStream::into_stream((20u8, value), encoder),
+            #[cfg(feature = "complex")]
+            Self::C32(value) => en::IntoStream::into_stream(
+                (21u8, value.iter().map(|z| (z.re, z.im)).collect::<Vec<_>>()),
+                encoder,
+            ),
+            #[cfg(feature = "complex")]
+            Self::MetadataC32(value) => en::IntoStream::into_stream((22u8, value), encoder),
+            #[cfg(feature = "complex")]
+            Self::C64(value) => en::IntoStream::into_stream(
+                (23u8, value.iter().map(|z| (z.re, z.im)).collect::<Vec<_>>()),
+                encoder,
+            ),
+            #[cfg(feature = "complex")]
+            Self::MetadataC64(value) => en::IntoStream::into_stream((24u8, value), encoder),
             Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
             Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
             Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
@@ -67,6 +121,40 @@ impl de::Visitor for FsEntryVisitor {
             4 => FsEntry::F64(seq.expect_next(()).await?),
             5 => FsEntry::MetadataU8(seq.expect_next(()).await?),
             6 => FsEntry::MetadataF64(seq.expect_next(()).await?),
+            7 => FsEntry::U16(seq.expect_next(()).await?),
+            8 => FsEntry::MetadataU16(seq.expect_next(()).await?),
+            9 => FsEntry::U32(seq.expect_next(()).await?),
+            10 => FsEntry::MetadataU32(seq.expect_next(()).await?),
+            11 => FsEntry::U64(seq.expect_next(()).await?),
+            12 => FsEntry::MetadataU64(seq.expect_next(()).await?),
+            13 => FsEntry::I8(seq.expect_next(()).await?),
+            14 => FsEntry::MetadataI8(seq.expect_next(()).await?),
+            15 => FsEntry::I16(seq.expect_next(()).await?),
+            16 => FsEntry::MetadataI16(seq.expect_next(()).await?),
+            17 => FsEntry::I32(seq.expect_next(()).await?),
+            18 => FsEntry::MetadataI32(seq.expect_next(()).await?),
+            19 => FsEntry::I64(seq.expect_next(()).await?),
+            20 => FsEntry::MetadataI64(seq.expect_next(()).await?),
+            #[cfg(feature = "complex")]
+            21 => FsEntry::C32(
+                seq.expect_next::<Vec<(f32, f32)>>(())
+                    .await?
+                    .into_iter()
+                    .map(|(re, im)| fensor::complex::Complex32::new(re, im))
+                    .collect(),
+            ),
+            #[cfg(feature = "complex")]
+            22 => FsEntry::MetadataC32(seq.expect_next(()).await?),
+            #[cfg(feature = "complex")]
+            23 => FsEntry::C64(
+                seq.expect_next::<Vec<(f64, f64)>>(())
+                    .await?
+                    .into_iter()
+                    .map(|(re, im)| fensor::complex::Complex64::new(re, im))
+                    .collect(),
+            ),
+            #[cfg(feature = "complex")]
+            24 => FsEntry::MetadataC64(seq.expect_next(()).await?),
             tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
         };
 
@@ -96,6 +184,45 @@ as_type!(FsEntry, U8, Vec<u8>);
 as_type!(FsEntry, F64, Vec<f64>);
 as_type!(FsEntry, MetadataU8, fensor::TensorMetadata<u8>);
 as_type!(FsEntry, MetadataF64, fensor::TensorMetadata<f64>);
+
+as_type!(FsEntry, U16, Vec<u16>);
+as_type!(FsEntry, MetadataU16, fensor::TensorMetadata<u16>);
+
+as_type!(FsEntry, U32, Vec<u32>);
+as_type!(FsEntry, MetadataU32, fensor::TensorMetadata<u32>);
+
+as_type!(FsEntry, U64, Vec<u64>);
+as_type!(FsEntry, MetadataU64, fensor::TensorMetadata<u64>);
+
+as_type!(FsEntry, I8, Vec<i8>);
+as_type!(FsEntry, MetadataI8, fensor::TensorMetadata<i8>);
+
+as_type!(FsEntry, I16, Vec<i16>);
+as_type!(FsEntry, MetadataI16, fensor::TensorMetadata<i16>);
+
+as_type!(FsEntry, I32, Vec<i32>);
+as_type!(FsEntry, MetadataI32, fensor::TensorMetadata<i32>);
+
+as_type!(FsEntry, I64, Vec<i64>);
+as_type!(FsEntry, MetadataI64, fensor::TensorMetadata<i64>);
+
+#[cfg(feature = "complex")]
+as_type!(FsEntry, C32, Vec<fensor::complex::Complex32>);
+#[cfg(feature = "complex")]
+as_type!(
+    FsEntry,
+    MetadataC32,
+    fensor::TensorMetadata<fensor::complex::Complex32>
+);
+
+#[cfg(feature = "complex")]
+as_type!(FsEntry, C64, Vec<fensor::complex::Complex64>);
+#[cfg(feature = "complex")]
+as_type!(
+    FsEntry,
+    MetadataC64,
+    fensor::TensorMetadata<fensor::complex::Complex64>
+);
 
 pub fn unique_tmp_dir(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();

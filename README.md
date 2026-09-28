@@ -32,34 +32,41 @@ exact block shape. Sparse copies omit final zeros and reset the axis hint to `No
 
 ## Supported operations
 
-Stored types are `u8`, `f32`, and `f64`; u8 accepts the full range 0–255. Schema
+Stored types are `u8/u16/u32/u64`, `i8/i16/i32/i64`, and `f32/f64`.
+The optional `complex` feature adds `fensor::complex::{Complex32, Complex64}`,
+with f32 and f64 components respectively. Boolean outputs use u8, which accepts
+the full range 0–255; native bool and abstract number classes are not storage types. Schema
 and geometry metadata use number-general's `NumberType`, re-exported by fensor.
 `TensorGeometry::DType` names the Rust element type; `dtype()` returns its class.
 Unsupported or abstract number classes are rejected during schema construction.
 
 | Trait | Operations | Input → output |
 |---|---|---|
-| `TensorUnary` | `exp`, `ln`, `round` | f32/f64 → same dtype |
-| `TensorAbs` | `abs` | u8/f32/f64 → same dtype |
-| `TensorTrig` | `sin`, `asin`, `sinh`, `cos`, `acos`, `cosh`, `tan`, `atan`, `tanh` | f32/f64 → same dtype |
-| `TensorCast<f64>` | `cast` | f32 → f64 |
-| `TensorUnaryBoolean` | `not` | u8/f32/f64 → u8 |
-| `TensorNumeric` | `is_nan`, `is_inf` | f32/f64 → u8 |
-| `TensorMath`, `TensorMathScalar` | `add`, `sub`, `mul`, `div`, `pow`, `rem`; `_scalar` variants | Matching u8/f32/f64 → same dtype |
-| `TensorMath`, `TensorMathScalar` | `log`, `log_scalar` (value, base) | Matching f32/f64 → same dtype |
-| `TensorCompare`, `TensorCompareScalar` | `eq`, `ne`, `gt`, `ge`, `lt`, `le`; `_scalar` variants | Matching u8/f32/f64 → u8 |
-| `TensorBoolean`, `TensorBooleanScalar` | `and`, `or`, `xor`; `_scalar` variants | Matching u8/f32/f64 → u8 |
+| `TensorUnary` | `exp`, `ln`; `round` | Float/complex → same dtype; round is real-float only |
+| `TensorAbs` | `abs` | Real → same dtype; complex → component real dtype |
+| `TensorTrig` | `sin`, `asin`, `sinh`, `cos`, `acos`, `cosh`, `tan`, `atan`, `tanh` | Float/complex → same dtype |
+| `TensorCast<To>` | `cast` | Any supported concrete dtype → any supported concrete dtype |
+| `TensorComplex` | `conj`; `re`, `im`, `angle` | Complex → complex; complex → component real dtype |
+| `TensorUnaryBoolean` | `not` | Any supported dtype → u8 |
+| `TensorNumeric` | `is_nan`, `is_inf` | Float/complex → u8 |
+| `TensorMath`, `TensorMathScalar` | `add`, `sub`, `mul`, `div`, `pow`; `_scalar` variants | Matching supported dtypes → same dtype |
+| `TensorMath`, `TensorMathScalar` | `rem`, `rem_scalar`; `log`, `log_scalar` (value, base) | Matching real dtypes; matching float/complex dtypes |
+| `TensorCompare`, `TensorCompareScalar` | `eq`, `ne`; `gt`, `ge`, `lt`, `le`; `_scalar` variants | Matching supported dtypes; ordering requires real inputs → u8 |
+| `TensorBoolean`, `TensorBooleanScalar` | `and`, `or`, `xor`; `_scalar` variants | Matching supported dtypes → u8 |
 | `TensorWhere` | `condition.cond(&then, &or_else)` | u8 condition; matching branches → branch dtype |
-| `TensorReduceAll` | `sum_all`, `product_all`, `min_all`, `max_all` | u8/f32/f64 → scalar of same dtype |
-| `TensorReduceBoolean` | `all`, `any` | u8/f32/f64 → bool |
-| `TensorReduce` | `sum`, `product`, `min`, `max` | u8/f32/f64 → lazy view of same dtype |
-| `TensorMatrixUnary` | `mt`, `diag` | u8/f32/f64 → same dtype |
-| `TensorMatMul` | `matmul` | Matching u8/f32/f64 → same dtype |
+| `TensorReduceAll` | `sum_all`, `product_all`; `min_all`, `max_all` | Any supported dtype; extrema require real inputs → same scalar dtype |
+| `TensorReduceBoolean` | `all`, `any` | Any supported dtype → bool |
+| `TensorReduce` | `sum`, `product`; `min`, `max` | Any supported dtype; extrema require real inputs → same dtype |
+| `TensorMatrixUnary` | `mt`, `diag` | Any supported dtype → same dtype |
+| `TensorMatMul` | `matmul` | Matching supported dtypes → same dtype |
 
 Arithmetic methods borrow operands and are asynchronous. Elementwise tensor
 operands must have identical shapes and dtypes; scalar arguments match the source
-dtype. Broadcasting and casts are explicit. Only f32-to-f64 casting is supported;
-operations before and after that cast execute in their respective dtypes.
+dtype. Broadcasting and casts are explicit, including identity and narrowing casts.
+Select the destination through the result type or `TensorCast::<To>::cast(&view)`;
+operations before and after a cast execute in their respective dtypes.
+Conversions follow number-general's pipeline, including intermediate widths:
+for example, -1i8 → u64 yields 255, while -1f64 → u8 yields zero.
 Unary composition nests sources, for example
 `UnaryView<UnaryView<Source, Round>, Exp>`. Public operation markers live in
 `unary`, `binary`, `scalar`, and `reduce`.
@@ -71,11 +78,14 @@ the output geometry instead of moving through the aggregate. Rank-zero views
 cannot be streamed or copied. Empty-dimension tensor storage is unsupported.
 
 Numerical rules belong to [ha-ndarray](../ha-ndarray/NUMERICS.md). In particular,
-u8 arithmetic wraps and integer division/remainder by zero return zero. Floats
+integer arithmetic wraps at its dtype width and integer division/remainder by zero return zero. Floats
 retain backend NaN, infinity, signed-zero, and underflow behavior without domain
 clamping. Logical operations return exactly u8 0/1: zero is false, and nonzero
 values, including NaN, are true. Comparisons follow IEEE unordered-NaN rules.
-Backend validation status belongs to ha-ndarray, not this crate's test results.
+Complex operations retain the backend's principal branches; complex predicates
+inspect either component, and complex zero requires both components to be zero.
+`mt` transposes without conjugation. Backend validation status belongs to
+ha-ndarray, not this crate's test results.
 
 ## Sparse support
 
@@ -219,6 +229,10 @@ sequential. Validation/error handling is non-transactional: failures propagate a
 can leave partial output, with no guaranteed write prefix or concurrent-error
 precedence. Synchronization and cleanup remain caller responsibilities.
 
+Element types need no destream implementation: adapters encode their payloads,
+including any complex component representation. fensor's typed metadata remains
+codec-neutral and encodes geometry only.
+
 The freqfs cache accounts for block payload bytes and applies admission backpressure
 through eviction/spill. Configure cache capacity, minimum free disk space, and
 admission wait in freqfs; oversized files, exhausted admission deadlines, and disk
@@ -229,6 +243,14 @@ fewer delivery stalls do not guarantee faster copying. See [benchmark methodolog
 and interpretation](BENCHMARKS.md).
 
 ## Compatibility notes
+
+- The default build supports ten real dtypes; enable `complex` for the two native
+  complex types. Existing metadata and adapter formats are unchanged; adapters
+  must explicitly support new payload types.
+- `TensorElement` no longer requires value serialization traits. `TensorAbs`
+  reports the backend absolute-value dtype, and real-only operation bounds now
+  apply to individual methods/associated outputs. Generic callers must state
+  these bounds where needed. Cast destinations may now need an explicit annotation.
 
 - Logical geometry now uses `u64`: import `Shape`, `Strides`, `Range`, and
   `AxisRange` from fensor, and use the re-exported `Axes` for axis identifiers.

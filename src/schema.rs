@@ -1,7 +1,7 @@
 use std::io;
 
 use b_table::{IndexSchema, Schema};
-use number_general::{FloatType, NumberType, UIntType};
+use number_general::{FloatType, IntType, NumberType, UIntType};
 use smallvec::SmallVec;
 
 use crate::{Error, PORTABLE_INLINE_RANK, Result as FResult};
@@ -49,10 +49,17 @@ pub struct TensorSchema {
 
 impl TensorSchema {
     pub fn new(dtype: NumberType, shape: Shape) -> FResult<Self> {
-        if !matches!(
-            dtype,
-            NumberType::UInt(UIntType::U8) | NumberType::Float(FloatType::F32 | FloatType::F64)
-        ) {
+        let supported = match dtype {
+            NumberType::UInt(UIntType::U8 | UIntType::U16 | UIntType::U32 | UIntType::U64)
+            | NumberType::Int(IntType::I8 | IntType::I16 | IntType::I32 | IntType::I64)
+            | NumberType::Float(FloatType::F32 | FloatType::F64) => true,
+            #[cfg(feature = "complex")]
+            NumberType::Complex(
+                number_general::ComplexType::C32 | number_general::ComplexType::C64,
+            ) => true,
+            _ => false,
+        };
+        if !supported {
             return Err(Error::InvalidSchema(format!(
                 "unsupported tensor dtype: {dtype}"
             )));

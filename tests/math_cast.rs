@@ -108,23 +108,24 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
             .await
             .unwrap();
     }
-    let expression = tensor
-        .view()
-        .transpose(None)
-        .unwrap()
-        .sin()
-        .await
-        .unwrap()
-        .flip(0)
-        .unwrap()
-        .cast()
-        .await
-        .unwrap()
-        .exp()
-        .await
-        .unwrap()
-        .squeeze(axes![1])
-        .unwrap();
+    let expression = TensorCast::<f64>::cast(
+        &(tensor
+            .view()
+            .transpose(None)
+            .unwrap()
+            .sin()
+            .await
+            .unwrap()
+            .flip(0)
+            .unwrap()),
+    )
+    .await
+    .unwrap()
+    .exp()
+    .await
+    .unwrap()
+    .squeeze(axes![1])
+    .unwrap();
     let mut dropped = expression.read_blocks().unwrap();
     assert_eq!(dropped.try_next().await.unwrap().unwrap().len(), 4096);
     drop(dropped);
@@ -177,12 +178,7 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
     .await
     .unwrap();
     tensor.write_value(&[1, 2], 0.2).await.unwrap();
-    let expression = tensor
-        .view()
-        .round()
-        .await
-        .unwrap()
-        .cast()
+    let expression = TensorCast::<f64>::cast(&(tensor.view().round().await.unwrap()))
         .await
         .unwrap()
         .transpose(None)

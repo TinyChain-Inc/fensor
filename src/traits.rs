@@ -259,13 +259,17 @@ pub trait TensorUnary: TensorGeometry + Sized {
 
     type LnOutput: TensorRead<DType = Self::DType>;
 
-    type RoundOutput: TensorRead<DType = Self::DType>;
+    type RoundOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Real;
 
     fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>>;
 
     fn ln(&self) -> BoxFuture<'_, Result<Self::LnOutput>>;
 
-    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>;
+    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 }
 
 /// Logical negation evaluated only on original support for sparse tensors.
@@ -314,7 +318,9 @@ pub trait TensorNumeric: TensorGeometry + Sized {
     fn is_inf(&self) -> BoxFuture<'_, Result<Self::IsInfOutput>>;
 }
 
-/// Lazy element-type conversion. Currently supports f32 to f64.
+/// Lazy conversion between supported concrete element types, including narrowing.
+/// Uses ha-ndarray's number-general conversion pipeline, not Rust `as` casts.
+/// Select the destination with result typing or `TensorCast::<To>::cast(&source)`.
 ///
 /// The destination storage adapter need only support the output dtype:
 ///
@@ -337,9 +343,9 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// }
 /// ```
 ///
-/// Narrowing is not supported:
+/// Narrowing follows the backend conversion contract:
 ///
-/// ```compile_fail,E0277
+/// ```
 /// use fensor::{Tensor, TensorCast, TensorFileEntry};
 /// async fn narrow<FE: TensorFileEntry<f64>>(source: &Tensor<FE, f64>) {
 ///     let _ = TensorCast::<f32>::cast(&source.view()).await;
@@ -351,9 +357,12 @@ pub trait TensorCast<To: crate::TensorElement>: TensorGeometry + Sized {
     fn cast(&self) -> BoxFuture<'_, Result<Self::Output>>;
 }
 
-/// Elementwise absolute value preserving the stored element type.
-pub trait TensorAbs: TensorGeometry + Sized {
-    type Output: TensorRead<DType = Self::DType>;
+/// Elementwise absolute value; complex magnitudes have the component's real dtype.
+pub trait TensorAbs: TensorGeometry + Sized
+where
+    Self::DType: ha_ndarray::Number,
+{
+    type Output: TensorRead<DType = <Self::DType as ha_ndarray::Number>::Abs>;
 
     fn abs(&self) -> BoxFuture<'_, Result<Self::Output>>;
 }
@@ -415,7 +424,9 @@ where
     type LogOutput: TensorRead<DType = Self::DType>
     where
         Self::DType: ha_ndarray::Float;
-    type RemOutput: TensorRead<DType = Self::DType>;
+    type RemOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Real;
 
     fn add<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::AddOutput>>;
 
@@ -431,7 +442,9 @@ where
     where
         Self::DType: ha_ndarray::Float;
 
-    fn rem<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::RemOutput>>;
+    fn rem<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::RemOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 }
 
 /// Lazy elementwise arithmetic with scalar arguments.
@@ -454,7 +467,9 @@ pub trait TensorMathScalar: TensorGeometry {
     where
         Self::DType: ha_ndarray::Float;
 
-    type RemOutput: TensorRead<DType = Self::DType>;
+    type RemOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Real;
 
     fn add_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::AddOutput>>;
 
@@ -470,7 +485,9 @@ pub trait TensorMathScalar: TensorGeometry {
     where
         Self::DType: ha_ndarray::Float;
 
-    fn rem_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::RemOutput>>;
+    fn rem_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::RemOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 }
 
 /// Lazy elementwise comparisons returning exactly zero or one.
@@ -486,25 +503,41 @@ where
 
     type NeOutput: TensorRead<DType = u8>;
 
-    type GtOutput: TensorRead<DType = u8>;
+    type GtOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    type GeOutput: TensorRead<DType = u8>;
+    type GeOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    type LtOutput: TensorRead<DType = u8>;
+    type LtOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    type LeOutput: TensorRead<DType = u8>;
+    type LeOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
     fn eq<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::EqOutput>>;
 
     fn ne<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::NeOutput>>;
 
-    fn gt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GtOutput>>;
+    fn gt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GtOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn ge<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GeOutput>>;
+    fn ge<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GeOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn lt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LtOutput>>;
+    fn lt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LtOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn le<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LeOutput>>;
+    fn le<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LeOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 }
 
 /// Lazy elementwise comparisons with scalar arguments, returning zero or one.
@@ -516,25 +549,41 @@ pub trait TensorCompareScalar: TensorGeometry {
 
     type NeOutput: TensorRead<DType = u8>;
 
-    type GtOutput: TensorRead<DType = u8>;
+    type GtOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    type GeOutput: TensorRead<DType = u8>;
+    type GeOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    type LtOutput: TensorRead<DType = u8>;
+    type LtOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    type LeOutput: TensorRead<DType = u8>;
+    type LeOutput: TensorRead<DType = u8>
+    where
+        Self::DType: ha_ndarray::Real;
 
     fn eq_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::EqOutput>>;
 
     fn ne_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::NeOutput>>;
 
-    fn gt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GtOutput>>;
+    fn gt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GtOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn ge_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GeOutput>>;
+    fn ge_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GeOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn lt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LtOutput>>;
+    fn lt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LtOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn le_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LeOutput>>;
+    fn le_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LeOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 }
 
 /// Lazy elementwise logical operations returning exactly zero or one.
@@ -600,17 +649,25 @@ pub trait TensorReduce: TensorGeometry {
 
     type ProductOutput: TensorRead<DType = Self::DType>;
 
-    type MinOutput: TensorRead<DType = Self::DType>;
+    type MinOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    type MaxOutput: TensorRead<DType = Self::DType>;
+    type MaxOutput: TensorRead<DType = Self::DType>
+    where
+        Self::DType: ha_ndarray::Real;
 
     fn sum(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::SumOutput>>;
 
     fn product(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::ProductOutput>>;
 
-    fn min(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MinOutput>>;
+    fn min(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MinOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn max(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MaxOutput>>;
+    fn max(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MaxOutput>>
+    where
+        Self::DType: ha_ndarray::Real;
 }
 
 /// Terminal reductions over retained source support, not implicit sparse zeros.
@@ -624,9 +681,13 @@ pub trait TensorReduceAll: TensorRead {
 
     fn product_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
 
-    fn min_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
+    fn min_all(&self) -> BoxFuture<'_, Result<Self::DType>>
+    where
+        Self::DType: ha_ndarray::Real;
 
-    fn max_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
+    fn max_all(&self) -> BoxFuture<'_, Result<Self::DType>>
+    where
+        Self::DType: ha_ndarray::Real;
 }
 
 /// Short-circuit boolean reductions over retained source support.
@@ -719,4 +780,90 @@ pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
     }
 
     validate::iter_range_coords(tensor.shape(), &range)
+}
+
+/// Complex elementwise projections, retaining source support.
+///
+/// Descriptions clone without requiring adapters to clone. Only the destination
+/// adapter must support the real output of a component projection:
+///
+/// ```
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorComplex, TensorCast, TensorRead};
+/// async fn project<A: TensorFileEntry<Complex32>, B: TensorFileEntry<f64>>(
+///     source: &Tensor<A, Complex32>, dir: freqfs::DirLock<B>,
+/// ) -> fensor::Result<Tensor<B, f64>> {
+///     let real = source.view().conj().await?.re().await?.clone();
+///     let widened = TensorCast::<f64>::cast(&real).await?;
+///     Tensor::copy_from(dir, &widened, 16).await
+/// }
+/// ```
+///
+/// Complex projections remain read-only:
+///
+/// ```compile_fail
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorComplex, TensorWrite};
+/// fn writable<V: TensorWrite>(_: V) {}
+/// async fn example<F: TensorFileEntry<Complex32>>(t: &Tensor<F, Complex32>) {
+///     writable(t.view().re().await.unwrap());
+/// }
+/// ```
+///
+/// Complex ordering and extrema are unavailable; equality and sum/product remain supported:
+///
+/// ```compile_fail
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorCompare};
+/// async fn example<F: TensorFileEntry<Complex32>>(t: &Tensor<F, Complex32>) {
+///     let _ = t.view().gt(&t.view()).await;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorReduceAll};
+/// async fn example<F: TensorFileEntry<Complex32>>(t: &Tensor<F, Complex32>) {
+///     let _ = t.min_all().await;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorReduce, Axes};
+/// async fn example<F: TensorFileEntry<Complex32>>(t: &Tensor<F, Complex32>) {
+///     let _ = t.view().max(Axes::new(), false).await;
+/// }
+/// ```
+///
+/// Remainder and rounding also require real data:
+///
+/// ```compile_fail
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorMathScalar};
+/// async fn example<F: TensorFileEntry<Complex32>>(t: &Tensor<F, Complex32>) {
+///     let _ = t.view().rem_scalar(Complex32::new(1., 0.)).await;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorUnary};
+/// async fn example<F: TensorFileEntry<Complex32>>(t: &Tensor<F, Complex32>) {
+///     let _ = t.view().round().await;
+/// }
+/// ```
+#[cfg(feature = "complex")]
+pub trait TensorComplex: TensorGeometry + Sized
+where
+    Self::DType: ha_ndarray::Complex,
+{
+    type ConjOutput: TensorRead<DType = Self::DType>;
+
+    type ReOutput: TensorRead<DType = <Self::DType as ha_ndarray::Complex>::Real>;
+
+    type ImOutput: TensorRead<DType = <Self::DType as ha_ndarray::Complex>::Real>;
+
+    type AngleOutput: TensorRead<DType = <Self::DType as ha_ndarray::Complex>::Real>;
+
+    fn conj(&self) -> BoxFuture<'_, Result<Self::ConjOutput>>;
+
+    fn re(&self) -> BoxFuture<'_, Result<Self::ReOutput>>;
+
+    fn im(&self) -> BoxFuture<'_, Result<Self::ImOutput>>;
+
+    fn angle(&self) -> BoxFuture<'_, Result<Self::AngleOutput>>;
 }

@@ -3,6 +3,8 @@
 use std::marker::PhantomData;
 
 use futures::{StreamExt, TryStreamExt};
+#[cfg(feature = "complex")]
+use ha_ndarray::NDArrayComplex;
 use ha_ndarray::{
     ArrayAccess, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayTrig, NDArrayUnary,
     NDArrayUnaryBoolean,
@@ -42,7 +44,9 @@ macro_rules! unary_op {
 
         impl sealed::Sealed for $name {}
 
-        impl<$ty: $($bounds)+> UnaryOp<$ty> for $name {
+        impl<$ty: $($bounds)+> UnaryOp<$ty> for $name
+        where $output: TensorElement,
+        {
             type Output = $output;
 
             fn apply(
@@ -71,8 +75,8 @@ unary_op!(
 );
 
 unary_op!(
-    /// Elementwise absolute value.
-    Abs, abs, T: [TensorElement + ha_ndarray::Number<Abs = T>] => T
+    /// Elementwise absolute value, returning real magnitudes for complex inputs.
+    Abs, abs, T: [TensorElement] => T::Abs
 );
 
 unary_op!(
@@ -135,16 +139,16 @@ unary_op!(
     IsInf, is_inf, T: [TensorElement + ha_ndarray::Float] => u8
 );
 
-/// Element-type conversion; currently only `Cast<f64>` on f32 is supported.
+/// Element-type conversion using the backend's number-general cast pipeline.
 #[derive(Clone, Copy, Debug)]
 pub struct Cast<To>(PhantomData<To>);
 
-impl sealed::Sealed for Cast<f64> {}
+impl<To: TensorElement> sealed::Sealed for Cast<To> {}
 
-impl UnaryOp<f32> for Cast<f64> {
-    type Output = f64;
+impl<From: TensorElement, To: TensorElement> UnaryOp<From> for Cast<To> {
+    type Output = To;
 
-    fn apply(&self, array: ArrayAccess<'static, f32>) -> Result<ArrayAccess<'static, f64>> {
+    fn apply(&self, array: ArrayAccess<'static, From>) -> Result<ArrayAccess<'static, To>> {
         Ok(ArrayAccess::from(array.cast()?))
     }
 }
@@ -158,7 +162,8 @@ impl UnaryOp<f32> for Cast<f64> {
 /// use fensor::{Tensor, TensorAbs, TensorCast, TensorFileEntry, TensorNumeric, TensorTransform, TensorTrig, TensorUnary, TensorWrite};
 /// fn requires_write<V: TensorWrite>(_: &V) {}
 /// async fn computed_is_read_only<FE: TensorFileEntry<f32>>(tensor: &Tensor<FE, f32>) {
-///     let computed = tensor.view().abs().await.unwrap().cast().await.unwrap().cos().await.unwrap().exp().await.unwrap().is_nan().await.unwrap()
+///     let cast = TensorCast::<f64>::cast(&tensor.view().abs().await.unwrap()).await.unwrap();
+///     let computed = cast.cos().await.unwrap().exp().await.unwrap().is_nan().await.unwrap()
 ///         .transpose(None).unwrap();
 ///     requires_write(&computed);
 /// }
@@ -172,7 +177,8 @@ impl UnaryOp<f32> for Cast<f64> {
 /// async fn geometric_is_writable<FE: TensorFileEntry<f32>>(tensor: &Tensor<FE, f32>) {
 ///     let source = tensor.view().clone();
 ///     requires_write(&source);
-///     let computed = source.abs().await.unwrap().cast().await.unwrap().sin().await.unwrap().round().await.unwrap()
+///     let cast = TensorCast::<f64>::cast(&source.abs().await.unwrap()).await.unwrap();
+///     let computed = cast.sin().await.unwrap().round().await.unwrap()
 ///         .transpose(None).unwrap().clone();
 ///     let _cloned = computed.clone();
 /// }
@@ -203,13 +209,23 @@ macro_rules! unary_constructor {
 impl<E> TensorUnary for E
 where
     E: Expression + Clone,
-    E::DType: TensorElement + ha_ndarray::Float + ha_ndarray::Real,
+    E::DType: TensorElement + ha_ndarray::Float,
 {
     unary_constructor!(ExpOutput, exp, Exp);
 
     unary_constructor!(LnOutput, ln, Ln);
 
-    unary_constructor!(RoundOutput, round, Round);
+    type RoundOutput
+        = UnaryView<Self, Round>
+    where
+        E::DType: ha_ndarray::Real;
+
+    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>
+    where
+        E::DType: ha_ndarray::Real,
+    {
+        Box::pin(async move { Ok(UnaryView::new(self.clone(), Round)) })
+    }
 }
 
 impl<E> TensorUnaryBoolean for E
@@ -230,11 +246,13 @@ where
     unary_constructor!(IsInfOutput, is_inf, IsInf);
 }
 
-impl<E> TensorCast<f64> for E
+impl<E, To> TensorCast<To> for E
 where
-    E: Expression<DType = f32> + Clone,
+    E: Expression + Clone,
+    E::DType: TensorElement,
+    To: TensorElement,
 {
-    type Output = UnaryView<Self, Cast<f64>>;
+    type Output = UnaryView<Self, Cast<To>>;
 
     fn cast(&self) -> BoxFuture<'_, Result<Self::Output>> {
         Box::pin(async move {
@@ -249,7 +267,8 @@ where
 impl<E> TensorAbs for E
 where
     E: Expression + Clone,
-    E::DType: TensorElement + ha_ndarray::Number<Abs = E::DType>,
+    E::DType: TensorElement,
+    <E::DType as ha_ndarray::Number>::Abs: TensorElement,
 {
     unary_constructor!(Output, abs, Abs);
 }
@@ -446,4 +465,44 @@ where
             .masked()
         })
     }
+}
+
+#[cfg(feature = "complex")]
+unary_op!(
+    /// Complex conjugation.
+    Conj, conj, T: [TensorElement + ha_ndarray::Complex] => T
+);
+
+#[cfg(feature = "complex")]
+unary_op!(
+    /// Real component of a complex value.
+    Re, re, T: [TensorElement + ha_ndarray::Complex] => T::Real
+);
+
+#[cfg(feature = "complex")]
+unary_op!(
+    /// Imaginary component of a complex value.
+    Im, im, T: [TensorElement + ha_ndarray::Complex] => T::Real
+);
+
+#[cfg(feature = "complex")]
+unary_op!(
+    /// Principal complex argument in radians.
+    Angle, angle, T: [TensorElement + ha_ndarray::Complex] => T::Real
+);
+
+#[cfg(feature = "complex")]
+impl<E> crate::TensorComplex for E
+where
+    E: Expression + Clone,
+    E::DType: TensorElement + ha_ndarray::Complex,
+    <E::DType as ha_ndarray::Complex>::Real: TensorElement,
+{
+    unary_constructor!(ConjOutput, conj, Conj);
+
+    unary_constructor!(ReOutput, re, Re);
+
+    unary_constructor!(ImOutput, im, Im);
+
+    unary_constructor!(AngleOutput, angle, Angle);
 }

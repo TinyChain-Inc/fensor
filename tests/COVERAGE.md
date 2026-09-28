@@ -43,3 +43,20 @@ describes the shared workloads, two entrypoints, smoke instructions and record s
 Routine checks use `cargo test`; benchmark harnesses compile only with the
 `benchmarks` feature. See [CONTRIBUTING.md](../CONTRIBUTING.md) for targeted
 checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
+
+## Concrete dtype coverage
+
+- `dtype_storage`: all concrete dtypes in dense/sparse storage, spill/reload,
+  write-through, zero lifecycle, copy persistence, malformed blocks, and typed
+  metadata mismatch, concrete tensor/view/schema classes, typed metadata shape,
+  and complex feature gating. `number_type` owns abstract-class rejection and
+  computed-output classes.
+- `integer_types`: every integer width's operation families, axis/terminal
+  reductions, matrix consumers, wrapping boundaries, and signed negative powers.
+- `all_casts`: every enabled source/destination pair against backend buffers and
+  the number-general scalar pipeline, reusing one source per dtype/layout.
+  Literal conversion fixtures independently check fensor point and block reads.
+- `complex_types`: complex operation families, component projections, signed zeros,
+  branch cuts, exceptional predicates, retained support, and concurrent/cancelled
+  consumption across batch boundaries. Existing float suites retain their accuracy
+  and exceptional-value ownership. Public doctests own capability restrictions.

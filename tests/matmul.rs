@@ -244,7 +244,7 @@ async fn batches_nested_expressions_and_transforms() {
         &[6., 8., 10., 12.],
     )
     .await;
-    let cast = product.cast().await.unwrap();
+    let cast = TensorCast::<f64>::cast(&product).await.unwrap();
     check(
         &cast.matmul(&b.cast().await.unwrap()).await.unwrap(),
         &[1f64, 2., 3., 4., 5., 6., 7., 8.],

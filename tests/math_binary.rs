@@ -318,24 +318,24 @@ async fn sparse_support_survives_zero_intermediates_but_not_copying() {
 async fn nested_transforms_casts_predicates_and_explicit_broadcast() {
     let a = source(&[1f32, 2., 3., 4.], Layout::Dense, 2).await;
     let b = source(&[2f32, 0., 1., 2.], Layout::Dense, 3).await;
-    let expression = a
-        .view()
-        .flip(0)
-        .unwrap()
-        .sub(&b.view())
-        .await
-        .unwrap()
-        .flip(0)
-        .unwrap()
-        .cast()
-        .await
-        .unwrap()
-        .is_nan()
-        .await
-        .unwrap()
-        .not()
-        .await
-        .unwrap();
+    let expression = TensorCast::<f64>::cast(
+        &(a.view()
+            .flip(0)
+            .unwrap()
+            .sub(&b.view())
+            .await
+            .unwrap()
+            .flip(0)
+            .unwrap()),
+    )
+    .await
+    .unwrap()
+    .is_nan()
+    .await
+    .unwrap()
+    .not()
+    .await
+    .unwrap();
     check(expression, vec![1u8; 4]).await;
     let transformed = a
         .view()
@@ -1010,13 +1010,7 @@ async fn sparse_scalar_comparison_and_selection_support() {
 async fn mixed_elementwise_transforms_and_broadcast() {
     let a = source(&[0f32, 1., 2., 3., 4., 5.], Layout::Dense, 2).await;
     let one = source(&[1f64], Layout::Dense, 1).await;
-    let a = a
-        .view()
-        .reshape(shape![2, 3])
-        .unwrap()
-        .flip(1)
-        .unwrap()
-        .cast()
+    let a = TensorCast::<f64>::cast(&(a.view().reshape(shape![2, 3]).unwrap().flip(1).unwrap()))
         .await
         .unwrap()
         .add_scalar(1f64)

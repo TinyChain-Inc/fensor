@@ -194,11 +194,7 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
     )
     .await
     .unwrap();
-    let expression = tensor
-        .view()
-        .transpose(None)
-        .unwrap()
-        .cast()
+    let expression = TensorCast::<f64>::cast(&(tensor.view().transpose(None).unwrap()))
         .await
         .unwrap()
         .is_nan()
