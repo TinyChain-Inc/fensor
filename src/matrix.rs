@@ -111,6 +111,22 @@ where
     }
 }
 
+#[cfg(feature = "complex")]
+impl<E> crate::TensorMatrixUnaryComplex for E
+where
+    E: Expression + TensorRead + TensorTransform + Clone,
+    E::DType: TensorElement + ha_ndarray::Complex,
+    <E::DType as ha_ndarray::Complex>::Real: TensorElement,
+{
+    type HermitianOutput = crate::UnaryView<Self, crate::unary::Conj>;
+
+    fn mh(&self) -> BoxFuture<'_, Result<Self::HermitianOutput>> {
+        use crate::TensorComplex;
+
+        Box::pin(async move { self.mt().await?.conj().await })
+    }
+}
+
 impl<S: TensorGeometry> TensorGeometry for DiagView<S> {
     type DType = S::DType;
 
