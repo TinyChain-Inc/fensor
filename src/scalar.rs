@@ -57,27 +57,27 @@ macro_rules! scalar_op {
 
 scalar_op!(
     /// Lazy scalar add operation.
-    AddScalar, add_scalar, T: [TensorElement + Real] => T
+    AddScalar, add_scalar, T: [TensorElement] => T
 );
 
 scalar_op!(
     /// Lazy scalar sub operation.
-    SubScalar, sub_scalar, T: [TensorElement + Real] => T
+    SubScalar, sub_scalar, T: [TensorElement] => T
 );
 
 scalar_op!(
     /// Lazy scalar mul operation.
-    MulScalar, mul_scalar, T: [TensorElement + Real] => T
+    MulScalar, mul_scalar, T: [TensorElement] => T
 );
 
 scalar_op!(
     /// Lazy scalar div operation.
-    DivScalar, div_scalar, T: [TensorElement + Real] => T
+    DivScalar, div_scalar, T: [TensorElement] => T
 );
 
 scalar_op!(
     /// Lazy scalar pow operation.
-    PowScalar, pow_scalar, T: [TensorElement + Real] => T
+    PowScalar, pow_scalar, T: [TensorElement] => T
 );
 
 scalar_op!(
@@ -104,7 +104,7 @@ macro_rules! scalar_constructor {
 impl<E> TensorMathScalar for E
 where
     E: Expression + Clone,
-    E::DType: TensorElement + Real,
+    E::DType: TensorElement,
 {
     scalar_constructor!(AddOutput, add_scalar, AddScalar);
 
@@ -121,7 +121,17 @@ where
     where
         E::DType: Float;
 
-    scalar_constructor!(RemOutput, rem_scalar, RemScalar);
+    type RemOutput
+        = UnaryView<Self, RemScalar<E::DType>>
+    where
+        E::DType: Real;
+
+    fn rem_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::RemOutput>>
+    where
+        E::DType: Real,
+    {
+        Box::pin(async move { Ok(UnaryView::new(self.clone(), RemScalar(rhs))) })
+    }
 
     fn log_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LogOutput>>
     where
@@ -133,12 +143,12 @@ where
 
 scalar_op!(
     /// Lazy scalar eq operation.
-    EqScalar, eq_scalar, T: [TensorElement + Real] => u8
+    EqScalar, eq_scalar, T: [TensorElement] => u8
 );
 
 scalar_op!(
     /// Lazy scalar ne operation.
-    NeScalar, ne_scalar, T: [TensorElement + Real] => u8
+    NeScalar, ne_scalar, T: [TensorElement] => u8
 );
 
 scalar_op!(
@@ -164,40 +174,80 @@ scalar_op!(
 impl<E> TensorCompareScalar for E
 where
     E: Expression + Clone,
-    E::DType: TensorElement + Real,
+    E::DType: TensorElement,
 {
     scalar_constructor!(EqOutput, eq_scalar, EqScalar);
 
     scalar_constructor!(NeOutput, ne_scalar, NeScalar);
 
-    scalar_constructor!(GtOutput, gt_scalar, GtScalar);
+    type GtOutput
+        = UnaryView<Self, GtScalar<E::DType>>
+    where
+        E::DType: Real;
 
-    scalar_constructor!(GeOutput, ge_scalar, GeScalar);
+    fn gt_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::GtOutput>>
+    where
+        E::DType: Real,
+    {
+        Box::pin(async move { Ok(UnaryView::new(self.clone(), GtScalar(rhs))) })
+    }
 
-    scalar_constructor!(LtOutput, lt_scalar, LtScalar);
+    type GeOutput
+        = UnaryView<Self, GeScalar<E::DType>>
+    where
+        E::DType: Real;
 
-    scalar_constructor!(LeOutput, le_scalar, LeScalar);
+    fn ge_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::GeOutput>>
+    where
+        E::DType: Real,
+    {
+        Box::pin(async move { Ok(UnaryView::new(self.clone(), GeScalar(rhs))) })
+    }
+
+    type LtOutput
+        = UnaryView<Self, LtScalar<E::DType>>
+    where
+        E::DType: Real;
+
+    fn lt_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LtOutput>>
+    where
+        E::DType: Real,
+    {
+        Box::pin(async move { Ok(UnaryView::new(self.clone(), LtScalar(rhs))) })
+    }
+
+    type LeOutput
+        = UnaryView<Self, LeScalar<E::DType>>
+    where
+        E::DType: Real;
+
+    fn le_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LeOutput>>
+    where
+        E::DType: Real,
+    {
+        Box::pin(async move { Ok(UnaryView::new(self.clone(), LeScalar(rhs))) })
+    }
 }
 
 scalar_op!(
     /// Lazy scalar and operation.
-    AndScalar, and_scalar, T: [TensorElement + Real] => u8
+    AndScalar, and_scalar, T: [TensorElement] => u8
 );
 
 scalar_op!(
     /// Lazy scalar or operation.
-    OrScalar, or_scalar, T: [TensorElement + Real] => u8
+    OrScalar, or_scalar, T: [TensorElement] => u8
 );
 
 scalar_op!(
     /// Lazy scalar xor operation.
-    XorScalar, xor_scalar, T: [TensorElement + Real] => u8
+    XorScalar, xor_scalar, T: [TensorElement] => u8
 );
 
 impl<E> TensorBooleanScalar for E
 where
     E: Expression + Clone,
-    E::DType: TensorElement + Real,
+    E::DType: TensorElement,
 {
     scalar_constructor!(AndOutput, and_scalar, AndScalar);
 

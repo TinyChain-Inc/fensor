@@ -3,7 +3,6 @@ use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
 
 use b_table::{TableLock, collate::Collator};
-use destream::{de, en};
 use freqfs::{DirLock, FileLoad};
 use futures::{StreamExt, TryStreamExt};
 
@@ -36,25 +35,38 @@ const METADATA: &str = "metadata";
 /// Maximum sparse-index keys retained per page, independent of execution batches.
 const SPARSE_INDEX_PAGE_ENTRIES: usize = 4096;
 
+/// A concrete numerical element. Filesystem adapters own payload serialization;
+/// elements themselves need no destream implementation.
 pub trait TensorElement:
-    ha_ndarray::Number
-    + number_general::DType
-    + Copy
-    + Default
-    + PartialEq
-    + Send
-    + Sync
-    + 'static
-    + de::FromStream<Context = ()>
-    + for<'en> en::ToStream<'en>
+    ha_ndarray::Number + number_general::DType + Copy + Default + PartialEq + Send + Sync + 'static
 {
 }
 
 impl TensorElement for u8 {}
 
+impl TensorElement for u16 {}
+
+impl TensorElement for u32 {}
+
+impl TensorElement for u64 {}
+
+impl TensorElement for i8 {}
+
+impl TensorElement for i16 {}
+
+impl TensorElement for i32 {}
+
+impl TensorElement for i64 {}
+
 impl TensorElement for f32 {}
 
 impl TensorElement for f64 {}
+
+#[cfg(feature = "complex")]
+impl TensorElement for ha_ndarray::complex::Complex32 {}
+
+#[cfg(feature = "complex")]
+impl TensorElement for ha_ndarray::complex::Complex64 {}
 
 pub trait TensorFileEntry<T: TensorElement>:
     FileLoad

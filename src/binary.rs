@@ -191,7 +191,7 @@ impl<L, R> TensorMath<R> for L
 where
     L: Expression + Clone,
     R: Expression<DType = L::DType> + Clone,
-    L::DType: TensorElement + Real,
+    L::DType: TensorElement,
 {
     binary_constructor!(AddOutput, add, Add, R);
 
@@ -208,7 +208,17 @@ where
     where
         L::DType: Float;
 
-    binary_constructor!(RemOutput, rem, Rem, R);
+    type RemOutput
+        = BinaryView<Self, R, Rem>
+    where
+        L::DType: Real;
+
+    fn rem<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::RemOutput>>
+    where
+        L::DType: Real,
+    {
+        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Rem) })
+    }
 
     fn log<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LogOutput>>
     where
@@ -407,12 +417,12 @@ where
 
 binary_op!(
     /// Elementwise eq operation returning zero or one.
-    Eq, eq, T: [TensorElement + Real] => u8
+    Eq, eq, T: [TensorElement] => u8
 );
 
 binary_op!(
     /// Elementwise ne operation returning zero or one.
-    Ne, ne, T: [TensorElement + Real] => u8
+    Ne, ne, T: [TensorElement] => u8
 );
 
 binary_op!(
@@ -439,41 +449,81 @@ impl<L, R> TensorCompare<R> for L
 where
     L: Expression + Clone,
     R: Expression<DType = L::DType> + Clone,
-    L::DType: TensorElement + Real,
+    L::DType: TensorElement,
 {
     binary_constructor!(EqOutput, eq, Eq, R);
 
     binary_constructor!(NeOutput, ne, Ne, R);
 
-    binary_constructor!(GtOutput, gt, Gt, R);
+    type GtOutput
+        = BinaryView<Self, R, Gt>
+    where
+        L::DType: Real;
 
-    binary_constructor!(GeOutput, ge, Ge, R);
+    fn gt<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::GtOutput>>
+    where
+        L::DType: Real,
+    {
+        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Gt) })
+    }
 
-    binary_constructor!(LtOutput, lt, Lt, R);
+    type GeOutput
+        = BinaryView<Self, R, Ge>
+    where
+        L::DType: Real;
 
-    binary_constructor!(LeOutput, le, Le, R);
+    fn ge<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::GeOutput>>
+    where
+        L::DType: Real,
+    {
+        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Ge) })
+    }
+
+    type LtOutput
+        = BinaryView<Self, R, Lt>
+    where
+        L::DType: Real;
+
+    fn lt<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LtOutput>>
+    where
+        L::DType: Real,
+    {
+        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Lt) })
+    }
+
+    type LeOutput
+        = BinaryView<Self, R, Le>
+    where
+        L::DType: Real;
+
+    fn le<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LeOutput>>
+    where
+        L::DType: Real,
+    {
+        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Le) })
+    }
 }
 
 binary_op!(
     /// Elementwise and operation returning zero or one.
-    And, and, T: [TensorElement + Real] => u8
+    And, and, T: [TensorElement] => u8
 );
 
 binary_op!(
     /// Elementwise or operation returning zero or one.
-    Or, or, T: [TensorElement + Real] => u8
+    Or, or, T: [TensorElement] => u8
 );
 
 binary_op!(
     /// Elementwise xor operation returning zero or one.
-    Xor, xor, T: [TensorElement + Real] => u8
+    Xor, xor, T: [TensorElement] => u8
 );
 
 impl<L, R> TensorBoolean<R> for L
 where
     L: Expression + Clone,
     R: Expression<DType = L::DType> + Clone,
-    L::DType: TensorElement + Real,
+    L::DType: TensorElement,
 {
     binary_constructor!(AndOutput, and, And, R);
 

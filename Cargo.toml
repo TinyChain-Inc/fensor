@@ -9,6 +9,7 @@ repository = "https://github.com/TinyChain-Inc/fensor"
 # Compile measurement harnesses only when explicitly requested.
 [features]
 benchmarks = []
+complex = ["ha-ndarray/complex"]
 
 [[test]]
 name = "benchmark"

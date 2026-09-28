@@ -119,6 +119,8 @@ mod view;
 pub use binary::BinaryView;
 pub use error::{Error, Result};
 pub use ha_ndarray::Axes;
+#[cfg(feature = "complex")]
+pub use ha_ndarray::complex;
 pub use matmul::MatMulView;
 pub use matrix::DiagView;
 pub use metadata::TensorMetadata;
@@ -129,6 +131,8 @@ pub use schema::{
     contiguous_strides,
 };
 pub use selection::WhereView;
+#[cfg(feature = "complex")]
+pub use traits::TensorComplex;
 pub use traits::{
     BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray,
     TensorBlockStore, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,

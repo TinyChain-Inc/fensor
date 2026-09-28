@@ -7,8 +7,9 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
 
 ## API extensions
 
-- Casts beyond f32-to-f64, additional integer/complex dtypes, and their storage
-  adapters and conformance tests. f32, f64, and u8 storage already exist.
+- Fourier transforms and conjugate-transpose convenience. All twelve concrete
+  backend dtypes, casts between them, and complex elementwise projections are
+  supported; complex types are opt-in.
 - Construction/composition APIs such as constants, ranges, random generation,
   stacking and concatenation, reusing bounded expressions and consumers.
 

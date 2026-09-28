@@ -28,6 +28,7 @@ Before review, run the correctness suite and lint gate once on the final changes
 ```sh
 cargo fmt --check
 cargo test
+cargo test --features complex
 cargo clippy --all-targets -- -D warnings
 git diff --check
 ```
@@ -35,6 +36,8 @@ git diff --check
 `cargo test` includes unit tests, integration tests, and doctests. Benchmark and
 profiling harnesses require the opt-in `benchmarks` feature and remain ignored
 unless explicitly selected. Correctness tests do not require that feature.
+The separate complex-enabled run covers native complex storage, projections,
+and the full cast matrix; the default run checks that feature boundaries hold.
 
 Changes to shared test/benchmark infrastructure also need the two small smoke
 fixtures in [BENCHMARKS.md](BENCHMARKS.md), plus

@@ -32,7 +32,7 @@ pub struct Sum;
 
 impl sealed::Sealed for Sum {}
 
-impl<T: TensorElement + Real> ReduceOp<T> for Sum {
+impl<T: TensorElement> ReduceOp<T> for Sum {
     fn partial(&self, values: Vec<T>) -> Result<T> {
         Ok(expression::batch_array(values)?.sum_all()?)
     }
@@ -52,7 +52,7 @@ pub struct Product;
 
 impl sealed::Sealed for Product {}
 
-impl<T: TensorElement + Real> ReduceOp<T> for Product {
+impl<T: TensorElement> ReduceOp<T> for Product {
     fn partial(&self, values: Vec<T>) -> Result<T> {
         Ok(expression::batch_array(values)?.product_all()?)
     }
@@ -151,7 +151,7 @@ where
 impl<E> TensorReduceAll for E
 where
     E: Expression + TensorRead,
-    E::DType: TensorElement + Real,
+    E::DType: TensorElement,
 {
     fn sum_all(&self) -> BoxFuture<'_, Result<Self::DType>> {
         Box::pin(terminal::<_, Sum>(self, Sum))
@@ -161,11 +161,17 @@ where
         Box::pin(terminal::<_, Product>(self, Product))
     }
 
-    fn min_all(&self) -> BoxFuture<'_, Result<Self::DType>> {
+    fn min_all(&self) -> BoxFuture<'_, Result<Self::DType>>
+    where
+        E::DType: Real,
+    {
         Box::pin(terminal::<_, Min>(self, Min))
     }
 
-    fn max_all(&self) -> BoxFuture<'_, Result<Self::DType>> {
+    fn max_all(&self) -> BoxFuture<'_, Result<Self::DType>>
+    where
+        E::DType: Real,
+    {
         Box::pin(terminal::<_, Max>(self, Max))
     }
 }
@@ -333,15 +339,21 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
 impl<E> TensorReduce for E
 where
     E: Expression + Clone,
-    E::DType: TensorElement + Real,
+    E::DType: TensorElement,
 {
     type SumOutput = ReduceView<Self, Sum>;
 
     type ProductOutput = ReduceView<Self, Product>;
 
-    type MinOutput = ReduceView<Self, Min>;
+    type MinOutput
+        = ReduceView<Self, Min>
+    where
+        E::DType: Real;
 
-    type MaxOutput = ReduceView<Self, Max>;
+    type MaxOutput
+        = ReduceView<Self, Max>
+    where
+        E::DType: Real;
 
     fn sum(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::SumOutput>> {
         Box::pin(async move { ReduceView::new(self.clone(), axes, keepdims, Sum) })
@@ -351,11 +363,17 @@ where
         Box::pin(async move { ReduceView::new(self.clone(), axes, keepdims, Product) })
     }
 
-    fn min(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MinOutput>> {
+    fn min(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MinOutput>>
+    where
+        E::DType: Real,
+    {
         Box::pin(async move { ReduceView::new(self.clone(), axes, keepdims, Min) })
     }
 
-    fn max(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MaxOutput>> {
+    fn max(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MaxOutput>>
+    where
+        E::DType: Real,
+    {
         Box::pin(async move { ReduceView::new(self.clone(), axes, keepdims, Max) })
     }
 }

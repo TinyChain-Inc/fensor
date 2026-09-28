@@ -220,6 +220,19 @@ retained keys separately from the requests constructed for their visible regions
 Boundary tests use owning constants and adjacent values; numerical and benchmark fixtures retain
 explicit inputs. Structural contract tests are indexed in [coverage ownership](tests/COVERAGE.md).
 
+## Element types and payload ownership
+
+Expressions use native backend element types and delegate numerical conversions
+and complex operations to ha-ndarray. Real-only capabilities are method bounds,
+not runtime dtype dispatch. Complex projections and casts retain source support.
+Element traits impose no payload codec: adapters own complex representations and
+preserve concrete types through reload. The optional complex feature only enables
+additional types/operations; it does not select another execution path.
+
+Batch and storage capacities count elements. Their bounded payload bytes scale
+with element width, including both complex components; cache accounting uses the
+actual Rust payload size. Typed geometry metadata remains unchanged.
+
 ## Geometry and collection ownership
 
 `Shape` and `Strides` hold `u64` metadata inline through `PORTABLE_INLINE_RANK`
