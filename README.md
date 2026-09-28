@@ -30,6 +30,9 @@ The destination adapter can differ from the source adapter and must support the
 output dtype. `max_capacity` limits storage-block capacity; it does not select an
 exact block shape. Sparse copies omit final zeros and reset the axis hint to `None`.
 
+The [collection handoff contract](DESIGN.md#collection-handoff) distinguishes
+verified public usage from the remaining transactional integration gaps.
+
 ## Supported operations
 
 Stored types are `u8/u16/u32/u64`, `i8/i16/i32/i64`, and `f32/f64`.
@@ -184,6 +187,21 @@ Nested and 2D transforms may recompute groups; bounded memory does not imply
 optimal transform throughput.
 
 ## Streams, bounds, and concurrency
+
+New sparse storage uses block extent one on its sparse axis (axis zero by
+default), spending the remaining capacity on other axes in trailing-first order.
+Existing metadata retains its recorded block shape; loading never retessellates
+stored data. Logical regions larger than a block span multiple grid blocks.
+
+A sparse zero write clears only that element. Its index key remains while the
+key's visible region contains nonzeros. An entirely zero physical block is deleted
+only after a streaming index check finds no other reference; this last-value
+reclamation can scan the index. Empty-key removal may leave nonzero unreferenced
+payload for future compaction. Related mutations still require caller coordination;
+these steps are non-transactional and offer no rollback.
+
+Physical block lengths are validated against bounded metadata. Adapters remain
+responsible for limiting decoding allocations before fensor receives a payload.
 
 | Consumer | Delivery order |
 |---|---|

@@ -114,7 +114,20 @@ pub(crate) struct StorageSchema {
 impl StorageSchema {
     /// Creation path: run the greedy algorithm to pick a block shape.
     pub(crate) fn new(tensor_shape: &[u64], layout: Layout, max_capacity: usize) -> FResult<Self> {
-        let block_schema = BlockSchema::new(tensor_shape, max_capacity)?;
+        validate_shape_dims(tensor_shape)?;
+        // A sparse key fixes one coordinate on its sparse axis. Spending block
+        // capacity on that axis would allocate payload invisible through the key.
+        let block_schema = if let Layout::Sparse { axis } = layout {
+            let axis = axis.unwrap_or(0);
+            let mut region = Shape::from_slice(tensor_shape);
+            let extent = region
+                .get_mut(axis)
+                .ok_or_else(|| Error::InvalidSchema("sparse axis hint out of bounds".into()))?;
+            *extent = 1;
+            BlockSchema::new(&region, max_capacity)?
+        } else {
+            BlockSchema::new(tensor_shape, max_capacity)?
+        };
         Self::from_block_schema(tensor_shape, layout, block_schema)
     }
 

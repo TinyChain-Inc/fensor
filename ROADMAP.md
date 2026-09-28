@@ -27,6 +27,8 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
   products scan logical contraction length.
 - Bounded sparse compaction and filesystem/index metadata scaling. Execution
   batch limits do not bound filesystem metadata; whole-index collection is prohibited.
+  Ordinary zero writes reclaim entirely zero, unreferenced blocks using a streamed
+  reference check; compaction still owns other unreachable payload.
 
 ## Execution and storage costs
 
@@ -50,3 +52,8 @@ backend conformance. Backend integration must retain bounded, lazy consumption.
 
 Transaction lifecycle, recovery, cross-host orchestration, codec selection, and
 durability policy remain caller responsibilities, not pending fensor features.
+
+See the [collection handoff contract](DESIGN.md#collection-handoff) for unresolved
+transaction-visible leaf access, storage geometry/occupied traversal, and
+payload/index version ownership. The public API smoke test verifies current
+usage without implementing transactions or certifying copy-on-write readiness.

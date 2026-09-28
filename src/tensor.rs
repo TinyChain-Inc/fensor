@@ -137,13 +137,6 @@ impl<FE> Storage<FE> {
     }
 }
 
-enum SparseWriteAction {
-    Write(u64),
-    DeleteRow(u64),
-    NoOp,
-    CreateBlockAndWrite(u64),
-}
-
 #[derive(Clone)]
 pub struct Tensor<FE, T> {
     storage: Arc<Storage<FE>>,
@@ -804,39 +797,6 @@ where
         .boxed())
     }
 
-    async fn lookup_sparse_block_for_coord(
-        &self,
-        base_coord: &[u64],
-        block_offset: u64,
-    ) -> Result<Option<u64>> {
-        let key = self.sparse_key(base_coord, block_offset);
-        self.lookup_block_id(&key).await
-    }
-
-    async fn plan_sparse_write(
-        &self,
-        base_coord: &[u64],
-        block_offset: u64,
-        value: T,
-    ) -> Result<SparseWriteAction> {
-        if let Some(block_id) = self
-            .lookup_sparse_block_for_coord(base_coord, block_offset)
-            .await?
-        {
-            if value == T::default() {
-                return Ok(SparseWriteAction::DeleteRow(block_id));
-            }
-            return Ok(SparseWriteAction::Write(block_id));
-        }
-
-        if value == T::default() {
-            return Ok(SparseWriteAction::NoOp);
-        }
-
-        let block_id: u64 = rand::random();
-        Ok(SparseWriteAction::CreateBlockAndWrite(block_id))
-    }
-
     async fn new_storage(
         blocks: DirLock<FE>,
         index: Option<TableLock<SparseTableSchema, SparseIndexSchema, Collator<u64>, FE>>,
@@ -875,11 +835,54 @@ where
         })
     }
 
-    async fn is_empty_block(&self, block_id: u64) -> Result<bool> {
-        match self.read_block(block_id).await? {
-            Some(block) => Ok(block.iter().all(|v| *v == T::default())),
-            None => Ok(true),
+    // Inspect one validated physical block with rank-sized scratch. A key sees
+    // only its sparse-axis coordinate and valid tensor coordinates at grid edges.
+    fn sparse_occupancy(&self, block: &[T], coord: &[u64]) -> Result<(bool, bool)> {
+        let axis = sparse_axis_for_layout(self.layout());
+        let mut local = crate::schema::Coord::new();
+        let mut block_populated = false;
+        for (offset, &value) in block.iter().enumerate() {
+            if value == T::default() {
+                continue;
+            }
+            block_populated = true;
+            crate::request::decode_flat(offset as u64, self.block_shape(), &mut local)?;
+            if local[axis] == coord[axis] % self.block_shape()[axis]
+                && local.iter().enumerate().all(|(a, &i)| {
+                    let origin = coord[a] - coord[a] % self.block_shape()[a];
+                    i < self.shape()[a] - origin
+                })
+            {
+                return Ok((true, true));
+            }
         }
+        Ok((false, block_populated))
+    }
+
+    // There is no reverse index by physical ID. Stream until the first reference;
+    // retain no row collection, and release index guards before deleting a file.
+    async fn sparse_block_referenced(&self, id: u64) -> Result<bool> {
+        let index = self.sparse_index()?.read().await;
+        let mut rows = index.rows(Default::default(), &[], false, None).await?;
+        let axis = sparse_axis_for_layout(self.layout());
+        let mut grid = crate::schema::Coord::new();
+        while let Some(row) = rows.try_next().await? {
+            #[cfg(test)]
+            crate::read_metrics::record(|m| m.index_entries += 1);
+            if row.len() != 3 || row[0] >= self.shape()[axis] || row[1] >= self.num_blocks() {
+                return Err(Error::InvalidLayout("invalid sparse reference key".into()));
+            }
+            crate::request::decode_flat(row[1], &self.storage.storage_schema().shape, &mut grid)?;
+            if row[0] / self.block_shape()[axis] != grid[axis] {
+                return Err(Error::InvalidLayout(
+                    "sparse reference key disagrees with grid block".into(),
+                ));
+            }
+            if row[2] == id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -976,30 +979,45 @@ where
                         .await
                 }
                 Layout::Sparse { .. } => {
-                    match self.plan_sparse_write(coord, block_grid_id, value).await? {
-                        SparseWriteAction::Write(block_id) => {
-                            self.write_block_updates(block_id, &[(0, offset_in_block, value)])
-                                .await
+                    let key = self.sparse_key(coord, block_grid_id);
+                    if let Some(id) = self.lookup_block_id(&key).await? {
+                        if value != T::default() {
+                            return self
+                                .write_block_updates(id, &[(0, offset_in_block, value)])
+                                .await;
                         }
-                        SparseWriteAction::DeleteRow(block_id) => {
-                            let key = self.sparse_key(coord, block_grid_id);
-                            self.delete_row(key).await?;
-                            if self.is_empty_block(block_id).await? {
-                                self.delete_block(block_id).await;
-                            }
 
-                            Ok(())
+                        let (region_populated, block_populated) = {
+                            let file = self
+                                .storage
+                                .blocks()
+                                .read()
+                                .await
+                                .get_file(&id.to_string())
+                                .cloned()
+                                .ok_or_else(|| {
+                                    Error::from(IoError::new(ErrorKind::NotFound, "Missing block"))
+                                })?;
+                            let mut block = file.write::<Vec<T>>().await?;
+                            self.apply_block_updates(&mut block, &[(0, offset_in_block, value)])?;
+                            #[cfg(test)]
+                            copy_metrics::record(|m| m.block_updates += 1);
+                            self.sparse_occupancy(&block, coord)?
+                        };
+                        if !region_populated {
+                            self.delete_row(key).await?;
+                            if !block_populated && !self.sparse_block_referenced(id).await? {
+                                self.delete_block(id).await;
+                            }
                         }
-                        SparseWriteAction::CreateBlockAndWrite(block_id) => {
-                            self.write_block(block_id, self.default_block()).await?;
-                            let key = self.sparse_key(coord, block_grid_id);
-                            self.upsert_block_id(key, block_id).await?;
-                            self.write_block_updates(block_id, &[(0, offset_in_block, value)])
-                                .await?;
-                            Ok(())
-                        }
-                        SparseWriteAction::NoOp => Ok(()),
+                    } else if value != T::default() {
+                        let id = rand::random();
+                        let mut block = self.default_block();
+                        self.apply_block_updates(&mut block, &[(0, offset_in_block, value)])?;
+                        self.write_block(id, block).await?;
+                        self.upsert_block_id(key, id).await?;
                     }
+                    Ok(())
                 }
             }
         })
@@ -1298,9 +1316,173 @@ mod sparse_lifecycle_tests {
     async fn block_id_for_coord(tensor: &Tensor<TestFE, f32>, coord: &[u64]) -> Option<u64> {
         let BlockPosition { block_id, .. } = tensor.block_position_from_base_coord(coord);
         tensor
-            .lookup_sparse_block_for_coord(coord, block_id)
+            .lookup_block_id(&tensor.sparse_key(coord, block_id))
             .await
             .expect("lookup")
+    }
+
+    // Persisted layouts remain readable and writable even when creation chooses
+    // a more compact sparse-axis extent. No production layout selector is needed.
+    async fn persisted_sparse(
+        name: &str,
+        shape: Shape,
+        block_shape: Shape,
+        axis: Option<usize>,
+    ) -> (PathBuf, Tensor<TestFE, f32>) {
+        let (root, dir) = new_dir(name).await;
+        let (blocks, index_dir) = {
+            let mut dir = dir.write().await;
+            (
+                dir.create_dir(BLOCKS.into()).unwrap(),
+                dir.create_dir(INDEX.into()).unwrap(),
+            )
+        };
+        let index = TableLock::create(SparseTableSchema::default(), Collator::default(), index_dir)
+            .unwrap();
+        let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape.clone()).unwrap();
+        let storage =
+            StorageSchema::from_block_shape(&shape, Layout::Sparse { axis }, block_shape).unwrap();
+        let tensor = Tensor::<TestFE, f32>::new_storage(blocks, Some(index), schema, storage)
+            .await
+            .unwrap();
+        tensor.sync().await.unwrap();
+        drop(tensor);
+        drop(dir);
+        let tensor = Tensor::load(open_dir(&root).unwrap()).await.unwrap();
+        (root, tensor)
+    }
+
+    #[tokio::test]
+    async fn clearing_one_value_preserves_the_rest_of_its_sparse_key() {
+        let (root, tensor) = create_sparse("shared_key_zero", shape![2, 2], 4, Some(0)).await;
+        tensor.write_value(&[0, 0], 3.).await.unwrap();
+        tensor.write_value(&[0, 1], 7.).await.unwrap();
+        let id = block_id_for_coord(&tensor, &[0, 0]).await.unwrap();
+        assert_eq!(block_id_for_coord(&tensor, &[0, 1]).await, Some(id));
+
+        tensor.write_value(&[0, 0], 0.).await.unwrap();
+        assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), 7.);
+        assert_eq!(block_id_for_coord(&tensor, &[0, 1]).await, Some(id));
+        tensor.write_value(&[0, 1], 0.).await.unwrap();
+        assert!(block_id_for_coord(&tensor, &[0, 1]).await.is_none());
+        assert!(tensor.read_block(id).await.unwrap().is_none());
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn zero_writes_respect_persisted_regions_edges_and_aliases() {
+        for axis in [None, Some(0), Some(1), Some(2)] {
+            let a = axis.unwrap_or(0);
+            let (root, tensor) =
+                persisted_sparse("persisted_regions", shape![3, 3, 3], shape![2, 2, 2], axis).await;
+            let mut first = vec![0, 0, 0];
+            let mut neighbor = first.clone();
+            neighbor[(a + 1) % 3] = 1;
+            tensor.write_value(&first, 2.).await.unwrap();
+            tensor.write_value(&neighbor, f32::NAN).await.unwrap();
+            let id = block_id_for_coord(&tensor, &first).await.unwrap();
+            tensor.write_value(&first, -0.).await.unwrap();
+            assert!(tensor.read_value(&neighbor).await.unwrap().is_nan());
+            assert_eq!(block_id_for_coord(&tensor, &neighbor).await, Some(id));
+
+            // An alias owns another sparse-axis region in the same physical block.
+            first[a] = 1;
+            let grid = tensor.block_position_from_base_coord(&first).block_id;
+            tensor
+                .upsert_block_id(tensor.sparse_key(&first, grid), id)
+                .await
+                .unwrap();
+            tensor.write_value(&first, 5.).await.unwrap();
+            tensor.write_value(&neighbor, 0.).await.unwrap();
+            assert_eq!(tensor.read_value(&first).await.unwrap(), 5.);
+            assert!(block_id_for_coord(&tensor, &neighbor).await.is_none());
+
+            // A referenced all-zero block must remain readable until its last key is removed.
+            let zero_key = tensor.sparse_key(&neighbor, 0);
+            tensor.upsert_block_id(zero_key, id).await.unwrap();
+            tensor.write_value(&first, 0.).await.unwrap();
+            assert!(tensor.read_block(id).await.unwrap().is_some());
+            tensor.write_value(&neighbor, 0.).await.unwrap();
+            assert!(tensor.read_block(id).await.unwrap().is_none());
+
+            // Padding is not part of an edge key's visible region. Retain nonzero
+            // physical payload outside that region rather than destroying other data.
+            let edge = [2, 2, 2];
+            tensor.write_value(&edge, 9.).await.unwrap();
+            let edge_id = block_id_for_coord(&tensor, &edge).await.unwrap();
+            let mut block = tensor.read_block(edge_id).await.unwrap().unwrap();
+            block[7] = 11.;
+            tensor.write_block(edge_id, block).await.unwrap();
+            tensor.write_value(&edge, 0.).await.unwrap();
+            assert!(block_id_for_coord(&tensor, &edge).await.is_none());
+            assert_eq!(tensor.read_block(edge_id).await.unwrap().unwrap()[7], 11.);
+            tensor.sync().await.unwrap();
+            drop(tensor);
+            let loaded = Tensor::<TestFE, f32>::load(open_dir(&root).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(loaded.block_shape(), &[2, 2, 2]);
+            assert_eq!(loaded.read_value(&edge).await.unwrap(), 0.);
+            cleanup(&root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_reference_scan_retains_the_empty_file() {
+        let (root, tensor) = create_sparse("bad_reference", shape![2, 2], 4, None).await;
+        tensor.write_value(&[0, 0], 1.).await.unwrap();
+        let id = block_id_for_coord(&tensor, &[0, 0]).await.unwrap();
+        tensor.upsert_block_id(vec![99, 0], 123).await.unwrap();
+        assert!(matches!(
+            tensor.write_value(&[0, 0], 0.).await,
+            Err(Error::InvalidLayout(_))
+        ));
+        assert!(
+            tensor
+                .read_block(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .iter()
+                .all(|v| *v == 0.)
+        );
+        assert!(block_id_for_coord(&tensor, &[0, 0]).await.is_none());
+        cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sparse_capacity_spans_grids_without_axis_padding() {
+        for capacity in [1, 7, 31, 128, MAX_BLOCK_CAPACITY] {
+            for axis in [None, Some(0), Some(1), Some(2)] {
+                let (root, tensor) = create_sparse(
+                    "sparse_capacity",
+                    shape![3, 5, MAX_BLOCK_CAPACITY as u64 + 1],
+                    capacity,
+                    axis,
+                )
+                .await;
+                assert_eq!(tensor.block_shape()[axis.unwrap_or(0)], 1);
+                assert!(tensor.block_len() <= capacity);
+                for (coord, value) in [([0, 0, 0], 1.), ([2, 4, MAX_BLOCK_CAPACITY as u64], 2.)] {
+                    tensor.write_value(&coord, value).await.unwrap();
+                    assert_eq!(tensor.read_value(&coord).await.unwrap(), value);
+                }
+                tensor.sync().await.unwrap();
+                drop(tensor);
+                let loaded = Tensor::<TestFE, f32>::load(open_dir(&root).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(loaded.block_shape()[axis.unwrap_or(0)], 1);
+                assert_eq!(
+                    loaded
+                        .read_value(&[2, 4, MAX_BLOCK_CAPACITY as u64])
+                        .await
+                        .unwrap(),
+                    2.
+                );
+                cleanup(&root).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -1531,7 +1713,8 @@ mod sparse_lifecycle_tests {
 
     #[tokio::test]
     async fn storage_batch_uses_sparse_keys_not_grid_block_ids() {
-        let (root, tensor) = create_sparse("batch_keys", shape![3, 2], 6, Some(0)).await;
+        let (root, tensor) =
+            persisted_sparse("batch_keys", shape![3, 2], shape![3, 2], Some(0)).await;
         tensor.write_value(&[0, 0], 2.).await.unwrap();
         tensor.write_value(&[2, 1], 3.).await.unwrap();
 
@@ -1742,7 +1925,8 @@ mod sparse_lifecycle_tests {
 
     #[tokio::test]
     async fn copy_batches_coalesce_existing_physical_blocks() {
-        let (root, tensor) = create_sparse("copy_physical", shape![2, 4], 8, None).await;
+        let (root, tensor) =
+            persisted_sparse("copy_physical", shape![2, 4], shape![2, 4], None).await;
         tensor.write_value(&[0, 0], 1.).await.unwrap();
         let id = tensor.lookup_block_id(&[0, 0]).await.unwrap().unwrap();
         tensor.upsert_block_id(vec![1, 0], id).await.unwrap();

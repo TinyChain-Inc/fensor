@@ -48,7 +48,7 @@ pub fn record(
     println!("FENSOR,{name},{operation},{temperature},{metric},{unit},{value}");
 }
 
-async fn measure(
+pub async fn measure(
     name: &str,
     operation: &str,
     temperature: &str,

@@ -727,7 +727,7 @@ async fn sparse_range_reads_only_selected_storage() {
     .unwrap();
     tensor.write_value(&[0], 0.2).await.unwrap();
     tensor.write_value(&[7], 0.2).await.unwrap();
-    let block_id = tensor.lookup_block_id(&[7, 3]).await.unwrap().unwrap();
+    let block_id = tensor.lookup_block_id(&[7, 7]).await.unwrap().unwrap();
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     blocks.write().await.delete(&block_id.to_string()).await;
     let view = tensor.view();
