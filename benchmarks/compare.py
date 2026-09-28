@@ -37,7 +37,7 @@ def main():
     parser.add_argument("before", type=Path)
     parser.add_argument("after", type=Path)
     parser.add_argument("--entry", choices=["benchmark", "profiling::profile"], default="benchmark")
-    parser.add_argument("--suite", choices=["all", "matrix", "reduction", "completion", "pipeline", "copy"], default="all")
+    parser.add_argument("--suite", choices=["all", "matrix", "reduction", "completion", "pipeline", "copy", "sparse"], default="all")
     parser.add_argument("--pairs", type=int, default=2)
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--before-revision", required=True)

@@ -218,7 +218,9 @@ pub trait TensorTransform: TensorGeometry + Sized {
 }
 
 /// Async storage-block access, bounded by validated storage block capacity.
-/// A block is not a whole-tensor collection.
+/// A block is not a whole-tensor collection or an execution batch. Implementing
+/// this trait does not replace the storage used by existing expression leaves.
+/// Writes do not coordinate sparse index updates or transaction visibility.
 pub trait TensorBlockStore: Send + Sync {
     type Block: Clone + Send + Sync + 'static;
 
@@ -228,6 +230,10 @@ pub trait TensorBlockStore: Send + Sync {
 }
 
 /// Sparse index access primitives for layouts backed by `b-table`.
+///
+/// These are low-level point operations, not an occupied-entry stream or a
+/// pluggable expression backend. Callers must coordinate raw index changes with
+/// payload ownership; these methods provide no transaction visibility.
 pub trait TensorSparseIndex: Send + Sync {
     fn lookup_block_id<'a>(&'a self, key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>>;
 

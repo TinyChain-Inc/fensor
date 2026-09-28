@@ -19,6 +19,9 @@ mod read_cases;
 #[path = "slice_cases.rs"]
 mod slice_cases;
 
+#[path = "sparse_cases.rs"]
+mod sparse_cases;
+
 pub async fn run() {
     let selected = std::env::var("FENSOR_BENCH_SUITE").unwrap_or_else(|_| "all".into());
     match selected.as_str() {
@@ -27,12 +30,14 @@ pub async fn run() {
         "completion" => completion_cases::run().await,
         "pipeline" => pipeline_cases::run().await,
         "copy" => copy_cases::run().await,
+        "sparse" => sparse_cases::run().await,
         "all" => {
             read_cases::run().await;
             slice_cases::run().await;
             completion_cases::run().await;
             pipeline_cases::run().await;
             copy_cases::run().await;
+            sparse_cases::run().await;
         }
         _ => panic!("unknown benchmark suite {selected}"),
     }

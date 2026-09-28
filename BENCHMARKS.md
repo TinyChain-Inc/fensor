@@ -31,6 +31,16 @@ harness changes, apply only its test-only changes to the frozen baseline; retain
 its production source hash. Never substitute another revision for a missing
 baseline. Finish builds before timing, and run comparisons without concurrent tests.
 
+The `sparse` suite isolates sparse-axis allocation and final-value clearing across
+the standard capacities, leading/trailing axes, and two cache budgets. It records
+allocated payload bytes, data-file and index-row counts alongside separate stream,
+copy-plus-sync, and clear timings. The profiling entrypoint also reports index
+entries examined during reclamation. These are logical payload and cached
+filesystem measurements, not physical-device throughput.
+Clearing comparisons include corrected reclamation: an older implementation may
+remove keys while retaining payload files, so the two timings can represent
+different amounts of completed storage work.
+
 ```sh
 export CC=/usr/bin/cc CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/cc
 export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1

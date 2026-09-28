@@ -27,6 +27,19 @@ cache, shared cursor, or expression registry is part of execution.
 
 ## Requests and evaluation
 
+Sparse allocation fixes the sparse-axis block extent at one for new storage.
+Persisted layouts retain their recorded extents and share the same access path.
+Zero writes validate and clear one offset, then inspect at most one physical
+block with rank-sized scratch. Only valid edge coordinates on the key's fixed
+sparse-axis coordinate determine whether that key remains populated.
+
+Block guards are released before index mutation. Reclamation of an entirely
+zero block streams index rows until another physical-ID reference is found;
+without a reverse index, absence requires a full scan. No row collection is
+retained, and an index error prevents file deletion. Nonzero data outside a
+removed key's visible region is preserved. This is ordinary non-transactional
+mutation, not a concurrency or recovery protocol.
+
 Fourier views are bounded evaluation boundaries like reductions and matrix
 products. Each transformed axis is capped at `MAX_BATCH_ELEMENTS`; complete
 axis groups pack into requests within that same limit. Request-sized group keys
@@ -264,3 +277,34 @@ bounds. Large axis descriptors, affine coefficients, and matrix map keys also
 remain heap-backed to avoid embedding oversized inline arrays in requests and
 futures. SmallVec does not alter the execution bound or promise allocation-free
 operation. See [collection rules](CODE_STYLE.md#collections-and-geometry).
+
+## Collection handoff
+
+The public API smoke test in `tests/handoff.rs` verifies filesystem-backed
+composition, geometric mutation, low-level block/index access, and explicit
+copy/sync/reload. It does not certify transactional copy-on-write readiness.
+Existing transforms suffice for initial integration; reshape still requires
+contiguous geometry, and broadcast/gather write-through restrictions remain.
+
+Execution batches are not physical storage blocks. Tensor clones share storage,
+streams observe live sources, and `copy_from` creates independent storage.
+Synchronization does not establish transaction visibility. Public block/index
+traits expose low-level access; they neither replace the concrete storage used by
+expression leaves nor coordinate payload mutations with index mutations.
+
+Storage mapping and bounded occupied-region traversal exist internally. There is
+no public occupied-entry stream or transaction-visible expression source. Public
+sparse streams scan selected logical coordinates, and sparse matrix products scan
+logical contraction positions. Indexed numeric reductions do not imply general
+indexed sparse execution.
+
+Reclamation checks references in the tensor's current index only. Cross-version
+visibility, deletion markers, and reference lifetimes belong to the collection.
+Before integrating transaction-visible storage, resolve these questions against
+its concrete requirements rather than adding speculative interfaces:
+
+- How will expression leaves read transaction-visible blocks and index entries?
+- How will the caller reuse storage geometry and bounded occupied traversal?
+- Who coordinates payload/index version ownership and safe reclamation?
+
+These remain integration gaps, not missing arithmetic or transform operations.

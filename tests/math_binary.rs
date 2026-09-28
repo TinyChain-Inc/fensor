@@ -475,7 +475,7 @@ async fn selected_range_propagates_corruption_only_when_read() {
     .unwrap();
     tensor.write_value(&[0], 0.2).await.unwrap();
     tensor.write_value(&[7], 0.2).await.unwrap();
-    let id = tensor.lookup_block_id(&[7, 3]).await.unwrap().unwrap();
+    let id = tensor.lookup_block_id(&[7, 7]).await.unwrap().unwrap();
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     blocks.write().await.delete(&id.to_string()).await;
     let empty = source(&[0f32; 8], Layout::Sparse { axis: None }, 3).await;
@@ -1112,7 +1112,7 @@ async fn conditional_selected_range_propagates_each_operand_error() {
     .unwrap();
     corrupt.write_value(&[0], 1).await.unwrap();
     corrupt.write_value(&[7], 1).await.unwrap();
-    let id = corrupt.lookup_block_id(&[7, 3]).await.unwrap().unwrap();
+    let id = corrupt.lookup_block_id(&[7, 7]).await.unwrap().unwrap();
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     blocks.write().await.delete(&id.to_string()).await;
     let empty = source(&[0u8; 8], Layout::Sparse { axis: None }, 3).await;

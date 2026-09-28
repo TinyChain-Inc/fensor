@@ -6,6 +6,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 
 | Contract | Primary coverage |
 |---|---|
+| Public downstream composition, geometric mutation, known-key block access, copy/sync/reload | `handoff` (f32 dense/trailing-axis sparse); no transaction-readiness claim |
 | Logical u64 geometry, inline rank spilling, overflow, large-coordinate persistence | `geometry`; request/mapping/storage-run unit bounds |
 | Matrix transpose/diagonal dtype and consumer parity, output transforms, support, huge selected reads, corruption, cache pressure, cancellation and write constraints | `matrix_unary`; matrix unit request/support counters; diagonal doctests |
 | Matrix shapes, dtypes, operand layouts and backend agreement | `matmul` numerical parity matrix, block streams |
@@ -46,6 +47,12 @@ checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
 
 ## Concrete dtype coverage
 
+- Sparse lifecycle unit tests own same-key zero writes, persisted block geometry,
+  edge padding, physical aliases, failed reclamation scans, and capacity/axis
+  allocation. `dtype_storage` checks geometric and bulk zero writes for every
+  supported dtype. Existing storage/planner tests retain alias grouping coverage
+  with explicitly persisted layouts.
+
 - `fourier` owns complex conjugate transpose, independent forward/inverse Fourier
   expectations, propagated round-trip bounds, consumer parity, sparse group support,
   output transforms, corruption and axis-limit rejection. Fourier unit tests own
@@ -65,3 +72,8 @@ checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
   branch cuts, exceptional predicates, retained support, and concurrent/cancelled
   consumption across batch boundaries. Existing float suites retain their accuracy
   and exceptional-value ownership. Public doctests own capability restrictions.
+
+The `handoff` smoke test reuses public APIs only. Broader transform coverage stays
+with `access_matrix` and mapping tests; independent codecs with `storage_codec`;
+sparse lifecycle and corruption with `dtype_storage` and tensor unit tests;
+bounded requests and execution with the structural suites listed above.
