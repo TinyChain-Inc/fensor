@@ -1,10 +1,8 @@
 //! Absolute-value and trigonometric views use the same filesystem consumers.
 
-use fensor::unary::UnaryOp;
 use fensor::{
-    AxisRange, Layout, Tensor, TensorAbs, TensorElement, TensorFileEntry, TensorGeometry,
-    TensorRead, TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite,
-    UnaryView,
+    AxisRange, Layout, Tensor, TensorAbs, TensorGeometry, TensorRead, TensorSchema,
+    TensorTransform, TensorTrig, TensorUnary, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -16,81 +14,22 @@ use common::{FsEntry, new_dir};
 
 mod common;
 
-fn assert_float<T: Copy + Into<f64>>(actual: T, expected: T) {
+fn same_float<T: Copy + Into<f64>>(actual: T, expected: T) -> bool {
     let (actual, expected) = (actual.into(), expected.into());
     if expected.is_nan() {
-        assert!(actual.is_nan(), "expected NaN, got {actual}");
+        actual.is_nan()
     } else if expected.is_infinite() {
-        assert_eq!(actual, expected);
+        actual == expected
+    } else if expected == 0.0 {
+        actual == expected && actual.is_sign_negative() == expected.is_sign_negative()
     } else {
         let tolerance = if std::mem::size_of::<T>() == 4 {
             1e-6
         } else {
             1e-12
         };
-        assert!(
-            (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
-            "expected {expected}, got {actual}"
-        );
+        (actual - expected).abs() <= tolerance * expected.abs().max(1.0)
     }
-}
-
-async fn check_consumers<T, O>(view: UnaryView<TensorView<'_, FsEntry, T>, O>, expected: &[T])
-where
-    T: TensorElement + Into<f64>,
-    FsEntry: TensorFileEntry<T>,
-    O: UnaryOp<T, Output = T>,
-{
-    let blocks: Vec<Vec<T>> = view.read_blocks().unwrap().try_collect().await.unwrap();
-    let values: Vec<_> = blocks.into_iter().flatten().collect();
-    assert_eq!(values.len(), expected.len());
-    let (out_root, out_dir) = new_dir("trig_materialized").await;
-    let output = Tensor::copy_from(out_dir, &view, 3).await.unwrap();
-    for (i, &expected) in expected.iter().enumerate() {
-        let coord = [i as u64];
-        let point = view.read_value(&coord).await.unwrap();
-        assert_float(point, expected);
-        assert_float(values[i], expected);
-        assert_float(output.read_value(&coord).await.unwrap(), expected);
-        // Sparse storage omits zeros; dense consumers preserve signed zero.
-        if matches!(view.layout(), Layout::Dense) && expected == T::default() {
-            assert_eq!(
-                Into::<f64>::into(point).is_sign_negative(),
-                Into::<f64>::into(expected).is_sign_negative()
-            );
-            assert_eq!(
-                Into::<f64>::into(values[i]).is_sign_negative(),
-                Into::<f64>::into(expected).is_sign_negative()
-            );
-            assert_eq!(
-                Into::<f64>::into(output.read_value(&coord).await.unwrap()).is_sign_negative(),
-                Into::<f64>::into(expected).is_sign_negative()
-            );
-        }
-    }
-    if matches!(view.layout(), Layout::Sparse { .. }) {
-        let rows: Vec<_> = view
-            .read_sparse_elements_in_order(
-                range![AxisRange::In(0, expected.len() as u64, 1)],
-                axes![0],
-            )
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let expected_rows: Vec<_> = expected
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| **v != T::default())
-            .collect();
-        assert_eq!(rows.len(), expected_rows.len());
-        for ((coord, actual), (i, expected)) in rows.into_iter().zip(expected_rows) {
-            assert_eq!(coord, vec![i as u64]);
-            assert_float(actual, *expected);
-        }
-    }
-    common::cleanup(&out_root).await;
 }
 
 macro_rules! operation_matrix {
@@ -98,7 +37,6 @@ macro_rules! operation_matrix {
         #[tokio::test]
         async fn $name() {
             for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
-                let (root, dir) = new_dir(stringify!($name)).await;
                 let input: Vec<$t> = vec![
                     -2.0,
                     -1.0,
@@ -115,21 +53,15 @@ macro_rules! operation_matrix {
                     <$t>::NEG_INFINITY,
                     <$t>::NAN,
                 ];
-                let tensor = Tensor::<FsEntry, $t>::create(
-                    dir,
-                    TensorSchema::new(
-                        <$t as number_general::DType>::dtype(),
-                        shape![input.len() as u64],
-                    )
-                    .unwrap(),
+                let (root, tensor) = common::fixture::source(
+                    stringify!($name),
+                    shape![input.len() as u64],
                     layout,
                     3,
+                    1_000_000,
+                    input.iter().copied(),
                 )
-                .await
-                .unwrap();
-                for (i, &value) in input.iter().enumerate() {
-                    tensor.write_value(&[i as u64], value).await.unwrap();
-                }
+                .await;
                 macro_rules! check {
                     ($method:ident) => {{
                         let mut expected = Vec::new();
@@ -151,7 +83,18 @@ macro_rules! operation_matrix {
                                 expected.push(result[0]);
                             }
                         }
-                        check_consumers(tensor.view().$method().await.unwrap(), &expected).await;
+                        let view = tensor.view().$method().await.unwrap();
+                        let equal = |actual: $t, expected: $t| {
+                            same_float(actual, expected)
+                                || (matches!(layout, Layout::Sparse { .. })
+                                    && actual == 0.0
+                                    && expected == 0.0)
+                        };
+                        if stringify!($method) == "sin" {
+                            common::fixture::consumers(&view, &expected, equal, equal).await;
+                        } else {
+                            common::fixture::blocks(&view, &expected, equal).await;
+                        }
                     }};
                 }
                 check!(abs);

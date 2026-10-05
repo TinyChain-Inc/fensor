@@ -1,15 +1,11 @@
 //! Matrix-unary views delegate numerical expression construction to their source.
 
-use futures::{StreamExt, TryStreamExt};
-
-use crate::expression::{self, Batch, Expression};
+use crate::expression::{Batch, Expression};
 use crate::mapping::CoordinateMap;
-use crate::request::{self, BatchRequest};
-use crate::schema::Coord;
+use crate::request::BatchRequest;
 use crate::{
-    Axes, BoxFuture, Error, Layout, Range, Result, Shape, SparseElementStream, Strides,
-    TensorElement, TensorGeometry, TensorMatrixUnary, TensorRead, TensorTransform,
-    TensorViewSemantics, ValueBlockStream,
+    Axes, BoxFuture, Error, Layout, Result, Shape, Strides, TensorElement, TensorGeometry,
+    TensorMatrixUnary, TensorRead, TensorTransform, TensorViewSemantics,
 };
 
 /// A lazy, read-only diagonal projection. Transforms address its output geometry.
@@ -46,23 +42,13 @@ use crate::{
 ///     Ok(())
 /// }
 /// ```
+#[derive(Clone)]
 pub struct DiagView<Source> {
     source: Source,
     // Original output geometry and transform metadata are rank-sized.
     shape: Shape,
     strides: Strides,
     mapping: CoordinateMap,
-}
-
-impl<S: Clone> Clone for DiagView<S> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            shape: self.shape.clone(),
-            strides: self.strides.clone(),
-            mapping: self.mapping.clone(),
-        }
-    }
 }
 
 impl<E> TensorMatrixUnary for E
@@ -150,10 +136,6 @@ impl<S: TensorGeometry> TensorViewSemantics for DiagView<S> {
     fn is_base_tensor(&self) -> bool {
         false
     }
-
-    fn supports_write_through(&self) -> bool {
-        false
-    }
 }
 
 impl<S> Expression for DiagView<S>
@@ -161,25 +143,35 @@ where
     S: Expression,
     S::DType: TensorElement,
 {
-    fn build<'a>(&'a self, request: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn expression_nodes(&self) -> Result<usize> {
+        crate::expression::traversal::node_count([self.source.expression_nodes()?])
+    }
+
+    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
+        self.source.detach_sources(pending);
+    }
+
+    fn build<'a>(
+        &'a self,
+        context: crate::expression::Context<'a>,
+        request: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
-            let mut cursor = request.cursor(self.shape())?;
-            // Two reusable rank-sized buffers and at most MAX_BATCH_ELEMENTS
-            // source coordinates. Correlated diagonal axes are not a rectangle.
-            let mut coord = Coord::new();
-            let mut mapped = Coord::new();
+            // Correlated diagonal axes require bounded explicit source coordinates.
             let mut coordinates = Vec::with_capacity(request.len());
-            while cursor.next_into(&mut coord) {
-                self.mapping
-                    .resolve_into(&coord, &self.shape, &self.strides, &mut mapped)?;
-                let index = mapped[mapped.len() - 1];
-                mapped.push(index);
-                coordinates.push(mapped.to_vec());
-            }
+            self.mapping
+                .visit_mapped(&request, &self.shape, &self.strides, |_, mapped| {
+                    let index = mapped[mapped.len() - 1];
+                    mapped.push(index);
+                    coordinates.push(mapped.to_vec());
+                    Ok(())
+                })?;
             let request = BatchRequest::explicit(coordinates)?;
             // Preserve the source's lazy ndarray expression and support. This
             // projection adds no evaluation or buffering boundary.
-            self.source.build(&request).await
+            context
+                .batch(&self.source, std::sync::Arc::new(request))
+                .await
         })
     }
 }
@@ -189,104 +181,19 @@ where
     S: Expression,
     S::DType: TensorElement,
 {
-    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
-        expression::coordinate_blocks(self)
-    }
-
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Ok(
-                expression::evaluate_batch(self, &BatchRequest::point(coord))
-                    .await?
-                    .values[0],
-            )
-        })
-    }
-
-    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = request::linear_requests(self.shape())?;
-
-        Ok(expression::ordered_batches(self, coords)
-            .map_ok(|(_, batch)| batch.values)
-            .boxed())
-    }
-
-    fn read_sparse_elements_in_order<'a>(
-        &'a self,
-        range: Range,
-        requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        Box::pin(async move {
-            let coords = crate::traits::sparse_coords(self, range, requested_order)?;
-
-            Ok(
-                expression::ordered_batches(self, request::explicit_requests(coords))
-                    .and_then(move |(coords, values)| async move {
-                        Ok(futures::stream::iter(expression::sparse_elements(
-                            coords,
-                            values,
-                            self.shape(),
-                        )?))
-                    })
-                    .try_flatten()
-                    .boxed(),
-            )
-        })
-    }
+    crate::expression::reader_members!(
+        read_value,
+        read_blocks,
+        read_coordinate_blocks,
+        read_sparse_elements_in_order
+    );
 }
 
 impl<S> TensorTransform for DiagView<S>
 where
     S: TensorGeometry,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.reshape(shape)?,
-            ..self
-        })
-    }
-
-    fn broadcast(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.broadcast(shape)?,
-            ..self
-        })
-    }
-
-    fn slice(self, range: Range) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.slice(range)?,
-            ..self
-        })
-    }
-
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.transpose(permutation)?,
-            ..self
-        })
-    }
-
-    fn flip(self, axis: usize) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.flip(axis)?,
-            ..self
-        })
-    }
-
-    fn squeeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.squeeze(axes)?,
-            ..self
-        })
-    }
-
-    fn unsqueeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.unsqueeze(axes)?,
-            ..self
-        })
-    }
+    crate::mapping::transform_methods!();
 }
 
 #[cfg(test)]
@@ -309,13 +216,13 @@ mod tests {
         .await;
         let product = tensor.view().matmul(&tensor.view()).await.unwrap();
         assert!(
-            super::Expression::preferred_requests(&product, product.shape())
+            crate::expression::traversal::preferred(&product, product.shape())
                 .unwrap()
                 .is_some()
         );
         let diagonal = product.diag().await.unwrap();
         assert!(
-            super::Expression::preferred_requests(&diagonal, diagonal.shape())
+            crate::expression::traversal::preferred(&diagonal, diagonal.shape())
                 .unwrap()
                 .is_none()
         );
@@ -348,8 +255,7 @@ mod tests {
                 crate::read_metrics::CURRENT.with(|metrics| {
                     let metrics = metrics.borrow();
                     assert_eq!(metrics.requested, MAX_BATCH_ELEMENTS);
-                    assert_eq!(metrics.borrows, 1);
-                    assert_eq!(metrics.lookups, 2);
+                    assert_eq!(metrics.logical_payload_reads, 2);
                 });
             })
             .await;

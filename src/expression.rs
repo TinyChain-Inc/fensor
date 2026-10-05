@@ -1,7 +1,9 @@
 //! Private batch construction shared by typed elementwise expressions.
 
-use futures::StreamExt;
+use std::ops::Deref;
+
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{Array, ArrayAccess, Buffer, NDArray, NDArrayRead, NDArrayWhere};
 
 use crate::request::{self, BatchRequest};
@@ -9,6 +11,11 @@ use crate::traits::BoxFuture;
 use crate::{
     Error, Layout, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView,
 };
+
+mod driver;
+pub use driver::Context;
+
+pub(crate) mod traversal;
 
 /// Execution limit independent of filesystem storage block capacity.
 pub(crate) const MAX_BATCH_ELEMENTS: usize = 4096;
@@ -46,21 +53,90 @@ pub trait Expression: TensorGeometry
 where
     Self::DType: TensorElement,
 {
-    /// Supply requests for the consumer's current logical shape, if preferred.
-    /// None delegates to another source or the consumer's default linear order.
-    fn preferred_requests(&self, _shape: &[u64]) -> Result<Option<RequestIterator>> {
-        Ok(None)
+    /// Count retained descriptions for admission at the dynamic value boundary.
+    fn expression_nodes(&self) -> Result<usize> {
+        Ok(1)
     }
 
-    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
-        Ok(slice.stream())
+    /// Detach runtime-owned operands before releasing this expression description.
+    fn detach_sources(&mut self, _pending: &mut Vec<Box<dyn crate::owned::Drain>>) {}
+
+    /// Describe one preferred-request step for the consumer's logical shape.
+    /// None leaves request selection to another source or the consumer.
+    fn preferred_step<'a>(&'a self, _shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
+        Ok(traversal::Preferred::Ready(None))
     }
 
-    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>>;
+    /// Describe one ordered-support step, retaining supported intermediate zeros.
+    fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
+        Ok(traversal::Support::Ready(slice.stream()))
+    }
+
+    /// Describe one selection step; native readers may retain storage order.
+    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
+        Ok(traversal::Selection::Ready(slice.stream()))
+    }
+
+    fn build<'a>(
+        &'a self,
+        context: Context<'a>,
+        coords: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<Self::DType>>>;
 }
 
 /// Owned bounded requests; expression types themselves use static dispatch.
 pub(crate) type RequestIterator = Box<dyn Iterator<Item = BatchRequest> + Send>;
+
+pub(crate) async fn read_value<E: Expression + ?Sized>(
+    source: &E,
+    coord: &[u64],
+) -> Result<E::DType>
+where
+    E::DType: TensorElement,
+{
+    Ok(evaluate_batch(source, &BatchRequest::point(coord))
+        .await?
+        .values[0])
+}
+
+pub(crate) fn read_blocks<E: Expression + ?Sized>(
+    source: &E,
+) -> Result<crate::ValueBlockStream<'_, E::DType>>
+where
+    E::DType: TensorElement,
+{
+    let requests = request::linear_requests(source.shape())?;
+    Ok(ordered_batches(source, requests)
+        .map_ok(|(_, batch)| batch.values)
+        .boxed())
+}
+
+macro_rules! reader_members {
+    ($($method:ident),+ $(,)?) => { $($crate::expression::reader_members!(@member $method);)+ };
+    (@member read_value) => {
+        fn read_value<'a>(&'a self, coord: &'a [u64]) -> $crate::BoxFuture<'a, $crate::Result<Self::DType>> {
+            Box::pin($crate::expression::read_value(self, coord))
+        }
+    };
+    (@member read_blocks) => {
+        fn read_blocks(&self) -> $crate::Result<$crate::ValueBlockStream<'_, Self::DType>> {
+            $crate::expression::read_blocks(self)
+        }
+    };
+    (@member read_coordinate_blocks) => {
+        fn read_coordinate_blocks(&self) -> $crate::Result<$crate::CoordinateBlockStream<'_, Self::DType>> {
+            $crate::expression::coordinate_blocks(self)
+        }
+    };
+    (@member read_sparse_elements_in_order) => {
+        fn read_sparse_elements_in_order<'a>(&'a self, range: $crate::Range, order: $crate::Axes)
+            -> $crate::BoxFuture<'a, $crate::Result<$crate::SparseElementStream<'a, Self::DType>>>
+        {
+            Box::pin(async move { $crate::expression::ordered_sparse(self, range, order) })
+        }
+    };
+}
+pub(crate) use reader_members;
 
 pub fn coordinate_blocks<E: Expression + ?Sized>(
     expression: &E,
@@ -68,22 +144,39 @@ pub fn coordinate_blocks<E: Expression + ?Sized>(
 where
     E::DType: TensorElement,
 {
-    let requests = match expression.preferred_requests(expression.shape())? {
+    Ok(completion_batches(expression)?
+        .map(move |batch| {
+            let (request, batch) = batch?;
+            Ok((request.into_coordinates(expression.shape())?, batch.values))
+        })
+        .boxed())
+}
+
+/// Shared completion-order consumption before a caller chooses its output representation.
+pub(crate) fn completion_batches<'a, H>(
+    expression: H,
+) -> Result<
+    impl futures::Stream<Item = Result<CoordinateBatch<<H::Target as TensorGeometry>::DType>>>
+    + Send
+    + 'a,
+>
+where
+    H: Deref + Clone + Send + Sync + 'a,
+    H::Target: Expression,
+    <H::Target as TensorGeometry>::DType: TensorElement,
+{
+    let requests = match traversal::preferred(&*expression, expression.shape())? {
         Some(requests) => requests,
         None => Box::new(request::linear_requests(expression.shape())?),
     };
     Ok(
         evaluation_futures(expression, futures::stream::iter(requests.map(Ok)))
-            .buffer_unordered(num_cpus::get().max(1))
-            .map(move |batch| {
-                let (request, batch) = batch?;
-                Ok((request.into_coordinates(expression.shape())?, batch.values))
-            })
-            .boxed(),
+            .buffer_unordered(num_cpus::get().max(1)),
     )
 }
 
 pub struct Batch<T: TensorElement> {
+    pub(crate) _allocation: Option<driver::Allocation>,
     pub array: ArrayAccess<'static, T>,
     // One byte per coordinate in this evaluation batch, not the whole tensor.
     // Streaming batches contain at most MAX_BATCH_ELEMENTS coordinates; point reads use one.
@@ -106,6 +199,28 @@ impl<T: TensorElement> Batch<T> {
         validate_support(&self.support, expected)
     }
 
+    fn into_evaluated(self) -> Result<EvaluatedBatch<T>> {
+        let expected = self.array.size();
+        self.validate(expected)?;
+        let batch = EvaluatedBatch {
+            _allocation: self._allocation,
+            values: self.array.buffer()?.to_slice()?.into_vec(),
+            support: self.support,
+        };
+        batch.validate(expected)?;
+        Ok(batch)
+    }
+
+    pub(crate) fn realize(self) -> Result<Self> {
+        let expected = self.array.size();
+        self.validate(expected)?;
+        Ok(Self {
+            _allocation: self._allocation,
+            array: ArrayAccess::from(self.array.into_read()?),
+            support: self.support,
+        })
+    }
+
     // Selection is part of the lazy expression, not a materialized intermediate.
     pub fn masked(self) -> Result<Self> {
         validate_bound("batch expression", self.array.size())?;
@@ -119,6 +234,7 @@ impl<T: TensorElement> Batch<T> {
         };
 
         Ok(Self {
+            _allocation: self._allocation,
             array: values,
             support: self.support,
         })
@@ -156,23 +272,11 @@ where
     E: Expression + ?Sized,
     E::DType: TensorElement,
 {
-    coords.validate(expression.shape())?;
-
-    #[cfg(test)]
-    crate::read_metrics::record(|m| m.slice_requests += 1);
-    let batch = expression.build(coords).await?;
-    batch.validate(coords.len())?;
-
-    // Only this bounded ndarray batch is materialized, never the full tensor.
-    let evaluated = EvaluatedBatch {
-        values: batch.array.buffer()?.to_slice()?.into_vec(),
-        support: batch.support,
-    };
-    evaluated.validate(coords.len())?;
-    Ok(evaluated)
+    driver::evaluate(expression, std::sync::Arc::new(coords.clone())).await
 }
 
 pub struct EvaluatedBatch<T> {
+    pub(crate) _allocation: Option<driver::Allocation>,
     pub values: Vec<T>,
     pub support: Option<Vec<u8>>,
 }
@@ -199,25 +303,47 @@ impl<T> EvaluatedBatch<T> {
     }
 }
 
-/// Expand coordinates only at the sparse output boundary, preserving order and duplicates.
-/// Both collections are bounded by the validated execution request.
+/// Allocate compact request coordinates only for nonzero sparse output. Explicit
+/// coordinate payloads transfer their existing allocations, retaining order and duplicates.
 pub(crate) fn sparse_elements<T: TensorElement>(
     request: BatchRequest,
     batch: EvaluatedBatch<T>,
     shape: &[u64],
-) -> Result<impl Iterator<Item = Result<(Vec<u64>, T)>>> {
+) -> Result<impl Iterator<Item = Result<(Vec<u64>, T)>> + Send + use<T>> {
+    enum Coordinates {
+        Explicit(std::vec::IntoIter<Vec<u64>>),
+        Compact(request::Cursor<BatchRequest, std::sync::Arc<[u64]>>),
+    }
+
     batch.validate(request.len())?;
-    let coords = request.into_coordinates(shape)?;
-    validate_len(
-        "sparse output coordinates",
-        coords.len(),
-        batch.values.len(),
-    )?;
-    Ok(coords
+    let mut coordinates = match request.kind() {
+        request::RequestKind::Explicit(_) => {
+            Coordinates::Explicit(request.into_coordinates(shape)?.into_iter())
+        }
+        _ => Coordinates::Compact(request.into_cursor(shape.into())?),
+    };
+    let mut scratch = crate::schema::Coord::new();
+    Ok(batch
+        .values
         .into_iter()
-        .zip(batch.values)
-        .filter(|(_, value)| *value != T::default())
-        .map(Ok))
+        .filter_map(move |value| match &mut coordinates {
+            Coordinates::Explicit(coords) => {
+                let coord = coords.next().expect("validated sparse output cardinality");
+                (value != T::default()).then_some(Ok((coord, value)))
+            }
+            Coordinates::Compact(cursor) => {
+                assert!(
+                    cursor.next_into(&mut scratch),
+                    "validated sparse output cardinality"
+                );
+                if value == T::default() {
+                    return None;
+                }
+                #[cfg(test)]
+                crate::read_metrics::record(|m| m.expanded_coordinates += 1);
+                Some(Ok((scratch.to_vec(), value)))
+            }
+        }))
 }
 
 type CoordinateBatch<T> = (BatchRequest, EvaluatedBatch<T>);
@@ -240,13 +366,14 @@ where
 
 /// Ordered delivery for consumers whose value or error boundaries require it.
 /// Also accepts demand-driven sparse-index requests without another buffer.
-pub(crate) fn ordered_requests<'a, E, R>(
-    expression: &'a E,
+pub(crate) fn ordered_requests<'a, H, R>(
+    expression: H,
     requests: R,
-) -> BoxStream<'a, Result<CoordinateBatch<E::DType>>>
+) -> BoxStream<'a, Result<CoordinateBatch<<H::Target as TensorGeometry>::DType>>>
 where
-    E: Expression + ?Sized,
-    E::DType: TensorElement,
+    H: Deref + Clone + Send + Sync + 'a,
+    H::Target: Expression,
+    <H::Target as TensorGeometry>::DType: TensorElement,
     R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,
 {
     evaluation_futures(expression, requests)
@@ -254,48 +381,69 @@ where
         .boxed()
 }
 
-/// Build lazy evaluation futures, without buffering, spawning, or expanding
-/// coordinates. Each consumer chooses delivery order at its sole buffer boundary.
-pub(crate) fn evaluation_futures<'a, E, R>(
-    expression: &'a E,
+/// Build lazy evaluation futures from borrowed or owned source handles. Only
+/// the outer consumer chooses buffering and delivery order.
+pub(crate) fn evaluation_futures<'a, H, R>(
+    expression: H,
     requests: R,
 ) -> impl futures::Stream<
-    Item = impl std::future::Future<Output = Result<CoordinateBatch<E::DType>>> + Send + 'a,
+    Item = impl std::future::Future<
+        Output = Result<CoordinateBatch<<H::Target as TensorGeometry>::DType>>,
+    > + Send
+           + 'a,
 > + Send
 + 'a
 where
-    E: Expression + ?Sized,
-    E::DType: TensorElement,
+    H: Deref + Clone + Send + Sync + 'a,
+    H::Target: Expression,
+    <H::Target as TensorGeometry>::DType: TensorElement,
     R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,
 {
-    requests.map(move |coords| async move {
-        let coords = coords?;
-        let values = evaluate_batch(expression, &coords).await?;
-
-        Ok((coords, values))
+    requests.map(move |coords| {
+        let expression = expression.clone();
+        async move {
+            let coords = coords?;
+            let values = evaluate_batch(&*expression, &coords).await?;
+            Ok((coords, values))
+        }
     })
 }
 
-impl<FE, T> Expression for TensorView<'_, FE, T>
+impl<S: crate::TensorSource> Expression for TensorView<S>
 where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    S::DType: TensorElement,
 {
-    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
+    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
         self.slice_requests_for_storage(slice)
+            .map(traversal::Selection::Ready)
     }
 
-    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<T>>> {
+    fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
+        self.ordered_storage_requests(slice)
+            .map(traversal::Support::Ready)
+    }
+
+    fn build<'a>(
+        &'a self,
+        _context: Context<'a>,
+        coords: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<S::DType>>> {
         Box::pin(async move {
-            let values = self.read_batch(coords).await?;
+            let values = self.read_batch(&coords).await?;
 
             let support = if matches!(self.layout(), Layout::Sparse { .. }) {
-                Some(values.iter().map(|v| u8::from(*v != T::ZERO)).collect())
+                Some(
+                    values
+                        .iter()
+                        .map(|v| u8::from(*v != S::DType::default()))
+                        .collect(),
+                )
             } else {
                 None
             };
 
             Ok(Batch {
+                _allocation: None,
                 array: batch_array(values)?,
                 support,
             })
@@ -308,12 +456,38 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
-        self.storage_slice_requests(slice, None)
+    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
+        crate::storage::slice_requests(self, slice, None).map(traversal::Selection::Ready)
     }
 
-    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<T>>> {
-        Box::pin(async move { self.view().build(coords).await })
+    fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
+        crate::storage::ordered_requests(
+            self,
+            slice,
+            crate::mapping::StorageSlice::identity(self.shape()),
+        )
+        .map(traversal::Support::Ready)
+    }
+
+    fn build<'a>(
+        &'a self,
+        _context: Context<'a>,
+        coords: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<T>>> {
+        Box::pin(async move {
+            let values = self.read_batch(&coords, None).await?;
+            let support = matches!(self.layout(), Layout::Sparse { .. }).then(|| {
+                values
+                    .iter()
+                    .map(|v| u8::from(*v != T::default()))
+                    .collect()
+            });
+            Ok(Batch {
+                _allocation: None,
+                array: batch_array(values)?,
+                support,
+            })
+        })
     }
 }
 
@@ -348,13 +522,27 @@ mod tests {
     }
 
     impl Expression for Provider<'_> {
-        fn preferred_requests(&self, shape: &[u64]) -> Result<Option<RequestIterator>> {
+        fn preferred_step<'a>(&'a self, shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
             self.calls.increment();
-            (self.provide)(shape)
+            (self.provide)(shape).map(traversal::Preferred::Ready)
         }
 
-        fn build<'a>(&'a self, request: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<u8>>> {
-            self.source.build(request)
+        fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
+            self.calls.increment();
+            Ok(traversal::Support::Ready(
+                match (self.provide)(self.shape())? {
+                    Some(requests) => futures::stream::iter(requests.map(Ok)).boxed(),
+                    None => slice.stream(),
+                },
+            ))
+        }
+
+        fn build<'a>(
+            &'a self,
+            context: Context<'a>,
+            request: std::sync::Arc<BatchRequest>,
+        ) -> BoxFuture<'a, Result<Batch<u8>>> {
+            self.source.build(context, request)
         }
     }
 
@@ -398,7 +586,7 @@ mod tests {
             });
             // Consumer shape is forwarded unchanged, rather than replaced by a leaf shape.
             let selected = a.cond(&b, &c).await.unwrap().not().await.unwrap();
-            let result = selected.preferred_requests(&[7, 3]);
+            let result = traversal::preferred(&selected, &[7, 3]);
             assert_eq!(result.is_err(), fails);
             assert_eq!(matches!(&result, Ok(Some(_))), supplies);
             if let Ok(Some(mut requests)) = result {
@@ -412,7 +600,7 @@ mod tests {
             }
 
             let binary = a.add(&b).await.unwrap();
-            let result = binary.preferred_requests(&[7, 3]);
+            let result = traversal::preferred(&binary, &[7, 3]);
             assert_eq!(result.is_err(), fails && expected[2] == 0);
             assert_eq!(matches!(&result, Ok(Some(_))), supplies && expected[2] == 0);
             assert_eq!(
@@ -423,32 +611,226 @@ mod tests {
         crate::test_support::cleanup(&root).await;
     }
 
-    #[test]
-    fn sparse_output_preserves_order_duplicates_and_nan() {
-        let request =
-            BatchRequest::explicit(vec![vec![2], vec![0], vec![2], vec![1], vec![0]]).unwrap();
-        let batch = EvaluatedBatch {
-            values: vec![3f32, -0., 4., f32::NAN, 0.],
-            support: Some(vec![1; 5]),
+    #[tokio::test]
+    async fn support_providers_preserve_error_precedence_and_ordered_union() {
+        use crate::{TensorMath, TensorUnaryBoolean, TensorWhere};
+
+        type Provide = fn(&[u64]) -> Result<Option<RequestIterator>>;
+        let none: Provide = |_| Ok(None);
+        let some: Provide = |_| {
+            Ok(Some(Box::new(
+                [
+                    BatchRequest::explicit(vec![vec![0], vec![0], vec![2]])?,
+                    BatchRequest::explicit(vec![vec![4]])?,
+                ]
+                .into_iter(),
+            )))
         };
-        let output = sparse_elements(request, batch, &[3])
+        let error: Provide = |_| Err(Error::Unsupported("support provider failure".into()));
+        let (root, tensor) = crate::test_support::fixture::source(
+            "support_providers",
+            vec![6].into(),
+            Layout::Sparse { axis: None },
+            2,
+            4096,
+            [0u8; 6],
+        )
+        .await;
+
+        for (providers, expected, fails) in [
+            ([none, error, none], [0, 1, 0], true),
+            ([none, none, error], [0, 1, 1], true),
+            ([error, none, none], [1, 1, 1], true),
+            ([none, some, some], [1, 1, 1], false),
+            ([some, none, some], [1, 1, 1], false),
+            ([some, some, none], [1, 1, 1], false),
+        ] {
+            let calls = [Counter::new(), Counter::new(), Counter::new()];
+            let [condition, left, right] = std::array::from_fn(|i| Provider {
+                source: &tensor,
+                calls: &calls[i],
+                provide: providers[i],
+            });
+            let selected = condition
+                .cond(&left, &right)
+                .await
+                .unwrap()
+                .not()
+                .await
+                .unwrap();
+            let requests = traversal::support(&selected, crate::slice::Slice::full(&[6]).unwrap());
+            assert_eq!(requests.is_err(), fails);
+            assert_eq!(calls.each_ref().map(|n| n.read()), expected);
+            if let Ok(mut requests) = requests {
+                let mut coordinates = Vec::new();
+                while let Some(request) = requests.try_next().await.unwrap() {
+                    assert!(request.len() <= MAX_BATCH_ELEMENTS);
+                    coordinates.extend(request.into_coordinates(&[6]).unwrap());
+                }
+                assert_eq!(coordinates, (0..6).map(|i| vec![i]).collect::<Vec<_>>());
+            }
+        }
+        for (providers, expected) in [([error, none], [1, 0]), ([none, error], [1, 1])] {
+            let calls = [Counter::new(), Counter::new()];
+            let [left, right] = std::array::from_fn(|i| Provider {
+                source: &tensor,
+                calls: &calls[i],
+                provide: providers[i],
+            });
+            assert!(
+                traversal::support(
+                    &left.add(&right).await.unwrap(),
+                    crate::slice::Slice::full(&[6]).unwrap(),
+                )
+                .is_err()
+            );
+            assert_eq!(calls.each_ref().map(|n| n.read()), expected);
+        }
+        crate::test_support::cleanup(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sparse_output_preserves_order_duplicates_and_nan() {
+        use crate::mapping::CoordinateMap;
+        use crate::request::{Axis, Cartesian, RequestKind};
+
+        let mapping = CoordinateMap::identity(ha_ndarray::shape![2, 3], &[3, 1])
+            .transpose(None)
             .unwrap()
-            .collect::<Result<Vec<_>>>()
+            .flip(0)
             .unwrap();
-        assert_eq!(&output[..2], &[(vec![2], 3.), (vec![2], 4.)]);
-        assert_eq!(output[2].0, vec![1]);
-        assert!(output[2].1.is_nan());
-        assert_eq!(output.len(), 3);
+        let mut high_rank = vec![1; crate::PORTABLE_INLINE_RANK + 2];
+        *high_rank.last_mut().unwrap() = 7;
+        let pattern = [
+            3f32,
+            -0.,
+            4.,
+            f32::from_bits(0x7fc01234),
+            0.,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let cases = [
+            (
+                "explicit",
+                BatchRequest::explicit(vec![vec![2], vec![0], vec![2], vec![1], vec![0]]).unwrap(),
+                vec![3],
+                &pattern[..],
+            ),
+            (
+                "linear batch boundary",
+                BatchRequest::linear(MAX_BATCH_ELEMENTS as u64 - 1, MAX_BATCH_ELEMENTS).unwrap(),
+                vec![2 * MAX_BATCH_ELEMENTS as u64],
+                &pattern[..],
+            ),
+            (
+                "rectangular duplicates",
+                BatchRequest::rectangles(vec![
+                    Cartesian::new(vec![
+                        Axis::Selected(vec![2, 0, 2]),
+                        Axis::Selected(vec![1, 3]),
+                    ])
+                    .unwrap(),
+                ])
+                .unwrap(),
+                vec![3, 4],
+                &pattern[..],
+            ),
+            (
+                "transformed flat runs",
+                BatchRequest::linear(0, 6)
+                    .unwrap()
+                    .mapped(&mapping, &[2, 3], &[3, 1])
+                    .unwrap(),
+                vec![2, 3],
+                &pattern[..],
+            ),
+            (
+                "high rank",
+                BatchRequest::linear(0, 7).unwrap(),
+                high_rank,
+                &pattern[..],
+            ),
+            (
+                "empty",
+                BatchRequest::linear(0, 0).unwrap(),
+                vec![1],
+                &pattern[..],
+            ),
+            (
+                "all zeros",
+                BatchRequest::linear(0, 7).unwrap(),
+                vec![7],
+                &[0., -0.][..],
+            ),
+        ];
+        for (name, request, shape, pattern) in cases {
+            let explicit = matches!(request.kind(), RequestKind::Explicit(_));
+            let expected_coords = request.coordinates(&shape).unwrap();
+            let pointers = match request.kind() {
+                RequestKind::Explicit(coords) => coords
+                    .iter()
+                    .map(|coord| coord.as_ptr())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let values: Vec<_> = (0..request.len())
+                .map(|i| pattern[i % pattern.len()])
+                .collect();
+            let expected: Vec<_> = expected_coords
+                .iter()
+                .zip(&values)
+                .enumerate()
+                .filter(|(_, (_, value))| **value != 0.)
+                .map(|(i, (coord, value))| (i, coord.clone(), value.to_bits()))
+                .collect();
+            crate::read_metrics::CURRENT
+                .scope(Default::default(), async {
+                    let output = sparse_elements(
+                        request,
+                        EvaluatedBatch {
+                            _allocation: None,
+                            support: Some(vec![1; values.len()]),
+                            values,
+                        },
+                        &shape,
+                    )
+                    .unwrap();
+                    crate::read_metrics::CURRENT.with(|m| {
+                        assert_eq!(m.borrow().expanded_coordinates, 0, "{name}");
+                    });
+                    let output = output.collect::<Result<Vec<_>>>().unwrap();
+                    assert_eq!(output.len(), expected.len(), "{name}");
+                    for ((coord, value), (i, expected_coord, bits)) in output.iter().zip(&expected)
+                    {
+                        assert_eq!(coord, expected_coord, "{name}");
+                        assert_eq!(value.to_bits(), *bits, "{name}");
+                        if explicit {
+                            assert_eq!(coord.as_ptr(), pointers[*i], "{name}");
+                        }
+                    }
+                    crate::read_metrics::CURRENT.with(|m| {
+                        assert_eq!(
+                            m.borrow().expanded_coordinates,
+                            if explicit { 0 } else { expected.len() },
+                            "{name}"
+                        );
+                    });
+                })
+                .await;
+        }
     }
 
     #[test]
     fn sparse_output_rejects_mismatched_values_and_support() {
         for batch in [
             EvaluatedBatch {
+                _allocation: None,
                 values: vec![1u8, 2],
                 support: None,
             },
             EvaluatedBatch {
+                _allocation: None,
                 values: vec![1u8],
                 support: Some(vec![]),
             },
@@ -456,6 +838,25 @@ mod tests {
             assert!(matches!(
                 sparse_elements(BatchRequest::point(&[0]), batch, &[1]),
                 Err(Error::InvalidLayout(_))
+            ));
+        }
+
+        for request in [
+            BatchRequest::linear(2, 1).unwrap(),
+            BatchRequest::linear(2, 0).unwrap(),
+            BatchRequest::rectangles(vec![
+                request::Cartesian::new(vec![request::Axis::range(1, 1)]).unwrap(),
+            ])
+            .unwrap(),
+        ] {
+            let batch = EvaluatedBatch {
+                _allocation: None,
+                values: vec![0u8; request.len()],
+                support: None,
+            };
+            assert!(matches!(
+                sparse_elements(request, batch, &[1]),
+                Err(Error::InvalidCoord(_))
             ));
         }
     }
@@ -487,22 +888,26 @@ mod tests {
     fn malformed_batches_fail_closed() {
         assert!(batch_array(vec![0u8; MAX_BATCH_ELEMENTS + 1]).is_err());
         let batch = Batch {
+            _allocation: None,
             array: batch_array(vec![1u8, 2]).unwrap(),
             support: None,
         };
         assert!(batch.validate(1).is_err());
         let batch = Batch {
+            _allocation: None,
             array: batch_array(vec![1u8, 2]).unwrap(),
             support: Some(vec![1]),
         };
         assert!(batch.validate(2).is_err());
         assert!(batch.masked().is_err());
         let evaluated = EvaluatedBatch {
+            _allocation: None,
             values: vec![1u8],
             support: None,
         };
         assert!(evaluated.validate(2).is_err());
         let evaluated = EvaluatedBatch {
+            _allocation: None,
             values: vec![1u8],
             support: Some(vec![]),
         };
@@ -516,6 +921,7 @@ mod tests {
         let values = vec![2u8, 3, 4, 5];
         let pointer = values.as_ptr();
         let values = EvaluatedBatch {
+            _allocation: None,
             values,
             support: Some(vec![0, 1, 0, 1]),
         }
@@ -545,3 +951,41 @@ mod tests {
 #[cfg(test)]
 #[path = "expression/concurrency_tests.rs"]
 mod concurrency_tests;
+
+pub(crate) fn ordered_sparse<'a, H>(
+    source: H,
+    range: crate::Range,
+    order: crate::Axes,
+) -> Result<crate::SparseElementStream<'a, <H::Target as TensorGeometry>::DType>>
+where
+    H: Deref + Clone + Send + Sync + 'a,
+    H::Target: Expression,
+    <H::Target as TensorGeometry>::DType: TensorElement,
+{
+    let slice = crate::traits::sparse_slice(&*source, range, order)?;
+    let requests = traversal::support(&*source, slice)?;
+    Ok(sparse_stream(source, requests))
+}
+
+/// Consume candidate support with one ordered buffer and no intermediate output collection.
+pub(crate) fn sparse_stream<'a, H, R>(
+    source: H,
+    requests: R,
+) -> crate::SparseElementStream<'a, <H::Target as TensorGeometry>::DType>
+where
+    H: Deref + Clone + Send + Sync + 'a,
+    H::Target: Expression,
+    <H::Target as TensorGeometry>::DType: TensorElement,
+    R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,
+{
+    let shape = source.shape().to_vec();
+    ordered_requests(source, requests)
+        .map(move |result| {
+            let (request, batch) = result?;
+            Ok::<_, Error>(futures::stream::iter(sparse_elements(
+                request, batch, &shape,
+            )?))
+        })
+        .try_flatten()
+        .boxed()
+}

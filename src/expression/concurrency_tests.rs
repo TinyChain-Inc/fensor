@@ -53,13 +53,14 @@ impl<T: TensorElement> Expression for Source<'_, T>
 where
     FsEntry: TensorFileEntry<T>,
 {
-    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<RequestIterator>> {
-        Ok(Some(Box::new(crate::schema::row_major_coords(shape)?.map(
-            |coord| BatchRequest::explicit(vec![coord]).unwrap(),
+    fn preferred_step<'a>(&'a self, shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
+        Ok(traversal::Preferred::Ready(Some(Box::new(
+            crate::schema::row_major_coords(shape)?
+                .map(|coord| BatchRequest::explicit(vec![coord]).unwrap()),
         ))))
     }
 
-    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
+    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
         // Test-only singleton batches preserve the validated slice selection.
         let requests = slice.requests().flat_map(|request| {
             request
@@ -68,10 +69,16 @@ where
                 .into_iter()
                 .map(|coord| BatchRequest::explicit(vec![coord]))
         });
-        Ok(futures::stream::iter(requests).boxed())
+        Ok(traversal::Selection::Ready(
+            futures::stream::iter(requests).boxed(),
+        ))
     }
 
-    fn build<'a>(&'a self, request: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<T>>> {
+    fn build<'a>(
+        &'a self,
+        context: super::Context<'a>,
+        request: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<T>>> {
         Box::pin(async move {
             let index = self.started.increment();
             let _finished = Finish(&self.finished);
@@ -81,7 +88,7 @@ where
             } else if self.fail_at == Some(index) {
                 return Err(Error::Unsupported("injected later batch failure".into()));
             }
-            let batch = self.tensor.build(request).await?;
+            let batch = self.tensor.build(context, request).await?;
             self.completed.increment();
             Ok(batch)
         })
@@ -142,10 +149,16 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             .unwrap();
     }
 
-    for cancel in [false, true] {
+    for (owned, cancel) in [(false, false), (false, true), (true, false), (true, true)] {
         let (source, release) = delayed(&tensor);
+        let source = std::sync::Arc::new(source);
+        let weak = std::sync::Arc::downgrade(&source);
         let requests = (0..count).map(|i| BatchRequest::explicit(vec![vec![i as u64]]).unwrap());
-        let mut stream = ordered_batches(&source, requests);
+        let mut stream = if owned {
+            ordered_requests(source.clone(), futures::stream::iter(requests.map(Ok)))
+        } else {
+            ordered_batches(&*source, requests)
+        };
         // Tokio's cooperative I/O budget may yield before the window finishes.
         futures::future::poll_fn(|cx| {
             assert!(stream.as_mut().poll_next(cx).is_pending());
@@ -176,7 +189,13 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             assert!(stream.try_next().await.unwrap().is_none());
             assert_eq!(source.started.read(), count as u64);
             assert_eq!(source.finished.read(), count as u64);
+            drop(stream);
         }
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "stream retained its source after drop"
+        );
     }
 
     test_support::cleanup(&root).await;
@@ -186,7 +205,7 @@ async fn stored<T: TensorElement>(
     name: &str,
     values: &[T],
     sparse: bool,
-) -> (std::path::PathBuf, Tensor<FsEntry, T>)
+) -> (crate::test_support::Directory, Tensor<FsEntry, T>)
 where
     FsEntry: TensorFileEntry<T>,
 {
@@ -440,4 +459,24 @@ async fn numeric_terminals_accept_completion_schedules() {
         }
         test_support::cleanup(&root).await;
     }
+}
+
+#[tokio::test]
+async fn owned_stream_error_releases_pending_evaluation_on_drop() {
+    let (root, tensor) = stored("owned_error", &[1u8, 2], false).await;
+    let (source, release) = delayed(&tensor);
+    let source = std::sync::Arc::new(source);
+    let weak = std::sync::Arc::downgrade(&source);
+    let requests = futures::stream::iter([Ok(BatchRequest::point(&[0]))]);
+    let mut stream = ordered_requests(source, requests);
+    release
+        .send(Err(Error::InvalidLayout("test read failure".into())))
+        .unwrap();
+    assert!(matches!(
+        stream.try_next().await,
+        Err(Error::InvalidLayout(_))
+    ));
+    drop(stream);
+    assert!(weak.upgrade().is_none());
+    test_support::cleanup(&root).await;
 }

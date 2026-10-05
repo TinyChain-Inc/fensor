@@ -1,10 +1,8 @@
 //! Native u8 storage and lazy boolean expressions over real filesystem tensors.
 
-use fensor::unary::UnaryOp;
 use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorCast, TensorElement, TensorFileEntry, TensorGeometry,
-    TensorNumeric, TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorView,
-    TensorWrite, UnaryView,
+    AxisRange, Error, Layout, Tensor, TensorCast, TensorNumeric, TensorRead, TensorSchema,
+    TensorTransform, TensorUnaryBoolean, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -16,53 +14,11 @@ use number_general::{FloatType, NumberType, UIntType};
 use common::{FsEntry, new_dir};
 mod common;
 
-async fn check_consumers<T, O>(view: UnaryView<TensorView<'_, FsEntry, T>, O>, expected: &[u8])
-where
-    T: TensorElement,
-    FsEntry: TensorFileEntry<T>,
-    O: UnaryOp<T, Output = u8>,
-{
-    let blocks: Vec<Vec<u8>> = view.read_blocks().unwrap().try_collect().await.unwrap();
-    assert_eq!(blocks.into_iter().flatten().collect::<Vec<_>>(), expected);
-    let (out_root, out_dir) = new_dir("boolean_out").await;
-    let output = Tensor::<FsEntry, u8>::copy_from(out_dir, &view, 2)
-        .await
-        .unwrap();
-    for (i, &value) in expected.iter().enumerate() {
-        let coord = [i as u64];
-        assert_eq!(view.read_value(&coord).await.unwrap(), value);
-        assert_eq!(output.read_value(&coord).await.unwrap(), value);
-    }
-    if matches!(view.layout(), Layout::Sparse { .. }) {
-        let rows: Vec<_> = view
-            .read_sparse_elements_in_order(
-                range![AxisRange::In(0, expected.len() as u64, 1)],
-                axes![0],
-            )
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(
-            rows,
-            expected
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| **v != 0)
-                .map(|(i, &v)| (vec![i as u64], v))
-                .collect::<Vec<_>>()
-        );
-    }
-    common::cleanup(&out_root).await;
-}
-
 macro_rules! float_predicates {
     ($name:ident, $t:ty) => {
         #[tokio::test]
         async fn $name() {
             for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
-                let (root, dir) = new_dir(stringify!($name)).await;
                 let input: Vec<$t> = vec![
                     0.0,
                     -0.0,
@@ -72,21 +28,15 @@ macro_rules! float_predicates {
                     <$t>::INFINITY,
                     <$t>::NEG_INFINITY,
                 ];
-                let tensor = Tensor::<FsEntry, $t>::create(
-                    dir,
-                    TensorSchema::new(
-                        <$t as number_general::DType>::dtype(),
-                        shape![input.len() as u64],
-                    )
-                    .unwrap(),
+                let (root, tensor) = common::fixture::source(
+                    stringify!($name),
+                    shape![input.len() as u64],
                     layout,
                     2,
+                    1_000_000,
+                    input.iter().copied(),
                 )
-                .await
-                .unwrap();
-                for (i, &value) in input.iter().enumerate() {
-                    tensor.write_value(&[i as u64], value).await.unwrap();
-                }
+                .await;
                 macro_rules! check {
                     ($method:ident) => {{
                         let array = ArrayAccess::from(
@@ -107,7 +57,13 @@ macro_rules! float_predicates {
                                 }
                             }
                         }
-                        check_consumers(tensor.view().$method().await.unwrap(), &expected).await;
+                        common::fixture::consumers(
+                            &tensor.view().$method().await.unwrap(),
+                            &expected,
+                            |a, b| a == b,
+                            |a, b| a == b,
+                        )
+                        .await;
                     }};
                 }
                 check!(not);
@@ -158,7 +114,13 @@ async fn u8_storage_views_not_and_reload() {
             expected[0] = 0;
         }
 
-        check_consumers(tensor.view().not().await.unwrap(), &expected).await;
+        common::fixture::consumers(
+            &tensor.view().not().await.unwrap(),
+            &expected,
+            |a, b| a == b,
+            |a, b| a == b,
+        )
+        .await;
 
         for (i, value) in [255, 127, 1, 0].into_iter().enumerate() {
             assert_eq!(flipped.read_value(&[i as u64]).await.unwrap(), value);
@@ -286,7 +248,7 @@ async fn u8_cache_spill_and_reload() {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let (root, _) = new_dir("u8_spill").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
-        let dir = cache.load(root.clone()).unwrap();
+        let dir = cache.load(root.to_path_buf()).unwrap();
         let tensor = Tensor::<FsEntry, u8>::create(
             dir.clone(),
             TensorSchema::new(NumberType::UInt(UIntType::U8), shape![2048]).unwrap(),
@@ -331,7 +293,7 @@ async fn u8_malformed_blocks_fail_closed() {
     .unwrap();
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     let file = blocks.read().await.get_file("0").unwrap().clone();
-    file.write::<Vec<u8>>().await.unwrap().truncate(1);
+    file.write::<Vec<u8>>(0).await.unwrap().truncate(1);
     assert!(matches!(
         tensor.read_value(&[0]).await,
         Err(Error::InvalidLayout(_))

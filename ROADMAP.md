@@ -15,20 +15,17 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
 
 ## Sparse traversal
 
-- Index-driven ordered sparse reads through geometric transforms. Current public
-  sparse streams scan the selected logical range; eligible numeric reductions
-  already enumerate occupied storage regions.
+- Extend indexed ordered reads to additional mappings whose order can be provided
+  directly by native indexes. Incompatible geometry retains bounded logical evaluation.
 - Indexed sparse diagonal traversal; current diagonal reads select bounded
   coordinates and full scans remain proportional to logical diagonal length.
-- Coordinated occupied-source traversal for binary, conditional, and aggregate
-  expression sources, preserving union support and corruption/error contracts.
+- Indexed aggregate output support traversal, preserving group support and corruption/error contracts.
 - Sparse matrix algorithms that skip empty contraction intervals without losing
   retained intermediate support or zero-times-infinity behavior. Current matrix
   products scan logical contraction length.
-- Bounded sparse compaction and filesystem/index metadata scaling. Execution
-  batch limits do not bound filesystem metadata; whole-index collection is prohibited.
-  Ordinary zero writes reclaim entirely zero, unreferenced blocks using a streamed
-  reference check; compaction still owns other unreachable payload.
+- Native table metadata scaling and bounded page compaction. Adaptive payloads
+  share pages and remove obsolete rows during replacement; execution batch
+  limits do not bound total filesystem metadata. Whole-index collection is prohibited.
 
 ## Execution and storage costs
 
@@ -36,9 +33,9 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
   already use affine runs. Preserve the bounded irregular/gather paths.
 - Operand reuse across matrix tiles and nested-expression scheduling, guided by
   measurements and without implicitly persisting computed intermediates.
-- Grouped general bulk writes and possible dense-initialization improvements.
-  `copy_from` already groups destination blocks and overlaps reads with sequential
-  writes. Investigate completion-order cache locality separately.
+- Dense-initialization improvements and completion-order cache locality, guided
+  by measurements. Native fills and value-buffer writes already update bounded
+  blocks; `copy_from` consumes and writes each destination batch sequentially.
 - Profile async allocation and backend scheduling before changing future types,
   CPU offloading, concurrency limits, or block-sizing policy. No public tuning
   abstraction is justified by a hypothetical performance benefit alone.
@@ -46,14 +43,14 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
 ## External dependencies and boundaries
 
 ha-ndarray owns numerical definitions, backend selection, fusion, and hardware
-parallelism. Follow its [numerical contract and validation status](../ha-ndarray/NUMERICS.md)
-for GPU conformance and future CubeCL support; fensor's storage tests cannot establish
+parallelism. Its [numerical contract and validation status](https://github.com/TinyChain-Inc/ha-ndarray/blob/main/NUMERICS.md)
+provide non-normative integration context for GPU conformance and future CubeCL
+support; fensor's storage tests cannot establish
 backend conformance. Backend integration must retain bounded, lazy consumption.
 
 Transaction lifecycle, recovery, cross-host orchestration, codec selection, and
 durability policy remain caller responsibilities, not pending fensor features.
 
-See the [collection handoff contract](DESIGN.md#collection-handoff) for unresolved
-transaction-visible leaf access, storage geometry/occupied traversal, and
-payload/index version ownership. The public API smoke test verifies current
-usage without implementing transactions or certifying copy-on-write readiness.
+See the [native storage contract](DESIGN.md#native-storage-and-sources) for the typed
+source, logical geometry, occupied traversal, owned value, strict loading, and
+native replacement interfaces.

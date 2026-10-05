@@ -32,10 +32,18 @@ pub enum AxisRange {
 pub const MAX_BLOCK_CAPACITY: usize = 4096;
 
 /// Sparse-index leaf size in bytes, as required by b_table::BTreeSchema.
-const SPARSE_INDEX_BLOCK_BYTES: usize = 4096;
+pub(crate) const SPARSE_INDEX_BLOCK_BYTES: usize = 4096;
 
-/// Sparse-index B-tree node order; independent of tensor block capacity.
-const SPARSE_INDEX_ORDER: usize = 16;
+/// Target retained bytes per sparse node, independent of tensor block capacity.
+pub(crate) const SPARSE_NODE_MEMORY: usize = 16384;
+
+// Include the wider index-node representation, not just scalar payload bytes.
+// Even order preserves the native split/merge occupancy invariant.
+pub(crate) fn sparse_node_order<V>(width: usize) -> usize {
+    let header = std::mem::size_of::<b_table::Node<V>>();
+    let row = std::mem::size_of::<Vec<V>>() + width * std::mem::size_of::<V>() + 16;
+    ((SPARSE_NODE_MEMORY - header) / row / 2 * 2).max(4)
+}
 
 /// Base tensor identity: dtype + fixed logical shape + fixed contiguous
 /// strides. Held by `Tensor`, never mutated after creation -- the *current*
@@ -115,8 +123,8 @@ impl StorageSchema {
     /// Creation path: run the greedy algorithm to pick a block shape.
     pub(crate) fn new(tensor_shape: &[u64], layout: Layout, max_capacity: usize) -> FResult<Self> {
         validate_shape_dims(tensor_shape)?;
-        // A sparse key fixes one coordinate on its sparse axis. Spending block
-        // capacity on that axis would allocate payload invisible through the key.
+        // Default sparse geometry fixes one sparse-axis coordinate per block and
+        // spends capacity on other axes. Explicit validated geometry can span regions.
         let block_schema = if let Layout::Sparse { axis } = layout {
             let axis = axis.unwrap_or(0);
             let mut region = Shape::from_slice(tensor_shape);
@@ -256,7 +264,7 @@ pub(crate) fn checked_product(shape: &[u64]) -> FResult<u64> {
 }
 
 /// Row-major (C-order) coordinate walk over `shape` for bounded reads and copies.
-pub(crate) struct RowMajorCoords {
+pub struct RowMajorCoords {
     shape: Shape,
     coord: Coord,
     remaining: u64,
@@ -264,7 +272,7 @@ pub(crate) struct RowMajorCoords {
 
 /// Stores only the shape and one current coordinate (both rank-sized).
 /// Total size is a counter, never a coordinate allocation.
-pub(crate) fn row_major_coords(shape: &[u64]) -> FResult<RowMajorCoords> {
+pub fn row_major_coords(shape: &[u64]) -> FResult<RowMajorCoords> {
     validate_shape_dims(shape)?;
     let remaining = checked_product(shape)?;
 
@@ -308,7 +316,7 @@ impl Iterator for RowMajorCoords {
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub struct SparseIndexSchema {
+pub(crate) struct SparseIndexSchema {
     columns: Vec<String>,
 }
 
@@ -332,7 +340,7 @@ impl b_table::BTreeSchema for SparseIndexSchema {
     }
 
     fn order(&self) -> usize {
-        SPARSE_INDEX_ORDER
+        sparse_node_order::<u64>(self.columns.len())
     }
 
     fn validate_key(
@@ -359,14 +367,26 @@ impl IndexSchema for SparseIndexSchema {
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub struct SparseTableSchema {
+pub(crate) struct SparseTableSchema {
+    key_len: usize,
     primary: SparseIndexSchema,
     auxiliary: Vec<(String, SparseIndexSchema)>,
+}
+
+impl SparseTableSchema {
+    pub(crate) fn descriptors() -> Self {
+        Self {
+            key_len: 1,
+            primary: SparseIndexSchema::new(vec!["block".into(), "encoding".into()]),
+            auxiliary: vec![],
+        }
+    }
 }
 
 impl Default for SparseTableSchema {
     fn default() -> Self {
         Self {
+            key_len: 2,
             primary: SparseIndexSchema::new(vec![
                 "coord".to_string(),
                 "block_offset".to_string(),
@@ -387,11 +407,11 @@ impl Schema for SparseTableSchema {
     type Index = SparseIndexSchema;
 
     fn key(&self) -> &[Self::Id] {
-        &self.primary.columns()[0..2]
+        &self.primary.columns()[..self.key_len]
     }
 
     fn values(&self) -> &[Self::Id] {
-        &self.primary.columns()[2..]
+        &self.primary.columns()[self.key_len..]
     }
 
     fn primary(&self) -> &Self::Index {
@@ -406,7 +426,7 @@ impl Schema for SparseTableSchema {
         &self,
         key: Vec<Self::Value>,
     ) -> std::result::Result<Vec<Self::Value>, Self::Error> {
-        if key.len() == 2 {
+        if key.len() == self.key_len {
             Ok(key)
         } else {
             Err(io::Error::new(
@@ -420,7 +440,7 @@ impl Schema for SparseTableSchema {
         &self,
         values: Vec<Self::Value>,
     ) -> std::result::Result<Vec<Self::Value>, Self::Error> {
-        if values.len() == 1 {
+        if values.len() == self.values().len() {
             Ok(values)
         } else {
             Err(io::Error::new(

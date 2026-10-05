@@ -192,8 +192,8 @@ mod tests {
     use super::*;
     use crate::test_support::{FsEntry, new_dir};
     use crate::{
-        Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorSparseIndex,
-        TensorTransform, TensorUnary, TensorWrite,
+        Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
+        TensorUnary, TensorWrite,
     };
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
                 });
             })
             .await;
-        let mut requests = crate::expression::Expression::slice_requests(
+        let mut requests = crate::expression::traversal::selection(
             &tensor,
             Slice::full(&[2, 1_000_000_000]).unwrap(),
         )
@@ -369,23 +369,14 @@ mod tests {
         .unwrap();
         tensor.write_value(&[0, 0], 1.).await.unwrap();
         tensor.write_value(&[0, 9_999], 2.).await.unwrap();
-        let id = tensor.lookup_block_id(&[0, 0]).await.unwrap().unwrap();
-        dir.read()
-            .await
-            .get_dir("blocks")
-            .unwrap()
-            .write()
-            .await
-            .delete(&id.to_string())
-            .await;
+        tensor.corrupt_sparse_payload(0).await;
         let slice = tensor
             .view()
             .slice(vec![AxisRange::At(0), AxisRange::In(5000, 10000, 1)].into())
             .unwrap();
         assert_eq!(slice.sum_all().await.unwrap(), 2.);
         assert!(tensor.sum_all().await.is_err());
-        tensor.delete_row(vec![0, 0]).await.unwrap();
-        tensor.upsert_block_id(vec![1, 0], id).await.unwrap();
+        tensor.corrupt_occupied_region([0, 0], [1, 0]).await;
         assert!(matches!(
             tensor.sum_all().await,
             Err(Error::InvalidLayout(_))
@@ -394,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn occupied_slices_respect_physical_aliases_and_live_sources() {
+    async fn occupied_slices_respect_shared_pages_and_live_sources() {
         let (root, dir) = new_dir("slice_alias").await;
         let tensor = Tensor::<FsEntry, f32>::create(
             dir,
@@ -406,12 +397,13 @@ mod tests {
         .unwrap();
         tensor.write_value(&[0, 0], 2.).await.unwrap();
         tensor.write_value(&[0, 1], 3.).await.unwrap();
-        let id = tensor.lookup_block_id(&[0, 0]).await.unwrap().unwrap();
-        tensor.upsert_block_id(vec![1, 1429], id).await.unwrap();
+        tensor.write_value(&[1, 0], 2.).await.unwrap();
+        tensor.write_value(&[1, 1], 3.).await.unwrap();
         assert_eq!(tensor.sum_all().await.unwrap(), 10.);
         let transposed = tensor.view().transpose(None).unwrap();
         assert_eq!(transposed.product_all().await.unwrap(), 36.);
-        tensor.delete_row(vec![1, 1429]).await.unwrap();
+        tensor.write_value(&[1, 0], 0.).await.unwrap();
+        tensor.write_value(&[1, 1], 0.).await.unwrap();
         assert_eq!(transposed.sum_all().await.unwrap(), 5.);
         crate::test_support::cleanup(&root).await;
     }

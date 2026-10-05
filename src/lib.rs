@@ -21,13 +21,13 @@
 //! delivery and `buffer_unordered` for coordinate streams and numeric terminals.
 //! Synchronous backend work runs on the polling thread and may use backend workers;
 //! `async move` does not create CPU parallelism. Inner evaluation adds no buffering.
-//! Copying overlaps one sequential update and one lookahead with `try_join!`.
+//! Copying completes each destination update before requesting the next source batch.
 //!
 //! Sparse support survives intermediate zeros. Numeric terminals accumulate in
 //! completion order under the backend aggregate contract, with no input-order
 //! error precedence. Boolean terminals retain logical short-circuit boundaries.
-//! Dropping consumption cancels pending evaluation. Copy failures can leave partial
-//! storage; call [`Tensor::sync`] explicitly before reopening it.
+//! Dropping consumption cancels pending evaluation. Copy failures leave unpublished
+//! storage for caller cleanup. Call [`Tensor::sync`] on completed storage before reopening.
 //!
 //! ## Compose and consume without result storage
 //!
@@ -79,6 +79,8 @@ mod matrix;
 
 mod metadata;
 
+mod owned;
+
 #[cfg(test)]
 mod read_metrics;
 
@@ -101,6 +103,11 @@ mod selection;
 mod slice;
 
 mod storage_read;
+
+mod sparse;
+mod storage;
+pub use sparse::{SparseCell, SparseNode};
+pub use storage::BlockUpdates;
 
 mod tensor;
 
@@ -130,18 +137,17 @@ pub use matmul::MatMulView;
 pub use matrix::DiagView;
 pub use metadata::TensorMetadata;
 pub use number_general::NumberType;
-pub use reduce::ReduceView;
+pub use reduce::{ReduceView, StatisticsElement, TensorStatistics};
 pub use schema::{
-    AxisRange, Layout, Range, Shape, SparseIndexSchema, SparseTableSchema, Strides, TensorSchema,
-    contiguous_strides,
+    AxisRange, Layout, MAX_BLOCK_CAPACITY, Range, RowMajorCoords, Shape, Strides, TensorSchema,
+    contiguous_strides, row_major_coords,
 };
 pub use selection::WhereView;
 pub use traits::{
-    BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray,
-    TensorBlockStore, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
-    TensorCompareScalar, TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar,
-    TensorMatrixUnary, TensorNumeric, TensorRead, TensorReduce, TensorReduceAll,
-    TensorReduceBoolean, TensorSparseIndex, TensorTransform, TensorTrig, TensorUnary,
+    BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray, TensorBoolean,
+    TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar, TensorGeometry,
+    TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric, TensorRead,
+    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig, TensorUnary,
     TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite, TensorWriteBulk,
     ValueBlockStream,
 };
@@ -150,6 +156,12 @@ pub use traits::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};
 
 pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 pub use unary::UnaryView;
+pub use validate::{
+    broadcast_reduce_axes, broadcast_shape, matmul_broadcast_shapes, reduction_axes,
+};
 pub use view::TensorView;
 
 pub(crate) const PORTABLE_INLINE_RANK: usize = 8;
+
+pub use owned::TensorExpression;
+pub use storage::{StorageGeometry, StorageRead, TensorSource};

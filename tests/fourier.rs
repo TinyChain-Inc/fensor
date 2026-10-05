@@ -81,7 +81,8 @@ where
                 layout,
                 7,
                 if matches!(layout, Layout::Dense) {
-                    256
+                    // Admit typed complex blocks and file envelopes, not encoded bytes.
+                    1024
                 } else {
                     1_000_000
                 },
@@ -447,7 +448,7 @@ async fn bounds_corruption_and_exceptional_values() {
     assert!(fft2(&v.clone().reshape(shape![8]).unwrap()).await.is_err());
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     let file = blocks.read().await.get_file("1").unwrap().clone();
-    file.write::<Vec<Complex64>>().await.unwrap().clear();
+    file.write::<Vec<Complex64>>(0).await.unwrap().clear();
     let fft = v.fft().await.unwrap();
     assert_eq!(
         fft.read_value(&[0, 0]).await.unwrap(),

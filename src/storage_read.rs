@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use crate::mapping::CoordinateMap;
-use crate::request::{BatchRequest, RequestKind, decode_flat, linear_segments};
+use crate::request::{BatchRequest, Progression, RequestKind, decode_flat, progressions};
 use crate::schema::{BlockPosition, Coord};
 use crate::{Error, Result};
 
@@ -51,10 +51,8 @@ impl Run {
     }
 }
 
-// Each logical address owns only its requested runs. Sparse keys include the
-// logical block ID; dense addresses use [0, block]. Physical aliases merge
-// after one lookup per sparse key.
-pub(crate) type LogicalGroups = BTreeMap<[u64; 2], Vec<Run>>;
+// Each logical block owns only its requested runs.
+pub(crate) type LogicalGroups = BTreeMap<u64, Vec<Run>>;
 
 pub(crate) struct StorageShape<'a> {
     pub shape: &'a [u64],
@@ -62,14 +60,6 @@ pub(crate) struct StorageShape<'a> {
     pub block_shape: &'a [u64],
     pub block_strides: &'a [u64],
     pub grid_strides: &'a [u64],
-    pub sparse_axis: Option<usize>,
-}
-
-struct Progression {
-    output: usize,
-    start: i128,
-    step: i128,
-    len: usize,
 }
 
 // Two rank-sized buffers, reused across all progression boundaries in a request.
@@ -137,7 +127,10 @@ impl StorageShape<'_> {
         let shape = mapping.map(|m| m.shape.as_slice()).unwrap_or(self.shape);
         request.validate(shape)?;
 
-        let affine = if matches!(request.kind(), RequestKind::Explicit(_)) {
+        let affine = if matches!(
+            request.kind(),
+            RequestKind::Explicit(_) | RequestKind::FlatRuns(_)
+        ) {
             None
         } else {
             match mapping {
@@ -164,40 +157,49 @@ impl StorageShape<'_> {
             delta: Coord::from_elem(0, self.shape.len()),
         };
 
-        if let Some((offset, strides)) = affine {
-            progressions(request, shape, offset, &strides, |progression| {
-                self.split(&mut emit, &mut scratch, progression)
-            })?;
-        } else {
-            let mut cursor = request.cursor(shape)?;
-            let mut coord = Coord::new();
-            let mut mapped = Coord::new();
-            let mut output = 0;
+        match (request.kind(), affine) {
+            (RequestKind::FlatRuns(runs), _)
+                if mapping.is_none_or(|m| m.is_identity(self.shape, self.strides)) =>
+            {
+                for run in runs {
+                    self.split(&mut emit, &mut scratch, *run)?;
+                }
+            }
+            (_, Some((offset, strides))) => {
+                progressions(request, shape, offset, &strides, |progression| {
+                    self.split(&mut emit, &mut scratch, progression)
+                })?;
+            }
+            _ => {
+                let mut cursor = request.cursor(shape)?;
+                let mut coord = Coord::new();
+                let mut mapped = Coord::new();
+                let mut output = 0;
 
-            while cursor.next_into(&mut coord) {
-                #[cfg(test)]
-                crate::read_metrics::record(|m| m.coordinate_resolutions += 1);
-                let coord = if let Some(mapping) = mapping {
-                    mapping.resolve_into(&coord, self.shape, self.strides, &mut mapped)?;
-                    &mapped
-                } else {
-                    &coord
-                };
+                while cursor.next_into(&mut coord) {
+                    #[cfg(test)]
+                    crate::read_metrics::record(|m| m.coordinate_resolutions += 1);
+                    let coord = if let Some(mapping) = mapping {
+                        mapping.resolve_into(&coord, self.shape, self.strides, &mut mapped)?;
+                        &mapped
+                    } else {
+                        &coord
+                    };
 
-                let (block, offset) = self.position(coord);
-                emit(
-                    self.key(coord, block),
-                    Run {
-                        output,
-                        offset,
-                        stride: 0,
-                        len: 1,
-                    },
-                )?;
-                output += 1;
+                    let (block, offset) = self.position(coord);
+                    emit(
+                        block,
+                        Run {
+                            output,
+                            offset,
+                            stride: 0,
+                            len: 1,
+                        },
+                    )?;
+                    output += 1;
+                }
             }
         }
-
         if end != request.len() {
             return Err(invalid());
         }
@@ -220,13 +222,9 @@ impl StorageShape<'_> {
         (position.block_id, position.offset_in_block)
     }
 
-    fn key(&self, coord: &[u64], block: u64) -> [u64; 2] {
-        [self.sparse_axis.map_or(0, |axis| coord[axis]), block]
-    }
-
     fn split(
         &self,
-        emit: &mut impl FnMut([u64; 2], Run) -> Result<()>,
+        emit: &mut impl FnMut(u64, Run) -> Result<()>,
         scratch: &mut Scratch,
         progression: Progression,
     ) -> Result<()> {
@@ -288,9 +286,6 @@ impl StorageShape<'_> {
                     count = (count as u64).min(steps.saturating_add(1)) as usize;
                 }
 
-                if self.sparse_axis == Some(i) && delta[i] != 0 {
-                    count = 1;
-                }
                 stride += delta[i] as i128 * self.block_strides[i] as i128 * step.signum();
             }
 
@@ -301,7 +296,7 @@ impl StorageShape<'_> {
                 i64::try_from(stride).map_err(|_| invalid())?
             };
             emit(
-                self.key(coord, block),
+                block,
                 Run {
                     output: output + done,
                     offset,
@@ -314,96 +309,6 @@ impl StorageShape<'_> {
 
         Ok(())
     }
-}
-
-// Invoke once per fastest-axis arithmetic progression, not per output element.
-// Selected-axis scans use caller-bounded metadata and preserve duplicates/order.
-fn progressions(
-    request: &BatchRequest,
-    shape: &[u64],
-    offset: i128,
-    strides: &[i128],
-    mut emit: impl FnMut(Progression) -> Result<()>,
-) -> Result<()> {
-    if shape.len() != strides.len() {
-        return Err(invalid());
-    }
-
-    if shape.is_empty() {
-        return emit(Progression {
-            output: 0,
-            start: offset,
-            step: 0,
-            len: request.len(),
-        });
-    }
-
-    let rank = shape.len();
-    let mut coord = Coord::from_elem(0, rank);
-    let flat = |coord: &[u64]| {
-        coord.iter().zip(strides).try_fold(offset, |n, (c, s)| {
-            s.checked_mul(*c as i128)
-                .and_then(|d| n.checked_add(d))
-                .ok_or_else(invalid)
-        })
-    };
-    match request.kind() {
-        RequestKind::Linear { start } => {
-            let varying = shape.iter().rposition(|d| *d > 1).unwrap_or(0);
-            for (index, output, len) in linear_segments(*start, request.len(), shape[varying])? {
-                decode_flat(index, shape, &mut coord)?;
-                emit(Progression {
-                    output,
-                    start: flat(&coord)?,
-                    step: strides[varying],
-                    len,
-                })?;
-            }
-        }
-        RequestKind::Rectangles(rectangles) => {
-            let mut output = 0;
-
-            for rect in rectangles {
-                if rect.len() == 0 {
-                    continue;
-                }
-
-                let axes = rect.axes();
-                // Trailing singleton axes are constants, not one-element rows.
-                let varying = axes.iter().rposition(|axis| axis.len() > 1).unwrap_or(0);
-
-                for (c, axis) in coord[varying + 1..].iter_mut().zip(&axes[varying + 1..]) {
-                    *c = axis.at(0);
-                }
-
-                let last = &axes[varying];
-
-                for prefix in 0..rect.len() / last.len() as usize {
-                    let mut index = prefix;
-
-                    for (c, axis) in coord[..varying].iter_mut().zip(&axes[..varying]).rev() {
-                        *c = axis.at(index as u64 % axis.len());
-                        index /= axis.len() as usize;
-                    }
-
-                    for (start, step, len) in last.segments() {
-                        let len = len as usize;
-                        coord[varying] = start;
-                        emit(Progression {
-                            output,
-                            start: flat(&coord)?,
-                            step: step.checked_mul(strides[varying]).ok_or_else(invalid)?,
-                            len,
-                        })?;
-                        output += len;
-                    }
-                }
-            }
-        }
-        RequestKind::Explicit(_) => unreachable!("explicit requests use the coordinate cursor"),
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -419,13 +324,12 @@ mod tests {
 
     fn compare(storage: &StorageShape<'_>, map: &CoordinateMap, request: BatchRequest) {
         let planned = storage.plan(&request, Some(map)).unwrap();
-        let mut actual = vec![(0, [0, 0], 0); request.len()];
+        let mut actual = vec![(0, 0); request.len()];
 
         for (key, runs) in planned {
             for run in runs {
                 for i in 0..run.len {
                     actual[run.output + i] = (
-                        key[1],
                         key,
                         (run.offset as i128 + i as i128 * run.stride as i128) as usize,
                     );
@@ -441,14 +345,14 @@ mod tests {
                 let base = map.resolve(coord, storage.shape, storage.strides).unwrap();
                 let base: Vec<_> = base.into_iter().collect();
                 let (id, offset) = storage.position(&base);
-                (id, storage.key(&base, id), offset)
+                (id, offset)
             })
             .collect();
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn affine_plans_match_scalar_mapping_across_blocks_and_sparse_axes() {
+    fn affine_plans_match_scalar_mapping_across_blocks() {
         let shape = shape![3, 5, 7];
         let strides = contiguous_strides(&shape).unwrap();
         let identity = CoordinateMap::identity(shape.clone(), &strides);
@@ -502,38 +406,35 @@ mod tests {
                 .collect();
             let grid_strides = contiguous_strides(&grid).unwrap();
 
-            for sparse_axis in [None, Some(0), Some(1), Some(2)] {
-                let storage = StorageShape {
-                    shape: &shape,
-                    strides: &strides,
-                    block_shape: &block_shape,
-                    block_strides: &block_strides,
-                    grid_strides: &grid_strides,
-                    sparse_axis,
-                };
+            let storage = StorageShape {
+                shape: &shape,
+                strides: &strides,
+                block_shape: &block_shape,
+                block_strides: &block_strides,
+                grid_strides: &grid_strides,
+            };
 
-                for map in &maps {
-                    let size = map.shape.iter().product::<u64>();
+            for map in &maps {
+                let size = map.shape.iter().product::<u64>();
 
-                    for start in 0..size {
-                        compare(
-                            &storage,
-                            map,
-                            BatchRequest::linear(start, (size - start).min(13) as usize).unwrap(),
-                        );
-                    }
-
-                    let axes = map
-                        .shape
-                        .iter()
-                        .map(|d| Axis::Selected(vec![(*d - 1), 0, 0]))
-                        .collect();
+                for start in 0..size {
                     compare(
                         &storage,
                         map,
-                        BatchRequest::rectangles(vec![Cartesian::new(axes).unwrap()]).unwrap(),
+                        BatchRequest::linear(start, (size - start).min(13) as usize).unwrap(),
                     );
                 }
+
+                let axes = map
+                    .shape
+                    .iter()
+                    .map(|d| Axis::Selected(vec![(*d - 1), 0, 0]))
+                    .collect();
+                compare(
+                    &storage,
+                    map,
+                    BatchRequest::rectangles(vec![Cartesian::new(axes).unwrap()]).unwrap(),
+                );
             }
         }
     }
@@ -548,7 +449,6 @@ mod tests {
             block_shape: &[2, 3, 4],
             block_strides: &[12, 4, 1],
             grid_strides: &[4, 2, 1],
-            sparse_axis: Some(1),
         };
 
         for start in 0..105 {
@@ -581,7 +481,6 @@ mod tests {
             block_shape: &[8, 8],
             block_strides: &[8, 1],
             grid_strides: &[1, 1],
-            sparse_axis: None,
         };
         let identity = CoordinateMap::identity(shape![8, 8], &[8, 1]);
 
@@ -627,7 +526,6 @@ mod tests {
                 1_000_000_000u64.div_ceil(crate::schema::MAX_BLOCK_CAPACITY as u64),
                 1,
             ],
-            sparse_axis: None,
         };
         let request = BatchRequest::linear(999_999_999_999_999_968, 32).unwrap();
         assert!(huge.plan(&request, None).unwrap().len() <= 2);
@@ -644,7 +542,6 @@ mod tests {
             block_shape: &[block_len as u64, 1],
             block_strides: &[1, 1],
             grid_strides: &[1, 1],
-            sparse_axis: None,
         };
 
         for request in [
@@ -677,7 +574,6 @@ mod tests {
             block_shape: &[8, 8],
             block_strides: &[8, 1],
             grid_strides: &[1, 1],
-            sparse_axis: None,
         };
 
         for (offset, stride) in [(64, 1), (-1, 1), (1, -1), (i128::MAX, i128::MAX)] {

@@ -20,7 +20,7 @@ async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(
         &["row", "coordinate", "sum", "product", "min", "max"],
     )
     .await;
-    benchmark::copy(&name, view, 31, cache).await;
+    benchmark::copy(&name, view, 31, cache, cache < 1_000_000).await;
 }
 
 pub async fn run() {
@@ -30,7 +30,8 @@ pub async fn run() {
         let kind = if sparse { "sparse" } else { "dense" };
         for cache in [32768, 1_000_000] {
             let (rows, cols) = if smoke { (2, 3) } else { (65, 129) };
-            let tensor = source(rows, cols, sparse, 128, if sparse { 7 } else { 1 }, cache).await;
+            let (_tensor_root, tensor) =
+                source(rows, cols, sparse, 128, if sparse { 7 } else { 1 }, cache).await;
             let geometric = tensor.view().transpose(None).unwrap();
             measure("geometric", kind, cache, &geometric).await;
             measure(
@@ -40,7 +41,7 @@ pub async fn run() {
                 &geometric.ln().await.unwrap().round().await.unwrap(),
             )
             .await;
-            let tensor = source(
+            let (_tensor_root, tensor) = source(
                 if smoke { 3 } else { 4097 },
                 2,
                 sparse,
@@ -57,8 +58,10 @@ pub async fn run() {
             )
             .await;
             let (m, k, n) = if smoke { (2, 3, 2) } else { (65, 17, 65) };
-            let left = source(m, k, sparse, 128, if sparse { 7 } else { 1 }, cache).await;
-            let right = source(k, n, sparse, 31, if sparse { 7 } else { 1 }, cache).await;
+            let (_left_root, left) =
+                source(m, k, sparse, 128, if sparse { 7 } else { 1 }, cache).await;
+            let (_right_root, right) =
+                source(k, n, sparse, 31, if sparse { 7 } else { 1 }, cache).await;
             measure(
                 "matrix",
                 kind,

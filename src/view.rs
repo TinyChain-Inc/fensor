@@ -1,82 +1,134 @@
 #[cfg(test)]
 mod tests;
 
-use futures::{StreamExt, TryStreamExt};
-
 use crate::mapping::{AxisContrib, CoordinateMap};
 use crate::schema::Layout;
 use crate::{
-    Axes, BoxFuture, Error, Range, Result, Shape, Tensor, TensorArray, TensorElement,
-    TensorFileEntry, TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, TensorWrite,
+    BoxFuture, Error, Result, TensorArray, TensorElement, TensorGeometry, TensorRead, TensorSource,
+    TensorTransform, TensorViewSemantics, TensorWrite,
 };
 
 /// A geometric view of filesystem-backed tensor storage.
-pub struct TensorView<'t, FE, T: TensorElement> {
-    tensor: &'t Tensor<FE, T>,
+#[derive(Clone)]
+pub struct TensorView<S> {
+    tensor: S,
     mapping: CoordinateMap,
 }
 
-impl<FE, T: TensorElement> Clone for TensorView<'_, FE, T> {
-    fn clone(&self) -> Self {
-        Self {
-            tensor: self.tensor,
-            mapping: self.mapping.clone(),
-        }
-    }
-}
-
-impl<'t, FE, T: TensorElement> TensorView<'t, FE, T>
+impl<S: TensorArray> TensorView<S>
 where
-    FE: TensorFileEntry<T>,
+    S::DType: TensorElement,
 {
-    pub(crate) fn new_identity(tensor: &'t Tensor<FE, T>) -> Self {
-        Self {
-            tensor,
-            mapping: CoordinateMap::identity(tensor.shape().into(), tensor.strides()),
+    pub fn new(tensor: S) -> Self {
+        let mapping = CoordinateMap::identity(tensor.shape().into(), tensor.strides());
+        Self { tensor, mapping }
+    }
+
+    pub fn source(&self) -> &S {
+        &self.tensor
+    }
+
+    /// Replace a source with identical base geometry, retaining this view's mapping.
+    pub fn with_source<R: TensorArray<DType = S::DType>>(self, source: R) -> Result<TensorView<R>> {
+        if self.tensor.schema() != source.schema() || self.tensor.layout() != source.layout() {
+            return Err(Error::InvalidLayout(
+                "replacement source geometry differs".into(),
+            ));
         }
+        Ok(TensorView {
+            tensor: source,
+            mapping: self.mapping,
+        })
     }
 
-    pub fn flat_offset(&self, coord: &[u64]) -> Result<i128> {
-        self.mapping.flat_offset(coord)
+    fn validate_geometry(&self, geometry: &crate::StorageGeometry) -> Result<()> {
+        if geometry.schema() != self.tensor.schema() || geometry.layout() != self.tensor.layout() {
+            return Err(Error::InvalidLayout(
+                "storage geometry differs from view source".into(),
+            ));
+        }
+        Ok(())
     }
 
-    pub(crate) async fn read_batch(
+    /// Map one bounded row-major value batch to logical-block updates.
+    /// This plans addresses only; callers enforce write-through and reserve storage.
+    pub fn plan_updates(
         &self,
-        request: &crate::request::BatchRequest,
-    ) -> Result<Vec<T>> {
-        self.tensor.read_batch(request, Some(&self.mapping)).await
+        geometry: &crate::StorageGeometry,
+        start: u64,
+        values: Vec<S::DType>,
+    ) -> Result<crate::BlockUpdates<S::DType>> {
+        self.validate_geometry(geometry)?;
+        let request = crate::request::BatchRequest::linear(start, values.len())?;
+        crate::storage::plan_updates(geometry, Some(&self.mapping), &request, values)
     }
 
-    pub(crate) fn slice_requests_for_storage(
+    /// Consume an owned expression into bounded destination updates in completion order.
+    /// Dropping the stream releases its source handles. This acquires no write permission.
+    pub fn updates_from(
         &self,
-        slice: crate::slice::Slice,
-    ) -> Result<crate::slice::Requests<'_>> {
-        if slice.len() <= crate::expression::MAX_BATCH_ELEMENTS as u64
-            || matches!(self.layout(), Layout::Dense)
-        {
-            return Ok(slice.stream());
+        geometry: &crate::StorageGeometry,
+        source: crate::TensorExpression<S::DType>,
+    ) -> Result<futures::stream::BoxStream<'static, Result<crate::BlockUpdates<S::DType>>>> {
+        use futures::{StreamExt, TryStreamExt};
+        self.validate_geometry(geometry)?;
+        if self.shape() != source.shape() {
+            return Err(Error::InvalidLayout(
+                "update source and destination shapes differ".into(),
+            ));
         }
-        match self
-            .mapping
-            .storage_slice(self.tensor.shape(), self.tensor.strides())?
-        {
-            Some(mapping) => self.tensor.storage_slice_requests(slice, Some(mapping)),
-            None => Ok(slice.stream()),
-        }
+        let geometry = geometry.clone();
+        let mapping = self.mapping.clone();
+        Ok(
+            crate::expression::completion_batches(std::sync::Arc::new(source))?
+                .and_then(move |(request, batch)| {
+                    futures::future::ready(crate::storage::plan_updates(
+                        &geometry,
+                        Some(&mapping),
+                        &request,
+                        batch.values,
+                    ))
+                })
+                .boxed(),
+        )
     }
 
-    fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
+    /// Conservative logical storage-block interval without enumerating the selection.
+    /// Irregular mappings may reserve gaps; explicit gather metadata is inspected once.
+    pub fn logical_block_range(
+        &self,
+        geometry: &crate::StorageGeometry,
+    ) -> Result<std::ops::Range<u64>> {
+        self.validate_geometry(geometry)?;
+        let Some((lo, hi)) = self.mapping.flat_bounds()? else {
+            return Ok(0..0);
+        };
+        let mut lower = Vec::with_capacity(self.tensor.shape().len());
+        let mut upper = Vec::with_capacity(self.tensor.shape().len());
+        for (&len, &stride) in self.tensor.shape().iter().zip(self.tensor.strides()) {
+            let (start, end) = (lo / stride, hi / stride);
+            if start / len == end / len {
+                lower.push(start % len);
+                upper.push(end % len);
+            } else {
+                lower.push(0);
+                upper.push(len - 1);
+            }
+        }
+        Ok(geometry.block_position(&lower)?.0..geometry.block_position(&upper)?.0 + 1)
+    }
+
+    pub fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
         self.mapping
             .resolve(coord, self.tensor.shape(), self.tensor.strides())
     }
 }
 
-impl<'t, FE, T> TensorGeometry for TensorView<'t, FE, T>
+impl<S: TensorArray> TensorGeometry for TensorView<S>
 where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    S::DType: TensorElement,
 {
-    type DType = T;
+    type DType = S::DType;
 
     fn dtype(&self) -> number_general::NumberType {
         self.tensor.dtype()
@@ -91,10 +143,9 @@ where
     }
 }
 
-impl<'t, FE, T> TensorViewSemantics for TensorView<'t, FE, T>
+impl<S: TensorArray> TensorViewSemantics for TensorView<S>
 where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    S::DType: TensorElement,
 {
     fn is_base_tensor(&self) -> bool {
         self.mapping.base_offset == 0
@@ -111,89 +162,33 @@ where
     }
 }
 
-impl<'t, FE, T> TensorTransform for TensorView<'t, FE, T>
+impl<S: TensorArray> TensorTransform for TensorView<S>
 where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    S::DType: TensorElement,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            tensor: self.tensor,
-            mapping: self.mapping.reshape(shape)?,
-        })
-    }
-
-    fn broadcast(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            tensor: self.tensor,
-            mapping: self.mapping.broadcast(shape)?,
-        })
-    }
-
-    fn slice(self, range: Range) -> Result<Self> {
-        Ok(Self {
-            tensor: self.tensor,
-            mapping: self.mapping.slice(range)?,
-        })
-    }
-
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        Ok(Self {
-            tensor: self.tensor,
-            mapping: self.mapping.transpose(permutation)?,
-        })
-    }
-
-    fn flip(self, axis: usize) -> Result<Self> {
-        Ok(Self {
-            tensor: self.tensor,
-            mapping: self.mapping.flip(axis)?,
-        })
-    }
-
-    fn squeeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            tensor: self.tensor,
-            mapping: self.mapping.squeeze(axes)?,
-        })
-    }
-
-    fn unsqueeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            tensor: self.tensor,
-            mapping: self.mapping.unsqueeze(axes)?,
-        })
-    }
+    crate::mapping::transform_methods!();
 }
 
-impl<'t, FE, T> TensorRead for TensorView<'t, FE, T>
+impl<S: TensorSource> TensorRead for TensorView<S>
 where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    S::DType: TensorElement,
 {
-    fn read_blocks(&self) -> Result<crate::ValueBlockStream<'_, Self::DType>> {
-        let requests = crate::request::linear_requests(self.shape())?;
-        Ok(crate::expression::ordered_batches(self, requests)
-            .map_ok(|(_, batch)| batch.values)
-            .boxed())
-    }
-
-    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
-        crate::expression::coordinate_blocks(self)
-    }
-
+    crate::expression::reader_members!(
+        read_blocks,
+        read_coordinate_blocks,
+        read_sparse_elements_in_order
+    );
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            let base_coord = self.resolve_base_coord(coord)?;
-            self.tensor.read_value(&base_coord).await
+            let request = crate::request::BatchRequest::point(coord);
+            Ok(self.read_batch(&request).await?[0])
         })
     }
 }
 
-impl<'t, FE, T> TensorWrite for TensorView<'t, FE, T>
+impl<S: TensorSource + TensorWrite> TensorWrite for TensorView<S>
 where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
+    S::DType: TensorElement,
 {
     fn write_value<'a>(
         &'a self,
@@ -210,5 +205,53 @@ where
             let base_coord = self.resolve_base_coord(coord)?;
             self.tensor.write_value(&base_coord, value).await
         })
+    }
+}
+
+impl<S: TensorSource> TensorView<S>
+where
+    S::DType: TensorElement,
+{
+    pub(crate) async fn read_batch(
+        &self,
+        request: &crate::request::BatchRequest,
+    ) -> Result<Vec<S::DType>> {
+        self.tensor
+            .read_storage(crate::StorageRead {
+                request,
+                mapping: Some(&self.mapping),
+            })
+            .await
+    }
+
+    pub(crate) fn ordered_storage_requests(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<crate::slice::Requests<'static>> {
+        match self
+            .mapping
+            .storage_slice(self.tensor.shape(), self.tensor.strides())?
+        {
+            Some(mapping) => crate::storage::ordered_requests(&self.tensor, slice, mapping),
+            None => Ok(slice.stream()),
+        }
+    }
+
+    pub(crate) fn slice_requests_for_storage(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<crate::slice::Requests<'_>> {
+        if slice.len() <= crate::expression::MAX_BATCH_ELEMENTS as u64
+            || matches!(self.layout(), Layout::Dense)
+        {
+            return Ok(slice.stream());
+        }
+        match self
+            .mapping
+            .storage_slice(self.tensor.shape(), self.tensor.strides())?
+        {
+            Some(mapping) => crate::storage::slice_requests(&self.tensor, slice, Some(mapping)),
+            None => Ok(slice.stream()),
+        }
     }
 }

@@ -17,12 +17,16 @@ Unary, binary, conditional, reduction, and matrix expressions remain lazy and
 read-only. Computed views implement neither `TensorWrite` nor `TensorArray`;
 geometric views retain constrained write-through access. View descriptions can
 be cloned without requiring the filesystem adapter to implement `Clone`.
+`TensorTransform` implementations provide all seven transformations;
+`TensorWriteBulk` implementations provide writes from buffers and fill. Each
+implementation validates supported geometry and input cardinality.
 
-Elementwise chains build nested ha-ndarray expressions over each batch.
-Reductions and matrix products introduce bounded **in-memory evaluation
-boundaries**, retaining batches, tiles, or accumulators. They never persist
-computed intermediates. This does not promise a single fused backend operation:
-nested expressions can recompute values, and source reads/cache spill can do I/O.
+Each consumed batch uses an explicit stack of evaluation frames. Elementwise
+operations realize their bounded numerical result through ha-ndarray before
+returning it to the parent; geometric projections forward their source result.
+Reductions, matrix products, and Fourier transforms retain bounded batches, tiles,
+or accumulators in the same process. They never persist computed intermediates.
+Nested expressions can recompute values, and source reads/cache spill can do I/O.
 
 `Tensor::copy_from(dir, &expression, max_capacity).await?` explicitly creates
 independent filesystem storage. Copying is never necessary between operations.
@@ -30,8 +34,14 @@ The destination adapter can differ from the source adapter and must support the
 output dtype. `max_capacity` limits storage-block capacity; it does not select an
 exact block shape. Sparse copies omit final zeros and reset the axis hint to `None`.
 
-The [collection handoff contract](DESIGN.md#collection-handoff) distinguishes
-verified public usage from the remaining transactional integration gaps.
+The [native storage contract](DESIGN.md#native-storage-and-sources) describes
+logical-block access, source ownership, and replacement guarantees.
+
+Logical shapes, strides, coordinates, and cardinalities use `u64`; axes use `usize`.
+Import `Shape`, `Strides`, `Range`, `AxisRange`, and `Axes` from fensor.
+`TensorGeometry::size()` returns `Result<u64>`; geometric flat offsets use checked
+`i128`. Operation traits expose per-operation associated output types. Generic
+callers state the required dtype bounds, and cast destinations may need annotations.
 
 ## Supported operations
 
@@ -82,7 +92,9 @@ transforms preserve operation order. Reduction and matrix output transforms map
 the output geometry instead of moving through the aggregate. Rank-zero views
 cannot be streamed or copied. Empty-dimension tensor storage is unsupported.
 
-Numerical rules belong to [ha-ndarray](../ha-ndarray/NUMERICS.md). In particular,
+Numerical rules belong to ha-ndarray. Its
+[numerical contract](https://github.com/TinyChain-Inc/ha-ndarray/blob/main/NUMERICS.md)
+provides non-normative integration context for this standalone crate. In particular,
 integer arithmetic wraps at its dtype width and integer division/remainder by zero return zero. Floats
 retain backend NaN, infinity, signed-zero, and underflow behavior without domain
 clamping. Logical operations return exactly u8 0/1: zero is false, and nonzero
@@ -123,11 +135,8 @@ else branch; an unselected branch still contributes support. Both branches are
 evaluated, so corruption in either branch propagates.
 
 Ordered sparse reads support logical row-major order, including transformed
-views, and reject other orders with `UnsupportedSparseIterationOrder`. They
-scan the selected logical range, sorting and deduplicating explicit selections
-for this reader only. Geometric slicing retains selection order and duplicates.
-Full-range ordered sparse reads still scale with logical size, not stored support.
-Eligible numeric reductions can use occupied-index traversal instead; see
+views, and reject other orders with `UnsupportedSparseIterationOrder`. They sort and deduplicate explicit selections for this reader only. Geometric slicing retains selection order and duplicates.
+Compatible geometry traverses occupied regions through paginated indexes. Unary, binary, and conditional expressions delegate and merge that support incrementally. Other mappings use bounded logical evaluation; see
 [slice traversal](DESIGN.md#slices-and-reductions).
 
 ## Reductions and matrix operations
@@ -143,6 +152,8 @@ An empty axis group stays absent for every operation, including product and
 extrema. Whole-tensor empty-support results are sum `0`, product `1`, `all=true`,
 and `any=false`; `min_all` and `max_all` return `Error::Unsupported`. Consequently,
 sparse reductions can differ from reductions over equivalent dense values.
+
+`TensorStatistics` supplies mean, population standard deviation, and Euclidean norm, both whole-tensor and by axis. Real results use f64; complex mean uses c64 and complex standard deviation and norm use f64. Empty support yields NaN for mean/std and zero for norm. Statistics include supported intermediate zeros and exclude implicit sparse zeros.
 
 Boolean terminals stop after a decisive consumed batch. Errors in that batch or
 earlier propagate; later errors may remain unobserved and prefetched reads may
@@ -188,17 +199,22 @@ optimal transform throughput.
 
 ## Streams, bounds, and concurrency
 
-New sparse storage uses block extent one on its sparse axis (axis zero by
+Sparse creation uses block extent one on its sparse axis (axis zero by
 default), spending the remaining capacity on other axes in trailing-first order.
 Existing metadata retains its recorded block shape; loading never retessellates
 stored data. Logical regions larger than a block span multiple grid blocks.
 
-A sparse zero write clears only that element. Its index key remains while the
-key's visible region contains nonzeros. An entirely zero physical block is deleted
-only after a streaming index check finds no other reference; this last-value
-reclamation can scan the index. Empty-key removal may leave nonzero unreferenced
-payload for future compaction. Related mutations still require caller coordination;
-these steps are non-transactional and offer no rollback.
+Sparse logical blocks use adaptive native payloads: small or lightly occupied
+blocks share typed `b-table` pages; larger, highly occupied blocks use dense
+payload files. A full payload below 1 KiB always uses rows. Otherwise rows are
+chosen when `nonzero_count * (24 + dtype_bytes) < block_len * dtype_bytes`.
+This initial cost heuristic is not an estimate of exact serialized size. Logical
+geometry and the 4,096-element block limit are independent of physical packing.
+
+Zero writes remove values and empty occupied regions. An all-zero block has no
+descriptor or payload. Replacement updates the block payload, descriptor, and occupancy
+under one native ownership guard. The same guard coordinates reads and synchronization. An
+interrupted mutation invalidates the owner; callers coordinate recovery.
 
 Physical block lengths are validated against bounded metadata. Adapters remain
 responsible for limiting decoding allocations before fensor receives a payload.
@@ -220,8 +236,11 @@ Concurrent source writes are not isolated. Dropping a stream cancels pending wor
 **ha-ndarray owns numerical parallelism; fensor owns bounded async concurrency.**
 The outer consumer keeps at most `num_cpus::get().max(1)` batch futures in flight,
 using `buffered` for ordered consumers and `buffer_unordered` otherwise. Inner
-evaluation adds no buffered streams. Synchronous backend calls run on the polling
-thread and may use ha-ndarray's workers; `async move` does not create CPU parallelism.
+evaluation adds no buffered streams or tasks. The driver suspends a parent until
+its requested child completes, preserving operand order without recursive future
+polling. Ready evaluation and sparse-support traversal yield cooperatively at
+bounded work intervals, so cancellation can interrupt cached work. Synchronous
+backend calls run on the polling thread and may use ha-ndarray's workers; `async move` does not create CPU parallelism.
 
 Numeric terminal accumulation can depend on read scheduling, including extreme
 overflow/underflow differences permitted by ha-ndarray's aggregate contract.
@@ -241,33 +260,35 @@ streams when they want an in-memory result; fensor offers no whole-result collec
 ## Storage, synchronization, and errors
 
 Filesystem adapters implement `freqfs::FileLoad`/`FileSave` and expose `Vec<T>`,
-`b_table::Node<u64>`, and `TensorMetadata<T>` through `AsType`. fensor requires
+`b_table::Node<u64>`, `SparseNode<T>`, and `TensorMetadata<T>` through `AsType`. fensor requires
 destream but prescribes no byte codec or whole-tensor transfer format. JSON and
 TBON adapters are exercised in tests; applications own their format choices.
 
-Metadata encodes geometry only. The adapter must preserve the Rust payload type
+Metadata encodes shape, layout, sparse axis, and block shape. The adapter must preserve the Rust payload type
 across reloads, for example with distinct tagged block/metadata variants per dtype.
 Decoding untagged metadata as whichever dtype was requested violates this contract.
-Adapters own format versions and migrations; fensor validates geometry and block
-lengths and fails closed on malformed input, without recovery or repair paths.
+The [native storage contract](DESIGN.md#native-storage-and-sources) defines these native structures.
+Adapters choose codecs and preserve exact typed scalar bits in sparse nodes; fensor
+validates geometry and native structure without recovery or repair paths.
 
 Call `tensor.sync().await?` before dropping and reopening storage. It writes blocks
 and publishes the current sparse index root; syncing only the containing directory
 does not publish that in-memory root. Exclude concurrent writes during sync.
-Callers own subsequent durable directory synchronization and transaction policy.
+Use `tensor.sync_all().await?` for delegated durable synchronization. Callers own
+transaction and recovery policy.
 fensor provides no commit, rollback, or isolation semantics.
 
-Copying groups bounded destination updates and overlaps one update with one source
-lookahead using `try_join!`, without spawning tasks. Destination batches remain
-sequential. Validation/error handling is non-transactional: failures propagate and
-can leave partial output, with no guaranteed write prefix or concurrent-error
-precedence. Synchronization and cleanup remain caller responsibilities.
+Copying groups bounded destination updates and finishes each batch before requesting
+the next source batch. It adds no lookahead or background work. Validation and errors
+remain non-transactional: failures propagate and can leave partial output without
+loadable metadata or a guaranteed write prefix. Synchronization and cleanup remain
+caller responsibilities.
 
 Element types need no destream implementation: adapters encode their payloads,
 including any complex component representation. fensor's typed metadata remains
 codec-neutral and encodes geometry only.
 
-The freqfs cache accounts for block payload bytes and applies admission backpressure
+The freqfs cache accounts for typed retained allocation and applies admission backpressure
 through eviction/spill. Configure cache capacity, minimum free disk space, and
 admission wait in freqfs; oversized files, exhausted admission deadlines, and disk
 failures return I/O errors. Bounded execution does not eliminate logical sparse
@@ -276,31 +297,42 @@ Completion-order copying can worsen cache locality and increase adapter traffic;
 fewer delivery stalls do not guarantee faster copying. See [benchmark methodology
 and interpretation](BENCHMARKS.md).
 
-## Compatibility notes
+## External storage sources
 
-- The default build supports ten real dtypes; enable `complex` for the two native
-  complex types. Existing metadata and adapter formats are unchanged; adapters
-  must explicitly support new payload types.
-- `TensorElement` no longer requires value serialization traits. `TensorAbs`
-  reports the backend absolute-value dtype, and real-only operation bounds now
-  apply to individual methods/associated outputs. Generic callers must state
-  these bounds where needed. Cast destinations may now need an explicit annotation.
+`TensorSource` connects typed native or caller-provided logical blocks to the
+same geometric views and expression evaluator. `StorageGeometry` describes bounded
+logical tiles, and occupied-region pages use logical grid IDs. Views own their
+source handles; `TensorExpression<T>` owns dynamically composed read-only values.
+Borrowed reads and owned consuming streams share one bounded evaluator. Runtime
+expression descriptions, evaluation frames, and live batch payloads have separate
+checked admission limits, independently of logical tensor size; see the [bound table](DESIGN.md#bound-and-policy-constants).
+Request and support traversal use explicit work lists, and final ownership release
+detaches operands before draining them. Dropping a stream cancels active evaluation
+and releases its retained source handles without following expression depth on the
+worker stack. Physical payload and index mutation are private to the native owner.
+Storage itself is never erased.
+`replace_logical_block` coordinates native sparse
+payload/index changes and preserves other logical blocks sharing native table pages.
 
-- Logical geometry now uses `u64`: import `Shape`, `Strides`, `Range`, and
-  `AxisRange` from fensor, and use the re-exported `Axes` for axis identifiers.
-  `TensorGeometry::size()` returns `Result<u64>`. Redundant shape/stride aliases
-  are removed; `TensorView::flat_offset` now returns `Result<i128>`. Adapter
-  coordinate payloads and persisted geometry are unchanged.
-
-- Typed adapter-owned metadata replaces the former version-2 text representation.
-  Existing data in that representation requires an explicit adapter migration;
-  fensor does not guess formats. There is no fensor dtype-string or whole-tensor codec.
-- Use `Tensor<FE, T>` and `NumberType` directly; per-dtype tensor aliases are removed.
-- Computed views have no `materialize` method; use `Tensor::copy_from` explicitly.
-  Scalar and axis-reduction traits return per-operation associated read outputs.
-- `TensorReadBulk`, `read_all`, `read_values`, and `Tensor::compact_sparse` are removed
-  without forwarding aliases. Consume streams explicitly. `TensorWriteBulk` still
-  accepts caller-owned buffers and validates cardinality before mutation.
+`Tensor::load` is strict and non-mutating: missing metadata, blocks or indexes,
+wrong payload types, invalid lengths, duplicate logical keys, and inconsistent
+index coordinates are errors. Each native owner has separate creation and loading
+operations; creation requires empty delegated storage. See the
+[native storage and sources](DESIGN.md#native-storage-and-sources) for the external ownership boundary.
 
 See [remaining work](ROADMAP.md), [execution design](DESIGN.md),
 [benchmark reproduction](BENCHMARKS.md), and [test ownership](tests/COVERAGE.md).
+
+Geometric `TensorView` values can plan bounded `BlockUpdates` from row-major value
+batches with `plan_updates`, or consume an owned expression with `updates_from`.
+The latter uses completion-order delivery and retains the source until consumption
+or drop. These methods describe logical-block offsets; callers own write permission
+and publication. Independent native materialization uses `Tensor::copy_from`.
+
+`Tensor::from_values` consumes exactly one typed row-major value per dense element.
+`Tensor::from_sparse_elements` consumes ordered unique coordinates for a sparse
+layout, validating coordinates and omitting zeros. Both accept borrowed, non-`Unpin`
+streams with an input error convertible from `fensor::Error`. They require empty
+delegated storage and publish metadata only after successful construction; callers
+own cleanup after errors or cancellation. Published replacement requires existing,
+valid dense files and never creates or repairs missing payloads.

@@ -52,7 +52,7 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     )
     .await
     .unwrap();
-    let cast: UnaryView<TensorView<'_, FsEntry, f32>, Cast<f64>> =
+    let cast: UnaryView<TensorView<fensor::Tensor<FsEntry, f32>>, Cast<f64>> =
         tensor.view().cast().await.unwrap();
     // Constructing the cast must not capture source values.
     for (i, &value) in input.iter().enumerate() {

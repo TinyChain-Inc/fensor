@@ -2,15 +2,15 @@
 
 use fensor::{
     Error, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
-    TensorSchema, TensorSparseIndex, TensorTransform, TensorWrite, TensorWriteBulk,
+    TensorSchema, TensorTransform, TensorWrite, TensorWriteBulk,
 };
 use ha_ndarray::shape;
 
 use common::{FsEntry, cleanup, fixture, numbers::same};
 
-mod common;
+use crate::test_support as common;
 
-async fn storage<T: TensorElement>()
+async fn storage<T: TensorElement>(samples: Option<[T; 2]>)
 where
     FsEntry: TensorFileEntry<T>,
 {
@@ -25,20 +25,37 @@ where
         let mut expected: Vec<T> = (0..len)
             .map(|i| if i % 3 == 0 { T::ZERO } else { T::ONE })
             .collect();
+        if let Some(samples) = samples {
+            expected[2..4].copy_from_slice(&samples);
+        }
         let cache = if matches!(layout, Layout::Dense) {
             2048
         } else {
             1_000_000
         };
-        let (root, tensor) = fixture::source(
-            "dtype_storage",
-            shape![len as u64],
-            layout,
-            31,
-            cache,
-            expected.clone(),
-        )
-        .await;
+        let root = common::Directory::new("dtype_storage").await;
+        let dir = freqfs::Cache::<FsEntry>::new(cache, None, 0, std::time::Duration::from_secs(1))
+            .load(root.to_path_buf())
+            .unwrap();
+        let schema = TensorSchema::new(T::dtype(), shape![len as u64]).unwrap();
+        // Borrow the expected values through a non-Unpin stream. Construction
+        // must not require Clone adapters, owned inputs, or a static decoder.
+        let tensor = if matches!(layout, Layout::Dense) {
+            let values = futures::stream::unfold(expected.iter(), |mut iter| async move {
+                iter.next().map(|&v| (Ok::<_, Error>(v), iter))
+            });
+            Tensor::from_values(dir, schema, 31, values).await.unwrap()
+        } else {
+            let entries = futures::stream::iter(
+                expected
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| Ok::<_, Error>((vec![i as u64], v))),
+            );
+            Tensor::from_sparse_elements(dir, schema, layout, 31, entries)
+                .await
+                .unwrap()
+        };
         assert_eq!(tensor.dtype(), T::dtype());
         assert_eq!(tensor.view().dtype(), T::dtype());
         assert_eq!(tensor.schema().dtype(), T::dtype());
@@ -51,7 +68,19 @@ where
             .await
             .unwrap();
         expected[len - 1] = T::ONE;
-        fixture::consumers(&tensor.view(), &expected, same, same).await;
+        if matches!(layout, Layout::Dense) {
+            fixture::blocks(&tensor.view(), &expected, same).await;
+            // Sample point access independently of the complete stream comparison.
+            // Cover special values, every block boundary, and the write-through value.
+            let block_len = tensor.block_len();
+            for (i, &value) in expected.iter().enumerate() {
+                if i < 4 || i + 1 == len || i % block_len <= 1 || i % block_len + 1 == block_len {
+                    assert!(same(tensor.read_value(&[i as u64]).await.unwrap(), value));
+                }
+            }
+        } else {
+            fixture::reads(&tensor.view(), &expected, same).await;
+        }
         tensor.write_value(&[1], T::ZERO).await.unwrap();
         expected[1] = T::ZERO;
         tensor.sync().await.unwrap();
@@ -64,8 +93,27 @@ where
             assert!(Tensor::<FsEntry, f64>::load(dir.clone()).await.is_err());
         }
         let tensor = Tensor::<FsEntry, T>::load(dir.clone()).await.unwrap();
-        assert_eq!(tensor.schema().dtype(), T::dtype());
+        assert_eq!(
+            tensor.schema(),
+            &TensorSchema::new(T::dtype(), shape![len as u64]).unwrap()
+        );
         fixture::blocks(&tensor, &expected, same).await;
+        let (copy_root, copy_dir) = common::new_dir("dtype_copy").await;
+        let copied =
+            Tensor::<FsEntry, T>::copy_from(copy_dir.clone(), &tensor.view().flip(0).unwrap(), 31)
+                .await
+                .unwrap();
+        let reversed: Vec<_> = expected.iter().copied().rev().collect();
+        fixture::blocks(&copied, &reversed, same).await;
+        copied.sync().await.unwrap();
+        drop(copied);
+        drop(copy_dir);
+        let copied = Tensor::<FsEntry, T>::load(common::open_dir(&copy_root).unwrap())
+            .await
+            .unwrap();
+        fixture::blocks(&copied, &reversed, same).await;
+        drop(copied);
+        cleanup(&copy_root).await;
 
         let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
         let metadata = blocks.read().await.get_file("metadata").unwrap().clone();
@@ -81,30 +129,29 @@ where
 
         // Corrupt a required block through its owning filesystem adapter. Reads
         // and scalar writes must reject the length before indexing or mutation.
-        let id = if matches!(layout, Layout::Dense) {
-            0
+        if matches!(layout, Layout::Sparse { .. }) {
+            tensor.corrupt_sparse_payload(2).await;
+            assert!(matches!(
+                tensor.read_value(&[2]).await,
+                Err(Error::InvalidLayout(_))
+            ));
+            assert!(matches!(
+                tensor.write_value(&[2], T::ONE).await,
+                Err(Error::InvalidLayout(_))
+            ));
         } else {
-            tensor.lookup_block_id(&[2, 2]).await.unwrap().unwrap()
-        };
-        let file = blocks
-            .read()
-            .await
-            .get_file(&id.to_string())
-            .unwrap()
-            .clone();
-        {
-            let mut values = file.write::<Vec<T>>().await.unwrap();
-            values.clear();
+            let file = blocks.read().await.get_file("0").unwrap().clone();
+            file.write::<Vec<T>>(0).await.unwrap().clear();
+            assert!(matches!(
+                tensor.read_value(&[2]).await,
+                Err(Error::InvalidLayout(_))
+            ));
+            assert!(matches!(
+                tensor.write_value(&[2], T::ONE).await,
+                Err(Error::InvalidLayout(_))
+            ));
+            assert!(file.read::<Vec<T>>().await.unwrap().is_empty());
         }
-        assert!(matches!(
-            tensor.read_value(&[2]).await,
-            Err(Error::InvalidLayout(_))
-        ));
-        assert!(matches!(
-            tensor.write_value(&[2], T::ONE).await,
-            Err(Error::InvalidLayout(_))
-        ));
-        assert!(file.read::<Vec<T>>().await.unwrap().is_empty());
         drop(tensor);
         drop(dir);
         cleanup(&root).await;
@@ -142,9 +189,12 @@ where
 
 macro_rules! storage_case {
     ($name:ident,$t:ty) => {
+        storage_case!($name, $t, None);
+    };
+    ($name:ident,$t:ty,$samples:expr) => {
         #[tokio::test]
         async fn $name() {
-            storage::<$t>().await;
+            storage::<$t>($samples).await;
         }
     };
 }
@@ -158,7 +208,11 @@ storage_case!(i16_storage, i16);
 storage_case!(i32_storage, i32);
 storage_case!(i64_storage, i64);
 storage_case!(f32_storage, f32);
-storage_case!(f64_storage, f64);
+storage_case!(
+    f64_storage,
+    f64,
+    Some([std::f64::consts::PI, std::f64::consts::E])
+);
 
 #[cfg(feature = "complex")]
 storage_case!(complex32_storage, fensor::complex::Complex32);

@@ -4,18 +4,16 @@
 
 use std::collections::BTreeMap;
 
-use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{ArrayAccess, NDArrayFourier, NDArrayRead, NDArrayTransform, Number};
 
 use crate::expression::{self, Batch, Expression, MAX_BATCH_ELEMENTS};
 use crate::mapping::CoordinateMap;
-use crate::request::{self, Axis, BatchRequest};
+use crate::request::{Axis, BatchRequest};
 use crate::schema::Coord;
 use crate::slice::Slice;
 use crate::{
-    Axes, BoxFuture, Error, Layout, Range, Result, Shape, SparseElementStream, Strides,
-    TensorElement, TensorFourier, TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics,
-    ValueBlockStream,
+    Axes, BoxFuture, Error, Layout, Result, Shape, Strides, TensorElement, TensorFourier,
+    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics,
 };
 
 mod sealed {
@@ -105,6 +103,7 @@ where
 ///     storage(&t.view().ifft().await.unwrap());
 /// }
 /// ```
+#[derive(Clone)]
 pub struct FourierView<Source, Op> {
     source: Source,
     op: Op,
@@ -112,18 +111,6 @@ pub struct FourierView<Source, Op> {
     shape: Shape,
     strides: Strides,
     mapping: CoordinateMap,
-}
-
-impl<S: Clone, O: Clone> Clone for FourierView<S, O> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            op: self.op.clone(),
-            shape: self.shape.clone(),
-            strides: self.strides.clone(),
-            mapping: self.mapping.clone(),
-        }
-    }
 }
 
 fn validate_axes(shape: &[u64], count: usize, operation: &str) -> Result<()> {
@@ -235,10 +222,6 @@ impl<S: TensorGeometry, O: Send + Sync> TensorViewSemantics for FourierView<S, O
     fn is_base_tensor(&self) -> bool {
         false
     }
-
-    fn supports_write_through(&self) -> bool {
-        false
-    }
 }
 
 // Group keys and scatter entries contain at most one entry per requested output.
@@ -251,21 +234,20 @@ where
     O: FourierOp<S::DType>,
 {
     fn groups(&self, request: &BatchRequest) -> Result<Groups> {
-        let mut cursor = request.cursor(self.shape())?;
-        let mut coord = Coord::new();
-        let mut mapped = Coord::new();
         let mut groups = Groups::new();
-        let mut destination = 0;
-        while cursor.next_into(&mut coord) {
-            self.mapping
-                .resolve_into(&coord, &self.shape, &self.strides, &mut mapped)?;
-            let frequency = mapped.pop().expect("validated Fourier rank") as usize;
-            groups
-                .entry(mapped.clone())
-                .or_default()
-                .push((destination, frequency));
-            destination += 1;
-        }
+        self.mapping.visit_mapped(
+            request,
+            &self.shape,
+            &self.strides,
+            |destination, mapped| {
+                let frequency = mapped.pop().expect("validated Fourier rank") as usize;
+                groups
+                    .entry(mapped.clone())
+                    .or_default()
+                    .push((destination, frequency));
+                Ok(())
+            },
+        )?;
         Ok(groups)
     }
 }
@@ -276,9 +258,21 @@ where
     S::DType: TensorElement,
     O: FourierOp<S::DType>,
 {
-    fn build<'a>(&'a self, request: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn expression_nodes(&self) -> Result<usize> {
+        crate::expression::traversal::node_count([self.source.expression_nodes()?])
+    }
+
+    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
+        self.source.detach_sources(pending);
+    }
+
+    fn build<'a>(
+        &'a self,
+        context: expression::Context<'a>,
+        request: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
-            let groups = self.groups(request)?;
+            let groups = self.groups(&request)?;
             // Axis length is checked before narrowing. Each pack and output vector
             // holds at most MAX_BATCH_ELEMENTS elements, independently of tensor size.
             let width = *self.shape.last().expect("validated Fourier rank") as usize;
@@ -301,7 +295,9 @@ where
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let input = BatchRequest::rectangles(rectangles)?;
-                let mut batch = expression::evaluate_batch(&self.source, &input).await?;
+                let mut batch = context
+                    .evaluate(&self.source, std::sync::Arc::new(input.clone()))
+                    .await?;
                 if let Some(mask) = &batch.support {
                     for (value, &supported) in batch.values.iter_mut().zip(mask) {
                         if supported == 0 {
@@ -344,6 +340,7 @@ where
             }
 
             Ok(Batch {
+                _allocation: None,
                 array: expression::batch_array(values)?,
                 support,
             })
@@ -357,104 +354,19 @@ where
     S::DType: TensorElement,
     O: FourierOp<S::DType>,
 {
-    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
-        expression::coordinate_blocks(self)
-    }
-
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Ok(
-                expression::evaluate_batch(self, &BatchRequest::point(coord))
-                    .await?
-                    .values[0],
-            )
-        })
-    }
-
-    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = request::linear_requests(self.shape())?;
-
-        Ok(expression::ordered_batches(self, coords)
-            .map_ok(|(_, batch)| batch.values)
-            .boxed())
-    }
-
-    fn read_sparse_elements_in_order<'a>(
-        &'a self,
-        range: Range,
-        requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        Box::pin(async move {
-            let coords = crate::traits::sparse_coords(self, range, requested_order)?;
-
-            Ok(
-                expression::ordered_batches(self, request::explicit_requests(coords))
-                    .and_then(move |(coords, values)| async move {
-                        Ok(futures::stream::iter(expression::sparse_elements(
-                            coords,
-                            values,
-                            self.shape(),
-                        )?))
-                    })
-                    .try_flatten()
-                    .boxed(),
-            )
-        })
-    }
+    crate::expression::reader_members!(
+        read_value,
+        read_blocks,
+        read_coordinate_blocks,
+        read_sparse_elements_in_order
+    );
 }
 
 impl<S, O: Send + Sync> TensorTransform for FourierView<S, O>
 where
     S: TensorGeometry,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.reshape(shape)?,
-            ..self
-        })
-    }
-
-    fn broadcast(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.broadcast(shape)?,
-            ..self
-        })
-    }
-
-    fn slice(self, range: Range) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.slice(range)?,
-            ..self
-        })
-    }
-
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.transpose(permutation)?,
-            ..self
-        })
-    }
-
-    fn flip(self, axis: usize) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.flip(axis)?,
-            ..self
-        })
-    }
-
-    fn squeeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.squeeze(axes)?,
-            ..self
-        })
-    }
-
-    fn unsqueeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.unsqueeze(axes)?,
-            ..self
-        })
-    }
+    crate::mapping::transform_methods!();
 }
 
 #[cfg(test)]
@@ -516,7 +428,7 @@ mod tests {
             })
             .await;
         assert!(
-            Expression::preferred_requests(&view, view.shape())
+            crate::expression::traversal::preferred(&view, view.shape())
                 .unwrap()
                 .is_none()
         );

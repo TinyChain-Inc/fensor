@@ -1,5 +1,5 @@
 use crate::schema::Coord;
-use crate::{AxisRange, Error, Range, Result, Shape};
+use crate::{Axes, AxisRange, Error, Range, Result, Shape};
 pub(crate) fn validate_coord(shape: &[u64], coord: &[u64]) -> Result<()> {
     if coord.len() != shape.len() {
         return Err(Error::InvalidCoord(
@@ -26,6 +26,74 @@ pub(crate) fn ensure_offset_in_bounds(offset: usize, block_len: usize) -> Result
             "block offset out of bounds".to_string(),
         ))
     }
+}
+
+/// Common broadcast shape, aligning trailing axes without narrowing logical dimensions.
+/// This describes geometry only; operands still need explicit broadcast transforms.
+pub fn broadcast_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
+    let mut shape = Shape::from_elem(1, left.len().max(right.len()));
+    let rank = shape.len();
+    for i in 0..rank {
+        let l = left.len().checked_sub(i + 1).map(|a| left[a]).unwrap_or(1);
+        let r = right
+            .len()
+            .checked_sub(i + 1)
+            .map(|a| right[a])
+            .unwrap_or(1);
+        if l != r && l != 1 && r != 1 {
+            return Err(Error::InvalidSchema(
+                "incompatible tensor broadcast shapes".into(),
+            ));
+        }
+        shape[rank - i - 1] = l.max(r);
+    }
+    Ok(shape)
+}
+
+/// Operand shapes with common matrix batch axes, preserving their final two axes.
+/// Contraction dimensions are validated by matrix multiplication itself.
+pub fn matmul_broadcast_shapes(left: &[u64], right: &[u64]) -> Result<(Shape, Shape)> {
+    if left.len() < 2 || right.len() < 2 {
+        return Err(Error::InvalidSchema(
+            "matmul requires rank at least two".into(),
+        ));
+    }
+    let mut left_shape = broadcast_shape(&left[..left.len() - 2], &right[..right.len() - 2])?;
+    let mut right_shape = left_shape.clone();
+    left_shape.extend_from_slice(&left[left.len() - 2..]);
+    right_shape.extend_from_slice(&right[right.len() - 2..]);
+    Ok((left_shape, right_shape))
+}
+
+/// Sorted, unique reduction axes, validated against the input rank.
+pub fn reduction_axes(rank: usize, mut axes: Axes) -> Result<Axes> {
+    axes.sort_unstable();
+    axes.dedup();
+    if axes.iter().any(|&axis| axis >= rank) {
+        return Err(Error::InvalidLayout("reduction axis out of bounds".into()));
+    }
+    Ok(axes)
+}
+
+/// Axes to sum with retained dimensions before reshaping to a broadcast source shape.
+pub fn broadcast_reduce_axes(source: &[u64], target: &[u64]) -> Result<Axes> {
+    if target.len() > source.len() {
+        return Err(Error::InvalidSchema(
+            "broadcast reduction increases rank".into(),
+        ));
+    }
+    let prefix = source.len() - target.len();
+    let mut axes: Axes = (0..prefix).collect();
+    for (axis, (&source, &target)) in source[prefix..].iter().zip(target).enumerate() {
+        if target == 1 && source != 1 {
+            axes.push(prefix + axis);
+        } else if source != target {
+            return Err(Error::InvalidSchema(
+                "invalid broadcast reduction target".into(),
+            ));
+        }
+    }
+    Ok(axes)
 }
 
 pub fn matmul_output_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
@@ -169,6 +237,57 @@ impl Iterator for RangeCoords {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_geometry_preserves_logical_width_and_explicit_matrix_contract() {
+        for (left, right, expected) in [
+            (vec![], vec![2, 3], vec![2, 3]),
+            (vec![2, 1, 4], vec![3, 4], vec![2, 3, 4]),
+            (vec![u64::MAX, 1], vec![1, 2], vec![u64::MAX, 2]),
+        ] {
+            assert_eq!(broadcast_shape(&left, &right).unwrap().as_slice(), expected);
+            assert_eq!(broadcast_shape(&right, &left).unwrap().as_slice(), expected);
+        }
+        assert!(broadcast_shape(&[2, 3], &[4, 3]).is_err());
+        let (left, right) = matmul_broadcast_shapes(&[2, 1, 3, 4], &[5, 4, 6]).unwrap();
+        assert_eq!(left.as_slice(), &[2, 5, 3, 4]);
+        assert_eq!(right.as_slice(), &[2, 5, 4, 6]);
+        assert_eq!(
+            matmul_output_shape(&left, &right).unwrap().as_slice(),
+            &[2, 5, 3, 6]
+        );
+        assert!(matmul_output_shape(&[2, 1, 3, 4], &[5, 4, 6]).is_err());
+        assert!(matmul_broadcast_shapes(&[3], &[3, 4]).is_err());
+        assert!(matmul_broadcast_shapes(&[2, 3, 4], &[5, 4, 6]).is_err());
+    }
+
+    #[test]
+    fn reduction_geometry_normalizes_axes_and_reverses_broadcasting() {
+        for (rank, axes, expected) in [
+            (0, vec![], vec![]),
+            (3, vec![2, 0, 2], vec![0, 2]),
+            (3, vec![], vec![]),
+        ] {
+            assert_eq!(
+                reduction_axes(rank, axes.into()).unwrap().as_slice(),
+                expected
+            );
+        }
+        assert!(reduction_axes(3, vec![3, 0, 3].into()).is_err());
+        for (source, target, expected) in [
+            (vec![2, 3, 4], vec![1, 4], vec![0, 1]),
+            (vec![2, 3], vec![2, 3], vec![]),
+            (vec![2, 3], vec![], vec![0, 1]),
+            (vec![u64::MAX, 3], vec![1, 3], vec![0]),
+        ] {
+            assert_eq!(
+                broadcast_reduce_axes(&source, &target).unwrap().as_slice(),
+                expected
+            );
+        }
+        assert!(broadcast_reduce_axes(&[2, 3], &[2, 2]).is_err());
+        assert!(broadcast_reduce_axes(&[2, 3], &[1, 2, 3]).is_err());
+    }
 
     #[test]
     fn range_cardinality_handles_empty_selections_and_overflow() {

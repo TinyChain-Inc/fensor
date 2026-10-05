@@ -64,8 +64,8 @@ impl TensorRead for Reader<'_> {
                     return Ok(None);
                 }
                 if index == 0 {
-                    // Creation is complete before the first source poll. Hold the real
-                    // destination block so the first update must wait on freqfs.
+                    // Inject a valid construction block and hold it so the first
+                    // update waits on freqfs before another source batch is requested.
                     let blocks = self
                         .destination
                         .read()
@@ -73,8 +73,18 @@ impl TensorRead for Reader<'_> {
                         .get_dir("blocks")
                         .unwrap()
                         .clone();
+                    blocks
+                        .write()
+                        .await
+                        .create_file(
+                            "0".into(),
+                            vec![0u8],
+                            std::mem::size_of::<FsEntry>() + std::mem::size_of::<Vec<u64>>() + 1,
+                        )
+                        .await
+                        .unwrap();
                     let file = blocks.read().await.get_file("0").unwrap().clone();
-                    let guard = file.write_owned::<Vec<u8>>().await.unwrap();
+                    let guard = file.write_owned::<Vec<u8>>(0).await.unwrap();
                     self.guard
                         .lock()
                         .unwrap()
@@ -95,7 +105,7 @@ impl TensorRead for Reader<'_> {
     }
 }
 
-async fn source() -> (std::path::PathBuf, Tensor<FsEntry, u8>) {
+async fn source() -> (common::Directory, Tensor<FsEntry, u8>) {
     let (root, dir) = common::new_dir("pipeline_source").await;
     let tensor = Tensor::create(
         dir,
@@ -112,7 +122,7 @@ async fn source() -> (std::path::PathBuf, Tensor<FsEntry, u8>) {
 }
 
 #[tokio::test]
-async fn lookahead_progresses_but_writes_and_buffering_stay_bounded() {
+async fn destination_backpressure_stops_source_consumption() {
     let (root, source) = source().await;
     let (out_root, dir) = common::new_dir("pipeline_output").await;
     let (send, receive) = oneshot::channel();
@@ -131,10 +141,9 @@ async fn lookahead_progresses_but_writes_and_buffering_stay_bounded() {
         _ = copy.as_mut().fuse() => panic!("copy completed before releasing its block"),
     };
     assert!(matches!(futures::poll!(copy.as_mut()), Poll::Pending));
-    assert_eq!(reader.reads.read(), 2, "one completed lookahead only");
+    assert_eq!(reader.reads.read(), 1, "no source lookahead while writing");
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
-    let second = blocks.read().await.get_file("1").unwrap().clone();
-    assert_eq!(&*second.read::<Vec<u8>>().await.unwrap(), &[0]);
+    assert!(blocks.read().await.get_file("1").is_none());
     drop(guard);
     let output = copy.await.unwrap();
     assert_eq!(
@@ -156,15 +165,15 @@ async fn lookahead_progresses_but_writes_and_buffering_stay_bounded() {
 }
 
 #[tokio::test]
-async fn cancellation_and_errors_drop_the_other_side() {
+async fn cancellation_and_errors_release_the_active_operation_and_source() {
     let (root, source) = source().await;
-    // Drop while reading/writing, source error while writing, destination error
-    // while the next read is pending. No timing or global-counter assertions.
+    // Cancel while writing or reading; propagate a source error only after the
+    // prior write completes; a destination error prevents the next source poll.
     for (fail_read, stall_read, corrupt) in [
         (false, false, false),
         (false, true, false),
         (true, false, false),
-        (false, true, true),
+        (true, false, true),
     ] {
         let (out_root, dir) = common::new_dir("pipeline_cancel").await;
         let (send, receive) = oneshot::channel();
@@ -178,40 +187,49 @@ async fn cancellation_and_errors_drop_the_other_side() {
             stall_read,
         };
         let mut copy = Box::pin(Tensor::copy_from(dir.clone(), &reader, 1));
-        // Drive only until the first block has been locked; the source error may
-        // be returned by the same poll, so retain that result for the error case.
-        let (mut guard, first) = match futures::future::select(receive, copy.as_mut()).await {
-            futures::future::Either::Left((guard, _)) => (guard.unwrap(), None),
-            futures::future::Either::Right((result, receive)) => {
-                (receive.await.unwrap(), Some(result))
-            }
-        };
-        if fail_read {
-            let result = match first {
-                Some(result) => result,
-                None => copy.as_mut().await,
-            };
-            assert!(matches!(result, Err(fensor::Error::Unsupported(_))));
-        } else {
-            assert!(first.is_none());
-            assert!(futures::poll!(copy.as_mut()).is_pending());
-            assert_eq!(reader.reads.read(), 2);
-        }
+        let mut guard = Some(futures::select! {
+            guard = receive.fuse() => guard.unwrap(),
+            _ = copy.as_mut().fuse() => panic!("copy completed before releasing its block"),
+        });
+        assert!(futures::poll!(copy.as_mut()).is_pending());
+        assert_eq!(reader.reads.read(), 1);
         if corrupt {
-            guard.clear();
-            drop(guard);
-            assert!(matches!(
-                copy.as_mut().await,
-                Err(fensor::Error::InvalidLayout(_))
-            ));
-        } else {
-            drop(guard);
+            guard.as_mut().unwrap().clear();
         }
+        if fail_read || stall_read {
+            drop(guard.take());
+            if corrupt {
+                assert!(matches!(
+                    copy.as_mut().await,
+                    Err(fensor::Error::InvalidLayout(_))
+                ));
+                assert_eq!(
+                    reader.reads.read(),
+                    1,
+                    "destination failure stops ingestion"
+                );
+            } else {
+                if fail_read {
+                    assert!(matches!(
+                        copy.as_mut().await,
+                        Err(fensor::Error::Unsupported(_))
+                    ));
+                } else {
+                    assert!(futures::poll!(copy.as_mut()).is_pending());
+                }
+                assert_eq!(reader.reads.read(), 2);
+            }
+        }
+        // The write-cancellation case still owns its destination guard here.
         drop(copy);
+        drop(guard);
         assert_eq!(reader.dropped.read(), 1);
         let reads = reader.reads.read();
-        let output = Tensor::<FsEntry, u8>::load(dir).await.unwrap();
-        assert_eq!(output.read_value(&[1]).await.unwrap(), 0);
+        assert!(Tensor::<FsEntry, u8>::load(dir.clone()).await.is_err());
+        let blocks = dir.read().await.get_dir("blocks").cloned().unwrap();
+        assert!(blocks.read().await.get_file("1").is_none());
+        let file = blocks.read().await.get_file("0").cloned().unwrap();
+        assert!(file.try_write::<Vec<u8>>(0).is_ok());
         assert_eq!(reader.reads.read(), reads);
         common::cleanup(&out_root).await;
     }

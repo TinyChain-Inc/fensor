@@ -2,7 +2,6 @@
 
 use std::marker::PhantomData;
 
-use futures::{StreamExt, TryStreamExt};
 #[cfg(feature = "complex")]
 use ha_ndarray::NDArrayComplex;
 use ha_ndarray::{
@@ -10,16 +9,15 @@ use ha_ndarray::{
     NDArrayUnaryBoolean,
 };
 
+use crate::Result;
 use crate::expression::{self, Batch, Expression};
-use crate::request::{self, BatchRequest};
+use crate::request::BatchRequest;
 use crate::schema::Layout;
 use crate::tensor::TensorElement;
 use crate::traits::{
-    BoxFuture, SparseElementStream, TensorAbs, TensorCast, TensorGeometry, TensorNumeric,
-    TensorRead, TensorTransform, TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics,
-    ValueBlockStream,
+    BoxFuture, TensorAbs, TensorCast, TensorGeometry, TensorNumeric, TensorRead, TensorTransform,
+    TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics,
 };
-use crate::{Axes, Range, Result, Shape};
 
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -197,10 +195,12 @@ impl<S, O> UnaryView<S, O> {
 
 // Expand only members of the explicit public-trait implementation below.
 macro_rules! unary_constructor {
-    ($output:ident, $method:ident, $op:ident) => {
-        type $output = UnaryView<Self, $op>;
+    ($output:ident, $method:ident, $op:ident $(; where [$($bounds:tt)+])?) => {
+        type $output = UnaryView<Self, $op> $(where $($bounds)+)?;
 
-        fn $method(&self) -> BoxFuture<'_, Result<Self::$output>> {
+        fn $method(&self) -> BoxFuture<'_, Result<Self::$output>>
+        $(where $($bounds)+)?
+        {
             Box::pin(async move { Ok(UnaryView::new(self.clone(), $op)) })
         }
     };
@@ -215,17 +215,7 @@ where
 
     unary_constructor!(LnOutput, ln, Ln);
 
-    type RoundOutput
-        = UnaryView<Self, Round>
-    where
-        E::DType: ha_ndarray::Real;
-
-    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>
-    where
-        E::DType: ha_ndarray::Real,
-    {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), Round)) })
-    }
+    unary_constructor!(RoundOutput, round, Round; where [E::DType: ha_ndarray::Real]);
 }
 
 impl<E> TensorUnaryBoolean for E
@@ -327,10 +317,6 @@ where
     fn is_base_tensor(&self) -> bool {
         false
     }
-
-    fn supports_write_through(&self) -> bool {
-        false
-    }
 }
 
 impl<S, O> TensorRead for UnaryView<S, O>
@@ -339,50 +325,12 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
-    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
-        expression::coordinate_blocks(self)
-    }
-
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Ok(
-                expression::evaluate_batch(self, &BatchRequest::point(coord))
-                    .await?
-                    .values[0],
-            )
-        })
-    }
-
-    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = request::linear_requests(self.shape())?;
-
-        Ok(expression::ordered_batches(self, coords)
-            .map_ok(|(_, batch)| batch.values)
-            .boxed())
-    }
-
-    fn read_sparse_elements_in_order<'a>(
-        &'a self,
-        range: Range,
-        requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        Box::pin(async move {
-            let coords = crate::traits::sparse_coords(self, range, requested_order)?;
-
-            Ok(
-                expression::ordered_batches(self, request::explicit_requests(coords))
-                    .and_then(move |(coords, values)| async move {
-                        Ok(futures::stream::iter(expression::sparse_elements(
-                            coords,
-                            values,
-                            self.shape(),
-                        )?))
-                    })
-                    .try_flatten()
-                    .boxed(),
-            )
-        })
-    }
+    crate::expression::reader_members!(
+        read_value,
+        read_blocks,
+        read_coordinate_blocks,
+        read_sparse_elements_in_order
+    );
 }
 
 impl<S, O> TensorTransform for UnaryView<S, O>
@@ -391,54 +339,7 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            source: self.source.reshape(shape)?,
-            op: self.op,
-        })
-    }
-
-    fn broadcast(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            source: self.source.broadcast(shape)?,
-            op: self.op,
-        })
-    }
-
-    fn flip(self, axis: usize) -> Result<Self> {
-        Ok(Self {
-            source: self.source.flip(axis)?,
-            op: self.op,
-        })
-    }
-
-    fn slice(self, range: Range) -> Result<Self> {
-        Ok(Self {
-            source: self.source.slice(range)?,
-            op: self.op,
-        })
-    }
-
-    fn squeeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            source: self.source.squeeze(axes)?,
-            op: self.op,
-        })
-    }
-
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        Ok(Self {
-            source: self.source.transpose(permutation)?,
-            op: self.op,
-        })
-    }
-
-    fn unsqueeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            source: self.source.unsqueeze(axes)?,
-            op: self.op,
-        })
-    }
+    crate::mapping::transform_methods!(operands: source; preserve_rest);
 }
 
 impl<S, O> Expression for UnaryView<S, O>
@@ -447,22 +348,56 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
-    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
-        self.source.slice_requests(slice)
+    fn expression_nodes(&self) -> Result<usize> {
+        crate::expression::traversal::node_count([self.source.expression_nodes()?])
     }
 
-    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
-        self.source.preferred_requests(shape)
+    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
+        self.source.detach_sources(pending);
     }
 
-    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Selection<'_>> {
+        Ok(expression::traversal::Selection::Source(Box::new(
+            move || self.source.selection_step(slice),
+        )))
+    }
+
+    fn support_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Support<'_>> {
+        Ok(expression::traversal::Support::Sources(vec![(
+            0,
+            Box::new(move || self.source.support_step(slice)),
+        )]))
+    }
+
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
+        Ok(expression::traversal::Preferred::Sources(vec![Box::new(
+            move || self.source.preferred_step(shape),
+        )]))
+    }
+
+    fn build<'a>(
+        &'a self,
+        context: expression::Context<'a>,
+        coords: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
-            let source = self.source.build(coords).await?;
+            let source = context.batch(&self.source, coords.clone()).await?;
             Batch {
+                _allocation: None,
                 array: self.op.apply(source.array)?,
                 support: source.support,
             }
-            .masked()
+            .masked()?
+            .realize()
         })
     }
 }

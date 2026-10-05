@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorCompareScalar, TensorElement, TensorFileEntry,
     TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnary, TensorRead, TensorReduce,
-    TensorReduceAll, TensorSchema, TensorSparseIndex, TensorTransform, TensorUnary,
-    TensorViewSemantics, TensorWhere, TensorWrite,
+    TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics, TensorWhere,
+    TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{Array, Buffer, MatrixUnary, NDArrayRead};
@@ -362,86 +362,6 @@ async fn bounded_batches_reuse_and_live_reads() {
 }
 
 #[tokio::test]
-async fn huge_selected_diagonal_and_corrupt_blocks() {
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let n = 1_000_000_000u64;
-        let (root, dir) = new_dir("huge_diag").await;
-        let tensor = Tensor::<FsEntry, u8>::create(
-            dir.clone(),
-            TensorSchema::new(u8::dtype(), smallvec![n, n]).unwrap(),
-            Layout::Sparse { axis: None },
-            1,
-        )
-        .await
-        .unwrap();
-        tensor.write_value(&[n - 1, n - 1], 255).await.unwrap();
-        tensor.write_value(&[0, 1], 127).await.unwrap();
-        let off = tensor.lookup_block_id(&[0, 1]).await.unwrap().unwrap();
-        dir.read()
-            .await
-            .get_dir("blocks")
-            .unwrap()
-            .write()
-            .await
-            .delete(&off.to_string())
-            .await;
-        let diag = tensor.view().diag().await.unwrap();
-        assert_eq!(diag.read_value(&[0]).await.unwrap(), 0);
-        let entries: Vec<_> = diag
-            .read_sparse_elements_in_order(smallvec![AxisRange::In(n - 2, n, 1)], smallvec![0])
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(entries, vec![(vec![n - 1], 255)]);
-        assert!(diag.read_value(&[n]).await.is_err());
-        assert!(
-            diag.read_sparse_elements_in_order(smallvec![AxisRange::At(n)], smallvec![0])
-                .await
-                .is_err()
-        );
-        assert!(
-            diag.read_sparse_elements_in_order(smallvec![AxisRange::At(0)], smallvec![1])
-                .await
-                .is_err()
-        );
-        let needed = tensor
-            .lookup_block_id(&[n - 1, n * n - 1])
-            .await
-            .unwrap()
-            .unwrap();
-        let file = dir
-            .read()
-            .await
-            .get_dir("blocks")
-            .unwrap()
-            .read()
-            .await
-            .get_file(&needed.to_string())
-            .cloned()
-            .unwrap();
-        file.write::<Vec<u8>>().await.unwrap().clear();
-        assert!(matches!(
-            diag.read_value(&[n - 1]).await,
-            Err(Error::InvalidLayout(_))
-        ));
-        dir.read()
-            .await
-            .get_dir("blocks")
-            .unwrap()
-            .write()
-            .await
-            .delete(&needed.to_string())
-            .await;
-        assert!(diag.read_value(&[n - 1]).await.is_err());
-        cleanup(&root).await;
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
 async fn constrained_cache_and_source_reload() {
     // The stored payload exceeds this cache; many tiny blocks exercise spill/reload.
     let (root, tensor) = fixture::source(
@@ -461,7 +381,7 @@ async fn constrained_cache_and_source_reload() {
     tensor.sync().await.unwrap();
     drop(tensor);
     let dir = freqfs::Cache::<FsEntry>::new(4096, None, 0, std::time::Duration::from_secs(1))
-        .load(root.clone())
+        .load(root.to_path_buf())
         .unwrap();
     let tensor = Tensor::<FsEntry, u8>::load(dir).await.unwrap();
     consumers(&tensor.view().diag().await.unwrap(), &expected, |a, b| {

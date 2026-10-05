@@ -34,10 +34,6 @@ pub trait TensorArray: TensorGeometry {
     fn schema(&self) -> &TensorSchema;
 
     fn strides(&self) -> &[u64];
-
-    fn schema_dtype(&self) -> NumberType {
-        self.schema().dtype()
-    }
 }
 
 /// A lazily-produced, row-major-ordered stream of populated sparse elements.
@@ -149,103 +145,30 @@ pub trait TensorWrite: TensorGeometry {
     -> BoxFuture<'a, Result<()>>;
 }
 
-/// Bulk writes consume caller-owned values without collecting their coordinates.
-/// The caller budgets the supplied buffer; tensor-to-tensor writes and fill iterate lazily.
+/// Bulk writes use bounded working memory in addition to caller-owned values.
+/// Native value-buffer writes group one execution batch by logical block;
+/// fills traverse lazily.
+/// Implementers provide both mutation operations.
 pub trait TensorWriteBulk: TensorWrite {
     fn write_values<'a>(
         &'a self,
-        _range: Range,
-        _values: Vec<Self::DType>,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "bulk write is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+        range: Range,
+        values: Vec<Self::DType>,
+    ) -> BoxFuture<'a, Result<()>>;
 
-    fn write_tensor<'a, T>(&'a self, _other: &'a T) -> BoxFuture<'a, Result<()>>
-    where
-        T: TensorRead<DType = Self::DType> + Sync + ?Sized,
-    {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "write_tensor is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
-
-    fn fill<'a>(&'a self, _value: Self::DType) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "fill is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn fill<'a>(&'a self, value: Self::DType) -> BoxFuture<'a, Result<()>>;
 }
 
 /// Transform-style ndarray operations (metadata/view level).
+/// Implementers provide every transformation and validate its supported geometry.
 pub trait TensorTransform: TensorGeometry + Sized {
     fn reshape(self, shape: Shape) -> Result<Self>;
-
-    fn broadcast(self, _shape: Shape) -> Result<Self> {
-        Err(Error::Unsupported(
-            "broadcast is not implemented for this tensor backend".to_string(),
-        ))
-    }
-
-    fn flip(self, _axis: usize) -> Result<Self> {
-        Err(Error::Unsupported(
-            "flip is not implemented for this tensor backend".to_string(),
-        ))
-    }
-
+    fn broadcast(self, shape: Shape) -> Result<Self>;
+    fn flip(self, axis: usize) -> Result<Self>;
     fn slice(self, range: Range) -> Result<Self>;
-
-    fn squeeze(self, _axes: Axes) -> Result<Self> {
-        Err(Error::Unsupported(
-            "squeeze is not implemented for this tensor backend".to_string(),
-        ))
-    }
-
+    fn squeeze(self, axes: Axes) -> Result<Self>;
     fn transpose(self, permutation: Option<Axes>) -> Result<Self>;
-
-    fn unsqueeze(self, _axes: Axes) -> Result<Self> {
-        Err(Error::Unsupported(
-            "unsqueeze is not implemented for this tensor backend".to_string(),
-        ))
-    }
-}
-
-/// Async storage-block access, bounded by validated storage block capacity.
-/// A block is not a whole-tensor collection or an execution batch. Implementing
-/// this trait does not replace the storage used by existing expression leaves.
-/// Writes do not coordinate sparse index updates or transaction visibility.
-pub trait TensorBlockStore: Send + Sync {
-    type Block: Clone + Send + Sync + 'static;
-
-    fn read_block<'a>(&'a self, block_id: u64) -> BoxFuture<'a, Result<Option<Self::Block>>>;
-
-    fn write_block<'a>(&'a self, block_id: u64, block: Self::Block) -> BoxFuture<'a, Result<()>>;
-}
-
-/// Sparse index access primitives for layouts backed by `b-table`.
-///
-/// These are low-level point operations, not an occupied-entry stream or a
-/// pluggable expression backend. Callers must coordinate raw index changes with
-/// payload ownership; these methods provide no transaction visibility.
-pub trait TensorSparseIndex: Send + Sync {
-    fn lookup_block_id<'a>(&'a self, key: &'a [u64]) -> BoxFuture<'a, Result<Option<u64>>>;
-
-    fn upsert_block_id<'a>(&'a self, key: Vec<u64>, block_id: u64) -> BoxFuture<'a, Result<()>>;
-
-    fn delete_row<'a>(&'a self, _key: Vec<u64>) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async move {
-            Err(Error::Unsupported(
-                "delete_row is not implemented for this tensor backend".to_string(),
-            ))
-        })
-    }
+    fn unsqueeze(self, axes: Axes) -> Result<Self>;
 }
 
 /// Base/view capability contract, aligned with v1 writeability semantics.
@@ -781,6 +704,37 @@ pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
     range: Range,
     requested_order: Axes,
 ) -> Result<validate::RangeCoords> {
+    let range = sparse_range(tensor, range, requested_order)?;
+    validate::iter_range_coords(tensor.shape(), &range)
+}
+
+pub(crate) fn sparse_slice<V: TensorGeometry + ?Sized>(
+    tensor: &V,
+    range: Range,
+    order: Axes,
+) -> Result<crate::slice::Slice> {
+    let range = sparse_range(tensor, range, order)?;
+    validate::iter_range_coords(tensor.shape(), &range)?;
+    let axes = range
+        .into_iter()
+        .map(|axis| match axis {
+            crate::AxisRange::At(at) => crate::request::Axis::range(at, 1),
+            crate::AxisRange::In(start, end, step) => crate::request::Axis::Span {
+                start,
+                step,
+                len: (end - start).div_ceil(step),
+            },
+            crate::AxisRange::Of(values) => crate::request::Axis::Selected(values),
+        })
+        .collect();
+    crate::slice::Slice::new(tensor.shape(), axes)
+}
+
+fn sparse_range<V: TensorGeometry + ?Sized>(
+    tensor: &V,
+    range: Range,
+    requested_order: Axes,
+) -> Result<Range> {
     let base_order: Vec<_> = (0..tensor.ndim()).collect();
 
     if requested_order.as_slice() != base_order.as_slice() {
@@ -808,7 +762,7 @@ pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
         }
     }
 
-    validate::iter_range_coords(tensor.shape(), &range)
+    Ok(range)
 }
 
 /// Complex elementwise projections, retaining source support.

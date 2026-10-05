@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{MatrixDual, NDArrayRead, NDArrayTransform, Number};
 
 use crate::expression::{self, Batch, Expression};
@@ -10,9 +9,8 @@ use crate::mapping::CoordinateMap;
 use crate::request::{self, Axis, BatchRequest, Cartesian, RequestKind};
 use crate::schema::Coord;
 use crate::{
-    Axes, BoxFuture, Layout, Range, Result, Shape, SparseElementStream, TensorElement,
-    TensorGeometry, TensorMatMul, TensorRead, TensorTransform, TensorViewSemantics,
-    ValueBlockStream,
+    BoxFuture, Layout, Result, Shape, TensorElement, TensorGeometry, TensorMatMul, TensorRead,
+    TensorTransform, TensorViewSemantics,
 };
 
 /// Maximum rows and columns per spatial tile; result size is TILE_SIDE squared.
@@ -110,13 +108,7 @@ fn plan_tiles(
     }
 
     let mut tiles: TileRequests = BTreeMap::new();
-    let mut cursor = coords.cursor(&mapping.shape)?;
-    let mut input = Coord::new();
-    let mut mapped = Coord::new();
-    let mut position = 0;
-
-    while cursor.next_into(&mut input) {
-        mapping.resolve_into(&input, shape, strides, &mut mapped)?;
+    mapping.visit_mapped(coords, shape, strides, |position, mapped| {
         let column = mapped[mapped.len() - 1];
         let row = mapped[mapped.len() - 2];
         let mut coord = mapped[..mapped.len() - 2].to_vec();
@@ -126,8 +118,8 @@ fn plan_tiles(
             .entry(coord)
             .or_default()
             .push((position, row, column));
-        position += 1;
-    }
+        Ok(())
+    })?;
 
     Ok(tiles)
 }
@@ -394,7 +386,7 @@ fn plan_request(
         match request.kind() {
             RequestKind::Rectangles(rectangles) => return cartesian_plans(rectangles, shape),
             RequestKind::Linear { start } => return linear_plans(*start, request.len(), shape),
-            RequestKind::Explicit(_) => {}
+            RequestKind::Explicit(_) | RequestKind::FlatRuns(_) => {}
         }
     }
 
@@ -465,28 +457,43 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
+    fn expression_nodes(&self) -> Result<usize> {
+        crate::expression::traversal::node_count([
+            self.left.expression_nodes()?,
+            self.right.expression_nodes()?,
+        ])
+    }
+
+    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
+        self.left.detach_sources(pending);
+        self.right.detach_sources(pending);
+    }
+
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
         let requests: expression::RequestIterator = if shape.len() < 2 {
             Box::new(request::linear_requests(shape)?)
         } else {
             Box::new(request::tiled_requests(shape)?)
         };
-        Ok(Some(requests))
+        Ok(expression::traversal::Preferred::Ready(Some(requests)))
     }
 
-    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+    fn build<'a>(
+        &'a self,
+        context: expression::Context<'a>,
+        coords: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
-            #[cfg(test)]
-            let planning = crate::read_metrics::Timer::new(|m| &mut m.planning);
             let tiles = plan_request(
                 &self.mapping,
                 &self.output_shape,
                 &self.output_strides,
-                coords,
+                &coords,
             )?;
 
-            #[cfg(test)]
-            drop(planning);
             let mut values = vec![L::DType::ZERO; coords.len()];
             let mut support =
                 matches!(self.layout(), Layout::Sparse { .. }).then(|| vec![0; coords.len()]);
@@ -517,13 +524,13 @@ where
                         operand_request(self.right.shape(), &key, &columns, start, count, false)?;
 
                     // Direct evaluation: nested products/reductions start no buffered streams.
-                    #[cfg(test)]
-                    let operands = crate::read_metrics::Timer::new(|m| &mut m.operands);
-                    let left = expression::evaluate_batch(&self.left, &left_coords).await?;
-                    let right = expression::evaluate_batch(&self.right, &right_coords).await?;
+                    let left = context
+                        .evaluate(&self.left, std::sync::Arc::new(left_coords))
+                        .await?;
+                    let right = context
+                        .evaluate(&self.right, std::sync::Arc::new(right_coords))
+                        .await?;
 
-                    #[cfg(test)]
-                    drop(operands);
                     if let Some((row_support, column_support)) = &mut summaries {
                         for (i, supported) in row_support.iter_mut().enumerate() {
                             *supported |= left.support.as_ref().is_none_or(|s| {
@@ -543,18 +550,11 @@ where
                         .reshape(ha_ndarray::shape![rows.len(), count])?;
                     let right = expression::batch_array(right.values)?
                         .reshape(ha_ndarray::shape![count, columns.len()])?;
-                    #[cfg(test)]
-                    let backend = crate::read_metrics::Timer::new(|m| &mut m.backend);
                     let partial = left.matmul(right)?.buffer()?.to_slice()?.into_vec();
-
-                    #[cfg(test)]
-                    drop(backend);
 
                     #[cfg(test)]
                     crate::read_metrics::record(|m| m.backend_calls += 1);
 
-                    #[cfg(test)]
-                    let _accumulation = crate::read_metrics::Timer::new(|m| &mut m.accumulate);
                     combine_partial(&mut accumulated, partial, rows.len() * columns.len())?;
                 }
 
@@ -573,6 +573,7 @@ where
             }
 
             Batch {
+                _allocation: None,
                 array: expression::batch_array(values)?,
                 support,
             }
@@ -614,10 +615,6 @@ where
     fn is_base_tensor(&self) -> bool {
         false
     }
-
-    fn supports_write_through(&self) -> bool {
-        false
-    }
 }
 
 impl<L, R> TensorRead for MatMulView<L, R>
@@ -626,50 +623,12 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
-        expression::coordinate_blocks(self)
-    }
-
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Ok(
-                expression::evaluate_batch(self, &BatchRequest::point(coord))
-                    .await?
-                    .values[0],
-            )
-        })
-    }
-
-    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = request::linear_requests(self.shape())?;
-
-        Ok(expression::ordered_batches(self, coords)
-            .map_ok(|(_, batch)| batch.values)
-            .boxed())
-    }
-
-    fn read_sparse_elements_in_order<'a>(
-        &'a self,
-        range: Range,
-        requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        Box::pin(async move {
-            let coords = crate::traits::sparse_coords(self, range, requested_order)?;
-
-            Ok(
-                expression::ordered_batches(self, request::explicit_requests(coords))
-                    .and_then(move |(coords, values)| async move {
-                        Ok(futures::stream::iter(expression::sparse_elements(
-                            coords,
-                            values,
-                            self.shape(),
-                        )?))
-                    })
-                    .try_flatten()
-                    .boxed(),
-            )
-        })
-    }
+    crate::expression::reader_members!(
+        read_value,
+        read_blocks,
+        read_coordinate_blocks,
+        read_sparse_elements_in_order
+    );
 }
 
 impl<L, R> TensorTransform for MatMulView<L, R>
@@ -678,54 +637,7 @@ where
     R: TensorGeometry<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.reshape(shape)?,
-            ..self
-        })
-    }
-
-    fn broadcast(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.broadcast(shape)?,
-            ..self
-        })
-    }
-
-    fn slice(self, range: Range) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.slice(range)?,
-            ..self
-        })
-    }
-
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.transpose(permutation)?,
-            ..self
-        })
-    }
-
-    fn flip(self, axis: usize) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.flip(axis)?,
-            ..self
-        })
-    }
-
-    fn squeeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.squeeze(axes)?,
-            ..self
-        })
-    }
-
-    fn unsqueeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            mapping: self.mapping.unsqueeze(axes)?,
-            ..self
-        })
-    }
+    crate::mapping::transform_methods!();
 }
 
 #[cfg(test)]

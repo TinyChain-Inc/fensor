@@ -1,5 +1,11 @@
 //! Coordinate mapping shared by geometric storage and reduction views.
 
+#[cfg(test)]
+mod delegation_tests;
+
+#[cfg(test)]
+mod traversal_tests;
+
 use std::{iter, sync::Arc};
 
 use smallvec::SmallVec;
@@ -233,6 +239,27 @@ impl CoordinateMap {
         Ok(Some((offset, strides)))
     }
 
+    /// Visit mapped coordinates in request order using two reusable scratch buffers.
+    /// The callback may modify its borrowed coordinate; the next resolution resets it.
+    pub(crate) fn visit_mapped(
+        &self,
+        request: &crate::request::BatchRequest,
+        base_shape: &[u64],
+        base_strides: &[u64],
+        mut visit: impl FnMut(usize, &mut Coord) -> Result<()>,
+    ) -> Result<()> {
+        let mut cursor = request.cursor(&self.shape)?;
+        let mut input = Coord::new();
+        let mut mapped = Coord::new();
+        let mut position = 0;
+        while cursor.next_into(&mut input) {
+            self.resolve_into(&input, base_shape, base_strides, &mut mapped)?;
+            visit(position, &mut mapped)?;
+            position += 1;
+        }
+        Ok(())
+    }
+
     pub fn resolve_into(
         &self,
         coord: &[u64],
@@ -250,6 +277,40 @@ impl CoordinateMap {
         out.clear();
         out.extend(strides.iter().zip(shape).map(|(s, d)| (offset / *s) % *d));
         Ok(())
+    }
+
+    /// Bounds derived from rank-sized mapping and explicit gather metadata.
+    pub(crate) fn flat_bounds(&self) -> Result<Option<(u64, u64)>> {
+        if self.shape.contains(&0) {
+            return Ok(None);
+        }
+        let overflow = || Error::InvalidCoord("mapping bounds overflow".into());
+        let (mut lo, mut hi) = (self.base_offset, self.base_offset);
+        for (axis, &len) in self.axes.iter().zip(&self.shape) {
+            let (min, max) = match axis {
+                AxisContrib::Stride(step) => {
+                    let end = step.checked_mul(i128::from(len - 1)).ok_or_else(overflow)?;
+                    (end.min(0), end.max(0))
+                }
+                AxisContrib::Broadcast(offset) => (*offset, *offset),
+                AxisContrib::Gather(offsets) => {
+                    let mut min = i128::MAX;
+                    let mut max = i128::MIN;
+                    for index in 0..offsets.len {
+                        let value = *offsets.get(index).ok_or_else(overflow)?;
+                        min = min.min(value);
+                        max = max.max(value);
+                    }
+                    (min, max)
+                }
+            };
+            lo = lo.checked_add(min).ok_or_else(overflow)?;
+            hi = hi.checked_add(max).ok_or_else(overflow)?;
+        }
+        Ok(Some((
+            u64::try_from(lo).map_err(|_| overflow())?,
+            u64::try_from(hi).map_err(|_| overflow())?,
+        )))
     }
 
     pub fn flat_offset(&self, coord: &[u64]) -> Result<i128> {
@@ -737,6 +798,61 @@ fn flip_axis_contrib(current: &AxisContrib, dim: u64) -> Result<(i128, AxisContr
         AxisContrib::Gather(g) => (0, AxisContrib::Gather(g.flipped())),
     })
 }
+
+// Mechanical transforms preserve each value's distinct source and write capabilities.
+macro_rules! transform_methods {
+    (operands: $first:ident $(, $rest:ident)* $(; $preserve:ident)?) => {
+        $crate::mapping::transform_methods!(@owned reshape, shape, $crate::Shape; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned broadcast, shape, $crate::Shape; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned slice, range, $crate::Range; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned transpose, permutation, Option<$crate::Axes>; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned squeeze, axes, $crate::Axes; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned unsqueeze, axes, $crate::Axes; $first $(, $rest)* $(; $preserve)?);
+        fn flip(self, axis: usize) -> $crate::Result<Self> {
+            let $first = self.$first.flip(axis)?;
+            $(let $rest = self.$rest.flip(axis)?;)*
+            Ok($crate::mapping::transform_methods!(@construct self; [$first $(, $rest)*] $(; $preserve)?))
+        }
+    };
+    (@owned $method:ident, $arg:ident, $ty:ty; $first:ident $(, $rest:ident)* $(; $preserve:ident)?) => {
+        fn $method(self, $arg: $ty) -> $crate::Result<Self> {
+            $crate::mapping::transform_methods!(@bind self, $method, $arg; $first $(, $rest)*);
+            Ok($crate::mapping::transform_methods!(@construct self; [$first $(, $rest)*] $(; $preserve)?))
+        }
+    };
+    (@construct $value:ident; [$($field:ident),+]) => {
+        Self { $($field,)+ }
+    };
+    (@construct $value:ident; [$($field:ident),+]; preserve_rest) => {
+        Self { $($field,)+ ..$value }
+    };
+    (@bind $value:ident, $method:ident, $arg:ident; $last:ident) => {
+        let $last = $value.$last.$method($arg)?;
+    };
+    (@bind $value:ident, $method:ident, $arg:ident; $first:ident, $($rest:ident),+) => {
+        let $first = $value.$first.$method($arg.clone())?;
+        $crate::mapping::transform_methods!(@bind $value, $method, $arg; $($rest),+);
+    };
+
+    () => {
+        $crate::mapping::transform_methods!(reshape, shape, $crate::Shape);
+        $crate::mapping::transform_methods!(broadcast, shape, $crate::Shape);
+        $crate::mapping::transform_methods!(slice, range, $crate::Range);
+        $crate::mapping::transform_methods!(transpose, permutation, Option<$crate::Axes>);
+        $crate::mapping::transform_methods!(flip, axis, usize);
+        $crate::mapping::transform_methods!(squeeze, axes, $crate::Axes);
+        $crate::mapping::transform_methods!(unsqueeze, axes, $crate::Axes);
+    };
+    ($method:ident, $arg:ident, $ty:ty) => {
+        fn $method(self, $arg: $ty) -> $crate::Result<Self> {
+            Ok(Self {
+                mapping: self.mapping.$method($arg)?,
+                ..self
+            })
+        }
+    };
+}
+pub(crate) use transform_methods;
 
 #[cfg(test)]
 mod tests {

@@ -10,13 +10,13 @@ async fn source(
     cols: usize,
     layout: Layout,
     cache: usize,
-) -> (std::path::PathBuf, Tensor<FsEntry, f32>) {
+) -> (common::Directory, Tensor<FsEntry, f32>) {
     let (root, tensor) = common::fixture::source(
         "pipeline_source",
         shape![rows as u64, cols as u64],
         layout,
         128,
-        cache,
+        1_000_000,
         (0..rows).flat_map(|i| {
             (0..cols).map(move |j| {
                 if layout == Layout::Dense || (i + j) % 7 == 0 {
@@ -28,8 +28,7 @@ async fn source(
         }),
     )
     .await;
-    tensor.sync().await.unwrap();
-    (root, tensor)
+    super::benchmark_source::reopen(root, tensor, cache).await
 }
 
 pub async fn run() {
@@ -55,7 +54,7 @@ pub async fn run() {
                 let name = format!("pipeline_{name}_{kind}_cache{cache}");
                 benchmark::streams(&name, &view, &["coordinate"]).await;
                 for capacity in [1, 7, 31, 128, 4096] {
-                    benchmark::copy(&name, &view, capacity, cache).await;
+                    benchmark::copy(&name, &view, capacity, cache, cache < 1_000_000).await;
                 }
                 drop(view);
                 drop(a);

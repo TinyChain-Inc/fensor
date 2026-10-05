@@ -1,4 +1,4 @@
-//! Copy-specific transposed fixtures, including multi-batch overlap.
+//! Copy-specific transposed fixtures, including blocks revisited across batches.
 
 use super::{benchmark, common};
 use fensor::{Layout, TensorTransform};
@@ -35,7 +35,7 @@ pub async fn run() {
             let name = format!("copy_{fixture}_{layout:?}").replace(',', "-");
             for cache in caches {
                 for capacity in [1, 7, 31, 128, 4096] {
-                    benchmark::copy(&name, &view, capacity, cache).await;
+                    benchmark::copy(&name, &view, capacity, cache, cache < 1_000_000).await;
                 }
             }
             drop(view);
