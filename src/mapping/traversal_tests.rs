@@ -207,3 +207,22 @@ fn dense_base_flat_offset_diagnostic() {
     let map = CoordinateMap::identity(shape, &strides);
     assert_eq!(map.flat_offset(&[1, 2, 3]).unwrap(), 23);
 }
+
+#[test]
+fn storage_slice_preserves_singleton_axis_identity() {
+    for shape in [
+        smallvec::smallvec![1, 1_000_000_007],
+        smallvec::smallvec![1, 1, 1_000_000_007],
+        smallvec::smallvec![2, 1, 1_000_000_007],
+        smallvec::smallvec![1_000_000_007, 1],
+    ] {
+        let strides = schema::contiguous_strides(&shape).unwrap();
+        let mapping = CoordinateMap::identity(shape.clone(), &strides);
+        let slice = mapping.storage_slice(&shape, &strides).unwrap().unwrap();
+        assert_eq!(
+            slice.axes,
+            (0..shape.len()).map(|axis| (axis, 1)).collect::<Vec<_>>()
+        );
+        assert_eq!(slice.origins.as_slice(), vec![0; shape.len()]);
+    }
+}

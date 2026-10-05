@@ -71,13 +71,11 @@ impl TensorSource for Source {
         })
     }
 
-    fn occupied_regions(
+    fn occupied_blocks(
         &self,
-        after: Option<[u64; 2]>,
-        lo: u64,
-        hi: u64,
-    ) -> futures::stream::BoxStream<'static, fensor::Result<[u64; 2]>> {
-        self.tensor.occupied_regions(after, lo, hi)
+        range: std::ops::Range<u64>,
+    ) -> futures::stream::BoxStream<'static, fensor::Result<u64>> {
+        self.tensor.occupied_blocks(range)
     }
 }
 
@@ -145,10 +143,10 @@ async fn exercise(case: &str) {
         } else if case.starts_with("mixed") && i % 2 == 0 {
             TensorExpression::new(
                 expression
-                    .add_scalar(1.)
+                    .mul_scalar(2.)
                     .await
                     .unwrap()
-                    .sub_scalar(1.)
+                    .div_scalar(2.)
                     .await
                     .unwrap(),
             )
@@ -260,18 +258,17 @@ async fn exercise(case: &str) {
             drop(stream);
         }
         "sparse" => {
-            // Retain support through an intermediate zero, but never create
-            // support at the source's implicit zero.
+            // A deep intermediate can become zero; another operand supplies its
+            // ordinary value without turning the source's implicit zero nonzero.
+            let zeros = expression.sub(&expression).await.unwrap();
             let transformed = TensorExpression::new(
-                expression
-                    .sub_scalar(2.)
-                    .await
-                    .unwrap()
-                    .add_scalar(3.)
+                zeros
+                    .add(&expression.mul_scalar(1.5).await.unwrap())
                     .await
                     .unwrap(),
             )
             .unwrap();
+            drop(zeros);
             drop(expression);
             assert_eq!(transformed.read_value(&[0]).await.unwrap(), 0.);
             let entries: Vec<_> = transformed

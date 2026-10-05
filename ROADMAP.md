@@ -19,11 +19,14 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
   directly by native indexes. Incompatible geometry retains bounded logical evaluation.
 - Indexed sparse diagonal traversal; current diagonal reads select bounded
   coordinates and full scans remain proportional to logical diagonal length.
-- Indexed aggregate output support traversal, preserving group support and corruption/error contracts.
+- Indexed aggregate output candidates, preserving implicit-zero values and corruption/error contracts.
+- Reuse native traversal for sorted nonadjacent blocks without reading unselected
+  storage. Consecutive keys share a bounded range; scattered candidates and
+  transaction-visible sources still perform repeated logical-block lookups.
 - Sparse matrix algorithms that skip empty contraction intervals without losing
-  retained intermediate support or zero-times-infinity behavior. Current matrix
+  zero-times-infinity behavior. Current matrix
   products scan logical contraction length.
-- Native table metadata scaling and bounded page compaction. Adaptive payloads
+- Native table metadata scaling and bounded page compaction. Dense chunk rows
   share pages and remove obsolete rows during replacement; execution batch
   limits do not bound total filesystem metadata. Whole-index collection is prohibited.
 

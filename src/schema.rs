@@ -1,6 +1,3 @@
-use std::io;
-
-use b_table::{IndexSchema, Schema};
 use number_general::{FloatType, IntType, NumberType, UIntType};
 use smallvec::SmallVec;
 
@@ -36,14 +33,6 @@ pub(crate) const SPARSE_INDEX_BLOCK_BYTES: usize = 4096;
 
 /// Target retained bytes per sparse node, independent of tensor block capacity.
 pub(crate) const SPARSE_NODE_MEMORY: usize = 16384;
-
-// Include the wider index-node representation, not just scalar payload bytes.
-// Even order preserves the native split/merge occupancy invariant.
-pub(crate) fn sparse_node_order<V>(width: usize) -> usize {
-    let header = std::mem::size_of::<b_table::Node<V>>();
-    let row = std::mem::size_of::<Vec<V>>() + width * std::mem::size_of::<V>() + 16;
-    ((SPARSE_NODE_MEMORY - header) / row / 2 * 2).max(4)
-}
 
 /// Base tensor identity: dtype + fixed logical shape + fixed contiguous
 /// strides. Held by `Tensor`, never mutated after creation -- the *current*
@@ -125,15 +114,19 @@ impl StorageSchema {
     /// Creation path: run the greedy algorithm to pick a block shape.
     pub(crate) fn new(tensor_shape: &[u64], layout: Layout, max_capacity: usize) -> FResult<Self> {
         validate_shape_dims(tensor_shape)?;
-        // Default sparse geometry fixes one sparse-axis coordinate per block and
-        // spends capacity on other axes. Explicit validated geometry can span regions.
+        // Sparse coordinates identify a dense suffix. Without a sparse axis,
+        // each stored payload is one scalar.
         let block_schema = if let Layout::Sparse { axis } = layout {
-            let axis = axis.unwrap_or(0);
             let mut region = Shape::from_slice(tensor_shape);
-            let extent = region
-                .get_mut(axis)
-                .ok_or_else(|| Error::InvalidSchema("sparse axis hint out of bounds".into()))?;
-            *extent = 1;
+            if let Some(axis) = axis {
+                region
+                    .get_mut(..=axis)
+                    .ok_or_else(|| Error::InvalidSchema("sparse axis out of bounds".into()))?
+                    .fill(1);
+            } else {
+                region.fill(1);
+            }
+
             BlockSchema::new(&region, max_capacity)?
         } else {
             BlockSchema::new(tensor_shape, max_capacity)?
@@ -163,12 +156,24 @@ impl StorageSchema {
         layout: Layout,
         block_schema: BlockSchema,
     ) -> FResult<Self> {
-        if let Layout::Sparse { axis: Some(axis) } = layout
-            && axis >= tensor_shape.len()
-        {
-            return Err(Error::InvalidSchema(
-                "sparse axis hint out of bounds".to_string(),
-            ));
+        if let Layout::Sparse { axis } = layout {
+            let prefix = match axis {
+                Some(axis) if axis < tensor_shape.len() => axis + 1,
+                Some(_) => {
+                    return Err(Error::InvalidSchema("sparse axis out of bounds".into()));
+                }
+                None => tensor_shape.len(),
+            };
+
+            if block_schema
+                .shape
+                .get(..prefix)
+                .is_none_or(|prefix| prefix.iter().any(|&extent| extent != 1))
+            {
+                return Err(Error::InvalidLayout(
+                    "sparse block spans multiple sparse coordinates".into(),
+                ));
+            }
         }
 
         let shape: Shape = tensor_shape
@@ -314,142 +319,6 @@ impl Iterator for RowMajorCoords {
         }
 
         Some(out.into_vec())
-    }
-}
-
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub(crate) struct SparseIndexSchema {
-    columns: Vec<String>,
-}
-
-impl SparseIndexSchema {
-    pub fn new(columns: Vec<String>) -> Self {
-        Self { columns }
-    }
-}
-
-impl b_table::BTreeSchema for SparseIndexSchema {
-    type Error = io::Error;
-
-    type Value = u64;
-
-    fn block_size(&self) -> usize {
-        SPARSE_INDEX_BLOCK_BYTES
-    }
-
-    fn len(&self) -> usize {
-        self.columns.len()
-    }
-
-    fn order(&self) -> usize {
-        sparse_node_order::<u64>(self.columns.len())
-    }
-
-    fn validate_key(
-        &self,
-        key: Vec<Self::Value>,
-    ) -> std::result::Result<Vec<Self::Value>, Self::Error> {
-        if key.len() == self.len() {
-            Ok(key)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid sparse index key length",
-            ))
-        }
-    }
-}
-
-impl IndexSchema for SparseIndexSchema {
-    type Id = String;
-
-    fn columns(&self) -> &[Self::Id] {
-        &self.columns
-    }
-}
-
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub(crate) struct SparseTableSchema {
-    key_len: usize,
-    primary: SparseIndexSchema,
-    auxiliary: Vec<(String, SparseIndexSchema)>,
-}
-
-impl SparseTableSchema {
-    pub(crate) fn descriptors() -> Self {
-        Self {
-            key_len: 1,
-            primary: SparseIndexSchema::new(vec!["block".into(), "encoding".into()]),
-            auxiliary: vec![],
-        }
-    }
-}
-
-impl Default for SparseTableSchema {
-    fn default() -> Self {
-        Self {
-            key_len: 2,
-            primary: SparseIndexSchema::new(vec![
-                "coord".to_string(),
-                "block_offset".to_string(),
-                "block_id".to_string(),
-            ]),
-            auxiliary: vec![],
-        }
-    }
-}
-
-impl Schema for SparseTableSchema {
-    type Id = String;
-
-    type Error = io::Error;
-
-    type Value = u64;
-
-    type Index = SparseIndexSchema;
-
-    fn key(&self) -> &[Self::Id] {
-        &self.primary.columns()[..self.key_len]
-    }
-
-    fn values(&self) -> &[Self::Id] {
-        &self.primary.columns()[self.key_len..]
-    }
-
-    fn primary(&self) -> &Self::Index {
-        &self.primary
-    }
-
-    fn auxiliary(&self) -> &[(String, Self::Index)] {
-        &self.auxiliary
-    }
-
-    fn validate_key(
-        &self,
-        key: Vec<Self::Value>,
-    ) -> std::result::Result<Vec<Self::Value>, Self::Error> {
-        if key.len() == self.key_len {
-            Ok(key)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid sparse table key length",
-            ))
-        }
-    }
-
-    fn validate_values(
-        &self,
-        values: Vec<Self::Value>,
-    ) -> std::result::Result<Vec<Self::Value>, Self::Error> {
-        if values.len() == self.values().len() {
-            Ok(values)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid sparse table value length",
-            ))
-        }
     }
 }
 
@@ -658,6 +527,49 @@ mod tests {
             StorageSchema::from_block_shape(&[10], Layout::Dense, vec![3u64].into())
                 .expect("via from_block_shape");
         assert_eq!(via_new, via_block_shape);
+    }
+
+    #[test]
+    fn sparse_storage_has_scalar_or_dense_suffix_payloads() {
+        let shape = [3, 5, 7];
+
+        for (axis, capacity, expected) in [
+            (None, MAX_BLOCK_CAPACITY, [1, 1, 1]),
+            (Some(0), MAX_BLOCK_CAPACITY, [1, 5, 7]),
+            (Some(1), MAX_BLOCK_CAPACITY, [1, 1, 7]),
+            (Some(2), MAX_BLOCK_CAPACITY, [1, 1, 1]),
+            (Some(0), 4, [1, 1, 4]),
+            (Some(1), 4, [1, 1, 4]),
+        ] {
+            let layout = Layout::Sparse { axis };
+            let storage = StorageSchema::new(&shape, layout, capacity).unwrap();
+            assert_eq!(storage.block_schema.shape.as_slice(), expected);
+            assert_eq!(
+                StorageSchema::from_block_shape(&shape, layout, expected.to_vec().into()).unwrap(),
+                storage
+            );
+
+            for prefix in 0..axis.map_or(shape.len(), |axis| axis + 1) {
+                let mut invalid = expected;
+                invalid[prefix] = 2;
+                assert!(matches!(
+                    StorageSchema::from_block_shape(&shape, layout, invalid.to_vec().into()),
+                    Err(Error::InvalidLayout(_))
+                ));
+            }
+        }
+
+        for axis in [shape.len(), usize::MAX] {
+            let layout = Layout::Sparse { axis: Some(axis) };
+            assert!(matches!(
+                StorageSchema::new(&shape, layout, MAX_BLOCK_CAPACITY),
+                Err(Error::InvalidSchema(_))
+            ));
+            assert!(matches!(
+                StorageSchema::from_block_shape(&shape, layout, vec![1, 1, 1].into()),
+                Err(Error::InvalidSchema(_))
+            ));
+        }
     }
 
     #[test]

@@ -23,7 +23,9 @@
 //! `async move` does not create CPU parallelism. Inner evaluation adds no buffering.
 //! Copying completes each destination update before requesting the next source batch.
 //!
-//! Sparse support survives intermediate zeros. Numeric terminals accumulate in
+//! Sparse absence is numerical zero; reductions count all logical values. Sparse
+//! pointwise operations reject nonzero implicit backgrounds unless converted with
+//! [`TensorExpression::into_dense`]. Numeric terminals accumulate in
 //! completion order under the backend aggregate contract, with no input-order
 //! error precedence. Boolean terminals retain logical short-circuit boundaries.
 //! Dropping consumption cancels pending evaluation. Copy failures leave unpublished
@@ -37,7 +39,7 @@
 //!
 //! ```no_run
 //! use fensor::{
-//!     Result, Tensor, TensorFileEntry, TensorMatMul, TensorMathScalar, TensorRead,
+//!     Result, Tensor, TensorExpression, TensorFileEntry, TensorMatMul, TensorMathScalar, TensorRead,
 //!     TensorUnary,
 //! };
 //! use futures::TryStreamExt;
@@ -47,8 +49,8 @@
 //!     right: &Tensor<FE, f32>,
 //!     mut visit: impl FnMut(&[u64], f32),
 //! ) -> Result<()> {
-//!     let result = left.view()
-//!         .matmul(&right.view()).await?
+//!     let product = left.view().matmul(&right.view()).await?;
+//!     let result = TensorExpression::new(product)?.into_dense()
 //!         .add_scalar(1.0).await?
 //!         .exp().await?;
 //!

@@ -9,7 +9,7 @@ use crate::{
     TensorViewSemantics, TensorWhere,
 };
 
-/// Read-only selection retaining support from the condition and both branches.
+/// Read-only selection over the condition and both branches.
 ///
 /// A zero condition selects `or_else`; every nonzero condition selects `then`.
 /// Both branches are read, so errors in an unselected branch still propagate.
@@ -58,10 +58,15 @@ use crate::{
 /// ) { let _ = c.view().cond(&a.view(), &b.view()).await; }
 /// ```
 #[derive(Clone)]
-pub struct WhereView<Condition, Then, Else> {
+pub struct WhereView<Condition, Then, Else>
+where
+    Then: TensorGeometry,
+    Then::DType: TensorElement,
+{
     condition: Condition,
     then: Then,
     or_else: Else,
+    zero: Then::DType,
 }
 
 impl<C, L, R> TensorWhere<L, R> for C
@@ -85,6 +90,7 @@ where
             }
 
             Ok(WhereView {
+                zero: or_else.implicit_zero(),
                 condition: self.clone(),
                 then: then.clone(),
                 or_else: or_else.clone(),
@@ -143,6 +149,10 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
+    fn implicit_zero(&self) -> Self::DType {
+        self.zero
+    }
+
     fn expression_nodes(&self) -> Result<usize> {
         crate::expression::traversal::node_count([
             self.condition.expression_nodes()?,
@@ -161,22 +171,26 @@ where
         &self,
         slice: crate::slice::Slice,
     ) -> Result<expression::traversal::Selection<'_>> {
-        expression::traversal::support(self, slice).map(expression::traversal::Selection::Ready)
+        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
     }
 
-    fn support_step(
+    fn ordered_step(
         &self,
         slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Support<'_>> {
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+        }
+
         let then_slice = slice.clone();
         let or_else_slice = slice.clone();
-        Ok(expression::traversal::Support::Sources(vec![
-            (1, Box::new(move || self.then.support_step(then_slice))),
+        Ok(expression::traversal::Ordered::Sources(vec![
+            (1, Box::new(move || self.then.ordered_step(then_slice))),
             (
                 2,
-                Box::new(move || self.or_else.support_step(or_else_slice)),
+                Box::new(move || self.or_else.ordered_step(or_else_slice)),
             ),
-            (0, Box::new(move || self.condition.support_step(slice))),
+            (0, Box::new(move || self.condition.ordered_step(slice))),
         ]))
     }
 
@@ -200,17 +214,11 @@ where
             let condition = context.batch(&self.condition, coords.clone()).await?;
             let then = context.batch(&self.then, coords.clone()).await?;
             let or_else = context.batch(&self.or_else, coords.clone()).await?;
-            let support = expression::union_support(
-                condition.support,
-                expression::union_support(then.support, or_else.support)?,
-            )?;
 
             Batch {
                 _allocation: None,
                 array: ArrayAccess::from(condition.array.cond(then.array, or_else.array)?),
-                support,
             }
-            .masked()?
             .realize()
         })
     }
@@ -238,5 +246,5 @@ where
     R: TensorTransform<DType = L::DType>,
     L::DType: TensorElement,
 {
-    crate::mapping::transform_methods!(operands: condition, then, or_else);
+    crate::mapping::transform_methods!(operands: condition, then, or_else; preserve_rest);
 }

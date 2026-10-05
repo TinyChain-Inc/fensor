@@ -198,7 +198,6 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
             // The benchmark workloads use f32/f64; this is adapter-owned
             // accounting, not a native storage introspection API.
             let (leaf, rows, memory) = match node {
-                FsEntry::Node(node) => node_metrics(&node),
                 FsEntry::SparseF32(node) => node_metrics(&node),
                 FsEntry::SparseF64(node) => node_metrics(&node),
                 _ => panic!("unexpected benchmark node"),

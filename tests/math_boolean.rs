@@ -1,8 +1,8 @@
 //! Native u8 storage and lazy boolean expressions over real filesystem tensors.
 
 use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorCast, TensorNumeric, TensorRead, TensorSchema,
-    TensorTransform, TensorUnaryBoolean, TensorWrite,
+    AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorNumeric, TensorRead,
+    TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -42,7 +42,7 @@ macro_rules! float_predicates {
                         let array = ArrayAccess::from(
                             Array::new(Buffer::from(input.clone()), shape![input.len()]).unwrap(),
                         );
-                        let mut expected = array
+                        let expected = array
                             .$method()
                             .unwrap()
                             .buffer()
@@ -50,15 +50,14 @@ macro_rules! float_predicates {
                             .to_slice()
                             .unwrap()
                             .into_vec();
-                        if matches!(layout, Layout::Sparse { .. }) {
-                            for (i, &value) in input.iter().enumerate() {
-                                if value == 0.0 {
-                                    expected[i] = 0;
-                                }
-                            }
-                        }
+                        let source = TensorExpression::new(tensor.view()).unwrap();
+                        let source = if stringify!($method) == "not" {
+                            source.into_dense()
+                        } else {
+                            source
+                        };
                         common::fixture::consumers(
-                            &tensor.view().$method().await.unwrap(),
+                            &source.$method().await.unwrap(),
                             &expected,
                             |a, b| a == b,
                             |a, b| a == b,
@@ -102,7 +101,7 @@ async fn u8_storage_views_not_and_reload() {
         tensor.write_value(&[1], 1).await.unwrap();
         let input = vec![0u8, 1, 127, 255];
         let array = ArrayAccess::from(Array::new(Buffer::from(input), shape![4]).unwrap());
-        let mut expected = array
+        let expected = array
             .not()
             .unwrap()
             .buffer()
@@ -110,12 +109,14 @@ async fn u8_storage_views_not_and_reload() {
             .to_slice()
             .unwrap()
             .into_vec();
-        if matches!(layout, Layout::Sparse { .. }) {
-            expected[0] = 0;
-        }
 
         common::fixture::consumers(
-            &tensor.view().not().await.unwrap(),
+            &TensorExpression::new(tensor.view())
+                .unwrap()
+                .into_dense()
+                .not()
+                .await
+                .unwrap(),
             &expected,
             |a, b| a == b,
             |a, b| a == b,
@@ -146,7 +147,7 @@ async fn u8_storage_views_not_and_reload() {
 }
 
 #[tokio::test]
-async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results() {
+async fn dense_predicate_chain_preserves_cast_zeros_and_copy_parity() {
     let (root, dir) = new_dir("boolean_chain").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
@@ -163,7 +164,10 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
         .await
         .unwrap()
         .flip(0)
+        .unwrap();
+    let expression = TensorExpression::new(expression)
         .unwrap()
+        .into_dense()
         .not()
         .await
         .unwrap()
@@ -188,21 +192,30 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
         vec![4096, 4]
     );
     let values: Vec<_> = first.into_iter().flatten().collect();
-    assert_eq!(&values[..2], &[0, 0]);
+    assert_eq!(&values[..2], &[1, 0]);
     assert!(values[2..].iter().all(|&v| v == 1));
     let rows: Vec<_> = expression
-        .read_sparse_elements_in_order(range![AxisRange::In(0, 4100, 1)], axes![0])
-        .await
+        .read_coordinate_blocks()
         .unwrap()
+        .map_ok(|(coords, values)| {
+            futures::stream::iter(
+                coords
+                    .into_iter()
+                    .zip(values)
+                    .filter(|(_, value)| *value != 0)
+                    .map(Ok::<_, fensor::Error>),
+            )
+        })
+        .try_flatten()
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(rows.len(), 4098);
-    assert!(rows.iter().all(|(c, v)| c[0] >= 2 && *v == 1));
+    assert_eq!(rows.len(), 4099);
+    assert!(rows.iter().all(|(c, v)| c[0] != 1 && *v == 1));
     let selected = expression.slice(range![AxisRange::In(0, 4, 1)]).unwrap();
     let (out_root, out_dir) = new_dir("boolean_chain_out").await;
     let output = Tensor::copy_from(out_dir, &selected, 2).await.unwrap();
-    for (i, value) in [0, 0, 1, 1].into_iter().enumerate() {
+    for (i, value) in [1, 0, 1, 1].into_iter().enumerate() {
         assert_eq!(selected.read_value(&[i as u64]).await.unwrap(), value);
         assert_eq!(output.read_value(&[i as u64]).await.unwrap(), value);
     }
@@ -215,10 +228,9 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
         .await
         .unwrap();
     assert_eq!(
-        source
-            .is_nan()
-            .await
+        TensorExpression::new(source.is_nan().await.unwrap())
             .unwrap()
+            .into_dense()
             .not()
             .await
             .unwrap()
@@ -228,15 +240,16 @@ async fn sparse_predicate_chain_preserves_support_across_cast_and_false_results(
         1
     );
     assert_eq!(
-        intermediate
-            .view()
+        TensorExpression::new(intermediate.view())
+            .unwrap()
+            .into_dense()
             .not()
             .await
             .unwrap()
             .read_value(&[0])
             .await
             .unwrap(),
-        0
+        1
     );
     for root in [&root, &out_root, &mid_root] {
         common::cleanup(root).await;

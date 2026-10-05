@@ -12,8 +12,8 @@ pub async fn storage() {
         ("vector", vec![128], 0, false),
         ("narrow", vec![128, 3], 0, false),
         ("trailing", vec![3, 128], 1, false),
-        ("low_occupancy", vec![4096, 16], 1, false),
-        ("high_occupancy", vec![4096, 16], 1, true),
+        ("low_occupancy", vec![16, 4096], 0, false),
+        ("high_occupancy", vec![16, 4096], 0, true),
     ] {
         if smoke && shape[0] == 4096 {
             shape[0] = 16;
@@ -130,8 +130,11 @@ pub async fn storage() {
 
 pub async fn mutation() {
     use fensor::{StorageGeometry, TensorWriteBulk};
-    for layout in [Layout::Dense, Layout::Sparse { axis: Some(1) }] {
-        for block_shape in [vec![4, 16], vec![16, 16]] {
+    for (layout, shapes) in [
+        (Layout::Dense, [vec![4, 16], vec![16, 16]]),
+        (Layout::Sparse { axis: Some(0) }, [vec![1, 16], vec![1, 64]]),
+    ] {
+        for block_shape in shapes {
             for scalar in [true, false] {
                 common::counters::reset_traffic();
                 let (root, dir) = common::new_dir("bulk_mutation").await;
@@ -388,7 +391,7 @@ async fn sparse_selections() {
     .await;
     assert_eq!(tensor.storage_geometry().block_len(), 4096);
     let expression = TensorExpression::new(tensor).unwrap();
-    // Full 32 KiB blocks select dense payloads under the existing packing rule.
+    // Each selected physical chunk contains 32 KiB of dense numerical values.
     // Visit every block repeatedly while consuming only a point or eight values.
     for width in [1, 8] {
         let selections: Vec<_> = (0..16)

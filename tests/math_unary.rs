@@ -3,8 +3,9 @@
 
 use fensor::unary::{Exp, Round};
 use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorTransform, TensorUnary,
-    TensorView, TensorViewSemantics, TensorWrite, UnaryView,
+    AxisRange, Error, Layout, Tensor, TensorAbs, TensorExpression, TensorRead, TensorSchema,
+    TensorTransform, TensorTrig, TensorUnary, TensorView, TensorViewSemantics, TensorWrite,
+    UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
@@ -161,7 +162,7 @@ async fn ln_domain_edges_produce_ieee754_values_not_errors() {
 }
 
 #[tokio::test]
-async fn sparse_round_exp_ln_all_supported_on_populated_elements_only() {
+async fn sparse_round_and_explicit_dense_exp_ln_preserve_values() {
     let (_root, tensor) = common::fixture::source(
         "sparse_unary_supported",
         shape![2, 3, 4],
@@ -185,8 +186,32 @@ async fn sparse_round_exp_ln_all_supported_on_populated_elements_only() {
         let view = tensor.view();
         let result = match op_name {
             "round" => Tensor::copy_from(out_dir, &view.round().await.expect("round"), 1000).await,
-            "exp" => Tensor::copy_from(out_dir, &view.exp().await.expect("exp"), 1000).await,
-            "ln" => Tensor::copy_from(out_dir, &view.ln().await.expect("ln"), 1000).await,
+            "exp" => {
+                Tensor::copy_from(
+                    out_dir,
+                    &TensorExpression::new(view.clone())
+                        .unwrap()
+                        .into_dense()
+                        .exp()
+                        .await
+                        .expect("exp"),
+                    1000,
+                )
+                .await
+            }
+            "ln" => {
+                Tensor::copy_from(
+                    out_dir,
+                    &TensorExpression::new(view)
+                        .unwrap()
+                        .into_dense()
+                        .ln()
+                        .await
+                        .expect("ln"),
+                    1000,
+                )
+                .await
+            }
             _ => unreachable!(),
         }
         .unwrap_or_else(|err| panic!("copy {op_name} should succeed: {err}"));
@@ -210,8 +235,13 @@ async fn sparse_round_exp_ln_all_supported_on_populated_elements_only() {
                 .read_value(&[0, 0, 0])
                 .await
                 .expect("read unpopulated"),
-            0.0,
-            "{op_name} must leave unpopulated coordinates as the implicit zero"
+            match op_name {
+                "round" => 0.,
+                "exp" => 1.,
+                "ln" => f32::NEG_INFINITY,
+                _ => unreachable!(),
+            },
+            "{op_name} must use the logical zero at unpopulated coordinates"
         );
     }
 }
@@ -242,7 +272,12 @@ async fn transformed_sparse_unary_view_copies() {
         )
         .expect("slice should succeed");
 
-    let chain = sliced.exp().await.expect("exp should succeed lazily");
+    let chain = TensorExpression::new(sliced)
+        .unwrap()
+        .into_dense()
+        .exp()
+        .await
+        .expect("exp should succeed lazily");
     let result = Tensor::copy_from(out_dir, &chain, 2)
         .await
         .expect("copy transformed sparse");
@@ -251,8 +286,11 @@ async fn transformed_sparse_unary_view_copies() {
         1.6f32.exp()
     );
     assert_eq!(
-        result.read_value(&[0, 0, 0]).await.expect("implicit zero"),
-        0.0
+        result
+            .read_value(&[0, 0, 0])
+            .await
+            .expect("zero background"),
+        1.0
     );
 }
 
@@ -341,7 +379,7 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
 }
 
 #[tokio::test]
-async fn sparse_chain_preserves_input_support_through_intermediate_zero() {
+async fn sparse_chain_keeps_intermediate_zeros_through_transforms() {
     let (root, dir) = new_dir("sparse_chain_support").await;
     let tensor = create_sparse_tensor::<f32>(
         dir,
@@ -350,18 +388,17 @@ async fn sparse_chain_preserves_input_support_through_intermediate_zero() {
     )
     .await;
     tensor.write_value(&[1, 2], -0.2).await.unwrap();
-    let expression: UnaryView<UnaryView<TensorView<fensor::Tensor<FsEntry, f32>>, Round>, Exp> =
-        tensor
-            .view()
-            .round()
-            .await
-            .unwrap()
-            .exp()
-            .await
-            .unwrap()
-            .transpose(Some(axes![1, 0]))
-            .unwrap();
-    assert_eq!(expression.read_value(&[2, 1]).await.unwrap(), 1.0);
+    let expression = tensor
+        .view()
+        .round()
+        .await
+        .unwrap()
+        .sin()
+        .await
+        .unwrap()
+        .transpose(Some(axes![1, 0]))
+        .unwrap();
+    assert_eq!(expression.read_value(&[2, 1]).await.unwrap(), 0.0);
     assert_eq!(expression.read_value(&[0, 0]).await.unwrap(), 0.0);
     let rows: Vec<_> = expression
         .read_sparse_elements_in_order(
@@ -373,7 +410,7 @@ async fn sparse_chain_preserves_input_support_through_intermediate_zero() {
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(rows, vec![(vec![2, 1], 1.0)]);
+    assert!(rows.is_empty());
     let (out_root, out_dir) = new_dir("sparse_chain_support_out").await;
     let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
     for coord in iter_coords(&[3, 2]) {
@@ -491,7 +528,7 @@ async fn large_sparse_shape_constructs_streams_without_expanding_axes() {
         None,
     )
     .await;
-    let expression = tensor.view().exp().await.unwrap();
+    let expression = tensor.view().round().await.unwrap();
     let sparse = expression
         .read_sparse_elements_in_order(range![AxisRange::In(0, length, 1)], axes![0])
         .await
@@ -537,8 +574,9 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
             (0..6).map(|i| i as f32 + 0.25),
         )
         .await;
-        let expression = tensor
-            .view()
+        let expression = TensorExpression::new(tensor.view())
+            .unwrap()
+            .into_dense()
             .slice(range![
                 AxisRange::In(0, 2, 1),
                 AxisRange::In(0, 1, 1),
@@ -586,12 +624,14 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
         let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
         if matches!(layout, Layout::Sparse { .. }) {
             let rows: Vec<_> = expression
-                .read_sparse_elements_in_order(
-                    range![AxisRange::In(0, 3, 1), AxisRange::In(0, 2, 1)],
-                    axes![0, 1],
-                )
-                .await
+                .read_coordinate_blocks()
                 .unwrap()
+                .map_ok(|(coords, values)| {
+                    futures::stream::iter(
+                        coords.into_iter().zip(values).map(Ok::<_, fensor::Error>),
+                    )
+                })
+                .try_flatten()
                 .try_collect()
                 .await
                 .unwrap();
@@ -627,10 +667,10 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
         )
         .await;
         for offset in [1, 3, 5] {
-            tensor.write_value(&[(length - offset)], 0.2).await.unwrap();
+            tensor.write_value(&[(length - offset)], 1.2).await.unwrap();
         }
         let view = tensor.view();
-        let unary = view.round().await.unwrap().exp().await.unwrap();
+        let unary = view.round().await.unwrap().sin().await.unwrap();
         let selection = range![AxisRange::Of(vec![
             length - 1,
             length - 5,
@@ -700,7 +740,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             .try_collect()
             .await
             .unwrap();
-        assert!(rows.iter().all(|(_, value)| *value == 1.0));
+        assert!(rows.iter().all(|(_, value)| *value == 1.0f32.sin()));
         common::cleanup(&root).await;
     })
     .await
@@ -708,7 +748,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
 }
 
 #[tokio::test]
-async fn sparse_unary_batches_preserve_support_and_independent_consumption() {
+async fn sparse_unary_batches_filter_zeros_and_preserve_independent_consumption() {
     let (root, tensor) = common::fixture::source(
         "sparse_unary_batch_boundary",
         shape![1, 4100],
@@ -718,13 +758,13 @@ async fn sparse_unary_batches_preserve_support_and_independent_consumption() {
         (0..4100).map(|i| if i % 2 == 0 { 0.2f32 } else { 1.2 }),
     )
     .await;
-    let expression = tensor.view().round().await.unwrap().exp().await.unwrap();
+    let expression = tensor.view().abs().await.unwrap();
     let range = range![AxisRange::At(0), AxisRange::In(0, 4100, 1)];
     let mut dropped = expression
         .read_sparse_elements_in_order(range.clone(), axes![0, 1])
         .await
         .unwrap();
-    assert_eq!(dropped.try_next().await.unwrap(), Some((vec![0, 0], 1.0)));
+    assert_eq!(dropped.try_next().await.unwrap(), Some((vec![0, 0], 0.2)));
     drop(dropped);
     let first = expression
         .read_sparse_elements_in_order(range.clone(), axes![0, 1])
@@ -744,7 +784,7 @@ async fn sparse_unary_batches_preserve_support_and_independent_consumption() {
     for (coord, value) in &first {
         assert_eq!(*value, expression.read_value(coord).await.unwrap());
     }
-    let final_zeros = expression.ln().await.unwrap();
+    let final_zeros = expression.round().await.unwrap();
     let rows: Vec<_> = final_zeros
         .read_sparse_elements_in_order(range, axes![0, 1])
         .await

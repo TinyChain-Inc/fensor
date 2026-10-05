@@ -9,8 +9,8 @@ use crate::{
 };
 
 /// A lazy, read-only diagonal projection. Transforms address its output geometry.
-/// Sparse support is inherited only from diagonal coordinates, including supported
-/// intermediate zeros. Complete sparse scans traverse the logical diagonal length.
+/// Missing sparse diagonal entries are numerical zeros. Complete sparse scans
+/// traverse the logical diagonal length.
 ///
 /// Diagonals cannot be written, even after transforms:
 ///
@@ -169,7 +169,7 @@ where
                     Ok(())
                 })?;
             let request = BatchRequest::explicit(coordinates)?;
-            // Preserve the source's lazy ndarray expression and support. This
+            // Preserve the source's lazy ndarray expression. This
             // projection adds no evaluation or buffering boundary.
             context
                 .batch(&self.source, std::sync::Arc::new(request))
@@ -206,14 +206,14 @@ mod tests {
     use crate::{Layout, TensorGeometry, TensorMatMul, TensorMatrixUnary, TensorUnary};
 
     #[tokio::test]
-    async fn projection_preserves_support_in_one_bounded_source_request() {
+    async fn projection_preserves_values_in_one_bounded_source_request() {
         let (root, tensor) = fixture::source(
             "diag_batch",
             smallvec::smallvec![2, 2],
             Layout::Sparse { axis: None },
             2,
             4096,
-            [0.2f32, 7., 0., 0.],
+            [1.2f32, 7., 0., 0.],
         )
         .await;
         let product = tensor.view().matmul(&tensor.view()).await.unwrap();
@@ -228,17 +228,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let view = tensor
-            .view()
-            .round()
-            .await
-            .unwrap()
-            .diag()
-            .await
-            .unwrap()
-            .exp()
-            .await
-            .unwrap();
+        let view = tensor.view().round().await.unwrap().diag().await.unwrap();
         let request = BatchRequest::explicit(
             (0..MAX_BATCH_ELEMENTS)
                 .map(|i| vec![(i % 2) as u64])
@@ -248,12 +238,10 @@ mod tests {
         crate::read_metrics::CURRENT
             .scope(Default::default(), async {
                 let batch = expression::evaluate_batch(&view, &request).await.unwrap();
-                let support = batch.support.unwrap();
 
                 for (i, value) in batch.values.into_iter().enumerate() {
                     let expected = u8::from(i % 2 == 0);
                     assert_eq!(value, expected as f32);
-                    assert_eq!(support[i], expected);
                 }
                 crate::read_metrics::CURRENT.with(|metrics| {
                     let metrics = metrics.borrow();

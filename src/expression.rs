@@ -4,13 +4,11 @@ use std::ops::Deref;
 
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{Array, ArrayAccess, Buffer, NDArray, NDArrayRead, NDArrayWhere};
+use ha_ndarray::{Array, ArrayAccess, Buffer, NDArray, NDArrayRead, Number};
 
 use crate::request::{self, BatchRequest};
 use crate::traits::BoxFuture;
-use crate::{
-    Error, Layout, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView,
-};
+use crate::{Error, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView};
 
 mod driver;
 pub use driver::Context;
@@ -40,19 +38,17 @@ fn validate_bound(context: &str, actual: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_support(support: &Option<Vec<u8>>, expected: usize) -> Result<()> {
-    if let Some(support) = support {
-        validate_len("batch support", support.len(), expected)?;
-    }
-
-    Ok(())
-}
-
 // This module is private: callers cannot introduce arbitrary expression sources.
 pub trait Expression: TensorGeometry
 where
     Self::DType: TensorElement,
 {
+    /// Value of an omitted coordinate, including the sign of numerical zero.
+    /// Computed owners cache this scalar; querying it never traverses operands.
+    fn implicit_zero(&self) -> Self::DType {
+        Self::DType::ZERO
+    }
+
     /// Count retained descriptions for admission at the dynamic value boundary.
     fn expression_nodes(&self) -> Result<usize> {
         Ok(1)
@@ -67,9 +63,9 @@ where
         Ok(traversal::Preferred::Ready(None))
     }
 
-    /// Describe one ordered-support step, retaining supported intermediate zeros.
-    fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
-        Ok(traversal::Support::Ready(slice.stream()))
+    /// Describe ordered occupied-request candidates, independent of numerical values.
+    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
+        Ok(traversal::Ordered::Ready(slice.stream()))
     }
 
     /// Describe one selection step; native readers may retain storage order.
@@ -179,11 +175,6 @@ where
 pub struct Batch<T: TensorElement> {
     pub(crate) _allocation: Option<driver::Allocation>,
     pub array: ArrayAccess<'static, T>,
-    // One byte per coordinate in this evaluation batch, not the whole tensor.
-    // Streaming batches contain at most MAX_BATCH_ELEMENTS coordinates; point reads use one.
-    // None means every coordinate in this batch is supported, independently of
-    // intermediate numerical zeros. Batches need not align with storage blocks.
-    pub support: Option<Vec<u8>>,
 }
 
 pub fn batch_array<T: TensorElement>(values: Vec<T>) -> Result<ArrayAccess<'static, T>> {
@@ -196,8 +187,7 @@ pub fn batch_array<T: TensorElement>(values: Vec<T>) -> Result<ArrayAccess<'stat
 impl<T: TensorElement> Batch<T> {
     fn validate(&self, expected: usize) -> Result<()> {
         validate_bound("batch expression", self.array.size())?;
-        validate_len("batch expression", self.array.size(), expected)?;
-        validate_support(&self.support, expected)
+        validate_len("batch expression", self.array.size(), expected)
     }
 
     fn into_evaluated(self) -> Result<EvaluatedBatch<T>> {
@@ -206,63 +196,17 @@ impl<T: TensorElement> Batch<T> {
         let batch = EvaluatedBatch {
             _allocation: self._allocation,
             values: self.array.buffer()?.to_slice()?.into_vec(),
-            support: self.support,
         };
         batch.validate(expected)?;
         Ok(batch)
     }
 
     pub(crate) fn realize(self) -> Result<Self> {
-        let expected = self.array.size();
-        self.validate(expected)?;
+        self.validate(self.array.size())?;
         Ok(Self {
             _allocation: self._allocation,
             array: ArrayAccess::from(self.array.into_read()?),
-            support: self.support,
         })
-    }
-
-    // Selection is part of the lazy expression, not a materialized intermediate.
-    pub fn masked(self) -> Result<Self> {
-        validate_bound("batch expression", self.array.size())?;
-        validate_support(&self.support, self.array.size())?;
-        let values = match &self.support {
-            Some(support) if support.contains(&0) => ArrayAccess::from(
-                batch_array(support.clone())?
-                    .cond(self.array, batch_array(vec![T::ZERO; support.len()])?)?,
-            ),
-            _ => self.array,
-        };
-
-        Ok(Self {
-            _allocation: self._allocation,
-            array: values,
-            support: self.support,
-        })
-    }
-}
-
-/// Union original support without inspecting intermediate numerical values.
-///
-/// Both masks describe the same bounded coordinate batch, including when called
-/// recursively by nested expressions. The result has at most `MAX_BATCH_ELEMENTS`
-/// u8 entries; this helper neither reads tensor data nor collects whole-tensor support.
-pub fn union_support(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
-    for mask in [&left, &right].into_iter().flatten() {
-        validate_bound("support union", mask.len())?;
-    }
-
-    match (left, right) {
-        (Some(mut left), Some(right)) => {
-            validate_len("support union", right.len(), left.len())?;
-
-            for (l, r) in left.iter_mut().zip(right) {
-                *l |= r;
-            }
-
-            Ok(Some(left))
-        }
-        _ => Ok(None),
     }
 }
 
@@ -280,28 +224,12 @@ where
 pub struct EvaluatedBatch<T> {
     pub(crate) _allocation: Option<driver::Allocation>,
     pub values: Vec<T>,
-    pub support: Option<Vec<u8>>,
 }
 
 impl<T> EvaluatedBatch<T> {
     fn validate(&self, expected: usize) -> Result<()> {
         validate_bound("evaluated batch", self.values.len())?;
-        validate_len("evaluated batch", self.values.len(), expected)?;
-        validate_support(&self.support, expected)
-    }
-
-    pub fn populated(mut self) -> Result<Vec<T>> {
-        self.validate(self.values.len())?;
-        if let Some(support) = self.support {
-            let mut index = 0;
-            self.values.retain(|_| {
-                let keep = support[index] != 0;
-                index += 1;
-                keep
-            });
-        }
-
-        Ok(self.values)
+        validate_len("evaluated batch", self.values.len(), expected)
     }
 }
 
@@ -422,9 +350,9 @@ where
             .map(traversal::Selection::Ready)
     }
 
-    fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
+    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
         self.ordered_storage_requests(slice)
-            .map(traversal::Support::Ready)
+            .map(traversal::Ordered::Ready)
     }
 
     fn build<'a>(
@@ -435,21 +363,9 @@ where
         Box::pin(async move {
             let values = self.read_batch(&coords).await?;
 
-            let support = if matches!(self.layout(), Layout::Sparse { .. }) {
-                Some(
-                    values
-                        .iter()
-                        .map(|v| u8::from(*v != S::DType::default()))
-                        .collect(),
-                )
-            } else {
-                None
-            };
-
             Ok(Batch {
                 _allocation: None,
                 array: batch_array(values)?,
-                support,
             })
         })
     }
@@ -464,13 +380,13 @@ where
         crate::storage::slice_requests(self, slice, None).map(traversal::Selection::Ready)
     }
 
-    fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
+    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
         crate::storage::ordered_requests(
             self,
             slice,
             crate::mapping::StorageSlice::identity(self.shape()),
         )
-        .map(traversal::Support::Ready)
+        .map(traversal::Ordered::Ready)
     }
 
     fn build<'a>(
@@ -480,16 +396,9 @@ where
     ) -> BoxFuture<'a, Result<Batch<T>>> {
         Box::pin(async move {
             let values = self.read_batch(&coords, None).await?;
-            let support = matches!(self.layout(), Layout::Sparse { .. }).then(|| {
-                values
-                    .iter()
-                    .map(|v| u8::from(*v != T::default()))
-                    .collect()
-            });
             Ok(Batch {
                 _allocation: None,
                 array: batch_array(values)?,
-                support,
             })
         })
     }
@@ -498,6 +407,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Layout;
     use crate::test_support::counters::Counter;
 
     // Wrap real storage only to observe dispatch; numerical reads still delegate.
@@ -530,9 +440,9 @@ mod tests {
             (self.provide)(shape).map(traversal::Preferred::Ready)
         }
 
-        fn support_step(&self, slice: crate::slice::Slice) -> Result<traversal::Support<'_>> {
+        fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
             self.calls.increment();
-            Ok(traversal::Support::Ready(
+            Ok(traversal::Ordered::Ready(
                 match (self.provide)(self.shape())? {
                     Some(requests) => futures::stream::iter(requests.map(Ok)).boxed(),
                     None => slice.stream(),
@@ -615,8 +525,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn support_providers_preserve_error_precedence_and_ordered_union() {
-        use crate::{TensorMath, TensorUnaryBoolean, TensorWhere};
+    async fn ordered_providers_preserve_error_precedence_and_ordered_union() {
+        use crate::{TensorAbs, TensorMath, TensorWhere};
 
         type Provide = fn(&[u64]) -> Result<Option<RequestIterator>>;
         let none: Provide = |_| Ok(None);
@@ -630,9 +540,9 @@ mod tests {
             )))
         };
 
-        let error: Provide = |_| Err(Error::Unsupported("support provider failure".into()));
+        let error: Provide = |_| Err(Error::Unsupported("ordered provider failure".into()));
         let (root, tensor) = crate::test_support::fixture::source(
-            "support_providers",
+            "ordered_providers",
             vec![6].into(),
             Layout::Sparse { axis: None },
             2,
@@ -659,10 +569,10 @@ mod tests {
                 .cond(&left, &right)
                 .await
                 .unwrap()
-                .not()
+                .abs()
                 .await
                 .unwrap();
-            let requests = traversal::support(&selected, crate::slice::Slice::full(&[6]).unwrap());
+            let requests = traversal::ordered(&selected, crate::slice::Slice::full(&[6]).unwrap());
             assert_eq!(requests.is_err(), fails);
             assert_eq!(calls.each_ref().map(|n| n.read()), expected);
             if let Ok(mut requests) = requests {
@@ -684,7 +594,7 @@ mod tests {
                 provide: providers[i],
             });
             assert!(
-                traversal::support(
+                traversal::ordered(
                     &left.add(&right).await.unwrap(),
                     crate::slice::Slice::full(&[6]).unwrap(),
                 )
@@ -798,7 +708,6 @@ mod tests {
                         request,
                         EvaluatedBatch {
                             _allocation: None,
-                            support: Some(vec![1; values.len()]),
                             values,
                         },
                         &shape,
@@ -831,24 +740,15 @@ mod tests {
     }
 
     #[test]
-    fn sparse_output_rejects_mismatched_values_and_support() {
-        for batch in [
-            EvaluatedBatch {
-                _allocation: None,
-                values: vec![1u8, 2],
-                support: None,
-            },
-            EvaluatedBatch {
-                _allocation: None,
-                values: vec![1u8],
-                support: Some(vec![]),
-            },
-        ] {
-            assert!(matches!(
-                sparse_elements(BatchRequest::point(&[0]), batch, &[1]),
-                Err(Error::InvalidLayout(_))
-            ));
-        }
+    fn sparse_output_rejects_mismatched_values_and_invalid_requests() {
+        let batch = EvaluatedBatch {
+            _allocation: None,
+            values: vec![1u8, 2],
+        };
+        assert!(matches!(
+            sparse_elements(BatchRequest::point(&[0]), batch, &[1]),
+            Err(Error::InvalidLayout(_))
+        ));
 
         for request in [
             BatchRequest::linear(2, 1).unwrap(),
@@ -861,7 +761,6 @@ mod tests {
             let batch = EvaluatedBatch {
                 _allocation: None,
                 values: vec![0u8; request.len()],
-                support: None,
             };
             assert!(matches!(
                 sparse_elements(request, batch, &[1]),
@@ -899,45 +798,18 @@ mod tests {
         let batch = Batch {
             _allocation: None,
             array: batch_array(vec![1u8, 2]).unwrap(),
-            support: None,
         };
         assert!(batch.validate(1).is_err());
-        let batch = Batch {
-            _allocation: None,
-            array: batch_array(vec![1u8, 2]).unwrap(),
-            support: Some(vec![1]),
-        };
-        assert!(batch.validate(2).is_err());
-        assert!(batch.masked().is_err());
         let evaluated = EvaluatedBatch {
             _allocation: None,
             values: vec![1u8],
-            support: None,
         };
         assert!(evaluated.validate(2).is_err());
         let evaluated = EvaluatedBatch {
             _allocation: None,
-            values: vec![1u8],
-            support: Some(vec![]),
+            values: vec![0u8; MAX_BATCH_ELEMENTS + 1],
         };
-        assert!(evaluated.populated().is_err());
-        assert!(union_support(Some(vec![1]), Some(vec![1, 1])).is_err());
-        assert!(union_support(None, Some(vec![1; MAX_BATCH_ELEMENTS + 1])).is_err());
-    }
-
-    #[test]
-    fn filtering_reuses_the_owned_allocation() {
-        let values = vec![2u8, 3, 4, 5];
-        let pointer = values.as_ptr();
-        let values = EvaluatedBatch {
-            _allocation: None,
-            values,
-            support: Some(vec![0, 1, 0, 1]),
-        }
-        .populated()
-        .unwrap();
-        assert_eq!(values, [3, 5]);
-        assert_eq!(values.as_ptr(), pointer);
+        assert!(evaluated.validate(MAX_BATCH_ELEMENTS + 1).is_err());
     }
 
     #[test]
@@ -972,11 +844,11 @@ where
     <H::Target as TensorGeometry>::DType: TensorElement,
 {
     let slice = crate::traits::sparse_slice(&*source, range, order)?;
-    let requests = traversal::support(&*source, slice)?;
+    let requests = traversal::ordered(&*source, slice)?;
     Ok(sparse_stream(source, requests))
 }
 
-/// Consume candidate support with one ordered buffer and no intermediate output collection.
+/// Consume ordered candidates with one ordered buffer and no intermediate output collection.
 pub(crate) fn sparse_stream<'a, H, R>(
     source: H,
     requests: R,

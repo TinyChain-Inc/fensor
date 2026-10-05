@@ -20,8 +20,8 @@ pub(crate) const TILE_SIDE: usize = 32;
 const MAX_RECTANGLE_AMPLIFICATION: usize = 2;
 
 /// A lazy, read-only matrix product with independent source adapters.
-/// Sparse support is unioned across each contracted pair, then across contraction
-/// positions. Transforms address the product's output, not its operands.
+/// Missing sparse inputs are numerical zeros. Transforms address the product's
+/// output, not its operands.
 ///
 /// ```
 /// use fensor::{Tensor, TensorFileEntry, TensorMatMul, TensorTransform};
@@ -498,8 +498,6 @@ where
             )?;
 
             let mut values = vec![L::DType::ZERO; coords.len()];
-            let mut support =
-                matches!(self.layout(), Layout::Sparse { .. }).then(|| vec![0; coords.len()]);
             let inner = self.left.shape()[self.left.ndim() - 1];
 
             for MatrixPlan {
@@ -512,9 +510,6 @@ where
                     },
             } in tiles
             {
-                let mut summaries = support
-                    .as_ref()
-                    .map(|_| (vec![false; rows.len()], vec![false; columns.len()]));
                 // Only one running result tile, at most TILE_SIDE * TILE_SIDE values.
                 let mut accumulated = None;
                 let step = contraction_step(rows.len(), columns.len());
@@ -534,21 +529,6 @@ where
                         .evaluate(&self.right, std::sync::Arc::new(right_coords))
                         .await?;
 
-                    if let Some((row_support, column_support)) = &mut summaries {
-                        for (i, supported) in row_support.iter_mut().enumerate() {
-                            *supported |= left.support.as_ref().is_none_or(|s| {
-                                s[i * count..(i + 1) * count].iter().any(|v| *v != 0)
-                            });
-                        }
-
-                        for (j, supported) in column_support.iter_mut().enumerate() {
-                            *supported |= right
-                                .support
-                                .as_ref()
-                                .is_none_or(|s| (0..count).any(|k| s[k * columns.len() + j] != 0));
-                        }
-                    }
-
                     let left = expression::batch_array(left.values)?
                         .reshape(ha_ndarray::shape![rows.len(), count])?;
                     let right = expression::batch_array(right.values)?
@@ -563,24 +543,14 @@ where
 
                 let accumulated = accumulated.expect("nonzero contraction dimension");
                 scatter.each(columns.len(), |position, offset| {
-                    if let (Some(support), Some((row_support, column_support))) =
-                        (&mut support, &summaries)
-                    {
-                        support[position] = u8::from(
-                            row_support[offset / columns.len()]
-                                || column_support[offset % columns.len()],
-                        );
-                    }
                     values[position] = accumulated[offset];
                 });
             }
 
-            Batch {
+            Ok(Batch {
                 _allocation: None,
                 array: expression::batch_array(values)?,
-                support,
-            }
-            .masked()
+            })
         })
     }
 }

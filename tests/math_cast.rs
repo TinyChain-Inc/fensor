@@ -1,4 +1,4 @@
-//! Dtype-changing expressions retain root support and evaluate at consumption.
+//! Dtype-changing expressions preserve numerical zeros and evaluate at consumption.
 
 use fensor::unary::Cast;
 use fensor::{
@@ -167,7 +167,7 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
 }
 
 #[tokio::test]
-async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
+async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
     let (root, dir) = new_dir("cast_sparse").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
@@ -178,15 +178,23 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
     .await
     .unwrap();
     tensor.write_value(&[1, 2], 0.2).await.unwrap();
-    let expression = TensorCast::<f64>::cast(&(tensor.view().round().await.unwrap()))
+    let rounded = TensorCast::<f64>::cast(&(tensor.view().round().await.unwrap()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rounded.cos().await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
+    let expression = TensorCast::<f64>::cast(&tensor.view())
         .await
         .unwrap()
         .transpose(None)
         .unwrap()
-        .cos()
+        .sin()
         .await
         .unwrap();
-    assert_eq!(expression.read_value(&[2, 1]).await.unwrap(), 1.0f64);
+    let nonzero = (0.2f32 as f64).sin();
+    assert_eq!(expression.read_value(&[2, 1]).await.unwrap(), nonzero);
     assert_eq!(expression.read_value(&[0, 0]).await.unwrap(), 0.0f64);
     let selection = range![AxisRange::In(0, 3, 1), AxisRange::In(0, 2, 1)];
     let rows: Vec<_> = expression
@@ -196,7 +204,7 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(rows, vec![(vec![2, 1], 1.0f64)]);
+    assert_eq!(rows, vec![(vec![2, 1], nonzero)]);
     let (out_root, out_dir) = new_dir("cast_sparse_out").await;
     let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
     let blocks: Vec<Vec<f64>> = expression
@@ -207,11 +215,11 @@ async fn sparse_cast_preserves_original_support_and_filters_only_final_zeros() {
         .unwrap();
     let values: Vec<_> = blocks.into_iter().flatten().collect();
     for (i, coord) in common::iter_coords(&[3, 2]).enumerate() {
-        let expected = if coord == vec![2, 1] { 1.0 } else { 0.0 };
+        let expected = if coord == vec![2, 1] { nonzero } else { 0.0 };
         assert_eq!(values[i], expected);
         assert_eq!(output.read_value(&coord).await.unwrap(), expected);
     }
-    let final_zero = expression.ln().await.unwrap();
+    let final_zero = expression.round().await.unwrap();
     let rows: Vec<_> = final_zero
         .read_sparse_elements_in_order(selection, axes![0, 1])
         .await

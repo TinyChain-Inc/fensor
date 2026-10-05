@@ -2,10 +2,10 @@
 
 use fensor::{
     Layout, Tensor, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
-    TensorCompareScalar, TensorComplex, TensorElement, TensorFileEntry, TensorMatMul, TensorMath,
-    TensorMathScalar, TensorMatrixUnary, TensorNumeric, TensorRead, TensorReduce, TensorReduceAll,
-    TensorReduceBoolean, TensorTransform, TensorTrig, TensorUnary, TensorUnaryBoolean, TensorWhere,
-    TensorWrite,
+    TensorCompareScalar, TensorComplex, TensorElement, TensorExpression, TensorFileEntry,
+    TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric, TensorRead,
+    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig, TensorUnary,
+    TensorUnaryBoolean, TensorWhere, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -18,18 +18,6 @@ use ha_ndarray::{
 use common::{FsEntry, cleanup, fixture, numbers::same};
 
 mod common;
-
-async fn supported<V: TensorRead>(view: &V, mut expected: Vec<V::DType>, support: &[bool])
-where
-    V::DType: TensorElement,
-{
-    for (value, &present) in expected.iter_mut().zip(support) {
-        if !present {
-            *value = V::DType::ZERO;
-        }
-    }
-    fixture::blocks(view, &expected, same).await;
-}
 
 async fn operations<T: TensorElement + Complex>(input: Vec<T>)
 where
@@ -47,16 +35,13 @@ where
         )
         .await;
         let v = tensor.view();
+        let dense = TensorExpression::new(v.clone()).unwrap().into_dense();
         let a = Array::new(Buffer::from(input.clone()), shape![2, 2]).unwrap();
-        let support: Vec<_> = input
-            .iter()
-            .map(|v| matches!(layout, Layout::Dense) || *v != T::ZERO)
-            .collect();
         macro_rules! unary {
-            ($m:ident) => {
-                supported(
-                    &v.$m().await.unwrap(),
-                    a.clone()
+            ($m:ident, $source:ident) => {
+                fixture::blocks(
+                    &$source.$m().await.unwrap(),
+                    &a.clone()
                         .$m()
                         .unwrap()
                         .buffer()
@@ -64,35 +49,35 @@ where
                         .to_slice()
                         .unwrap()
                         .to_vec(),
-                    &support,
+                    same,
                 )
                 .await;
             };
         }
-        unary!(abs);
-        unary!(conj);
-        unary!(re);
-        unary!(im);
-        unary!(angle);
-        unary!(exp);
-        unary!(ln);
-        unary!(sin);
-        unary!(asin);
-        unary!(sinh);
-        unary!(cos);
-        unary!(acos);
-        unary!(cosh);
-        unary!(tan);
-        unary!(atan);
-        unary!(tanh);
-        unary!(not);
-        unary!(is_nan);
-        unary!(is_inf);
+        unary!(abs, v);
+        unary!(conj, v);
+        unary!(re, v);
+        unary!(im, v);
+        unary!(angle, v);
+        unary!(exp, dense);
+        unary!(ln, dense);
+        unary!(sin, v);
+        unary!(asin, v);
+        unary!(sinh, v);
+        unary!(cos, dense);
+        unary!(acos, dense);
+        unary!(cosh, dense);
+        unary!(tan, v);
+        unary!(atan, v);
+        unary!(tanh, v);
+        unary!(not, dense);
+        unary!(is_nan, v);
+        unary!(is_inf, v);
         macro_rules! binary {
-            ($m:ident,$s:ident) => {
-                supported(
-                    &v.$m(&v).await.unwrap(),
-                    a.clone()
+            ($m:ident, $s:ident, $binary_source:ident, $scalar_source:ident) => {
+                fixture::blocks(
+                    &$binary_source.$m(&$binary_source).await.unwrap(),
+                    &a.clone()
                         .$m(a.clone())
                         .unwrap()
                         .buffer()
@@ -100,12 +85,12 @@ where
                         .to_slice()
                         .unwrap()
                         .to_vec(),
-                    &support,
+                    same,
                 )
                 .await;
-                supported(
-                    &v.$s(T::ONE).await.unwrap(),
-                    a.clone()
+                fixture::blocks(
+                    &$scalar_source.$s(T::ONE).await.unwrap(),
+                    &a.clone()
                         .$s(T::ONE)
                         .unwrap()
                         .buffer()
@@ -113,37 +98,31 @@ where
                         .to_slice()
                         .unwrap()
                         .to_vec(),
-                    &support,
+                    same,
                 )
                 .await;
             };
         }
-        binary!(add, add_scalar);
-        binary!(sub, sub_scalar);
-        binary!(mul, mul_scalar);
-        binary!(div, div_scalar);
-        binary!(pow, pow_scalar);
-        binary!(log, log_scalar);
-        binary!(eq, eq_scalar);
-        binary!(ne, ne_scalar);
-        binary!(and, and_scalar);
-        binary!(or, or_scalar);
-        binary!(xor, xor_scalar);
-        let values: Vec<_> = input
-            .iter()
-            .zip(&support)
-            .filter(|(_, s)| **s)
-            .map(|(v, _)| *v)
-            .collect();
-        let supported_array =
-            Array::new(Buffer::from(values.clone()), shape![values.len()]).unwrap();
+        binary!(add, add_scalar, v, dense);
+        binary!(sub, sub_scalar, v, dense);
+        binary!(mul, mul_scalar, v, v);
+        binary!(div, div_scalar, dense, v);
+        binary!(pow, pow_scalar, dense, v);
+        binary!(log, log_scalar, dense, dense);
+        binary!(eq, eq_scalar, dense, v);
+        binary!(ne, ne_scalar, v, dense);
+        binary!(and, and_scalar, v, v);
+        binary!(or, or_scalar, v, dense);
+        binary!(xor, xor_scalar, v, dense);
+        let values = &input;
+        let values_array = Array::new(Buffer::from(input.clone()), shape![input.len()]).unwrap();
         assert!(same(
             tensor.sum_all().await.unwrap(),
-            supported_array.clone().sum_all().unwrap()
+            values_array.clone().sum_all().unwrap()
         ));
         assert!(same(
             tensor.product_all().await.unwrap(),
-            supported_array.product_all().unwrap()
+            values_array.product_all().unwrap()
         ));
         assert_eq!(
             tensor.all().await.unwrap(),
@@ -169,7 +148,6 @@ where
                 .map(|group| {
                     group
                         .iter()
-                        .filter(|i| support[**i])
                         .map(|i| input[*i])
                         .reduce(Number::mul)
                         .unwrap_or(T::ZERO)
@@ -196,18 +174,18 @@ where
             .to_vec();
         fixture::consumers(&v.matmul(&v).await.unwrap(), &expected, same, same).await;
         fixture::blocks(
-            &v.eq(&v).await.unwrap().cond(&v, &v).await.unwrap(),
+            &dense.eq(&dense).await.unwrap().cond(&v, &v).await.unwrap(),
             &input,
             same,
         )
         .await;
         let conjugate = v.conj().await.unwrap();
-        let expected: Vec<_> = input
-            .iter()
-            .zip(&support)
-            .map(|(v, present)| if *present { Complex::conj(*v) } else { T::ZERO })
-            .collect();
-        fixture::consumers(&conjugate, &expected, same, same).await;
+        let expected: Vec<_> = input.iter().map(|v| Complex::conj(*v)).collect();
+        // Sparse materialization omits all-zero elements, canonicalizing their zero signs.
+        fixture::consumers(&conjugate, &expected, same, |a, b| {
+            same(a, b) || (matches!(layout, Layout::Sparse { .. }) && a == T::ZERO && b == T::ZERO)
+        })
+        .await;
         let entries = conjugate
             .read_coordinate_blocks()
             .unwrap()
@@ -219,29 +197,30 @@ where
                 assert!(same(value, expected[(c[0] * 2 + c[1]) as usize]));
             }
         }
-        let cancelled = v.sub(&v).await.unwrap().exp().await.unwrap();
-        let expected: Vec<_> = support
-            .iter()
-            .map(|present| if *present { T::ONE } else { T::ZERO })
-            .collect();
-        fixture::blocks(&cancelled, &expected, same).await;
+        let cancelled = TensorExpression::new(v.sub(&v).await.unwrap())
+            .unwrap()
+            .into_dense()
+            .exp()
+            .await
+            .unwrap();
+        fixture::blocks(&cancelled, &[T::ONE; 4], same).await;
 
         if matches!(layout, Layout::Sparse { .. }) {
             for coord in common::iter_coords(&[2, 2]) {
                 tensor.write_value(&coord, T::ZERO).await.unwrap();
             }
             assert_eq!(tensor.sum_all().await.unwrap(), T::ZERO);
-            assert_eq!(tensor.product_all().await.unwrap(), T::ONE);
-            assert!(tensor.all().await.unwrap());
+            assert_eq!(tensor.product_all().await.unwrap(), T::ZERO);
+            assert!(!tensor.all().await.unwrap());
             assert!(!tensor.any().await.unwrap());
             fixture::blocks(
-                &v.product(axes![1], false)
-                    .await
+                &TensorExpression::new(v.product(axes![1], false).await.unwrap())
                     .unwrap()
+                    .into_dense()
                     .exp()
                     .await
                     .unwrap(),
-                &[T::ZERO; 2],
+                &[T::ONE; 2],
                 same,
             )
             .await;
@@ -348,10 +327,10 @@ exceptional!(complex32_exceptional, fensor::complex::Complex32, f32);
 exceptional!(complex64_exceptional, fensor::complex::Complex64, f64);
 
 #[tokio::test]
-async fn projection_support_batching_and_live_sources() {
+async fn projection_batching_and_live_sources() {
     use fensor::complex::Complex64 as C;
     let (root, tensor) = fixture::source(
-        "complex_support",
+        "complex_projection",
         shape![1, 2],
         Layout::Sparse { axis: None },
         2,
@@ -360,15 +339,15 @@ async fn projection_support_batching_and_live_sources() {
     )
     .await;
     let projected = tensor.view().re().await.unwrap();
-    let expanded = projected
-        .broadcast(shape![4097, 2])
+    let expanded = TensorExpression::new(projected.broadcast(shape![4097, 2]).unwrap())
         .unwrap()
+        .into_dense()
         .exp()
         .await
         .unwrap()
         .flip(0)
         .unwrap();
-    let expected: Vec<_> = (0..4097).flat_map(|_| [1., 0.]).collect();
+    let expected: Vec<_> = (0..4097).flat_map(|_| [1., 1.]).collect();
     let mut dropped = expanded.read_blocks().unwrap();
     dropped.try_next().await.unwrap().unwrap();
     drop(dropped);
@@ -380,9 +359,9 @@ async fn projection_support_batching_and_live_sources() {
     assert_eq!(a, b);
     assert_eq!(a.into_iter().flatten().collect::<Vec<_>>(), expected);
     assert_eq!(
-        TensorCast::<i64>::cast(&tensor.view())
-            .await
+        TensorExpression::new(TensorCast::<i64>::cast(&tensor.view()).await.unwrap())
             .unwrap()
+            .into_dense()
             .eq_scalar(0)
             .await
             .unwrap()
@@ -396,14 +375,16 @@ async fn projection_support_batching_and_live_sources() {
         .await
         .unwrap();
     assert_eq!(
-        copy.view()
+        TensorExpression::new(copy.view())
+            .unwrap()
+            .into_dense()
             .exp()
             .await
             .unwrap()
             .read_value(&[0, 0])
             .await
             .unwrap(),
-        0.
+        1.
     );
     tensor.write_value(&[0, 0], C::new(1., 2.)).await.unwrap();
     assert_eq!(expanded.read_value(&[0, 0]).await.unwrap(), 1f64.exp());

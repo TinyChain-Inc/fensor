@@ -1834,13 +1834,11 @@ mod section_h_persistence {
     }
 
     #[tokio::test]
-    async fn sparse_index_points_to_missing_block_on_read() {
-        let (root, dir) = new_dir("h_index_orphan").await;
-        let schema = schema_f32(shape![2, 1, 512]);
-
+    async fn missing_sparse_table_page_fails_closed() {
+        let (root, dir) = new_dir("h_sparse_missing_page").await;
         let tensor = Tensor::<FsEntry, f32>::create(
             dir.clone(),
-            schema.clone(),
+            schema_f32(shape![2, 1, 512]),
             Layout::Sparse { axis: Some(0) },
             512,
         )
@@ -1850,31 +1848,17 @@ mod section_h_persistence {
             .replace_logical_block(0, vec![5.; 512])
             .await
             .expect("write");
-
-        let blocks_dir = {
-            let guard = dir.read().await;
-            guard.get_dir("blocks").cloned().expect("blocks dir")
-        };
-        let block_id = {
-            let blocks_guard = blocks_dir.read().await;
-            blocks_guard
-                .names()
-                .find(|name| name.as_str() != "metadata")
-                .cloned()
-                .expect("the single written row's block file")
-        };
-        {
-            let mut blocks_guard = blocks_dir.write().await;
-            blocks_guard.delete(&block_id).await;
-        }
-        blocks_dir.sync().await.expect("sync deleted block");
-
-        let err = tensor
-            .read_value(&[0, 0, 2])
-            .await
-            .expect_err("orphan index row must fail closed");
-        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
-
+        let values = dir.read().await.get_dir("values").cloned().unwrap();
+        let primary = values.read().await.get_dir("primary").cloned().unwrap();
+        let name = primary.read().await.names().next().cloned().unwrap();
+        primary.write().await.delete(&name).await;
+        primary.sync().await.expect("sync deleted page");
+        assert!(tensor.read_value(&[0, 0, 2]).await.is_err());
+        assert!(Tensor::<FsEntry, f32>::load(dir).await.is_err());
+        assert!(
+            primary.read().await.is_empty(),
+            "strict reads must not repair missing storage"
+        );
         cleanup(&root).await;
     }
 

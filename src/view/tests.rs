@@ -1238,13 +1238,17 @@ async fn unsqueeze_then_squeeze_round_trip() {
 async fn update_planning_matches_coordinates_without_affine_expansion() {
     use crate::TensorSource;
 
-    for layout in [Layout::Dense, Layout::Sparse { axis: Some(1) }] {
+    for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
         for block_shape in [shape![2, 3], shape![4, 64]] {
             let (root, dir) = new_dir("update_plans").await;
             let geometry = crate::StorageGeometry::new(
                 TensorSchema::new(NumberType::Float(FloatType::F32), shape![5, 131]).unwrap(),
                 layout,
-                block_shape,
+                if matches!(layout, Layout::Dense) {
+                    block_shape
+                } else {
+                    shape![1, block_shape[1]]
+                },
             )
             .unwrap();
             let tensor = Tensor::<TestFE, f32>::create_with_geometry(dir, geometry.clone())
@@ -1314,11 +1318,15 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
             let wrong = crate::StorageGeometry::new(
                 tensor.schema().clone(),
                 if matches!(layout, Layout::Dense) {
-                    Layout::Sparse { axis: None }
+                    Layout::Sparse { axis: Some(0) }
                 } else {
                     Layout::Dense
                 },
-                geometry.block_shape().into(),
+                if matches!(layout, Layout::Dense) {
+                    shape![1, geometry.block_shape()[1]]
+                } else {
+                    geometry.block_shape().into()
+                },
             )
             .unwrap();
             assert!(base.plan_updates(&wrong, 0, vec![1.]).is_err());
@@ -1378,7 +1386,6 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
                 Ok(crate::expression::Batch {
                     _allocation: None,
                     array: crate::expression::batch_array(vec![1.; request.len()])?,
-                    support: None,
                 })
             })
         }

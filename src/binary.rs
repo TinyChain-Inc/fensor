@@ -1,6 +1,8 @@
 //! Typed, read-only elementwise expressions over two sources.
 
-use ha_ndarray::{ArrayAccess, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, Real};
+use ha_ndarray::{
+    ArrayAccess, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, NDArrayRead, Number, Real,
+};
 
 use crate::expression::{self, Batch, Expression};
 use crate::request::BatchRequest;
@@ -17,6 +19,8 @@ mod sealed {
 /// A sealed operation building an ndarray expression without evaluating it.
 pub trait BinaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     type Output: TensorElement;
+
+    const NAME: &'static str;
 
     fn apply(
         &self,
@@ -97,13 +101,25 @@ pub trait BinaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
 /// ) { let _ = a.view().eq(&b.view()).await; }
 /// ```
 #[derive(Clone)]
-pub struct BinaryView<Left, Right, Op> {
+pub struct BinaryView<Left, Right, Op>
+where
+    Left: TensorGeometry,
+    Left::DType: TensorElement,
+    Op: BinaryOp<Left::DType>,
+{
     left: Left,
     right: Right,
     op: Op,
+    zero: Op::Output,
 }
 
-impl<L: crate::TensorGeometry, R: crate::TensorGeometry, O> BinaryView<L, R, O> {
+impl<L, R, O> BinaryView<L, R, O>
+where
+    L: Expression,
+    R: Expression<DType = L::DType>,
+    L::DType: TensorElement,
+    O: BinaryOp<L::DType>,
+{
     fn new(left: L, right: R, op: O) -> Result<Self> {
         if left.shape() != right.shape() {
             return Err(Error::InvalidSchema(format!(
@@ -113,7 +129,25 @@ impl<L: crate::TensorGeometry, R: crate::TensorGeometry, O> BinaryView<L, R, O> 
             )));
         }
 
-        Ok(Self { left, right, op })
+        let zero = if matches!(left.layout(), Layout::Sparse { .. })
+            && matches!(right.layout(), Layout::Sparse { .. })
+        {
+            let left_zero = expression::batch_array(vec![left.implicit_zero()])?;
+            let right_zero = expression::batch_array(vec![right.implicit_zero()])?;
+            let zero = op.apply(left_zero, right_zero)?.read_value(&[0])?;
+            if zero != O::Output::ZERO {
+                return Err(Error::WouldDensify { operation: O::NAME });
+            }
+            zero
+        } else {
+            O::Output::ZERO
+        };
+        Ok(Self {
+            left,
+            right,
+            op,
+            zero,
+        })
     }
 }
 
@@ -128,6 +162,8 @@ macro_rules! binary_op {
 
         impl<$ty: $($bounds)+> BinaryOp<$ty> for $name {
             type Output = $output;
+
+            const NAME: &'static str = stringify!($method);
 
             fn apply(
                 &self,
@@ -253,6 +289,10 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
+    fn implicit_zero(&self) -> Self::DType {
+        self.zero
+    }
+
     fn expression_nodes(&self) -> Result<usize> {
         crate::expression::traversal::node_count([
             self.left.expression_nodes()?,
@@ -269,17 +309,21 @@ where
         &self,
         slice: crate::slice::Slice,
     ) -> Result<expression::traversal::Selection<'_>> {
-        expression::traversal::support(self, slice).map(expression::traversal::Selection::Ready)
+        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
     }
 
-    fn support_step(
+    fn ordered_step(
         &self,
         slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Support<'_>> {
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+        }
+
         let left_slice = slice.clone();
-        Ok(expression::traversal::Support::Sources(vec![
-            (0, Box::new(move || self.left.support_step(left_slice))),
-            (1, Box::new(move || self.right.support_step(slice))),
+        Ok(expression::traversal::Ordered::Sources(vec![
+            (0, Box::new(move || self.left.ordered_step(left_slice))),
+            (1, Box::new(move || self.right.ordered_step(slice))),
         ]))
     }
 
@@ -301,14 +345,11 @@ where
         Box::pin(async move {
             let left = context.batch(&self.left, coords.clone()).await?;
             let right = context.batch(&self.right, coords.clone()).await?;
-            let support = expression::union_support(left.support, right.support)?;
 
             Batch {
                 _allocation: None,
                 array: self.op.apply(left.array, right.array)?,
-                support,
             }
-            .masked()?
             .realize()
         })
     }

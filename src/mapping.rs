@@ -179,14 +179,19 @@ impl CoordinateMap {
                 return Ok(None);
             }
 
-            let base = (0..shape.len()).rev().find(|&base| {
+            let eligible = |base: usize| {
                 !axes.iter().any(|(axis, _)| *axis == base)
                     && stride.is_multiple_of(strides[base])
                     && (stride / strides[base])
                         .checked_mul(dim - 1)
                         .and_then(|delta| origins[base].checked_add(delta))
                         .is_some_and(|last| last < shape[base])
-            });
+            };
+            // A singleton's extent cannot distinguish its axis from a stepped
+            // later axis. Preserve exact strides first, in logical axis order.
+            let base = (0..shape.len())
+                .find(|&base| stride == strides[base] && eligible(base))
+                .or_else(|| (0..shape.len()).rev().find(|&base| eligible(base)));
             let Some(base) = base else {
                 return Ok(None);
             };

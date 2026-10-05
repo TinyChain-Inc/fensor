@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorArray, TensorExpression,
-    TensorGeometry, TensorMathScalar, TensorRead, TensorSchema, TensorSource, TensorTransform,
-    TensorView, TensorWrite,
+    TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorSchema, TensorSource,
+    TensorTransform, TensorUnary, TensorView, TensorWrite,
 };
 use futures::{StreamExt, TryStreamExt};
 use number_general::FloatType;
@@ -60,14 +60,12 @@ impl TensorSource for Source {
         })
     }
 
-    fn occupied_regions(
+    fn occupied_blocks(
         &self,
-        after: Option<[u64; 2]>,
-        lo: u64,
-        hi: u64,
-    ) -> futures::stream::BoxStream<'static, fensor::Result<[u64; 2]>> {
+        range: std::ops::Range<u64>,
+    ) -> futures::stream::BoxStream<'static, fensor::Result<u64>> {
         self.scans.fetch_add(1, Ordering::Relaxed);
-        let mut keys = self.tensor.occupied_regions(after, lo, hi);
+        let mut keys = self.tensor.occupied_blocks(range);
         let mut ended = false;
         futures::stream::poll_fn(move |cx| {
             assert!(!ended, "custom occupied scan polled after EOF");
@@ -165,7 +163,7 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
 }
 
 #[tokio::test]
-async fn owned_and_borrowed_consumers_preserve_geometry_support_and_nonfinite_values() {
+async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_values() {
     fn same(left: &[f64], right: &[f64]) {
         assert_eq!(left.len(), right.len());
         for (&left, &right) in left.iter().zip(right) {
@@ -182,10 +180,26 @@ async fn owned_and_borrowed_consumers_preserve_geometry_support_and_nonfinite_va
             [0.0f64, 1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 3.0],
         )
         .await;
-        // Subtraction retains the original support of the stored value 1, even
-        // though its intermediate value is zero. The outer addition observes it.
-        let inner = tensor.view().sub_scalar(1.0).await.unwrap();
-        let expression = TensorExpression::new(inner.add_scalar(2.0).await.unwrap()).unwrap();
+        // Rounding makes the stored value 1 an intermediate zero. The other
+        // operand restores its value; NaN and infinities retain their classifications.
+        let inner = tensor
+            .view()
+            .mul_scalar(0.25)
+            .await
+            .unwrap()
+            .round()
+            .await
+            .unwrap();
+        let expression = TensorExpression::new(
+            inner
+                .add(&tensor.view())
+                .await
+                .unwrap()
+                .mul_scalar(2.0)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         for value in [
             expression.clone(),
             expression.transpose(None).unwrap().flip(0).unwrap(),

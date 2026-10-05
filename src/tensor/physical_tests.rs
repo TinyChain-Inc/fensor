@@ -68,7 +68,10 @@ mod math_unary {
     use number_general::{FloatType, NumberType};
 
     use crate::test_support::{self as common, FsEntry, new_dir};
-    use crate::{AxisRange, Layout, Tensor, TensorRead, TensorSchema, TensorUnary, TensorWrite};
+    use crate::{
+        AxisRange, Layout, Tensor, TensorExpression, TensorRead, TensorSchema, TensorTransform,
+        TensorUnary, TensorWrite,
+    };
 
     #[tokio::test]
     async fn sparse_range_reads_only_selected_storage() {
@@ -82,10 +85,33 @@ mod math_unary {
         .await
         .unwrap();
         tensor.write_value(&[0], 0.2).await.unwrap();
+        tensor.write_value(&[3], 0.2).await.unwrap();
+        tensor.write_value(&[4], 1.2).await.unwrap();
         tensor.write_value(&[7], 0.2).await.unwrap();
+        tensor.corrupt_sparse_payload(3).await;
         tensor.corrupt_sparse_payload(7).await;
         let view = tensor.view();
-        let unary = view.round().await.unwrap().exp().await.unwrap();
+        // Consecutive groups share reads without visiting the corrupt gap;
+        // missing rows stay zero and repeated selections retain their order.
+        let selected = view
+            .clone()
+            .slice(range![AxisRange::Of(vec![4, 5, 0, 1, 4])])
+            .unwrap();
+        assert_eq!(
+            selected.read_blocks().unwrap().try_concat().await.unwrap(),
+            vec![1.2, 0., 0.2, 0., 1.2]
+        );
+        let dirty_group = view
+            .clone()
+            .slice(range![AxisRange::Of(vec![4, 5, 2, 3])])
+            .unwrap();
+        assert!(dirty_group.read_blocks().unwrap().try_next().await.is_err());
+        let unary = TensorExpression::new(view.round().await.unwrap())
+            .unwrap()
+            .into_dense()
+            .exp()
+            .await
+            .unwrap();
 
         async fn check(reader: &impl TensorRead<DType = f32>) {
             let rows: Vec<_> = reader
@@ -104,39 +130,64 @@ mod math_unary {
         }
         check(&tensor).await;
         check(&view).await;
-        check(&unary).await;
+        let clean = unary.clone().slice(range![AxisRange::In(0, 1, 1)]).unwrap();
+        assert_eq!(
+            clean
+                .read_blocks()
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            [vec![1.]]
+        );
+        let dirty = unary.slice(range![AxisRange::In(7, 8, 1)]).unwrap();
+        assert!(dirty.read_blocks().unwrap().try_next().await.is_err());
         common::cleanup(&root).await;
     }
 }
 
 mod storage_source {
+    use futures::TryStreamExt;
+    use get_size::GetSize;
     use number_general::FloatType;
 
     use crate::test_support::cleanup;
     use crate::test_support::{FsEntry, new_dir};
-    use crate::{Layout, NumberType, Tensor, TensorRead, TensorSchema, TensorWrite};
+    use crate::{
+        Layout, NumberType, SparseCell, SparseNode, Tensor, TensorRead, TensorSchema, TensorSource,
+        TensorWrite,
+    };
 
     #[tokio::test]
     async fn replacement_preserves_shared_sparse_pages_and_zero_deletions() {
         let (root, dir) = new_dir("logical_sparse").await;
         let schema =
             TensorSchema::new(NumberType::Float(FloatType::F64), vec![2, 2].into()).unwrap();
-        let tensor =
-            Tensor::<FsEntry, f64>::create(dir.clone(), schema, Layout::Sparse { axis: None }, 2)
-                .await
-                .unwrap();
+        let tensor = Tensor::<FsEntry, f64>::create(
+            dir.clone(),
+            schema,
+            Layout::Sparse { axis: Some(0) },
+            2,
+        )
+        .await
+        .unwrap();
         tensor.write_value(&[0, 0], 2.0).await.unwrap();
         assert_eq!(
             tensor
-                .storage
-                .sparse()
-                .unwrap()
-                .occupied_marker(&[0, 0])
+                .occupied_blocks(0..2)
+                .try_collect::<Vec<_>>()
                 .await
                 .unwrap(),
-            Some(0)
+            [0]
         );
         tensor.write_value(&[1, 0], 2.0).await.unwrap();
+        let values = dir.read().await.get_dir("values").cloned().unwrap();
+        let primary = values.read().await.get_dir("primary").cloned().unwrap();
+        assert_eq!(
+            primary.read().await.len(),
+            1,
+            "both rows share one native page"
+        );
         tensor
             .replace_logical_block(0, vec![9.0, 0.0])
             .await
@@ -145,15 +196,13 @@ mod storage_source {
         assert_eq!(tensor.read_value(&[1, 0]).await.unwrap(), 2.0);
         tensor.validate().await.unwrap();
         tensor.replace_logical_block(0, vec![0.0; 2]).await.unwrap();
-        assert!(
+        assert_eq!(
             tensor
-                .storage
-                .sparse()
-                .unwrap()
-                .occupied_marker(&[0, 0])
+                .occupied_blocks(0..2)
+                .try_collect::<Vec<_>>()
                 .await
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            [1]
         );
         assert_eq!(tensor.read_value(&[1, 0]).await.unwrap(), 2.0);
         tensor.sync().await.unwrap();
@@ -178,19 +227,35 @@ mod storage_source {
             .unwrap();
             tensor.write_value(&[0, 0], 1.0).await.unwrap();
             tensor.sync().await.unwrap();
-            let index_dir = dir.read().await.get_dir("index").cloned().unwrap();
-            let index = b_table::TableLock::load(
-                crate::schema::SparseTableSchema::default(),
-                b_table::collate::Collator::<u64>::default(),
-                index_dir,
-            )
-            .unwrap();
+            let values = dir.read().await.get_dir("values").cloned().unwrap();
+            let primary = values.read().await.get_dir("primary").cloned().unwrap();
+            let file = primary
+                .read()
+                .await
+                .iter()
+                .next()
+                .unwrap()
+                .1
+                .as_file()
+                .unwrap()
+                .clone();
             {
-                let mut index = index.write().await;
-                let key = if invalid_key { vec![10, 0] } else { vec![0, 0] };
-                index.upsert(key, vec![12]).await.unwrap();
+                let mut node = file.write::<SparseNode<f64>>(0).await.unwrap();
+                let b_table::Node::Leaf(rows) = &*node else {
+                    panic!("single sparse page")
+                };
+                let mut rows = rows.clone();
+                rows.push(vec![
+                    SparseCell::Key(if invalid_key { 10 } else { 0 }),
+                    SparseCell::Payload(vec![12.]),
+                ]);
+                let replacement = b_table::Node::Leaf(rows);
+                node.reserve(std::mem::size_of::<FsEntry>() + replacement.get_size())
+                    .await
+                    .unwrap();
+                *node = replacement;
             }
-            index.sync().await.unwrap();
+            tensor.sync().await.unwrap();
             assert!(Tensor::<FsEntry, f64>::load(dir).await.is_err());
             cleanup(&root).await;
         }
@@ -270,13 +335,13 @@ mod matmul {
 
 mod math_binary {
     use futures::TryStreamExt;
-    use ha_ndarray::{axes, range, shape};
+    use ha_ndarray::{range, shape};
     use number_general::DType;
 
     use crate::test_support::{self as common, FsEntry, new_dir};
     use crate::{
-        AxisRange, Layout, Tensor, TensorBooleanScalar, TensorMath, TensorRead, TensorSchema,
-        TensorUnary, TensorWhere, TensorWrite,
+        AxisRange, Layout, Tensor, TensorBooleanScalar, TensorExpression, TensorMath, TensorRead,
+        TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
     };
 
     #[tokio::test]
@@ -310,27 +375,24 @@ mod math_binary {
                 (&tensor, &empty)
             };
 
-            let expression = left
-                .view()
-                .add(&right.view())
-                .await
+            let expression = TensorExpression::new(left.view().add(&right.view()).await.unwrap())
                 .unwrap()
+                .into_dense()
                 .exp()
                 .await
                 .unwrap();
-            let values: Vec<_> = expression
-                .read_sparse_elements_in_order(range![AxisRange::At(0)], axes![0])
-                .await
-                .unwrap()
-                .try_collect()
-                .await
+            let clean = expression
+                .clone()
+                .slice(range![AxisRange::In(0, 1, 1)])
                 .unwrap();
+            let values: Vec<_> = clean.read_blocks().unwrap().try_collect().await.unwrap();
 
-            assert_eq!(values, vec![(vec![0], 0.2f32.exp())]);
-            let mut stream = expression
-                .read_sparse_elements_in_order(range![AxisRange::At(7)], axes![0])
-                .await
+            assert_eq!(values, vec![vec![0.2f32.exp()]]);
+            let dirty = expression
+                .clone()
+                .slice(range![AxisRange::In(7, 8, 1)])
                 .unwrap();
+            let mut stream = dirty.read_blocks().unwrap();
 
             assert!(stream.try_next().await.is_err());
             assert!(expression.read_value(&[7]).await.is_err());
@@ -372,27 +434,30 @@ mod math_binary {
         for position in 0..3 {
             let operands =
                 std::array::from_fn::<_, 3, _>(|i| if i == position { &corrupt } else { &empty });
-            let expression = operands[0]
-                .view()
-                .cond(&operands[1].view(), &operands[2].view())
-                .await
-                .unwrap()
-                .or_scalar(1)
-                .await
+            let expression = TensorExpression::new(
+                operands[0]
+                    .view()
+                    .cond(&operands[1].view(), &operands[2].view())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .into_dense()
+            .or_scalar(1)
+            .await
+            .unwrap();
+            let clean = expression
+                .clone()
+                .slice(range![AxisRange::In(0, 1, 1)])
                 .unwrap();
-            let values: Vec<_> = expression
-                .read_sparse_elements_in_order(range![AxisRange::At(0)], axes![0])
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-            assert_eq!(values, vec![(vec![0], 1)]);
+            let values: Vec<_> = clean.read_blocks().unwrap().try_collect().await.unwrap();
+            assert_eq!(values, vec![vec![1]]);
             assert!(expression.read_value(&[7]).await.is_err());
-            let mut stream = expression
-                .read_sparse_elements_in_order(range![AxisRange::At(7)], axes![0])
-                .await
+            let dirty = expression
+                .clone()
+                .slice(range![AxisRange::In(7, 8, 1)])
                 .unwrap();
+            let mut stream = dirty.read_blocks().unwrap();
             assert!(stream.try_next().await.is_err());
             assert!(
                 expression
@@ -413,8 +478,8 @@ mod reduce {
 
     use crate::test_support::{FsEntry, new_dir};
     use crate::{
-        AxisRange, Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
-        TensorSchema, TensorUnary, TensorWrite,
+        AxisRange, Layout, Tensor, TensorCompareScalar, TensorExpression, TensorRead, TensorReduce,
+        TensorReduceAll, TensorReduceBoolean, TensorSchema, TensorUnary, TensorWrite,
     };
 
     #[tokio::test]
@@ -476,7 +541,14 @@ mod reduce {
         tensor.corrupt_sparse_payload(8192).await;
         assert!(tensor.any().await.unwrap());
         assert!(!tensor.view().round().await.unwrap().all().await.unwrap());
-        assert!(tensor.all().await.is_err());
+        assert!(!tensor.all().await.unwrap());
+        let all_nonnegative = TensorExpression::new(tensor.clone())
+            .unwrap()
+            .into_dense()
+            .ge_scalar(0.)
+            .await
+            .unwrap();
+        assert!(all_nonnegative.all().await.is_err());
         assert!(tensor.view().round().await.unwrap().any().await.is_err());
         assert!(tensor.sum_all().await.is_err());
     }
@@ -492,13 +564,16 @@ mod bulk_mutation {
 
     #[tokio::test]
     async fn bulk_writes_publish_blocks_and_preserve_padding_and_duplicates() {
-        for layout in [Layout::Dense, Layout::Sparse { axis: Some(1) }] {
+        for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
             let (root, dir) = new_dir("bulk_blocks").await;
             let geometry = StorageGeometry::new(
                 TensorSchema::new(<f64 as number_general::DType>::dtype(), vec![9, 129].into())
                     .unwrap(),
                 layout,
-                vec![4, 64].into(),
+                match layout {
+                    Layout::Dense => vec![4, 64].into(),
+                    Layout::Sparse { .. } => vec![1, 64].into(),
+                },
             )
             .unwrap();
             let tensor = Tensor::<FsEntry, f64>::create_with_geometry(dir, geometry.clone())

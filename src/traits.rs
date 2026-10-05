@@ -208,7 +208,8 @@ pub trait TensorUnary: TensorGeometry + Sized {
         Self::DType: ha_ndarray::Real;
 }
 
-/// Logical negation evaluated only on original support for sparse tensors.
+/// Logical negation returns u8 values. Sparse inputs require explicit dense conversion
+/// because negating their implicit zero background produces one.
 pub trait TensorUnaryBoolean: TensorGeometry + Sized {
     type Output: TensorRead<DType = u8>;
 
@@ -229,7 +230,7 @@ pub trait TensorUnaryBoolean: TensorGeometry + Sized {
 /// Source and destination adapters need only support their respective dtypes:
 ///
 /// ```
-/// use fensor::{Result, Tensor, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
+/// use fensor::{Result, Tensor, TensorExpression, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
 /// use freqfs::DirLock;
 /// async fn mask<S, D>(
 ///     tensor: &Tensor<S, f32>,
@@ -240,7 +241,8 @@ pub trait TensorUnaryBoolean: TensorGeometry + Sized {
 ///     S: TensorFileEntry<f32>,
 ///     D: TensorFileEntry<u8>,
 /// {
-///     let mask = tensor.view().is_nan().await?.not().await?.clone();
+///     let source = TensorExpression::new(tensor.view())?.into_dense();
+///     let mask = source.is_nan().await?.not().await?.clone();
 ///     Tensor::copy_from(dir, &mask, max_capacity).await
 /// }
 /// ```
@@ -303,7 +305,7 @@ where
     fn abs(&self) -> BoxFuture<'_, Result<Self::Output>>;
 }
 
-/// Elementwise trigonometry, evaluated lazily over source support.
+/// Lazy elementwise trigonometry. Sparse inputs require a zero-preserving operation.
 pub trait TensorTrig: TensorGeometry + Sized {
     type SinOutput: TensorRead<DType = Self::DType>;
 
@@ -385,9 +387,9 @@ where
 
 /// Lazy elementwise arithmetic with scalar arguments.
 ///
-/// Scalars preserve the source's support: implicit sparse zeros stay absent even
-/// when the operation would map zero to a nonzero value. Arithmetic follows
-/// ha-ndarray's numerical contract, including wrapping u8 operations.
+/// Sparse construction rejects an operation whose implicit zero background becomes
+/// nonzero with [`Error::WouldDensify`]. Explicit [`crate::TensorExpression::into_dense`]
+/// permits it. Arithmetic follows ha-ndarray, including wrapping integer operations.
 pub trait TensorMathScalar: TensorGeometry {
     type AddOutput: TensorRead<DType = Self::DType>;
 
@@ -428,9 +430,9 @@ pub trait TensorMathScalar: TensorGeometry {
 
 /// Lazy elementwise comparisons returning exactly zero or one.
 ///
-/// Operands must have matching shapes and dtypes. Sparse expressions retain the
-/// union of original source support; comparisons do not populate absent values.
-/// Floating comparisons follow IEEE unordered-NaN and signed-zero rules.
+/// Operands must have matching shapes and dtypes. A sparse result requires the
+/// comparison of implicit zeros to remain zero; otherwise construction returns
+/// [`Error::WouldDensify`]. Floating comparisons follow IEEE unordered-NaN rules.
 pub trait TensorCompare<Rhs = Self>: TensorGeometry
 where
     Rhs: TensorGeometry<DType = Self::DType>,
@@ -478,8 +480,8 @@ where
 
 /// Lazy elementwise comparisons with scalar arguments, returning zero or one.
 ///
-/// Source support is preserved: comparing implicit sparse zeros to zero does
-/// not populate them.
+/// Sparse inputs require the comparison of implicit zero with the scalar to
+/// return zero; otherwise use [`crate::TensorExpression::into_dense`] first.
 pub trait TensorCompareScalar: TensorGeometry {
     type EqOutput: TensorRead<DType = u8>;
 
@@ -525,7 +527,7 @@ pub trait TensorCompareScalar: TensorGeometry {
 /// Lazy elementwise logical operations returning exactly zero or one.
 ///
 /// Zero is false; nonzero values, including NaN, are true. These are not bitwise
-/// operations. Shapes and dtypes must match; sparse support is their union.
+/// operations. Shapes and dtypes must match. Sparse candidates merge both operands.
 pub trait TensorBoolean<Rhs = Self>: TensorGeometry
 where
     Rhs: TensorGeometry<DType = Self::DType>,
@@ -545,8 +547,8 @@ where
 
 /// Lazy elementwise logical operations with scalar arguments.
 ///
-/// Zero is false and nonzero is true, including NaN. Results are zero or one;
-/// scalars do not add support to implicit sparse coordinates.
+/// Zero is false and nonzero is true, including NaN. Results are zero or one.
+/// An operation which changes the implicit sparse zero background is rejected.
 pub trait TensorBooleanScalar: TensorGeometry {
     type AndOutput: TensorRead<DType = u8>;
 
@@ -561,12 +563,12 @@ pub trait TensorBooleanScalar: TensorGeometry {
     fn xor_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::XorOutput>>;
 }
 
-/// Lazy selection with union-of-source-support semantics.
+/// Lazy selection over ordinary numerical values, including implicit sparse zeros.
 ///
 /// A zero condition selects `or_else`; any nonzero condition selects `then`.
 /// All shapes must match and branch dtypes must match. Both branches are read,
-/// including an unselected branch, and their errors propagate. Sparse support
-/// is the union of the condition and both branches, independent of selection.
+/// including an unselected branch, and their errors propagate. Sparse traversal
+/// merges candidates from the condition and both branches before evaluation.
 pub trait TensorWhere<Then, Else>: TensorGeometry<DType = u8>
 where
     Then: TensorGeometry,
@@ -578,8 +580,8 @@ where
     -> BoxFuture<'a, Result<Self::Output>>;
 }
 
-/// Lazy axis reductions over retained source support, including intermediate zeros.
-/// Empty sparse groups remain absent. Axes are sorted and deduplicated.
+/// Lazy axis reductions include every selected logical value, including implicit
+/// sparse zeros. Axes are sorted and deduplicated.
 pub trait TensorReduce: TensorGeometry {
     type SumOutput: TensorRead<DType = Self::DType>;
 
@@ -606,8 +608,8 @@ pub trait TensorReduce: TensorGeometry {
         Self::DType: ha_ndarray::Real;
 }
 
-/// Terminal reductions over retained source support, not implicit sparse zeros.
-/// Empty support gives sum=0 and product=1; extrema return an error.
+/// Terminal reductions include every logical value, including implicit sparse zeros.
+/// A nonempty all-zero tensor has zero sum, product, minimum, and maximum.
 /// Built-in expressions accumulate batches in completion order. Floating results
 /// may depend on scheduling within ha-ndarray's aggregate contract, including
 /// permitted extreme-range differences. The first observed error cancels pending
@@ -626,9 +628,9 @@ pub trait TensorReduceAll: TensorRead {
         Self::DType: ha_ndarray::Real;
 }
 
-/// Short-circuit boolean reductions over retained source support.
-/// Empty support gives all=true and any=false. Errors after a decisive batch
-/// may remain unobserved; dropping the remaining stream cancels pending work.
+/// Short-circuit boolean reductions include implicit sparse zeros in logical order.
+/// A nonempty all-zero tensor gives false for both operations. Errors after a
+/// decisive batch may remain unobserved; dropping the stream cancels pending work.
 pub trait TensorReduceBoolean: TensorRead {
     fn all(&self) -> BoxFuture<'_, Result<bool>>;
 
@@ -646,7 +648,7 @@ pub trait TensorMatrixUnary: TensorGeometry {
     fn mt(&self) -> BoxFuture<'_, Result<Self::TransposeOutput>>;
 
     /// Extract square matrix diagonals: `[..., N, N]` becomes `[..., N]`.
-    /// Only selected source coordinates contribute support.
+    /// Only selected source coordinates contribute values.
     fn diag(&self) -> BoxFuture<'_, Result<Self::DiagOutput>>;
 }
 
@@ -661,8 +663,8 @@ pub trait TensorMatrixUnaryComplex: TensorGeometry {
 /// Bounded, unnormalized last-axis Fourier transforms of complex expressions.
 ///
 /// Construction rejects axes exceeding the execution batch limit. Point reads
-/// evaluate the complete corresponding axis group. Any supported input makes
-/// every frequency in that group supported; an empty sparse group stays absent.
+/// evaluate the complete corresponding axis group, including implicit sparse zeros.
+/// Sparse output omits numerical zeros after evaluation.
 #[cfg(feature = "complex")]
 pub trait TensorFourier: TensorGeometry {
     type FftOutput: TensorRead<DType = Self::DType>;
@@ -678,8 +680,8 @@ pub trait TensorFourier: TensorGeometry {
 /// Shapes must be `[..., M, K]` and `[..., K, N]`, with identical batch dimensions
 /// and rank at least two. The output is `[..., M, N]`; shape/size errors are
 /// rejected before construction. Use transforms to broadcast explicitly.
-/// Sparse output support unions both operands across contraction positions,
-/// retaining supported zero results. See [`crate::MatMulView`] for composition.
+/// Both layouts evaluate the full logical contraction, including zero-times-infinity.
+/// See [`crate::MatMulView`] for composition.
 pub trait TensorMatMul<Rhs = Self>: TensorGeometry
 where
     Rhs: TensorGeometry<DType = Self::DType>,
@@ -772,7 +774,7 @@ fn sparse_range<V: TensorGeometry + ?Sized>(
     Ok(range)
 }
 
-/// Complex elementwise projections, retaining source support.
+/// Complex elementwise projections using ordinary numerical values.
 ///
 /// Descriptions clone without requiring adapters to clone. Only the destination
 /// adapter must support the real output of a component projection:

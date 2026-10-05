@@ -1,8 +1,8 @@
 //! Downstream public API smoke coverage, not a transaction or storage-provider test.
 
 use fensor::{
-    AxisRange, Layout, Tensor, TensorMathScalar, TensorRead, TensorReduce, TensorSource,
-    TensorTransform, TensorWrite,
+    AxisRange, Layout, Tensor, TensorExpression, TensorMathScalar, TensorRead, TensorReduce,
+    TensorSource, TensorTransform, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
@@ -41,7 +41,7 @@ async fn public_composition_storage_access_and_persistence() {
         )
         .await;
 
-        // The handoff uses logical geometry; physical payload IDs remain native.
+        // Logical block access does not expose native table pages.
         let geometry = source.storage_geometry();
         let (id, offset) = geometry.block_position(&[0, 0]).unwrap();
         assert_eq!(source.read_logical_block(id).await.unwrap()[offset], 1.0);
@@ -51,8 +51,9 @@ async fn public_composition_storage_access_and_persistence() {
         assert_eq!(geometric.read_value(&[0, 0]).await.unwrap(), 0.0);
         assert_eq!(geometric.read_value(&[0, 1]).await.unwrap(), 4.0);
 
-        let expression = source
-            .view()
+        let expression = TensorExpression::new(source.view())
+            .unwrap()
+            .into_dense()
             .slice(range![AxisRange::In(0, 2, 1), AxisRange::In(1, 3, 1)])
             .unwrap()
             .transpose(Some(axes![1, 0]))

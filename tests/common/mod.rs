@@ -10,7 +10,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use b_table::Node;
 use destream::{de, en};
 use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
 use freqfs::{Cache, DirLock};
@@ -41,7 +40,6 @@ pub enum FsEntry {
     SparseC32(fensor::SparseNode<fensor::complex::Complex32>),
     #[cfg(feature = "complex")]
     SparseC64(fensor::SparseNode<fensor::complex::Complex64>),
-    Node(Node<u64>),
     F32(Vec<f32>),
     MetadataF32(fensor::TensorMetadata<f32>),
     U8(Vec<u8>),
@@ -75,7 +73,6 @@ pub enum FsEntry {
 impl GetSize for FsEntry {
     fn get_heap_size(&self) -> usize {
         match self {
-            Self::Node(node) => node.get_heap_size(),
             Self::U8(values) => values.capacity() * std::mem::size_of::<u8>(),
             Self::MetadataU8(metadata) => metadata.get_heap_size(),
             Self::SparseU8(node) => node.get_heap_size(),
@@ -198,7 +195,6 @@ impl<'en> en::ToStream<'en> for FsEntry {
             ),
             #[cfg(feature = "complex")]
             Self::MetadataC64(value) => en::IntoStream::into_stream((24u8, value), encoder),
-            Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
             Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
             Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
             Self::U8(value) => en::IntoStream::into_stream((3u8, value), encoder),
@@ -245,7 +241,6 @@ impl de::Visitor for FsEntryVisitor {
                     .await?
                     .0,
             ),
-            0 => FsEntry::Node(seq.expect_next(()).await?),
             1 => FsEntry::F32(seq.expect_next(()).await?),
             2 => FsEntry::MetadataF32(seq.expect_next(MAX_METADATA_RANK).await?),
             3 => FsEntry::U8(seq.expect_next(()).await?),
@@ -308,7 +303,6 @@ impl de::FromStream for FsEntry {
     }
 }
 
-as_type!(FsEntry, Node, Node<u64>);
 as_type!(FsEntry, F32, Vec<f32>);
 as_type!(FsEntry, MetadataF32, fensor::TensorMetadata<f32>);
 as_type!(FsEntry, U8, Vec<u8>);

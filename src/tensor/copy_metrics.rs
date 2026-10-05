@@ -4,8 +4,7 @@ use std::cell::RefCell;
 pub(crate) struct Metrics {
     pub groups: usize,
     pub replaced_blocks: usize,
-    pub descriptor_writes: usize,
-    pub max_descriptor_batch: usize,
+    pub payload_writes: usize,
     pub block_updates: usize,
     pub constructed_blocks: usize,
     pub staged_elements: usize,

@@ -190,6 +190,7 @@ mod tests {
 
     use super::*;
     use crate::AxisRange;
+    use crate::TensorSource;
     use crate::test_support::{FsEntry, new_dir};
     use crate::{
         Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
@@ -278,7 +279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn huge_sparse_slices_keep_intermediate_support_and_release_guards() {
+    async fn huge_sparse_slices_keep_zero_candidates_and_release_guards() {
         let (root, dir) = new_dir("indexed_reduction").await;
         let tensor = Tensor::<FsEntry, f32>::create(
             dir,
@@ -294,14 +295,8 @@ mod tests {
             .scope(Default::default(), async {
                 assert_eq!(tensor.sum_all().await.unwrap(), 2.2);
                 let round = tensor.view().round().await.unwrap();
-                let result = round
-                    .exp()
-                    .await
-                    .unwrap()
-                    .sum(axes![1], false)
-                    .await
-                    .unwrap();
-                assert_eq!(result.read_value(&[0]).await.unwrap(), 1.);
+                let result = round.sum(axes![1], false).await.unwrap();
+                assert_eq!(result.read_value(&[0]).await.unwrap(), 0.);
                 let slice = tensor
                     .view()
                     .slice(vec![AxisRange::At(0), AxisRange::In(2, 1_000_000_000, 2)].into())
@@ -326,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packed_dense_groups_share_one_block_and_no_output_mask() {
+    async fn packed_dense_groups_share_one_block() {
         let (root, dir) = new_dir("packed_reduction").await;
         let tensor = Tensor::<FsEntry, f32>::create(
             dir,
@@ -348,7 +343,6 @@ mod tests {
                 let batch = crate::expression::evaluate_batch(&reduced, &request)
                     .await
                     .unwrap();
-                assert!(batch.support.is_none());
                 assert_eq!(batch.values, (0..64).map(|i| i as f32).collect::<Vec<_>>());
                 crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().borrows, 1));
             })
@@ -376,11 +370,15 @@ mod tests {
             .unwrap();
         assert_eq!(slice.sum_all().await.unwrap(), 2.);
         assert!(tensor.sum_all().await.is_err());
-        tensor.corrupt_occupied_region([0, 0], [1, 0]).await;
+        tensor.corrupt_sparse_key(0, 9_999).await;
         assert!(matches!(
-            tensor.sum_all().await,
+            tensor
+                .occupied_blocks(0..tensor.storage_geometry().block_count())
+                .try_collect::<Vec<_>>()
+                .await,
             Err(Error::InvalidLayout(_))
         ));
+        assert!(tensor.validate().await.is_err());
         crate::test_support::cleanup(&root).await;
     }
 
@@ -401,7 +399,7 @@ mod tests {
         tensor.write_value(&[1, 1], 3.).await.unwrap();
         assert_eq!(tensor.sum_all().await.unwrap(), 10.);
         let transposed = tensor.view().transpose(None).unwrap();
-        assert_eq!(transposed.product_all().await.unwrap(), 36.);
+        assert_eq!(transposed.product_all().await.unwrap(), 0.);
         tensor.write_value(&[1, 0], 0.).await.unwrap();
         tensor.write_value(&[1, 1], 0.).await.unwrap();
         assert_eq!(transposed.sum_all().await.unwrap(), 5.);

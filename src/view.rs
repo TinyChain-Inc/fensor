@@ -141,7 +141,16 @@ where
     }
 
     fn layout(&self) -> Layout {
-        self.tensor.layout()
+        match self.tensor.layout() {
+            Layout::Sparse { .. }
+                if !self
+                    .mapping
+                    .is_identity(self.tensor.shape(), self.tensor.strides()) =>
+            {
+                Layout::Sparse { axis: None }
+            }
+            layout => layout,
+        }
     }
 
     fn shape(&self) -> &[u64] {

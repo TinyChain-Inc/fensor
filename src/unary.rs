@@ -5,11 +5,10 @@ use std::marker::PhantomData;
 #[cfg(feature = "complex")]
 use ha_ndarray::NDArrayComplex;
 use ha_ndarray::{
-    ArrayAccess, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayTrig, NDArrayUnary,
-    NDArrayUnaryBoolean,
+    ArrayAccess, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayRead, NDArrayTrig, NDArrayUnary,
+    NDArrayUnaryBoolean, Number,
 };
 
-use crate::Result;
 use crate::expression::{self, Batch, Expression};
 use crate::request::BatchRequest;
 use crate::schema::Layout;
@@ -18,6 +17,7 @@ use crate::traits::{
     BoxFuture, TensorAbs, TensorCast, TensorGeometry, TensorNumeric, TensorRead, TensorTransform,
     TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics,
 };
+use crate::{Error, Result};
 
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -29,6 +29,8 @@ pub(crate) mod sealed {
 /// in a `UnaryView`.
 pub trait UnaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     type Output: TensorElement;
+
+    const NAME: &'static str;
 
     fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>>;
 }
@@ -46,6 +48,8 @@ macro_rules! unary_op {
         where $output: TensorElement,
         {
             type Output = $output;
+
+            const NAME: &'static str = stringify!($method);
 
             fn apply(
                 &self,
@@ -146,6 +150,8 @@ impl<To: TensorElement> sealed::Sealed for Cast<To> {}
 impl<From: TensorElement, To: TensorElement> UnaryOp<From> for Cast<To> {
     type Output = To;
 
+    const NAME: &'static str = "cast";
+
     fn apply(&self, array: ArrayAccess<'static, From>) -> Result<ArrayAccess<'static, To>> {
         Ok(ArrayAccess::from(array.cast()?))
     }
@@ -182,14 +188,35 @@ impl<From: TensorElement, To: TensorElement> UnaryOp<From> for Cast<To> {
 /// }
 /// ```
 #[derive(Clone)]
-pub struct UnaryView<Source, Op> {
+pub struct UnaryView<Source, Op>
+where
+    Source: TensorGeometry,
+    Source::DType: TensorElement,
+    Op: UnaryOp<Source::DType>,
+{
     source: Source,
     op: Op,
+    zero: Op::Output,
 }
 
-impl<S, O> UnaryView<S, O> {
-    pub(crate) fn new(source: S, op: O) -> Self {
-        Self { source, op }
+impl<S, O> UnaryView<S, O>
+where
+    S: Expression,
+    S::DType: TensorElement,
+    O: UnaryOp<S::DType>,
+{
+    pub(crate) fn new(source: S, op: O) -> Result<Self> {
+        let zero = if matches!(source.layout(), Layout::Sparse { .. }) {
+            let input = expression::batch_array(vec![source.implicit_zero()])?;
+            let zero = op.apply(input)?.read_value(&[0])?;
+            if zero != O::Output::ZERO {
+                return Err(Error::WouldDensify { operation: O::NAME });
+            }
+            zero
+        } else {
+            O::Output::ZERO
+        };
+        Ok(Self { source, op, zero })
     }
 }
 
@@ -201,7 +228,7 @@ macro_rules! unary_constructor {
         fn $method(&self) -> BoxFuture<'_, Result<Self::$output>>
         $(where $($bounds)+)?
         {
-            Box::pin(async move { Ok(UnaryView::new(self.clone(), $op)) })
+            Box::pin(async move { UnaryView::new(self.clone(), $op) })
         }
     };
 }
@@ -245,12 +272,7 @@ where
     type Output = UnaryView<Self, Cast<To>>;
 
     fn cast(&self) -> BoxFuture<'_, Result<Self::Output>> {
-        Box::pin(async move {
-            Ok(UnaryView {
-                source: self.clone(),
-                op: Cast(PhantomData),
-            })
-        })
+        Box::pin(async move { UnaryView::new(self.clone(), Cast(PhantomData)) })
     }
 }
 
@@ -348,6 +370,10 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
+    fn implicit_zero(&self) -> Self::DType {
+        self.zero
+    }
+
     fn expression_nodes(&self) -> Result<usize> {
         crate::expression::traversal::node_count([self.source.expression_nodes()?])
     }
@@ -365,13 +391,13 @@ where
         )))
     }
 
-    fn support_step(
+    fn ordered_step(
         &self,
         slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Support<'_>> {
-        Ok(expression::traversal::Support::Sources(vec![(
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        Ok(expression::traversal::Ordered::Sources(vec![(
             0,
-            Box::new(move || self.source.support_step(slice)),
+            Box::new(move || self.source.ordered_step(slice)),
         )]))
     }
 
@@ -394,9 +420,7 @@ where
             Batch {
                 _allocation: None,
                 array: self.op.apply(source.array)?,
-                support: source.support,
             }
-            .masked()?
             .realize()
         })
     }

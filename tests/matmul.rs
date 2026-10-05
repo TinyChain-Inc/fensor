@@ -1,9 +1,10 @@
-//! Filesystem-backed tiled matrix multiplication and source support.
+//! Filesystem-backed tiled matrix multiplication and zero-extended sparse values.
 
 use fensor::{
     AxisRange, Layout, Shape, Tensor, TensorCast, TensorCompareScalar, TensorElement,
-    TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorRead, TensorReduce,
-    TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
+    TensorExpression, TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere,
+    TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{Array, Buffer, MatrixDual, NDArrayRead, Number, axes, range, shape};
@@ -103,7 +104,7 @@ parity!(f64_parity, f64, false);
 parity!(u8_parity, u8, false);
 
 #[tokio::test]
-async fn sparse_union_support_and_copy_boundaries() {
+async fn sparse_zero_intermediates_and_copy_match_dense_semantics() {
     let (_a_root, a) = source(&[0.2f32, 0., 0., 0.], shape![2, 2], true, 2).await;
     let (_b_root, b) = source(&[0f32, 0., 0., 2.], shape![2, 2], true, 3).await;
     let view = a
@@ -114,33 +115,45 @@ async fn sparse_union_support_and_copy_boundaries() {
         .matmul(&b.view())
         .await
         .unwrap();
-    check(&view, &[0., 0., 0., 0.]).await;
-    check(&view.eq_scalar(0.).await.unwrap(), &[1, 1, 0, 1]).await;
-    let (_dir_root, dir) = new_dir("matmul_support_boundary").await;
+    check(&view, &[0.; 4]).await;
+    assert!(matches!(
+        view.eq_scalar(0.).await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
+    let (_dir_root, dir) = new_dir("matmul_zero_copy").await;
     let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &view, 2).await.unwrap();
-    check(&copy.view().eq_scalar(0.).await.unwrap(), &[0, 0, 0, 0]).await;
+    assert!(matches!(
+        copy.view().eq_scalar(0.).await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
     assert_eq!(view.sum_all().await.unwrap(), 0.);
+    let view = TensorExpression::new(view).unwrap().into_dense();
+    let copy = TensorExpression::new(copy).unwrap().into_dense();
+    check(&view.eq_scalar(0.).await.unwrap(), &[1; 4]).await;
+    check(&copy.eq_scalar(0.).await.unwrap(), &[1; 4]).await;
     let (_empty_root, empty) = source(&[0f32; 4], shape![2, 2], true, 2).await;
+    let empty = empty.view().matmul(&empty.view()).await.unwrap();
+    assert!(matches!(
+        empty.exp().await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
     check(
-        &empty
-            .view()
-            .matmul(&empty.view())
-            .await
+        &TensorExpression::new(empty)
             .unwrap()
+            .into_dense()
             .exp()
             .await
             .unwrap(),
-        &[0.; 4],
+        &[1.; 4],
     )
     .await;
     let (_cancel_root, cancel) = source(&[1f32, -1.], shape![1, 2], true, 2).await;
     let (_ones_root, ones) = source(&[1f32, 1.], shape![2, 1], true, 1).await;
+    let product = cancel.view().matmul(&ones.view()).await.unwrap();
     check(
-        &cancel
-            .view()
-            .matmul(&ones.view())
-            .await
+        &TensorExpression::new(product)
             .unwrap()
+            .into_dense()
             .exp()
             .await
             .unwrap(),

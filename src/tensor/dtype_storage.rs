@@ -163,32 +163,48 @@ where
 
     // All dtypes share the same elementwise zero lifecycle, including through
     // geometric and bulk writes. Keep persistence permutations in the fixture above.
-    let (root, tensor) = fixture::source(
-        "dtype_shared_key",
-        shape![2, 2],
+    for layout in [
         Layout::Sparse { axis: None },
-        4,
-        1_000_000,
-        [T::ONE, T::ONE, T::ZERO, T::ZERO],
-    )
-    .await;
-    tensor
-        .view()
-        .transpose(None)
-        .unwrap()
-        .write_value(&[0, 0], T::ZERO)
-        .await
-        .unwrap();
-    assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), T::ONE);
-    tensor
-        .write_values(
-            smallvec::smallvec![fensor::AxisRange::At(0), fensor::AxisRange::In(0, 2, 1)],
-            vec![T::ZERO, T::ZERO],
+        Layout::Sparse { axis: Some(0) },
+    ] {
+        let (root, tensor) = fixture::source(
+            "dtype_shared_key",
+            shape![2, 2],
+            layout,
+            4,
+            1_000_000,
+            [T::ONE, T::ONE, T::ZERO, T::ZERO],
         )
-        .await
-        .unwrap();
-    assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), T::ZERO);
-    cleanup(&root).await;
+        .await;
+        let tensor = if matches!(layout, Layout::Sparse { axis: Some(0) }) {
+            // Scalar sparse persistence is covered above. Reopen one small dense
+            // suffix payload for each dtype.
+            tensor.sync().await.unwrap();
+            drop(tensor);
+            Tensor::<FsEntry, T>::load(common::open_dir(&root).unwrap())
+                .await
+                .unwrap()
+        } else {
+            tensor
+        };
+        tensor
+            .view()
+            .transpose(None)
+            .unwrap()
+            .write_value(&[0, 0], T::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), T::ONE);
+        tensor
+            .write_values(
+                smallvec::smallvec![fensor::AxisRange::At(0), fensor::AxisRange::In(0, 2, 1)],
+                vec![T::ZERO, T::ZERO],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), T::ZERO);
+        cleanup(&root).await;
+    }
 }
 
 macro_rules! storage_case {

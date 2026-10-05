@@ -4,9 +4,9 @@ use std::io;
 use std::path::Path;
 
 use fensor::{
-    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorGeometry, TensorMatMul,
-    TensorMath, TensorMathScalar, TensorMetadata, TensorRead, TensorReduce, TensorReduceAll,
-    TensorSchema, TensorTransform, TensorWhere, TensorWrite,
+    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorExpression,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMetadata, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorWhere, TensorWrite,
 };
 use freqfs::{Cache, FileLoad, FileSave};
 use futures::TryStreamExt;
@@ -97,12 +97,10 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
         FsEntry::MetadataF32(
             TensorMetadata::new(vec![1; rank].into(), Layout::Dense, vec![1; rank].into()).unwrap(),
         ),
-        FsEntry::Node(b_table::Node::Leaf(vec![vec![1, 2, 3]; 17])),
         FsEntry::SparseF64(b_table::Node::Leaf(vec![
             vec![
                 fensor::SparseCell::Key(1),
-                fensor::SparseCell::Key(2),
-                fensor::SparseCell::Value(3.),
+                fensor::SparseCell::Payload(vec![3.]),
             ];
             17
         ])),
@@ -126,15 +124,14 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
                 .unwrap();
         assert!(bound.0 >= tbon.get_size());
     }
-    // This decoded page fits 16 KiB when decoding owns only its final rows;
-    // retaining a second encoded-row Vec would exceed that admission bound.
+    // This decoded page fits 16 KiB including retained row and payload capacities.
+    // Preflight must cover the owned containers, independently of encoded bytes.
     let tiny_page = FsEntry::SparseF64(b_table::Node::Leaf(vec![
         vec![
             fensor::SparseCell::Key(1),
-            fensor::SparseCell::Key(2),
-            fensor::SparseCell::Value(3.),
+            fensor::SparseCell::Payload(vec![3.]),
         ];
-        160
+        128
     ]));
     let bound: common::file_size::Size =
         tbon::de::try_decode((), tbon::en::encode(&tiny_page).unwrap())
@@ -238,7 +235,12 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
         Layout::Sparse { axis: None },
         Layout::Sparse { axis: Some(1) },
     ] {
-        let metadata = TensorMetadata::<f32>::new(shape![3, 4], layout, shape![1, 2]).unwrap();
+        let block_shape = if layout == Layout::Dense {
+            shape![1, 2]
+        } else {
+            shape![1, 1]
+        };
+        let metadata = TensorMetadata::<f32>::new(shape![3, 4], layout, block_shape).unwrap();
         let json: TensorMetadata<f32> =
             destream_json::de::try_decode(2, destream_json::en::encode(&metadata).unwrap())
                 .await
@@ -251,15 +253,15 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
         assert_eq!(tbon, metadata);
     }
 
-    let extra = (vec![3u64, 4], true, Some(1u64), vec![1u64, 2], 0u64);
+    let extra = (vec![3u64, 4], true, Some(1u64), vec![1u64, 1], 0u64);
     assert!(
         tbon::de::try_decode::<_, _, TensorMetadata<f32>>(2, tbon::en::encode(&extra).unwrap())
             .await
             .is_err()
     );
-    let fixture = (vec![3u64, 4], true, Some(1u64), vec![1u64, 2]);
+    let fixture = (vec![3u64, 4], true, Some(1u64), vec![1u64, 1]);
     let expected =
-        TensorMetadata::<f32>::new(shape![3, 4], Layout::Sparse { axis: Some(1) }, shape![1, 2])
+        TensorMetadata::<f32>::new(shape![3, 4], Layout::Sparse { axis: Some(1) }, shape![1, 1])
             .unwrap();
     let decoded: TensorMetadata<f32> = tbon::de::try_decode(2, tbon::en::encode(&fixture).unwrap())
         .await
@@ -302,7 +304,7 @@ async fn reload_rejects_out_of_bounds_sparse_axis() {
     let metadata = root.join("blocks").join("metadata");
     // Preserve the adapter envelope and valid geometry; corrupt only the axis.
     let original = tokio::fs::read(&metadata).await.unwrap();
-    let malformed = (2u8, (vec![3u64, 4], true, Some(2u64), vec![1u64, 2]));
+    let malformed = (2u8, (vec![3u64, 4], true, Some(2u64), vec![1u64, 1]));
     let mut bytes = Vec::new();
     let mut encoded = destream_json::en::encode(&malformed).unwrap();
 
@@ -319,7 +321,7 @@ async fn reload_rejects_out_of_bounds_sparse_axis() {
         // Decoding is owned by the adapter and reaches fensor as an I/O error.
         assert!(matches!(error, fensor::Error::Io(_)), "{error:?}");
         assert!(
-            error.to_string().contains("sparse axis hint out of bounds"),
+            error.to_string().contains("sparse axis out of bounds"),
             "{error}"
         );
     }
@@ -399,11 +401,13 @@ async fn conditional_sources_and_output_use_independent_codecs() {
         .and_scalar(127)
         .await
         .unwrap();
-    let expression = condition
-        .cond(&a.view().add_scalar(1.).await.unwrap(), &b.view())
-        .await
+    let shifted = TensorExpression::new(a.view())
         .unwrap()
-        .clone();
+        .into_dense()
+        .add_scalar(1.)
+        .await
+        .unwrap();
+    let expression = condition.cond(&shifted, &b.view()).await.unwrap().clone();
     let out_root = common::Directory::new("conditional_json_output").await;
     let out_cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
     let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();

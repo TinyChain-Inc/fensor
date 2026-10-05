@@ -1,4 +1,4 @@
-//! Bounded reductions over original expression support.
+//! Bounded reductions over logical values, including implicit sparse zeros.
 
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{NDArrayReduceAll, Number, Real};
@@ -34,7 +34,7 @@ pub trait ReduceOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     }
 }
 
-/// Sum over supported values.
+/// Sum over logical values.
 #[derive(Clone, Copy, Debug)]
 pub struct Sum;
 
@@ -61,7 +61,7 @@ impl<T: TensorElement> ReduceOp<T> for Sum {
     }
 }
 
-/// Product over supported values.
+/// Product over logical values.
 #[derive(Clone, Copy, Debug)]
 pub struct Product;
 
@@ -88,7 +88,7 @@ impl<T: TensorElement> ReduceOp<T> for Product {
     }
 }
 
-/// Min over supported values.
+/// Min over logical values.
 #[derive(Clone, Copy, Debug)]
 pub struct Min;
 
@@ -111,11 +111,11 @@ impl<T: TensorElement + Real> ReduceOp<T> for Min {
     }
 
     fn empty() -> Result<T> {
-        Err(Error::Unsupported("min_all has empty support".into()))
+        Err(Error::Unsupported("min_all has empty input".into()))
     }
 }
 
-/// Max over supported values.
+/// Max over logical values.
 #[derive(Clone, Copy, Debug)]
 pub struct Max;
 
@@ -138,11 +138,11 @@ impl<T: TensorElement + Real> ReduceOp<T> for Max {
     }
 
     fn empty() -> Result<T> {
-        Err(Error::Unsupported("max_all has empty support".into()))
+        Err(Error::Unsupported("max_all has empty input".into()))
     }
 }
 
-/// Numeric conversion owned by support-sensitive statistics.
+/// Numeric conversion owned by the statistics reductions.
 pub trait StatisticsElement: TensorElement + sealed::Sealed {
     type Mean: TensorElement;
 
@@ -197,7 +197,7 @@ macro_rules! complex_statistics {
 #[cfg(feature = "complex")]
 complex_statistics!(crate::complex::Complex32, crate::complex::Complex64);
 
-/// Mean counts original expression support, including supported numerical zeros.
+/// Mean counts every logical value, including implicit sparse zeros.
 #[derive(Clone, Copy, Debug)]
 pub struct Mean;
 
@@ -291,7 +291,7 @@ impl<T: StatisticsElement> ReduceOp<T> for StandardDeviation {
     }
 }
 
-/// Euclidean norm over original support.
+/// Euclidean norm over logical values.
 #[derive(Clone, Copy, Debug)]
 pub struct Norm;
 
@@ -324,7 +324,7 @@ impl<T: StatisticsElement> ReduceOp<T> for Norm {
     }
 }
 
-/// Support-sensitive statistics share native batching and axis traversal.
+/// Statistics include implicit zeros and share native batching and axis traversal.
 pub trait TensorStatistics: TensorGeometry
 where
     Self::DType: StatisticsElement,
@@ -383,10 +383,12 @@ where
 fn accumulate<T: TensorElement, O: ReduceOp<T>>(
     op: &O,
     state: &mut Option<O::State>,
-    batch: expression::EvaluatedBatch<T>,
+    remaining: &mut u64,
+    values: Vec<T>,
 ) -> Result<()> {
-    let values = batch.populated()?;
-
+    *remaining = remaining.checked_sub(values.len() as u64).ok_or_else(|| {
+        Error::InvalidLayout("reduction requests exceed selected cardinality".into())
+    })?;
     if !values.is_empty() {
         #[cfg(test)]
         crate::read_metrics::record(|m| m.reduction_calls += 1);
@@ -400,14 +402,46 @@ fn accumulate<T: TensorElement, O: ReduceOp<T>>(
     Ok(())
 }
 
+// Candidate requests cover distinct selected coordinates and may include numerical
+// zeros. Their complement is known zero; repeated partial states account for that
+// cardinality without constructing its values or changing the numerical combiner.
+fn accumulate_zeros<T: TensorElement, O: ReduceOp<T>>(
+    op: &O,
+    state: &mut Option<O::State>,
+    mut count: u64,
+    zero: T,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    #[cfg(test)]
+    crate::read_metrics::record(|m| m.reduction_calls += 1);
+    let mut partial = op.partial(vec![zero])?;
+    loop {
+        if count & 1 != 0 {
+            *state = Some(match *state {
+                Some(previous) => O::combine(previous, partial),
+                None => partial,
+            });
+        }
+        count >>= 1;
+        if count == 0 {
+            return Ok(());
+        }
+        partial = O::combine(partial, partial);
+    }
+}
+
 async fn terminal<E, O>(source: &E, op: O) -> Result<O::Output>
 where
     E: Expression,
     E::DType: TensorElement,
     O: ReduceOp<E::DType>,
 {
-    let requests =
-        expression::traversal::selection(source, crate::slice::Slice::full(source.shape())?)?;
+    let slice = crate::slice::Slice::full(source.shape())?;
+    let mut remaining = slice.len();
+    let requests = expression::traversal::selection(source, slice)?;
     // Numeric aggregates allow evaluation-order differences. Consume completed
     // batches immediately; boolean terminals retain logical ordered delivery.
     let batches =
@@ -416,9 +450,10 @@ where
     let mut state = None;
 
     while let Some((_, batch)) = batches.try_next().await? {
-        accumulate::<_, O>(&op, &mut state, batch)?;
+        accumulate::<_, O>(&op, &mut state, &mut remaining, batch.values)?;
     }
 
+    accumulate_zeros::<_, O>(&op, &mut state, remaining, source.implicit_zero())?;
     state.map(O::finish).unwrap_or_else(O::empty)
 }
 
@@ -458,12 +493,12 @@ where
     fn all(&self) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
             // Logical batches preserve which errors precede a decisive value;
-            // occupied-region traversal could change those short-circuit boundaries.
+            // indexed candidate traversal could change those short-circuit boundaries.
             let coords = request::linear_requests(self.shape())?;
             let mut batches = expression::ordered_batches(self, coords);
 
             while let Some((_, batch)) = batches.try_next().await? {
-                if batch.populated()?.into_iter().any(|v| v == E::DType::ZERO) {
+                if batch.values.into_iter().any(|v| v == E::DType::ZERO) {
                     return Ok(false);
                 }
             }
@@ -475,12 +510,12 @@ where
     fn any(&self) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
             // Logical batches preserve which errors precede a decisive value;
-            // occupied-region traversal could change those short-circuit boundaries.
+            // indexed candidate traversal could change those short-circuit boundaries.
             let coords = request::linear_requests(self.shape())?;
             let mut batches = expression::ordered_batches(self, coords);
 
             while let Some((_, batch)) = batches.try_next().await? {
-                if batch.populated()?.into_iter().any(|v| v != E::DType::ZERO) {
+                if batch.values.into_iter().any(|v| v != E::DType::ZERO) {
                     return Ok(true);
                 }
             }
@@ -676,9 +711,6 @@ where
         Box::pin(async move {
             // Output buffers are bounded by the current evaluation batch.
             let mut values = Vec::with_capacity(coords.len());
-            let mut support = matches!(self.layout(), Layout::Sparse { .. })
-                .then(|| Vec::with_capacity(coords.len()));
-
             let mut cursor = coords.cursor(self.shape())?;
             let mut coord = Coord::new();
             let mut pending = None;
@@ -694,18 +726,22 @@ where
 
                 if slice.len() > expression::MAX_BATCH_ELEMENTS as u64 {
                     let mut state = None;
+                    let mut remaining = slice.len();
                     let mut requests = expression::traversal::selection(&self.source, slice)?;
                     // Inner consumers never start buffered streams.
                     while let Some(request) = requests.try_next().await? {
                         let batch = context
                             .evaluate(&self.source, std::sync::Arc::new(request))
                             .await?;
-                        accumulate::<_, O>(&self.op, &mut state, batch)?;
+                        accumulate::<_, O>(&self.op, &mut state, &mut remaining, batch.values)?;
                     }
 
-                    if let Some(support) = &mut support {
-                        support.push(u8::from(state.is_some()));
-                    }
+                    accumulate_zeros::<_, O>(
+                        &self.op,
+                        &mut state,
+                        remaining,
+                        self.source.implicit_zero(),
+                    )?;
                     values.push(O::finish_axis(state)?);
                     continue;
                 }
@@ -738,24 +774,22 @@ where
                     )
                     .await?;
                 let mut input = batch.values.into_iter();
-                let mut masks = batch.support.map(Vec::into_iter);
 
                 for len in lengths {
                     let mut state = None;
+                    let mut remaining = len;
                     accumulate::<_, O>(
                         &self.op,
                         &mut state,
-                        expression::EvaluatedBatch {
-                            _allocation: None,
-                            values: input.by_ref().take(len as usize).collect(),
-                            support: masks
-                                .as_mut()
-                                .map(|m| m.by_ref().take(len as usize).collect()),
-                        },
+                        &mut remaining,
+                        input.by_ref().take(len as usize).collect(),
                     )?;
-                    if let Some(support) = &mut support {
-                        support.push(u8::from(state.is_some()));
-                    }
+                    accumulate_zeros::<_, O>(
+                        &self.op,
+                        &mut state,
+                        remaining,
+                        self.source.implicit_zero(),
+                    )?;
                     values.push(O::finish_axis(state)?);
                 }
             }
@@ -763,7 +797,6 @@ where
             Ok(Batch {
                 _allocation: None,
                 array: expression::batch_array(values)?,
-                support,
             })
         })
     }
@@ -785,4 +818,117 @@ where
     O: ReduceOp<S::DType>,
 {
     crate::mapping::transform_methods!();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use number_general::DType;
+
+    use super::*;
+    use crate::read_metrics::{CURRENT, Metrics};
+    use crate::test_support::{FsEntry, new_dir};
+    use crate::{
+        Tensor, TensorExpression, TensorMath, TensorMathScalar, TensorSchema, TensorWrite,
+    };
+
+    #[tokio::test]
+    async fn zero_gap_products_preserve_expression_signed_zeros() {
+        for len in [3, expression::MAX_BATCH_ELEMENTS as u64 + 1] {
+            let (_root, dir) = new_dir("reduce_signed_zero").await;
+            let tensor = Tensor::<FsEntry, f64>::create(
+                dir,
+                TensorSchema::new(f64::dtype(), vec![1, len].into()).unwrap(),
+                Layout::Sparse { axis: None },
+                31,
+            )
+            .await
+            .unwrap();
+
+            for first in [0., 1.] {
+                tensor.write_value(&[0, 0], first).await.unwrap();
+                let sparse = tensor.view().mul_scalar(-1.).await.unwrap();
+                let owned = TensorExpression::new(sparse.clone()).unwrap();
+                let dense = owned.clone().into_dense();
+                let expected = dense.product_all().await.unwrap().to_bits();
+                assert_eq!(expected, (-0.0_f64).to_bits());
+                assert_eq!(sparse.product_all().await.unwrap().to_bits(), expected);
+                assert_eq!(owned.product_all().await.unwrap().to_bits(), expected);
+                assert_eq!(
+                    owned
+                        .product(ha_ndarray::axes![1], false)
+                        .await
+                        .unwrap()
+                        .read_value(&[0])
+                        .await
+                        .unwrap()
+                        .to_bits(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_reductions_account_for_implicit_zero_gaps() {
+        let (_root, dir) = new_dir("reduce_zero_gaps").await;
+        let len = 1_000_000_007;
+        let tensor = Tensor::<FsEntry, f64>::create(
+            dir,
+            TensorSchema::new(f64::dtype(), vec![1, len].into()).unwrap(),
+            Layout::Sparse { axis: None },
+            31,
+        )
+        .await
+        .unwrap();
+        tensor.write_value(&[0, 1], 2.).await.unwrap();
+        tensor.write_value(&[0, len - 1], 3.).await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            CURRENT.scope(RefCell::new(Metrics::default()), async {
+                assert_eq!(tensor.sum_all().await.unwrap(), 5.);
+                assert_eq!(tensor.product_all().await.unwrap(), 0.);
+                assert_eq!(tensor.min_all().await.unwrap(), 0.);
+                assert_eq!(tensor.max_all().await.unwrap(), 3.);
+                assert_eq!(tensor.mean_all().await.unwrap(), 5. / len as f64);
+                let variance = 13. / len as f64 - (5. / len as f64).powi(2);
+                assert!((tensor.std_all().await.unwrap() - variance.sqrt()).abs() < 1e-12);
+                assert_eq!(tensor.norm_all().await.unwrap(), 13.0_f64.sqrt());
+                assert_eq!(
+                    tensor
+                        .view()
+                        .sum(ha_ndarray::axes![1], false)
+                        .await
+                        .unwrap()
+                        .read_value(&[0])
+                        .await
+                        .unwrap(),
+                    5.
+                );
+                let zeros = tensor.view().sub(&tensor.view()).await.unwrap();
+                assert_eq!(zeros.mean_all().await.unwrap(), 0.);
+                CURRENT.with(|metrics| {
+                    let metrics = metrics.borrow();
+                    assert!(metrics.requested > 0 && metrics.requested <= 24);
+                    assert!(metrics.reduction_calls <= 18);
+                });
+            }),
+        )
+        .await
+        .expect("indexed reductions must not scan the implicit-zero gap");
+
+        tensor.write_value(&[0, 1], f64::INFINITY).await.unwrap();
+        assert!(tensor.product_all().await.unwrap().is_nan());
+        assert!(tensor.std_all().await.unwrap().is_nan());
+        assert_eq!(tensor.mean_all().await.unwrap(), f64::INFINITY);
+        assert_eq!(tensor.norm_all().await.unwrap(), f64::INFINITY);
+
+        let mut state = None;
+        let mut remaining = 1;
+        assert!(accumulate(&Sum, &mut state, &mut remaining, vec![1., 2.]).is_err());
+        assert_eq!(remaining, 1);
+        assert_eq!(state, None);
+    }
 }

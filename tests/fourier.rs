@@ -1,9 +1,10 @@
 #![cfg(feature = "complex")]
 
 use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorElement, TensorFileEntry, TensorFourier,
-    TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnaryComplex, TensorRead, TensorReduce,
-    TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics, TensorWrite,
+    AxisRange, Error, Layout, Tensor, TensorElement, TensorExpression, TensorFileEntry,
+    TensorFourier, TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnaryComplex, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics,
+    TensorWrite,
     complex::{Complex32, Complex64},
     fft::{Fft, FourierOp, Ifft, fft2, ifft2},
 };
@@ -378,26 +379,38 @@ async fn sparse_group_support_and_live_sources() {
     let forward = v.fft().await.unwrap();
     consumers(&forward, &[one, one, one, one, z, z, z, z], 0.).await;
     let zero = v.sub(&v).await.unwrap();
-    let retained = zero.fft().await.unwrap().exp().await.unwrap();
-    consumers(&retained, &[one, one, one, one, z, z, z, z], 0.).await;
+    let transformed = zero.fft().await.unwrap();
+    assert!(matches!(
+        transformed.exp().await,
+        Err(Error::WouldDensify { operation: "exp" })
+    ));
+    let retained = TensorExpression::new(transformed)
+        .unwrap()
+        .into_dense()
+        .exp()
+        .await
+        .unwrap();
+    consumers(&retained, &[one; 8], 0.).await;
     let (copy_root, dir) = new_dir("fourier_support_copy").await;
     let copy = Tensor::<FsEntry, Complex64>::copy_from(dir, &zero, 2)
         .await
         .unwrap();
-    fixture::blocks(
-        &copy.view().fft().await.unwrap().exp().await.unwrap(),
-        &[z; 8],
-        same,
-    )
-    .await;
+    let copied = TensorExpression::new(copy.view().fft().await.unwrap())
+        .unwrap()
+        .into_dense()
+        .exp()
+        .await
+        .unwrap();
+    fixture::blocks(&copied, &[one; 8], same).await;
 
-    // Support propagates across the second transform axis as well.
-    fixture::blocks(
-        &fft2(&zero).await.unwrap().exp().await.unwrap(),
-        &[one; 8],
-        same,
-    )
-    .await;
+    // Both transform axes retain ordinary zeros before dense conversion.
+    let both_axes = TensorExpression::new(fft2(&zero).await.unwrap())
+        .unwrap()
+        .into_dense()
+        .exp()
+        .await
+        .unwrap();
+    fixture::blocks(&both_axes, &[one; 8], same).await;
     tensor.write_value(&[0, 0], z).await.unwrap();
     tensor.write_value(&[1, 1], one).await.unwrap();
     assert_eq!(forward.read_value(&[0, 0]).await.unwrap(), z);

@@ -24,7 +24,7 @@ non-transactional, and explicit about supported and unsupported behavior.
 
 ## Bounded execution
 
-Tensor execution must not allocate values, coordinates, support masks, or
+Tensor execution must not allocate values, coordinates, or
 partial-result collections proportional to total tensor size, output size, or
 reduction-group size. Coordinates must be generated lazily and consumed in
 bounded batches. Each collection must have an identifiable bound.
@@ -39,13 +39,16 @@ No whole-result collectors or whole-index compaction APIs.
 
 - Preserve one writable base and constrained geometric write-through. Computed
   views remain read-only; numerical definitions belong to ha-ndarray.
-- Keep support independent of intermediate values; copying establishes a new
-  sparse support boundary. Preserve ordered sparse-read rejection and scalar
-  zero-write lifecycle behavior.
+- Sparse absence is numerical zero. Reductions count logical cardinality; sparse
+  pointwise construction rejects nonzero implicit backgrounds unless explicitly
+  converted to dense. Candidate traversal is an index optimization, never a
+  numerical mask. Cache only the typed implicit-zero result needed to preserve
+  backend zero signs through expressions and indexed reductions. Preserve ordered
+  sparse reads and chunk-zero deletion.
 - Logical shapes, strides, coordinates, and cardinalities use `u64`; runtime
   axes and bounded buffer indices use `usize`. Follow the collection rules in
   `CODE_STYLE.md`. Preserve adapter-owned payload typing.
-- Validate batch sizes and support lengths before evaluation/combination and
+- Validate request and batch cardinalities before evaluation/combination and
   after consumption. Keep errors structured; no debug-only safety checks.
 - Keep counters test-only and isolated from storage synchronization. Use local
   or task-local observations for concurrent correctness tests.

@@ -1,7 +1,7 @@
 //! Absolute-value and trigonometric views use the same filesystem consumers.
 
 use fensor::{
-    AxisRange, Layout, Tensor, TensorAbs, TensorGeometry, TensorRead, TensorSchema,
+    AxisRange, Layout, Tensor, TensorAbs, TensorExpression, TensorRead, TensorSchema,
     TensorTransform, TensorTrig, TensorUnary, TensorWrite,
 };
 use futures::TryStreamExt;
@@ -66,9 +66,7 @@ macro_rules! operation_matrix {
                     ($method:ident) => {{
                         let mut expected = Vec::new();
                         for &value in &input {
-                            if matches!(layout, Layout::Sparse { .. }) && value == 0.0 {
-                                expected.push(0.0);
-                            } else {
+                            {
                                 let array = ArrayAccess::from(
                                     Array::new(Buffer::from(vec![value]), shape![1]).unwrap(),
                                 );
@@ -83,7 +81,13 @@ macro_rules! operation_matrix {
                                 expected.push(result[0]);
                             }
                         }
-                        let view = tensor.view().$method().await.unwrap();
+                        let source = TensorExpression::new(tensor.view()).unwrap();
+                        let source = if matches!(stringify!($method), "cos" | "acos" | "cosh") {
+                            source.into_dense()
+                        } else {
+                            source
+                        };
+                        let view = source.$method().await.unwrap();
                         let equal = |actual: $t, expected: $t| {
                             same_float(actual, expected)
                                 || (matches!(layout, Layout::Sparse { .. })
@@ -117,7 +121,7 @@ operation_matrix!(f32_abs_and_trig_consumers, f32);
 operation_matrix!(f64_abs_and_trig_consumers, f64);
 
 #[tokio::test]
-async fn mixed_sparse_chain_preserves_support_transforms_and_reuse() {
+async fn explicit_dense_chain_preserves_transforms_and_reuse() {
     let (root, dir) = new_dir("trig_sparse_chain").await;
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
@@ -130,8 +134,9 @@ async fn mixed_sparse_chain_preserves_support_transforms_and_reuse() {
     for i in 0..4101 {
         tensor.write_value(&[0, i], -0.2).await.unwrap();
     }
-    let expression = tensor
-        .view()
+    let expression = TensorExpression::new(tensor.view())
+        .unwrap()
+        .into_dense()
         .transpose(None)
         .unwrap()
         .abs()
@@ -150,7 +155,7 @@ async fn mixed_sparse_chain_preserves_support_transforms_and_reuse() {
     let mut dropped = expression.read_blocks().unwrap();
     let first = dropped.try_next().await.unwrap().unwrap();
     assert_eq!(first.len(), 4096);
-    assert_eq!(first[0], 0.0);
+    assert_eq!(first[0], 1.0);
     assert!(first[1..].iter().all(|&v| v == 1.0));
     drop(dropped);
     let (first, second) = futures::try_join!(
@@ -164,36 +169,32 @@ async fn mixed_sparse_chain_preserves_support_transforms_and_reuse() {
         vec![4096, 6]
     );
     let rows: Vec<_> = expression
-        .read_sparse_elements_in_order(
-            range![AxisRange::In(0, expression.size().unwrap(), 1)],
-            axes![0],
-        )
-        .await
+        .read_coordinate_blocks()
         .unwrap()
+        .map_ok(|(coords, values)| {
+            futures::stream::iter(coords.into_iter().zip(values).map(Ok::<_, fensor::Error>))
+        })
+        .try_flatten()
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(rows.len(), 4101);
-    assert!(
-        rows.iter()
-            .all(|(coord, value)| coord[0] > 0 && *value == 1.0)
-    );
+    assert_eq!(rows.len(), 4102);
+    assert!(rows.iter().all(|(_, value)| *value == 1.0));
     let final_zero = expression.ln().await.unwrap().sin().await.unwrap();
-    let rows: Vec<_> = final_zero
-        .read_sparse_elements_in_order(range![AxisRange::In(0, 4102, 1)], axes![0])
-        .await
+    let values: Vec<_> = final_zero
+        .read_blocks()
         .unwrap()
         .try_collect()
         .await
         .unwrap();
-    assert!(rows.is_empty());
+    assert!(values.into_iter().flatten().all(|value| value == 0.));
     // Check terminal consumers on a small selection; the full expression above
     // exercises batch boundaries without allocating thousands of sparse files.
     let expression = expression.slice(range![AxisRange::In(0, 8, 1)]).unwrap();
     let (out_root, out_dir) = new_dir("trig_chain_out").await;
     let output = Tensor::copy_from(out_dir, &expression, 16).await.unwrap();
     for i in 0..8 {
-        let expected = if i == 0 { 0.0 } else { 1.0 };
+        let expected = 1.0;
         assert_eq!(expression.read_value(&[i]).await.unwrap(), expected);
         assert_eq!(output.read_value(&[i]).await.unwrap(), expected);
     }

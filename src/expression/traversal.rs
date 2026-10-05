@@ -17,9 +17,9 @@ pub enum Preferred<'a> {
     Sources(Vec<Deferred<'a, Preferred<'a>>>),
 }
 
-pub enum Support<'a> {
+pub enum Ordered<'a> {
     Ready(Requests<'static>),
-    Sources(Vec<(usize, Deferred<'a, Support<'a>>)>),
+    Sources(Vec<(usize, Deferred<'a, Ordered<'a>>)>),
 }
 
 pub enum Selection<'a> {
@@ -27,7 +27,7 @@ pub enum Selection<'a> {
     Source(Deferred<'a, Selection<'a>>),
 }
 
-/// Runtime descriptions and support-planning work are bounded independently of batch width.
+/// Runtime descriptions and candidate-planning work are bounded independently of batch width.
 pub(crate) const MAX_EXPRESSION_NODES: usize = 65_536;
 
 pub fn node_count(children: impl IntoIterator<Item = usize>) -> Result<usize> {
@@ -96,7 +96,7 @@ where
     }
 }
 
-pub fn support<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Requests<'static>>
+pub fn ordered<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Requests<'static>>
 where
     E::DType: TensorElement,
 {
@@ -106,11 +106,11 @@ where
         Union(Vec<usize>),
     }
 
-    let mut pending: Vec<(usize, usize, Deferred<'_, Support<'_>>)> = Vec::new();
+    let mut pending: Vec<(usize, usize, Deferred<'_, Ordered<'_>>)> = Vec::new();
     let mut nodes = vec![Node::Union(vec![0])];
     let mut streams = Vec::new();
     reserve(&mut pending, 1)?;
-    pending.push((0, 0, Box::new(move || source.support_step(slice))));
+    pending.push((0, 0, Box::new(move || source.ordered_step(slice))));
     let mut visited = 0;
 
     while let Some((parent, slot, next)) = pending.pop() {
@@ -121,12 +121,12 @@ where
         }
         reserve(&mut nodes, 1)?;
         match next()? {
-            Support::Ready(stream) => {
+            Ordered::Ready(stream) => {
                 nodes.push(Node::Leaf(streams.len()));
                 reserve(&mut streams, 1)?;
                 streams.push(Some(stream));
             }
-            Support::Sources(children) => {
+            Ordered::Sources(children) => {
                 nodes.push(Node::Union(vec![0; children.len()]));
                 reserve(&mut pending, children.len())?;
                 pending.extend(
@@ -146,7 +146,7 @@ where
     while let Some(index) = traversal.pop() {
         match &nodes[index] {
             Node::Leaf(stream) => {
-                ordered.push(streams[*stream].take().expect("unique support leaf"))
+                ordered.push(streams[*stream].take().expect("unique candidate leaf"))
             }
             Node::Union(children) => {
                 reserve(&mut traversal, children.len())?;
@@ -156,7 +156,7 @@ where
     }
 
     if ordered.len() == 1 {
-        return Ok(ordered.pop().expect("one support stream"));
+        return Ok(ordered.pop().expect("one candidate stream"));
     }
 
     Ok(merge(ordered, source.shape().into()))
@@ -318,7 +318,7 @@ mod tests {
                 .map(|index| {
                     let lease = Arc::clone(&lease);
                     futures::stream::iter([if fail && index == 256 {
-                        Err(Error::InvalidLayout("support source failure".into()))
+                        Err(Error::InvalidLayout("candidate source failure".into()))
                     } else {
                         Ok(BatchRequest::linear(0, MAX_BATCH_ELEMENTS).unwrap())
                     }])
@@ -336,7 +336,7 @@ mod tests {
             );
             if fail {
                 assert!(
-                    matches!(stream.try_next().await, Err(Error::InvalidLayout(message)) if message == "support source failure")
+                    matches!(stream.try_next().await, Err(Error::InvalidLayout(message)) if message == "candidate source failure")
                 );
                 assert!(weak.upgrade().is_none());
             } else {

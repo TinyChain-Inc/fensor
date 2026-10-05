@@ -45,8 +45,7 @@ baseline. Finish builds before timing, and run comparisons without concurrent te
 The `sparse` suite isolates sparse-axis allocation and final-value clearing across
 the standard capacities, leading/trailing axes, and two cache budgets. It records
 payload-file bytes, all native table bytes, page occupancy, and retained decoded
-node memory alongside separate stream, copy-plus-sync, and clear timings. The profiling entrypoint also reports index
-entries examined during reclamation. Encoded file sizes and retained memory are recorded separately. These cached
+node memory alongside separate stream, copy-plus-sync, and clear timings. Encoded file sizes and retained memory are recorded separately. These cached
 filesystem measurements do not establish physical-device throughput.
 
 ```sh
@@ -133,8 +132,7 @@ out of project documentation. Timing thresholds do not belong in ordinary CI.
 The same harness selects `adaptive` for sparse vectors, narrow and trailing-axis
 regions, low occupancy, and nearly full blocks; `mutation` for scalar/fill and
 dense replacement; `traversal` for point/stream/reduction/transformed reads; and
-`reopen` for strict loading. Storage accounting includes descriptor, occupancy,
-and typed-value pages. It reads one synchronized page at a time outside timing.
+`reopen` for strict loading. Storage accounting includes native dense-chunk row pages and dense payload files. It reads one synchronized page at a time outside timing.
 
 ```sh
 FENSOR_BENCH_SUITE=adaptive cargo test --release --features benchmarks --test benchmark -- --ignored --nocapture --test-threads=1

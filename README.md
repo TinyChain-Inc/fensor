@@ -32,7 +32,9 @@ Nested expressions can recompute values, and source reads/cache spill can do I/O
 independent filesystem storage. Copying is never necessary between operations.
 The destination adapter can differ from the source adapter and must support the
 output dtype. `max_capacity` limits storage-block capacity; it does not select an
-exact block shape. Sparse copies omit final zeros and reset the axis hint to `None`.
+exact block shape. Sparse copying uses the expression's reported layout and omits
+final numerical zeros. Transformed owned expressions report scalar sparsity when
+their original sparse-axis geometry no longer describes the output.
 
 The [native storage contract](DESIGN.md#native-storage-and-sources) describes
 logical-block access, source ownership, and replacement guarantees.
@@ -104,40 +106,36 @@ inspect either component, and complex zero requires both components to be zero.
 `mt` transposes without conjugation. Backend validation status belongs to
 ha-ndarray, not this crate's test results.
 
-## Sparse support
+## Sparse values
 
-Dense leaves support every coordinate; sparse leaves support stored nonzero
-values. Expressions carry support independently of current numerical values.
-Final zeros are omitted only from sparse output. Copying into sparse storage
-establishes a new support boundary from stored nonzeros.
+An absent sparse value is ordinary numerical zero. Dense and sparse expressions
+use the same numerical kernels; there is no separate numerical support mask or
+history of intermediate zeros. Each pointwise expression retains its typed
+zero-background result so indexed reductions preserve backend signed-zero behavior.
+Sparse output omits numerical zeros, including zeros produced by an expression.
 
-| Expression | Retained support |
-|---|---|
-| Unary, cast, scalar operation | Source support |
-| Binary arithmetic, comparison, boolean | Union of both sources |
-| Conditional | Union of condition and both branches |
-| Axis reduction | Output group supported when any input in that group is supported |
-| Matrix product | Output supported when either operand is supported at any contraction position |
+Pointwise operations which would change the implicit zero background to a nonzero
+value return `Error::WouldDensify { operation }`. For example, sparse `exp()` and
+`add_scalar(1)` require explicit conversion first:
 
-Unsupported child values contribute zero before their parent operation. Unary
-and scalar operations do not populate implicit zeros, even for `exp`, `cos`,
-`add_scalar(1)`, or `eq_scalar(0)`. A populated `0.2` under `round().exp()` yields
-`1`; an implicit zero stays absent. Copying `round()` first loses that support.
-Direct sparse `not` emits no populated output, while `is_nan().not()` retains
-ones for finite nonzero values and infinities. Intermediate false results retain
-support just as intermediate numeric zeros do.
+```rust
+let dense = TensorExpression::new(source)?.into_dense();
+let result = dense.exp().await?;
+```
 
-Binary expressions are sparse only when both operands are sparse. For sparse
-`a`, `(a - a).exp()` is one on a's support and absent elsewhere; dividing the
-retained zeros by themselves yields NaN only on that support. A conditional is
-sparse only when all three inputs are sparse. An absent condition selects the
-else branch; an unselected branch still contributes support. Both branches are
-evaluated, so corruption in either branch propagates.
+`into_dense()` is lazy: it declares dense output without copying storage or
+changing existing clones. Evaluation then includes implicit zeros, so
+`exp()` returns one at those coordinates. Both conditional branches are evaluated;
+corruption in either branch propagates.
 
-Ordered sparse reads support logical row-major order, including transformed
-views, and reject other orders with `UnsupportedSparseIterationOrder`. They sort and deduplicate explicit selections for this reader only. Geometric slicing retains selection order and duplicates.
-Compatible geometry traverses occupied regions through paginated indexes. Unary, binary, and conditional expressions delegate and merge that support incrementally. Other mappings use bounded logical evaluation; see
-[slice traversal](DESIGN.md#slices-and-reductions).
+Ordered sparse reads emit logical row-major nonzero values, including transformed
+views, and reject other orders with `UnsupportedSparseIterationOrder`. They sort
+and deduplicate explicit selections for this reader only; geometric slicing retains
+selection order and duplicates. Compatible geometry traverses occupied logical blocks
+through paginated indexes. Eligible pointwise expressions delegate and merge these
+candidates incrementally. Other mappings and aggregate operations retain bounded
+logical evaluation; sparse storage alone does not guarantee work proportional to
+nonzero values. See [slice traversal](DESIGN.md#slices-and-reductions).
 
 ## Reductions and matrix operations
 
@@ -147,13 +145,13 @@ and deduplicated, and invalid axes fail at construction. Empty axes reduce
 singleton groups. `keepdims` retains reduced dimensions at extent one; removing
 every axis produces `[1]`.
 
-Sparse reductions exclude implicit zeros but include supported intermediate zeros.
-An empty axis group stays absent for every operation, including product and
-extrema. Whole-tensor empty-support results are sum `0`, product `1`, `all=true`,
-and `any=false`; `min_all` and `max_all` return `Error::Unsupported`. Consequently,
-sparse reductions can differ from reductions over equivalent dense values.
+Terminal and axis reductions include every selected logical value, including
+implicit sparse zeros. They have the same numerical meaning as reductions over
+equivalent dense values; an all-zero sparse tensor has zero product and extrema.
 
-`TensorStatistics` supplies mean, population standard deviation, and Euclidean norm, both whole-tensor and by axis. Real results use f64; complex mean uses c64 and complex standard deviation and norm use f64. Empty support yields NaN for mean/std and zero for norm. Statistics include supported intermediate zeros and exclude implicit sparse zeros.
+`TensorStatistics` supplies mean, population standard deviation, and Euclidean norm,
+both whole-tensor and by axis. Counts include implicit zeros. Real results use f64;
+complex mean uses c64 and complex standard deviation and norm use f64.
 
 Boolean terminals stop after a decisive consumed batch. Errors in that batch or
 earlier propagate; later errors may remain unobserved and prefetched reads may
@@ -162,24 +160,22 @@ already have started. Numeric terminals consume all batches, including extrema.
 Matrix multiplication requires rank ≥2, equal batch dimensions, and matching
 contraction dimensions: `[..., M, K] @ [..., K, N] -> [..., M, N]`. Use explicit
 broadcasting or casts to align operands. Products compose with every expression
-family, including nested products. A supported row times an absent sparse column
-has supported zero outputs; `exp()` can turn those into ones. A wholly absent row
-and column remain absent. Supported zero-times-infinity can produce NaN and must
-not be skipped. Floating results obey the backend aggregate accuracy contract,
-not bitwise equivalence to a multiply/reduce expression.
+family, including nested products. Dense and sparse operands share bounded tiles
+and full logical contraction: zero-times-infinity can produce NaN and must not be
+skipped. Floating results obey the backend aggregate accuracy contract, not bitwise
+equivalence to a multiply/reduce expression.
 
 Matrix-unary operations also require rank ≥2. `mt()` swaps the final two axes,
 leaving batch axes and existing geometric write constraints intact. `diag()`
 requires square final dimensions and returns a read-only view of shape
 `[..., N]` from `[..., N, N]`:
 
-```rust,ignore
+```rust
 let diagonal = tensor.view().mt().await?.diag().await?;
 ```
 
-Only diagonal source coordinates contribute support, including supported
-intermediate zeros; off-diagonal values do not populate the result. Transforms
-on a diagonal view address its output, and further operations remain lazy.
+Only diagonal source coordinates contribute values. Transforms on a diagonal
+view address its output, and further operations remain lazy.
 Selected reads visit the requested diagonal coordinates; a complete sparse scan
 still scales with logical diagonal length. Neither operation persists results.
 
@@ -191,30 +187,26 @@ forward scales by the axis length, or the product of both lengths for 2D.
 
 Each transformed axis must fit the execution limit in the
 [bound table](DESIGN.md#bound-and-policy-constants); construction rejects longer
-axes. Even a point read evaluates a complete axis group. Sparse absent inputs
-contribute zero, while any supported input supports every frequency in its group,
-including results that cancel to zero. Completely empty groups remain absent.
-Nested and 2D transforms may recompute groups; bounded memory does not imply
-optimal transform throughput.
+axes. Even a point read evaluates a complete axis group, including implicit sparse
+zeros. Nested and 2D transforms may recompute groups; bounded memory does not imply
+work proportional to nonzeros or optimal transform throughput.
 
 ## Streams, bounds, and concurrency
 
-Sparse creation uses block extent one on its sparse axis (axis zero by
-default), spending the remaining capacity on other axes in trailing-first order.
-Existing metadata retains its recorded block shape; loading never retessellates
-stored data. Logical regions larger than a block span multiple grid blocks.
+For `Layout::Sparse { axis: Some(a) }`, coordinates through axis `a` select a
+dense trailing region. Physical chunks have extent one on that prefix and split
+the full trailing shape into at most 4,096 elements each. `axis: None` selects
+scalar sparsity. Chunk capacity does not change the logical dense region.
+Loading validates the recorded geometry without retessellating it.
 
-Sparse logical blocks use adaptive native payloads: small or lightly occupied
-blocks share typed `b-table` pages; larger, highly occupied blocks use dense
-payload files. A full payload below 1 KiB always uses rows. Otherwise rows are
-chosen when `nonzero_count * (24 + dtype_bytes) < block_len * dtype_bytes`.
-This initial cost heuristic is not an estimate of exact serialized size. Logical
-geometry and the 4,096-element block limit are independent of physical packing.
+Sparse chunks are dense typed vectors in a native `b-table`, keyed by logical
+block ID. Rows share native pages. Missing chunks are zero; all-zero chunks have
+no row. Omission changes physical storage only: every logical coordinate still
+has its ordinary numerical value.
 
-Zero writes remove values and empty occupied regions. An all-zero block has no
-descriptor or payload. Replacement updates the block payload, descriptor, and occupancy
-under one native ownership guard. The same guard coordinates reads and synchronization. An
-interrupted mutation invalidates the owner; callers coordinate recovery.
+One native ownership guard coordinates reads, replacement, reclamation, and
+synchronization. Interrupted mutation invalidates the owner; callers coordinate
+recovery.
 
 Physical block lengths are validated against bounded metadata. Adapters remain
 responsible for limiting decoding allocations before fensor receives a payload.
@@ -222,7 +214,7 @@ responsible for limiting decoding allocations before fensor receives a payload.
 | Consumer | Delivery order |
 |---|---|
 | `read_blocks()` | Logical row-major values |
-| `read_sparse_elements_in_order()` | Requested supported row-major sparse order |
+| `read_sparse_elements_in_order()` | Requested row-major sparse order |
 | `read_coordinate_blocks()` | Completion-dependent batches of paired coordinates/values |
 | Whole-tensor numeric terminals | Accumulate batches in completion order |
 | Boolean terminals | Logical order with short-circuiting |
@@ -238,19 +230,17 @@ The outer consumer keeps at most `num_cpus::get().max(1)` batch futures in fligh
 using `buffered` for ordered consumers and `buffer_unordered` otherwise. Inner
 evaluation adds no buffered streams or tasks. The driver suspends a parent until
 its requested child completes, preserving operand order without recursive future
-polling. Ready evaluation and sparse-support traversal yield cooperatively at
+polling. Ready evaluation and occupied-candidate traversal yield cooperatively at
 bounded work intervals, so cancellation can interrupt cached work. Synchronous
 backend calls run on the polling thread and may use ha-ndarray's workers; `async move` does not create CPU parallelism.
 
 Numeric terminal accumulation can depend on read scheduling, including extreme
 overflow/underflow differences permitted by ha-ndarray's aggregate contract.
-Wrapping integers, NaN extrema, signed-zero rules, and empty-support identities
-are preserved. Unordered consumers promise no input-order error precedence.
+Wrapping integers, NaN extrema, and signed-zero rules are preserved. Unordered consumers promise no input-order error precedence.
 Numeric terminals return the first observed error and drop pending evaluation.
 
 Execution batches obey the [execution limit](DESIGN.md#bound-and-policy-constants).
-Values, coordinates, masks, and
-partial-result collections must not scale with total tensor, output, or reduction
+Values, coordinates, and partial-result collections must not scale with total tensor, output, or reduction
 group size. Caller-supplied values and explicit indices, rank-sized metadata,
 cache/filesystem metadata, and independent consumers are separate memory costs.
 This is not a total-process memory guarantee. The [execution design](DESIGN.md)
@@ -260,7 +250,7 @@ streams when they want an in-memory result; fensor offers no whole-result collec
 ## Storage, synchronization, and errors
 
 Filesystem adapters implement `freqfs::FileLoad`/`FileSave` and expose `Vec<T>`,
-`b_table::Node<u64>`, `SparseNode<T>`, and `TensorMetadata<T>` through `AsType`. fensor requires
+`SparseNode<T>`, and `TensorMetadata<T>` through `AsType`. fensor requires
 destream but prescribes no byte codec or whole-tensor transfer format. JSON and
 TBON adapters are exercised in tests; applications own their format choices.
 
@@ -301,12 +291,12 @@ and interpretation](BENCHMARKS.md).
 
 `TensorSource` connects typed native or caller-provided logical blocks to the
 same geometric views and expression evaluator. `StorageGeometry` describes bounded
-logical tiles, and occupied-region pages use logical grid IDs. Views own their
+logical tiles, and occupied-block streams use logical grid IDs. Views own their
 source handles; `TensorExpression<T>` owns dynamically composed read-only values.
 Borrowed reads and owned consuming streams share one bounded evaluator. Runtime
 expression descriptions, evaluation frames, and live batch payloads have separate
 checked admission limits, independently of logical tensor size; see the [bound table](DESIGN.md#bound-and-policy-constants).
-Request and support traversal use explicit work lists, and final ownership release
+Request and occupied-candidate traversal use explicit work lists, and final ownership release
 detaches operands before draining them. Dropping a stream cancels active evaluation
 and releases its retained source handles without following expression depth on the
 worker stack. Physical payload and index mutation are private to the native owner.

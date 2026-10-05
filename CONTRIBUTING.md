@@ -38,6 +38,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
+Feature configurations sharing one target directory must finish tests and doctests
+before the next build. Overlapping builds can replace backend artifacts while
+rustdoc still uses them.
+
 `cargo test` includes unit tests, integration tests, and doctests. Benchmark and
 profiling harnesses require the opt-in `benchmarks` feature and remain ignored
 unless explicitly selected. Correctness tests do not require that feature.

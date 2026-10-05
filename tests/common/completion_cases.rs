@@ -1,7 +1,8 @@
 //! Completion-order evaluation and numeric terminals, with ordered controls.
 
 use fensor::{
-    TensorMatMul, TensorRead, TensorReduce, TensorReduceAll, TensorTransform, TensorUnary,
+    TensorMatMul, TensorRead, TensorReduce, TensorReduceAll, TensorTransform, TensorTrig,
+    TensorUnary,
 };
 use ha_ndarray::axes;
 
@@ -39,7 +40,7 @@ pub async fn run() {
                 "unary",
                 kind,
                 cache,
-                &geometric.ln().await.unwrap().round().await.unwrap(),
+                &geometric.round().await.unwrap().sin().await.unwrap(),
             )
             .await;
             let (_tensor_root, tensor) = source(

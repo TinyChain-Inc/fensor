@@ -65,7 +65,7 @@ pub struct Context<'a> {
 impl<'a> Context<'a> {
     fn reserve<T: TensorElement>(&self, len: usize) -> Result<Allocation> {
         let bytes = len
-            .checked_mul(std::mem::size_of::<T>() + 1)
+            .checked_mul(std::mem::size_of::<T>())
             .ok_or_else(|| Error::Unsupported("expression batch allocation overflow".into()))?;
         self.live
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
@@ -251,7 +251,7 @@ mod tests {
             live: Arc::new(AtomicUsize::new(0)),
         };
 
-        let capacity = MAX_LIVE_BATCH_BYTES / (std::mem::size_of::<f64>() + 1);
+        let capacity = MAX_LIVE_BATCH_BYTES / (std::mem::size_of::<f64>());
         let allocation = context.reserve::<f64>(capacity).unwrap();
         assert!(context.reserve::<f64>(1).is_err());
         assert!(context.reserve::<f64>(usize::MAX).is_err());
@@ -261,11 +261,10 @@ mod tests {
         let batch = Batch {
             _allocation: Some(context.reserve::<f64>(1).unwrap()),
             array: super::super::batch_array(vec![1_f64]).unwrap(),
-            support: Some(vec![1]),
         };
 
         let values = batch.realize().unwrap().into_evaluated().unwrap();
-        assert_eq!(context.live.load(Ordering::Relaxed), 9);
+        assert_eq!(context.live.load(Ordering::Relaxed), 8);
         assert_eq!(values.values, [1.]);
         drop(values);
         assert_eq!(context.live.load(Ordering::Relaxed), 0);

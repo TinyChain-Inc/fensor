@@ -19,13 +19,15 @@ use crate::{
 pub struct TensorExpression<T: TensorElement> {
     source: Handle<T>,
     mapping: CoordinateMap,
+    dense: bool,
 }
 
 /// One admitted runtime description. Geometry and size never recurse through operands.
 struct Owned<T: TensorElement> {
     expression: Box<dyn Expression<DType = T>>,
-    layout: Layout,
     nodes: usize,
+    zero: T,
+    layout: Layout,
 }
 
 #[derive(Clone)]
@@ -72,16 +74,26 @@ impl<T: TensorElement> TensorExpression<T> {
     pub fn new<E: Expression<DType = T> + 'static>(source: E) -> Result<Self> {
         let nodes = expression::traversal::node_count([source.expression_nodes()?])?;
         let layout = source.layout();
+        let zero = source.implicit_zero();
         let strides = crate::contiguous_strides(source.shape())?;
         let mapping = CoordinateMap::identity(source.shape().into(), &strides);
         Ok(Self {
             source: Handle(Some(Arc::new(Owned {
                 expression: Box::new(source),
-                layout,
                 nodes,
+                zero,
+                layout,
             }))),
             mapping,
+            dense: false,
         })
+    }
+
+    /// Treat implicit sparse zeros as dense values without evaluating or copying storage.
+    /// This expression retains its operands; previously cloned expressions are unchanged.
+    pub fn into_dense(mut self) -> Self {
+        self.dense = true;
+        self
     }
 
     fn source(&self) -> &dyn Expression<DType = T> {
@@ -104,7 +116,7 @@ impl<T: TensorElement> TensorExpression<T> {
 
     pub fn into_sparse_elements(self) -> Result<crate::SparseElementStream<'static, T>> {
         let requests =
-            expression::traversal::support(&self, crate::slice::Slice::full(self.shape())?)?;
+            expression::traversal::ordered(&self, crate::slice::Slice::full(self.shape())?)?;
         Ok(expression::sparse_stream(Arc::new(self), requests))
     }
 }
@@ -117,7 +129,20 @@ impl<T: TensorElement> TensorGeometry for TensorExpression<T> {
     }
 
     fn layout(&self) -> Layout {
-        self.source.owned().layout
+        if self.dense {
+            return Layout::Dense;
+        }
+
+        match self.source.owned().layout {
+            Layout::Sparse { axis: Some(_) }
+                if self.mapping.base_offset != 0
+                    || self.mapping.shape.as_slice() != self.source().shape()
+                    || !self.mapping.is_c_contiguous() =>
+            {
+                Layout::Sparse { axis: None }
+            }
+            layout => layout,
+        }
     }
 
     fn shape(&self) -> &[u64] {
@@ -132,6 +157,10 @@ impl<T: TensorElement> TensorViewSemantics for TensorExpression<T> {
 }
 
 impl<T: TensorElement> Expression for TensorExpression<T> {
+    fn implicit_zero(&self) -> Self::DType {
+        self.source.owned().zero
+    }
+
     fn expression_nodes(&self) -> Result<usize> {
         Ok(self.source.owned().nodes)
     }
@@ -153,6 +182,9 @@ impl<T: TensorElement> Expression for TensorExpression<T> {
         &self,
         slice: crate::slice::Slice,
     ) -> Result<expression::traversal::Selection<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Selection::Ready(slice.stream()));
+        }
         let strides = crate::contiguous_strides(self.source().shape())?;
         Ok(if self.is_identity(&strides) {
             expression::traversal::Selection::Source(Box::new(move || {
@@ -163,18 +195,21 @@ impl<T: TensorElement> Expression for TensorExpression<T> {
         })
     }
 
-    fn support_step(
+    fn ordered_step(
         &self,
         slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Support<'_>> {
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+        }
         let strides = crate::contiguous_strides(self.source().shape())?;
         Ok(if self.is_identity(&strides) {
-            expression::traversal::Support::Sources(vec![(
+            expression::traversal::Ordered::Sources(vec![(
                 0,
-                Box::new(move || self.source().support_step(slice)),
+                Box::new(move || self.source().ordered_step(slice)),
             )])
         } else {
-            expression::traversal::Support::Ready(slice.stream())
+            expression::traversal::Ordered::Ready(slice.stream())
         })
     }
 

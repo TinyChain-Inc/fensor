@@ -4,7 +4,7 @@ use futures::{StreamExt, TryStreamExt};
 
 #[cfg(test)]
 use super::copy_metrics;
-use super::{Tensor, TensorElement, TensorFileEntry, adaptive};
+use super::{Tensor, TensorElement, TensorFileEntry, sparse_storage};
 use crate::request::BatchRequest;
 use crate::{BoxFuture, Error, Result, TensorSource};
 
@@ -67,7 +67,7 @@ where
     S: futures::Stream<Item = std::result::Result<(Vec<u64>, T), E>> + Send,
     E: From<Error>,
 {
-    let mut output = adaptive::Construction::new(tensor);
+    let mut output = sparse_storage::Construction::new(tensor);
     let entries = entries.fuse();
     futures::pin_mut!(entries);
     let mut previous = None;
@@ -250,7 +250,7 @@ mod tests {
                                 "construction never invokes ordinary replacement"
                             );
                             assert_eq!(m.replaced_blocks, 0);
-                            assert_eq!(m.descriptor_writes, m.constructed_blocks);
+                            assert_eq!(m.payload_writes, m.constructed_blocks);
                             assert!(m.max_staging_batch <= crate::expression::MAX_BATCH_ELEMENTS);
                             assert_eq!(
                                 m.constructed_blocks as u64,
@@ -261,8 +261,6 @@ mod tests {
                                 }
                             );
                         });
-                        crate::read_metrics::CURRENT
-                            .with(|m| assert_eq!(m.borrow().descriptor_lookups, 0));
                         tensor
                     }),
                 )

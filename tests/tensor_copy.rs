@@ -27,13 +27,7 @@ async fn copy_base_and_geometric_readers_into_independent_storage() {
         let (base_root, base_dir) = new_dir("copy_base").await;
         let copied = Tensor::copy_from(base_dir, &source, 3).await.unwrap();
         assert_eq!(copied.schema(), source.schema());
-        assert_eq!(
-            copied.layout(),
-            match layout {
-                Layout::Dense => Layout::Dense,
-                Layout::Sparse { .. } => Layout::Sparse { axis: None },
-            }
-        );
+        assert_eq!(copied.layout(), layout);
         let view = source.view().transpose(Some(axes![1, 0])).unwrap();
         let (view_root, view_dir) = new_dir("copy_view").await;
         let transposed = Tensor::copy_from(view_dir, &view, 2).await.unwrap();

@@ -14,6 +14,9 @@ pub enum Error {
         base_order: Vec<usize>,
         hint: String,
     },
+    WouldDensify {
+        operation: &'static str,
+    },
     Unsupported(String),
     DataMismatch(String),
 }
@@ -35,6 +38,10 @@ impl From<ha_ndarray::Error> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WouldDensify { operation } => write!(
+                f,
+                "{operation} would populate implicit sparse zeros; convert the tensor to dense first"
+            ),
             Self::Io(cause) => cause.fmt(f),
             Self::Nd(cause) => cause.fmt(f),
             Self::InvalidSchema(cause)

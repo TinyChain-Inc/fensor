@@ -46,6 +46,7 @@ async fn observe(
                         ("copy_groups", m.groups as u128),
                         ("copy_block_updates", m.block_updates as u128),
                         ("copy_constructed_blocks", m.constructed_blocks as u128),
+                        ("copy_payload_writes", m.payload_writes as u128),
                         ("copy_staged_elements", m.staged_elements as u128),
                     ] {
                         benchmark::record(name, operation, temperature, metric, "count", value);

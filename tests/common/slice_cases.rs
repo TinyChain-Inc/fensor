@@ -2,7 +2,7 @@
 
 use fensor::{
     AxisRange, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
-    TensorUnary, TensorWrite,
+    TensorTrig, TensorUnary, TensorWrite,
 };
 use ha_ndarray::{axes, shape};
 use number_general::DType;
@@ -85,7 +85,7 @@ pub async fn run() {
                     &selected.sum(axes![0], false).await.unwrap(),
                 )
                 .await;
-                let unary = view.round().await.unwrap().exp().await.unwrap();
+                let unary = view.round().await.unwrap().sin().await.unwrap();
                 measure(
                     &format!("{label}_unary"),
                     &unary.sum(axes![1], false).await.unwrap(),

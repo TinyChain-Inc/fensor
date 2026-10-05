@@ -1,5 +1,5 @@
-mod adaptive;
 mod construction;
+mod sparse_storage;
 
 #[cfg(test)]
 mod physical_tests;
@@ -59,7 +59,6 @@ tensor_elements!(
 
 pub trait TensorFileEntry<T: TensorElement>:
     FileLoad
-    + AsType<b_table::Node<u64>>
     + AsType<crate::SparseNode<T>>
     + AsType<Vec<T>>
     + AsType<TensorMetadata<T>>
@@ -72,7 +71,6 @@ pub trait TensorFileEntry<T: TensorElement>:
 impl<FE, T> TensorFileEntry<T> for FE
 where
     FE: FileLoad
-        + AsType<b_table::Node<u64>>
         + AsType<crate::SparseNode<T>>
         + AsType<Vec<T>>
         + AsType<TensorMetadata<T>>
@@ -92,13 +90,15 @@ struct DenseStorage<FE> {
     storage_schema: StorageSchema,
 }
 
+// Tensor already shares this owner through Arc; boxing a variant adds another allocation.
+#[allow(clippy::large_enum_variant)]
 enum Storage<FE, T> {
     Dense(DenseStorage<FE>),
-    Sparse(adaptive::SparseStorage<FE, T>),
+    Sparse(sparse_storage::SparseStorage<FE, T>),
 }
 
 impl<FE, T> Storage<FE, T> {
-    fn sparse(&self) -> Option<&adaptive::SparseStorage<FE, T>> {
+    fn sparse(&self) -> Option<&sparse_storage::SparseStorage<FE, T>> {
         match self {
             Self::Sparse(s) => Some(s),
             Self::Dense(_) => None,
@@ -225,9 +225,9 @@ where
                 blocks,
                 storage_schema: geometry.storage,
             }),
-            Layout::Sparse { .. } => {
-                Storage::Sparse(adaptive::SparseStorage::create(&dir, blocks, geometry).await?)
-            }
+            Layout::Sparse { .. } => Storage::Sparse(
+                sparse_storage::SparseStorage::create(&dir, blocks, geometry).await?,
+            ),
         };
 
         Ok(Self {
@@ -331,10 +331,7 @@ where
     {
         let schema =
             TensorSchema::new(<T as number_general::DType>::dtype(), source.shape().into())?;
-        let layout = match source.layout() {
-            Layout::Dense => Layout::Dense,
-            Layout::Sparse { .. } => Layout::Sparse { axis: None },
-        };
+        let layout = source.layout();
 
         let output = Self::unpublished(dir, schema, layout, max_capacity).await?;
         if matches!(source.layout(), Layout::Sparse { .. }) {
@@ -407,7 +404,7 @@ where
                 })
             }
             Layout::Sparse { .. } => {
-                Storage::Sparse(adaptive::SparseStorage::load(&dir, blocks, geometry)?)
+                Storage::Sparse(sparse_storage::SparseStorage::load(&dir, blocks, geometry)?)
             }
         };
 
@@ -565,12 +562,14 @@ where
                 let groups = self.read_groups(request, mapping)?;
                 let mut values = vec![T::ZERO; request.len()];
 
-                for (id, runs) in groups {
-                    let (_, block) = sparse.read(id).await?;
-
+                if groups.len() == 1 {
+                    let (&id, runs) = groups.first_key_value().expect("one logical block");
+                    let block = sparse.read(id).await?;
                     for run in runs {
                         run.scatter(&block, &mut values)?;
                     }
+                } else {
+                    sparse.read_groups(&groups, &mut values).await?;
                 }
                 return Ok(values);
             }
@@ -816,7 +815,7 @@ where
     }
 }
 
-// Required payload access is shared by dense storage and dense sparse encodings.
+// Dense reads and replacement require an existing, correctly typed payload.
 fn required_file<FE: FileLoad>(blocks: &Dir<FE>, id: u64) -> Result<FileLock<FE>> {
     blocks
         .get_file(&id.to_string())
@@ -925,18 +924,16 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
         Box::pin(async move { self.read_batch(read.request, read.mapping).await })
     }
 
-    fn occupied_regions(
+    fn occupied_blocks(
         &self,
-        after: Option<[u64; 2]>,
-        lo: u64,
-        hi: u64,
-    ) -> futures::stream::BoxStream<'static, Result<[u64; 2]>> {
-        futures::stream::try_unfold((self.clone(), after), move |(tensor, after)| async move {
+        range: std::ops::Range<u64>,
+    ) -> futures::stream::BoxStream<'static, Result<u64>> {
+        futures::stream::try_unfold((self.clone(), range), move |(tensor, range)| async move {
             let keys = tensor
                 .storage
                 .sparse()
                 .ok_or_else(|| Error::InvalidLayout("dense storage has no occupancy".into()))?
-                .slice_index_page(after, lo, hi)
+                .occupied_page(range.clone())
                 .await?;
             let Some(&last) = keys.last() else {
                 return Ok::<_, Error>(None);
@@ -944,7 +941,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
 
             Ok(Some((
                 futures::stream::iter(keys.into_iter().map(Ok)),
-                (tensor, Some(last)),
+                (tensor, last + 1..range.end),
             )))
         })
         .try_flatten()
@@ -957,7 +954,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
                 Storage::Sparse(sparse) => {
                     let _guard = sparse.gate.read().await;
                     sparse.healthy()?;
-                    sparse.read(id).await.map(|(_, values)| values)
+                    sparse.read(id).await
                 }
                 Storage::Dense(dense) => {
                     self.storage_geometry().block_bounds(id)?;

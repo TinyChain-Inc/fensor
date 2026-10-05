@@ -50,7 +50,7 @@ consistency remains automatic.
   Their `PORTABLE_INLINE_RANK` capacity is an allocation optimization, not a rank limit.
 - Use `Range` for rank-sized slice bounds; explicit `AxisRange::Of` selections own
   `Vec<u64>` and preserve order and duplicates. Shared gather tables retain `Arc`.
-- Use `Vec` for values, support masks, batches, runs, scatter lists, public
+- Use `Vec` for values, batches, runs, scatter lists, public
   coordinate payloads, and adapter buffers. Prefer slices when borrowing and
   arrays for fixed-cardinality structures such as sparse keys.
 - Keep large axis descriptors, signed affine coefficient vectors, and matrix map
@@ -69,7 +69,7 @@ declarations, constructors, recursive operand transforms, and reader forwarding
 members inside explicit trait implementations. Keep public trait declarations,
 behavioral control flow, and unusual bounds directly readable. Preserve each
 operation's documentation and explicit backend mapping. Forwarding macros delegate
-to ordinary functions which own execution; do not generate request planning, buffering, numerical algorithms, support propagation,
+to ordinary functions which own execution; do not generate request planning, buffering, numerical algorithms, candidate traversal,
 or error-control logic. Keep macros beside their owning subsystem, with explicit
 method lists and bounds at invocation sites. Do not introduce an operation registry.
 

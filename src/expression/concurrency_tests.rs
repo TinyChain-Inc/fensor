@@ -7,7 +7,7 @@ use number_general::DType;
 
 use super::*;
 use crate::test_support::{self, FsEntry, counters::Counter};
-use crate::{TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
+use crate::{Layout, TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
 
 struct Source<'a, T: TensorElement>
 where

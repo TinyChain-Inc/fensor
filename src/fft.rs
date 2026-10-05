@@ -68,8 +68,8 @@ where
 /// Lazy, read-only Fourier view with bounded complete-group evaluation.
 ///
 /// Output transforms change coordinate mapping, never the source transform axis.
-/// Even one requested frequency reads its complete input group. Sparse groups
-/// retain union support, including supported numerical zeros.
+/// Even one requested frequency reads its complete input group. Missing sparse
+/// inputs are numerical zeros.
 ///
 /// ```compile_fail
 /// use fensor::{Tensor, TensorFileEntry, TensorFourier};
@@ -279,8 +279,6 @@ where
             let width = *self.shape.last().expect("validated Fourier rank") as usize;
             let mut groups = groups.into_iter().peekable();
             let mut values = vec![S::DType::ZERO; request.len()];
-            let mut support =
-                matches!(self.layout(), Layout::Sparse { .. }).then(|| vec![0; request.len()]);
 
             while groups.peek().is_some() {
                 let pack: Vec<_> = groups.by_ref().take(MAX_BATCH_ELEMENTS / width).collect();
@@ -296,17 +294,9 @@ where
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let input = BatchRequest::rectangles(rectangles)?;
-                let mut batch = context
+                let batch = context
                     .evaluate(&self.source, std::sync::Arc::new(input.clone()))
                     .await?;
-                if let Some(mask) = &batch.support {
-                    for (value, &supported) in batch.values.iter_mut().zip(mask) {
-                        if supported == 0 {
-                            *value = S::DType::ZERO;
-                        }
-                    }
-                }
-
                 let array = expression::batch_array(batch.values)?
                     .reshape(ha_ndarray::shape![pack.len(), width])?;
                 let transformed = self
@@ -326,18 +316,8 @@ where
 
                 for (group, (_, destinations)) in pack.into_iter().enumerate() {
                     let start = group * width;
-                    let populated = batch
-                        .support
-                        .as_ref()
-                        .is_none_or(|mask| mask[start..start + width].iter().any(|&v| v != 0));
                     for (destination, frequency) in destinations {
-                        if populated {
-                            values[destination] = transformed[start + frequency];
-                        }
-
-                        if let Some(mask) = &mut support {
-                            mask[destination] = u8::from(populated);
-                        }
+                        values[destination] = transformed[start + frequency];
                     }
                 }
             }
@@ -345,7 +325,6 @@ where
             Ok(Batch {
                 _allocation: None,
                 array: expression::batch_array(values)?,
-                support,
             })
         })
     }
@@ -379,7 +358,7 @@ mod tests {
     use crate::test_support::{cleanup, fixture};
 
     #[tokio::test]
-    async fn complete_groups_pack_without_dense_support_masks() {
+    async fn complete_groups_pack_without_materialization() {
         let width = 7;
         let count = MAX_BATCH_ELEMENTS / width + 1;
         let (root, tensor) = fixture::source(
@@ -418,7 +397,6 @@ mod tests {
         crate::read_metrics::CURRENT
             .scope(Default::default(), async {
                 let batch = expression::evaluate_batch(&view, &request).await.unwrap();
-                assert!(batch.support.is_none());
                 assert!(
                     batch.values[..count + 1]
                         .iter()

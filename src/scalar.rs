@@ -1,7 +1,7 @@
 //! Scalar parameters attached to lazy unary expressions.
 //!
-//! Scalar operands preserve the source's support; they never populate implicit
-//! sparse zeros. The operation parameter has the source dtype.
+//! Scalar operations on sparse sources must preserve implicit zeros.
+//! The operation parameter has the source dtype.
 //!
 //! Computed scalar views remain read-only after transforms.
 //!
@@ -45,6 +45,8 @@ macro_rules! scalar_op {
         impl<$ty: $($bounds)+> UnaryOp<$ty> for $name<$ty> {
             type Output = $output;
 
+            const NAME: &'static str = stringify!($method);
+
             fn apply(
                 &self,
                 array: ArrayAccess<'static, $ty>,
@@ -53,6 +55,7 @@ macro_rules! scalar_op {
             }
         }
     };
+
 }
 
 scalar_op!(
@@ -98,7 +101,7 @@ macro_rules! scalar_constructor {
         fn $method(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::$output>>
         $(where $($bounds)+)?
         {
-            Box::pin(async move { Ok(UnaryView::new(self.clone(), $op(rhs))) })
+            Box::pin(async move { UnaryView::new(self.clone(), $op(rhs)) })
         }
     };
 }

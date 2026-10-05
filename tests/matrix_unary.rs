@@ -1,12 +1,12 @@
-//! Matrix-unary projection, support, geometry, and consumer contracts.
+//! Matrix-unary projection, zeros, geometry, and consumer contracts.
 
 use std::collections::BTreeSet;
 
 use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorCompareScalar, TensorElement, TensorFileEntry,
-    TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnary, TensorRead, TensorReduce,
-    TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics, TensorWhere,
-    TensorWrite,
+    AxisRange, Error, Layout, Tensor, TensorCompareScalar, TensorElement, TensorExpression,
+    TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnary, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics,
+    TensorWhere, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{Array, Buffer, MatrixUnary, NDArrayRead};
@@ -134,7 +134,7 @@ async fn shape_errors_and_transpose_write_through() {
 }
 
 #[tokio::test]
-async fn support_and_expression_composition() {
+async fn zeros_and_expression_composition() {
     let (root, tensor) = fixture::source(
         "diag_support",
         smallvec![2, 3, 3],
@@ -148,8 +148,17 @@ async fn support_and_expression_composition() {
     .await;
     let rounded = tensor.view().round().await.unwrap();
     let diagonal = rounded.diag().await.unwrap();
-    let restored = diagonal.exp().await.unwrap();
-    consumers(&restored, &[1., 0., 2f32.exp(), 0., 1., 0.], |a, b| a == b).await;
+    assert!(matches!(
+        diagonal.exp().await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
+    let restored = TensorExpression::new(diagonal.clone())
+        .unwrap()
+        .into_dense()
+        .exp()
+        .await
+        .unwrap();
+    consumers(&restored, &[1., 1., 2f32.exp(), 1., 1., 1.], |a, b| a == b).await;
     let transposed = diagonal.mt().await.unwrap();
     fixture::blocks(&transposed, &[0., 0., 0., 0., 2., 0.], |a, b| a == b).await;
     assert_eq!(diagonal.sum_all().await.unwrap(), 2.);
@@ -217,7 +226,7 @@ async fn support_and_expression_composition() {
 }
 
 #[tokio::test]
-async fn exception_bits_and_off_diagonal_support() {
+async fn exception_bits_and_off_diagonal_values() {
     for sparse in [false, true] {
         let (root, tensor) = fixture::source(
             "diag_exceptions",
@@ -267,8 +276,18 @@ async fn exception_bits_and_off_diagonal_support() {
         [0f32, 2., 3., 0.],
     )
     .await;
-    let diag = tensor.view().diag().await.unwrap().exp().await.unwrap();
-    consumers(&diag, &[0., 0.], |a, b| a == b).await;
+    let diag = tensor.view().diag().await.unwrap();
+    assert!(matches!(
+        diag.exp().await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
+    let diag = TensorExpression::new(diag)
+        .unwrap()
+        .into_dense()
+        .exp()
+        .await
+        .unwrap();
+    consumers(&diag, &[1., 1.], |a, b| a == b).await;
     cleanup(&root).await;
 }
 
@@ -343,12 +362,12 @@ async fn bounded_batches_reuse_and_live_reads() {
         .diag()
         .await
         .unwrap()
-        .exp()
+        .add(&tensor.view().diag().await.unwrap())
         .await
         .unwrap();
     let mut expected = vec![0.; n as usize];
-    expected[0] = 1.;
-    expected[n as usize - 1] = 1.;
+    expected[0] = 0.2;
+    expected[n as usize - 1] = 0.2;
     fixture::blocks(&diag, &expected, |a, b| a == b).await;
     let entries: Vec<_> = diag
         .read_sparse_elements_in_order(smallvec![AxisRange::In(0, n, 1)], smallvec![0])
@@ -357,7 +376,7 @@ async fn bounded_batches_reuse_and_live_reads() {
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(entries, vec![(vec![0], 1.), (vec![n - 1], 1.)]);
+    assert_eq!(entries, vec![(vec![0], 0.2), (vec![n - 1], 0.2)]);
     cleanup(&root).await;
 }
 

@@ -212,17 +212,13 @@ where
 
     fn read_logical_block(&self, id: u64) -> BoxFuture<'_, Result<Vec<Self::DType>>>;
 
-    /// Own a scan of sorted unique `(sparse-axis coordinate, logical grid block)`
-    /// keys strictly after `after`, within inclusive axis bounds. Retain bounded
-    /// lookahead until completion or drop, releasing index guards before delivery.
+    /// Own a scan of sorted unique occupied logical block IDs in `range`.
+    /// Retain bounded lookahead until completion or drop and release index guards
+    /// before delivery. Resume with `last + 1..range.end` after a delivered ID.
     /// Dense sources return an error when consumed.
-    fn occupied_regions(
-        &self,
-        after: Option<[u64; 2]>,
-        lo: u64,
-        hi: u64,
-    ) -> BoxStream<'static, Result<[u64; 2]>>;
+    fn occupied_blocks(&self, range: std::ops::Range<u64>) -> BoxStream<'static, Result<u64>>;
 
+    /// Read numerical values through one bounded storage plan, filling sparse absence with zeros.
     fn read_storage<'a>(
         &'a self,
         read: StorageRead<'a>,
@@ -235,7 +231,6 @@ where
                 block_shape: geometry.block_shape(),
                 block_strides: &geometry.storage.block_schema.strides,
                 grid_strides: &geometry.storage.strides,
-                // Logical blocks already combine every sparse key in their region.
             };
 
             let groups = shape.plan(read.request, read.mapping)?;
@@ -274,17 +269,14 @@ where
     }
 
     let mapping = mapping.unwrap_or_else(|| crate::mapping::StorageSlice::identity(source.shape()));
-    let sparse_axis = geometry
-        .sparse_axis()
-        .ok_or_else(|| Error::InvalidLayout("sparse traversal on dense storage".into()))?;
-    let (lo, hi) = if let Some((axis, &(_, step))) = mapping
-        .axes
-        .iter()
-        .enumerate()
-        .find(|(_, (base, _))| *base == sparse_axis)
-    {
+    // Bound the selection in block order using only rank-sized mapping metadata.
+    // Inner-axis slices can include unrelated occupied blocks in this interval;
+    // intersect their geometry before requesting any numerical payload.
+    let mut first = mapping.origins.clone();
+    let mut last = first.clone();
+    for (axis, &(base, step)) in mapping.axes.iter().enumerate() {
         let selection = &slice.axes[axis];
-        let (first, last) = match selection {
+        let (lo, hi) = match selection {
             crate::request::Axis::Span { .. } => {
                 (selection.at(0), selection.at(selection.len() - 1))
             }
@@ -293,23 +285,27 @@ where
                 *values.iter().max().expect("nonempty slice"),
             ),
         };
-        (
-            mapping.origins[sparse_axis] + first * step,
-            mapping.origins[sparse_axis] + last * step,
-        )
-    } else {
-        (mapping.origins[sparse_axis], mapping.origins[sparse_axis])
-    };
+        let mapped = |value: u64| {
+            value
+                .checked_mul(step)
+                .and_then(|offset| mapping.origins[base].checked_add(offset))
+                .ok_or_else(|| Error::InvalidCoord("sparse selection bound overflow".into()))
+        };
+        first[base] = mapped(lo)?;
+        last[base] = mapped(hi)?;
+    }
+    let first = geometry.block_position(&first)?.0;
+    let end = geometry.block_position(&last)?.0 + 1;
 
     struct Cursor {
-        keys: Option<BoxStream<'static, Result<[u64; 2]>>>,
+        keys: Option<BoxStream<'static, Result<u64>>>,
         pending: Option<crate::slice::SliceRequests>,
         // At most one bounded rectangle which did not fit the current batch.
         overflow: Option<crate::request::Cartesian>,
     }
 
     let cursor = Cursor {
-        keys: Some(source.occupied_regions(None, lo, hi)),
+        keys: Some(source.occupied_blocks(first..end)),
         pending: None,
         overflow: None,
     };
@@ -343,20 +339,12 @@ where
                     break;
                 };
 
-                let Some(row) = keys.try_next().await? else {
+                let Some(id) = keys.try_next().await? else {
                     cursor.keys = None;
                     break;
                 };
 
-                let mut bounds = geometry.block_bounds(row[1])?;
-
-                let coord = row[0];
-                if !(bounds[sparse_axis].0..bounds[sparse_axis].1).contains(&coord) {
-                    return Err(Error::InvalidLayout(
-                        "sparse slice key disagrees with its grid block".into(),
-                    ));
-                }
-                bounds[sparse_axis] = (coord, coord + 1);
+                let bounds = geometry.block_bounds(id)?;
                 if let Some(bounds) = mapping.bounds(&bounds) {
                     cursor.pending = Some(slice.intersect(&bounds)?.requests());
                 }
@@ -386,11 +374,7 @@ where
     S::DType: TensorElement,
 {
     let geometry = source.storage_geometry();
-    let Some(sparse_axis) = geometry.sparse_axis() else {
-        return Ok(slice.stream());
-    };
-
-    if source.shape()[..sparse_axis].iter().any(|&dim| dim != 1)
+    if matches!(source.layout(), Layout::Dense)
         || mapping.axes.windows(2).any(|axes| axes[0].0 >= axes[1].0)
     {
         return Ok(slice.stream());
@@ -399,16 +383,7 @@ where
     // after the first multi-element axis all block extents cover the full axis.
     let mut spans = false;
 
-    for (axis, (&block, &dim)) in geometry
-        .block_shape()
-        .iter()
-        .zip(source.shape())
-        .enumerate()
-    {
-        if axis == sparse_axis {
-            continue;
-        }
-
+    for (&block, &dim) in geometry.block_shape().iter().zip(source.shape()) {
         if spans && block < dim {
             return Ok(slice.stream());
         }
@@ -437,13 +412,20 @@ mod traversal_tests {
             (smallvec::smallvec![3, 5], smallvec::smallvec![2, 3]),
             (high, high_block),
         ] {
-            let layouts = std::iter::once(Layout::Dense)
+            let layouts = [Layout::Dense, Layout::Sparse { axis: None }]
+                .into_iter()
                 .chain((0..shape.len()).map(|axis| Layout::Sparse { axis: Some(axis) }));
             for layout in layouts {
+                let mut block = block.clone();
+                if let Layout::Sparse { axis } = layout {
+                    let prefix = axis.map_or(shape.len(), |axis| axis + 1);
+                    block[..prefix].fill(1);
+                }
+
                 let geometry = StorageGeometry::new(
                     TensorSchema::new(f64::dtype(), shape.clone()).unwrap(),
                     layout,
-                    block.clone(),
+                    block,
                 )
                 .unwrap();
 

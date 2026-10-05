@@ -1,7 +1,7 @@
 //! Shared sparse consumption through operation-specific, transformed expressions.
 use fensor::{
     AxisRange, Layout, Tensor, TensorElement, TensorMatMul, TensorMatrixUnary, TensorRead,
-    TensorSchema, TensorTransform, TensorUnary, TensorWrite,
+    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{Number, shape};
@@ -22,8 +22,8 @@ where
     if empty {
         assert!(values.iter().all(|value| *value == V::DType::ZERO));
     } else if intermediate_zero {
-        // A supported intermediate zero becomes one under exp; implicit zeros stay absent.
-        assert!(values.contains(&V::DType::ONE));
+        // Zero-preserving composition treats intermediate and implicit zeros alike.
+        assert!(values.contains(&V::DType::ZERO));
     }
     let full: fensor::Range = view
         .shape()
@@ -126,7 +126,11 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
             .flip(1)
             .unwrap();
         parity(&product, empty, false).await;
-        parity(&product.exp().await.unwrap(), empty, true).await;
+        assert!(matches!(
+            product.exp().await,
+            Err(fensor::Error::WouldDensify { .. })
+        ));
+        parity(&product.sin().await.unwrap(), empty, true).await;
         cleanup(&left_root).await;
         cleanup(&right_root).await;
 
@@ -159,8 +163,12 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
             .flip(0)
             .unwrap();
         parity(&diagonal, empty, false).await;
+        assert!(matches!(
+            diagonal.exp().await,
+            Err(fensor::Error::WouldDensify { .. })
+        ));
         parity(
-            &diagonal.round().await.unwrap().exp().await.unwrap(),
+            &diagonal.round().await.unwrap().sin().await.unwrap(),
             empty,
             true,
         )
@@ -207,7 +215,11 @@ async fn fourier_sparse_consumers_match_row_major_values() {
             .flip(1)
             .unwrap();
         parity(&spectrum, empty, false).await;
-        parity(&spectrum.exp().await.unwrap(), empty, true).await;
+        assert!(matches!(
+            spectrum.exp().await,
+            Err(fensor::Error::WouldDensify { .. })
+        ));
+        parity(&spectrum.sin().await.unwrap(), empty, true).await;
         cleanup(&root).await;
     }
 }

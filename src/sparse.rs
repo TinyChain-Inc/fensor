@@ -8,14 +8,20 @@ use number_general::{Complex, Float, Number};
 use crate::TensorElement;
 
 /// A native table cell, not a numerical cast or an erased storage value.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum SparseCell<T> {
     Key(u64),
-    Value(T),
+    Payload(Vec<T>),
 }
 
-// Tensor elements and the discriminator are stored entirely inline.
-impl<T: TensorElement> get_size::GetSize for SparseCell<T> {}
+impl<T: TensorElement> get_size::GetSize for SparseCell<T> {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Key(_) => 0,
+            Self::Payload(values) => values.capacity() * std::mem::size_of::<T>(),
+        }
+    }
+}
 
 impl<T> Default for SparseCell<T> {
     fn default() -> Self {
@@ -53,29 +59,33 @@ impl<T: TensorElement> Ord for SparseCell<T> {
     fn cmp(&self, b: &Self) -> Ordering {
         match (self, b) {
             (Self::Key(a), Self::Key(b)) => a.cmp(b),
-            (Self::Value(a), Self::Value(b)) => bits(*a).cmp(&bits(*b)),
+            (Self::Payload(a), Self::Payload(b)) => {
+                a.iter().copied().map(bits).cmp(b.iter().copied().map(bits))
+            }
             (Self::Key(_), _) => Ordering::Less,
             _ => Ordering::Greater,
         }
     }
 }
 
-/// Caller-owned native payload node; each row has two keys and one typed value.
+/// Caller-owned native payload node; each row has one logical block key and one dense payload.
 pub type SparseNode<T> = b_table::Node<SparseCell<T>>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PayloadSchema<T> {
     columns: Vec<String>,
+    block_len: usize,
     dtype: PhantomData<T>,
 }
 
-impl<T> Default for PayloadSchema<T> {
-    fn default() -> Self {
+impl<T> PayloadSchema<T> {
+    pub(crate) fn new(block_len: usize) -> Self {
         Self {
-            columns: ["block", "offset", "value"]
+            columns: ["block", "payload"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            block_len,
             dtype: PhantomData,
         }
     }
@@ -83,7 +93,7 @@ impl<T> Default for PayloadSchema<T> {
 
 impl<T> PartialEq for PayloadSchema<T> {
     fn eq(&self, b: &Self) -> bool {
-        self.columns == b.columns
+        self.columns == b.columns && self.block_len == b.block_len
     }
 }
 
@@ -102,17 +112,24 @@ impl<T: TensorElement> BTreeSchema for PayloadSchema<T> {
     }
 
     fn len(&self) -> usize {
-        3
+        2
     }
 
     fn order(&self) -> usize {
-        crate::schema::sparse_node_order::<SparseCell<T>>(3)
+        let header = std::mem::size_of::<b_table::Node<SparseCell<T>>>();
+        let row = std::mem::size_of::<Vec<SparseCell<T>>>()
+            + 2 * std::mem::size_of::<SparseCell<T>>()
+            + self.block_len * std::mem::size_of::<T>()
+            + 16;
+
+        // Native splitting and merging require an even order of at least four.
+        ((crate::schema::SPARSE_NODE_MEMORY - header) / row / 2 * 2).max(4)
     }
 
     fn validate_key(&self, row: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if row.len() != 3
-            || !row[..2].iter().all(|v| matches!(v, SparseCell::Key(_)))
-            || !matches!(row[2], SparseCell::Value(_))
+        if row.len() != 2
+            || !matches!(row[0], SparseCell::Key(_))
+            || !matches!(&row[1], SparseCell::Payload(values) if values.len() == self.block_len)
         {
             return Err(invalid());
         }
@@ -136,11 +153,11 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
     type Index = Self;
 
     fn key(&self) -> &[String] {
-        &self.columns[..2]
+        &self.columns[..1]
     }
 
     fn values(&self) -> &[String] {
-        &self.columns[2..]
+        &self.columns[1..]
     }
 
     fn primary(&self) -> &Self {
@@ -152,7 +169,7 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
     }
 
     fn validate_key(&self, key: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if key.len() != 2 || !key.iter().all(|v| matches!(v, SparseCell::Key(_))) {
+        if key.len() != 1 || !key.iter().all(|v| matches!(v, SparseCell::Key(_))) {
             return Err(invalid());
         }
 
@@ -160,7 +177,9 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
     }
 
     fn validate_values(&self, v: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if v.len() != 1 || !matches!(v[0], SparseCell::Value(_)) {
+        if v.len() != 1
+            || !matches!(&v[0], SparseCell::Payload(values) if values.len() == self.block_len)
+        {
             return Err(invalid());
         }
 
