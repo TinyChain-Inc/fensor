@@ -22,8 +22,11 @@ pub trait ReduceOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     type Output: TensorElement;
 
     fn partial(&self, values: Vec<T>) -> Result<Self::State>;
+
     fn combine(left: Self::State, right: Self::State) -> Self::State;
+
     fn finish(state: Self::State) -> Result<Self::Output>;
+
     fn empty() -> Result<Self::Output>;
 
     fn finish_axis(state: Option<Self::State>) -> Result<Self::Output> {
@@ -142,43 +145,68 @@ impl<T: TensorElement + Real> ReduceOp<T> for Max {
 /// Numeric conversion owned by support-sensitive statistics.
 pub trait StatisticsElement: TensorElement + sealed::Sealed {
     type Mean: TensorElement;
+
     fn components(self) -> [f64; 2];
+
     fn mean_value(value: [f64; 2]) -> Self::Mean;
 }
 
 macro_rules! real_statistics {
-    ($($ty:ty),+ $(,)?) => {$(
-        impl sealed::Sealed for $ty {}
-        impl StatisticsElement for $ty {
-            type Mean = f64;
-            fn components(self) -> [f64; 2] { [self as f64, 0.0] }
-            fn mean_value(value: [f64; 2]) -> f64 { value[0] }
-        }
-    )+};
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl sealed::Sealed for $ty {}
+
+            impl StatisticsElement for $ty {
+                type Mean = f64;
+
+                fn components(self) -> [f64; 2] {
+                    [self as f64, 0.0]
+                }
+
+                fn mean_value(value: [f64; 2]) -> f64 {
+                    value[0]
+                }
+            }
+        )+
+    };
 }
+
 real_statistics!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 
 #[cfg(feature = "complex")]
 macro_rules! complex_statistics {
-    ($($ty:ty),+ $(,)?) => {$(
-        impl sealed::Sealed for $ty {}
-        impl StatisticsElement for $ty {
-            type Mean = crate::complex::Complex64;
-            fn components(self) -> [f64; 2] { [self.re as f64, self.im as f64] }
-            fn mean_value(value: [f64; 2]) -> Self::Mean { Self::Mean::new(value[0], value[1]) }
-        }
-    )+};
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl sealed::Sealed for $ty {}
+
+            impl StatisticsElement for $ty {
+                type Mean = crate::complex::Complex64;
+
+                fn components(self) -> [f64; 2] {
+                    [self.re as f64, self.im as f64]
+                }
+
+                fn mean_value(value: [f64; 2]) -> Self::Mean {
+                    Self::Mean::new(value[0], value[1])
+                }
+            }
+        )+
+    };
 }
+
 #[cfg(feature = "complex")]
 complex_statistics!(crate::complex::Complex32, crate::complex::Complex64);
 
 /// Mean counts original expression support, including supported numerical zeros.
 #[derive(Clone, Copy, Debug)]
 pub struct Mean;
+
 impl sealed::Sealed for Mean {}
+
 impl<T: StatisticsElement> ReduceOp<T> for Mean {
     type State = (u64, [f64; 2]);
     type Output = T::Mean;
+
     fn partial(&self, values: Vec<T>) -> Result<Self::State> {
         let count = values.len() as u64;
         let sum = values.into_iter().fold([0.0; 2], |sum, value| {
@@ -187,18 +215,22 @@ impl<T: StatisticsElement> ReduceOp<T> for Mean {
         });
         Ok((count, sum))
     }
+
     fn combine((n, l): Self::State, (m, r): Self::State) -> Self::State {
         (n + m, [l[0] + r[0], l[1] + r[1]])
     }
+
     fn finish((count, sum): Self::State) -> Result<Self::Output> {
         Ok(T::mean_value([
             sum[0] / count as f64,
             sum[1] / count as f64,
         ]))
     }
+
     fn empty() -> Result<Self::Output> {
         Ok(T::mean_value([f64::NAN; 2]))
     }
+
     fn finish_axis(state: Option<Self::State>) -> Result<Self::Output> {
         state
             .map(<Self as ReduceOp<T>>::finish)
@@ -209,12 +241,16 @@ impl<T: StatisticsElement> ReduceOp<T> for Mean {
 /// Population standard deviation using squared complex magnitude.
 #[derive(Clone, Copy, Debug)]
 pub struct StandardDeviation;
+
 impl sealed::Sealed for StandardDeviation {}
+
 impl<T: StatisticsElement> ReduceOp<T> for StandardDeviation {
     type State = (u64, [f64; 2], f64);
     type Output = f64;
+
     fn partial(&self, values: Vec<T>) -> Result<Self::State> {
         let mut state = (0, [0.0; 2], 0.0);
+
         for value in values {
             let value = value.components();
             let count = state.0 + 1;
@@ -227,8 +263,10 @@ impl<T: StatisticsElement> ReduceOp<T> for StandardDeviation {
                 state.2 + delta[0] * (value[0] - mean[0]) + delta[1] * (value[1] - mean[1]);
             state = (count, mean, variance);
         }
+
         Ok(state)
     }
+
     fn combine((n, l, lv): Self::State, (m, r, rv): Self::State) -> Self::State {
         let count = n + m;
         let delta = [r[0] - l[0], r[1] - l[1]];
@@ -237,12 +275,15 @@ impl<T: StatisticsElement> ReduceOp<T> for StandardDeviation {
         let variance = lv + rv + (delta[0] * delta[0] + delta[1] * delta[1]) * n as f64 * weight;
         (count, mean, variance)
     }
+
     fn finish((count, _, variance): Self::State) -> Result<f64> {
         Ok((variance / count as f64).sqrt())
     }
+
     fn empty() -> Result<f64> {
         Ok(f64::NAN)
     }
+
     fn finish_axis(state: Option<Self::State>) -> Result<f64> {
         state
             .map(<Self as ReduceOp<T>>::finish)
@@ -253,10 +294,13 @@ impl<T: StatisticsElement> ReduceOp<T> for StandardDeviation {
 /// Euclidean norm over original support.
 #[derive(Clone, Copy, Debug)]
 pub struct Norm;
+
 impl sealed::Sealed for Norm {}
+
 impl<T: StatisticsElement> ReduceOp<T> for Norm {
     type State = f64;
     type Output = f64;
+
     fn partial(&self, values: Vec<T>) -> Result<f64> {
         Ok(values
             .into_iter()
@@ -266,12 +310,15 @@ impl<T: StatisticsElement> ReduceOp<T> for Norm {
             })
             .sum())
     }
+
     fn combine(left: f64, right: f64) -> f64 {
         left + right
     }
+
     fn finish(state: f64) -> Result<f64> {
         Ok(state.sqrt())
     }
+
     fn empty() -> Result<f64> {
         Ok(0.0)
     }
@@ -285,11 +332,17 @@ where
     type MeanOutput: TensorRead<DType = <Self::DType as StatisticsElement>::Mean>;
     type StdOutput: TensorRead<DType = f64>;
     type NormOutput: TensorRead<DType = f64>;
+
     fn mean_all(&self) -> BoxFuture<'_, Result<<Self::DType as StatisticsElement>::Mean>>;
+
     fn std_all(&self) -> BoxFuture<'_, Result<f64>>;
+
     fn norm_all(&self) -> BoxFuture<'_, Result<f64>>;
+
     fn mean(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MeanOutput>>;
+
     fn std(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::StdOutput>>;
+
     fn norm(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::NormOutput>>;
 }
 
@@ -312,12 +365,15 @@ where
     axis_constructor!(MeanOutput, mean, Mean);
     axis_constructor!(StdOutput, std, StandardDeviation);
     axis_constructor!(NormOutput, norm, Norm);
+
     fn mean_all(&self) -> BoxFuture<'_, Result<<Self::DType as StatisticsElement>::Mean>> {
         Box::pin(terminal(self, Mean))
     }
+
     fn std_all(&self) -> BoxFuture<'_, Result<f64>> {
         Box::pin(terminal(self, StandardDeviation))
     }
+
     fn norm_all(&self) -> BoxFuture<'_, Result<f64>> {
         Box::pin(terminal(self, Norm))
     }
@@ -635,6 +691,7 @@ where
                 } else {
                     break;
                 };
+
                 if slice.len() > expression::MAX_BATCH_ELEMENTS as u64 {
                     let mut state = None;
                     let mut requests = expression::traversal::selection(&self.source, slice)?;

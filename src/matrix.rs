@@ -69,6 +69,7 @@ where
                     self.shape()
                 )));
             }
+
             let mut axes: Axes = (0..rank).collect();
             axes.swap(rank - 2, rank - 1);
             self.clone().transpose(Some(axes))
@@ -84,6 +85,7 @@ where
                     self.shape()
                 )));
             }
+
             let shape = Shape::from_slice(&self.shape()[..rank - 1]);
             let strides = crate::schema::contiguous_strides(&shape)?;
             let mapping = CoordinateMap::identity(shape.clone(), &strides);
@@ -247,6 +249,7 @@ mod tests {
             .scope(Default::default(), async {
                 let batch = expression::evaluate_batch(&view, &request).await.unwrap();
                 let support = batch.support.unwrap();
+
                 for (i, value) in batch.values.into_iter().enumerate() {
                     let expected = u8::from(i % 2 == 0);
                     assert_eq!(value, expected as f32);

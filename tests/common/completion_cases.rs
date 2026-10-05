@@ -1,11 +1,12 @@
 //! Completion-order evaluation and numeric terminals, with ordered controls.
 
-use super::benchmark;
-use super::benchmark_source::source;
 use fensor::{
     TensorMatMul, TensorRead, TensorReduce, TensorReduceAll, TensorTransform, TensorUnary,
 };
 use ha_ndarray::axes;
+
+use super::benchmark;
+use super::benchmark_source::source;
 
 async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(
     name: &str,

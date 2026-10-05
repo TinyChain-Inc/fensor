@@ -128,6 +128,7 @@ fn validate_axes(shape: &[u64], count: usize, operation: &str) -> Result<()> {
             )));
         }
     }
+
     Ok(())
 }
 
@@ -305,6 +306,7 @@ where
                         }
                     }
                 }
+
                 let array = expression::batch_array(batch.values)?
                     .reshape(ha_ndarray::shape![pack.len(), width])?;
                 let transformed = self
@@ -332,6 +334,7 @@ where
                         if populated {
                             values[destination] = transformed[start + frequency];
                         }
+
                         if let Some(mask) = &mut support {
                             mask[destination] = u8::from(populated);
                         }
@@ -389,8 +392,10 @@ mod tests {
         )
         .await;
         tensor.sync().await.unwrap();
+
         fn files(path: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
             let mut paths = std::collections::BTreeSet::new();
+
             for entry in std::fs::read_dir(path).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
@@ -401,6 +406,7 @@ mod tests {
             }
             paths
         }
+
         let before = files(&root);
         let view = tensor.view().fft().await.unwrap();
         let coords = (0..count)

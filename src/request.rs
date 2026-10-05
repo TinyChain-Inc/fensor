@@ -27,6 +27,7 @@ pub(crate) fn decode_flat(mut flat: u64, shape: &[u64], out: &mut Coord) -> Resu
     if flat != 0 {
         return Err(Error::InvalidCoord("flat coordinate out of bounds".into()));
     }
+
     Ok(())
 }
 
@@ -41,11 +42,13 @@ pub(crate) fn linear_segments(
     if width == 0 || start.checked_add(len as u64).is_none() {
         return Err(Error::InvalidCoord("invalid linear segment bounds".into()));
     }
+
     let mut done = 0;
     Ok(std::iter::from_fn(move || {
         if done == len {
             return None;
         }
+
         let flat = start + done as u64;
         let count = ((len - done) as u64).min(width - flat % width) as usize;
         let segment = (flat, done, count);
@@ -91,6 +94,7 @@ impl Axis {
             if i == self.len() {
                 return None;
             }
+
             let start = self.at(i);
             let (step, end) = match self {
                 Self::Span { step, len, .. } => (*step as i128, *len),
@@ -100,6 +104,7 @@ impl Axis {
                         .map(|v| *v as i128 - start as i128)
                         .unwrap_or(0);
                     let mut end = i + 1;
+
                     while end < self.len()
                         && self.at(end) as i128 - self.at(end - 1) as i128 == step
                     {
@@ -108,6 +113,7 @@ impl Axis {
                     (step, end)
                 }
             };
+
             let len = end - i;
             i = end;
             Some((start, step, len))
@@ -166,6 +172,7 @@ impl Cartesian {
                 .try_fold(1u64, |n, a| n.checked_mul(a.len()))
                 .ok_or_else(|| Error::InvalidLayout("request cardinality overflow".into()))?
         };
+
         let len = usize::try_from(len)
             .map_err(|_| Error::InvalidLayout("request cardinality exceeds usize".into()))?;
         bound(len)?;
@@ -228,6 +235,7 @@ fn push_progression(runs: &mut Vec<Progression>, next: Progression) {
         } else {
             last.step
         };
+
         if last.output + last.len == next.output
             && (next.len == 1 || next.step == step)
             && step
@@ -330,6 +338,7 @@ impl BatchRequest {
             RequestKind::Explicit(_) | RequestKind::FlatRuns(_) => None,
             _ => mapping.affine()?,
         };
+
         if let Some((offset, strides)) = affine {
             progressions(self, &mapping.shape, offset, &strides, |run| {
                 push_progression(&mut runs, run);
@@ -358,6 +367,7 @@ impl BatchRequest {
                 Ok(())
             })?;
         }
+
         let mapped = Self {
             kind: RequestKind::FlatRuns(runs),
             len: self.len,
@@ -367,6 +377,7 @@ impl BatchRequest {
         if let RequestKind::FlatRuns(runs) = &mapped.kind {
             crate::read_metrics::record(|m| m.mapped_runs += runs.len());
         }
+
         Ok(mapped)
     }
 
@@ -387,10 +398,12 @@ impl BatchRequest {
                 bound(self.len)?;
                 let total = schema::checked_product(shape)? as i128;
                 let mut end = 0usize;
+
                 for run in runs {
                     if run.len == 0 || run.output != end {
                         return Err(invalid());
                     }
+
                     let last = run
                         .step
                         .checked_mul((run.len - 1) as i128)
@@ -400,12 +413,14 @@ impl BatchRequest {
                     if end > self.len {
                         return Err(invalid());
                     }
+
                     if run.start < 0 || run.start >= total || last < 0 || last >= total {
                         return Err(Error::InvalidCoord(
                             "mapped progression out of bounds".into(),
                         ));
                     }
                 }
+
                 if end != self.len {
                     return Err(invalid());
                 }
@@ -483,6 +498,7 @@ impl<R: Borrow<BatchRequest>, S: AsRef<[u64]>> Cursor<R, S> {
         if self.position == request.len {
             return false;
         }
+
         match &request.kind {
             RequestKind::Linear { start } => {
                 decode_flat(start + self.position as u64, shape, out)
@@ -501,6 +517,7 @@ impl<R: Borrow<BatchRequest>, S: AsRef<[u64]>> Cursor<R, S> {
                     self.rectangle += 1;
                     self.local = 0;
                 }
+
                 let run = &runs[self.rectangle];
                 let flat = run.start + run.step * self.local as i128;
                 decode_flat(flat as u64, shape, out).expect("validated flat run");
@@ -560,6 +577,7 @@ pub(crate) fn tiled_requests(
                     } else {
                         1
                     };
+
                     let start = *index * side;
                     Axis::range(start, (shape[i] - start).min(side))
                 })
@@ -593,6 +611,7 @@ pub(crate) fn progressions(
     if shape.len() != strides.len() {
         return Err(invalid());
     }
+
     if request.len() == 0 {
         return Ok(());
     }
@@ -615,9 +634,11 @@ pub(crate) fn progressions(
                 .ok_or_else(invalid)
         })
     };
+
     match request.kind() {
         RequestKind::Linear { start } => {
             let varying = shape.iter().rposition(|d| *d > 1).unwrap_or(0);
+
             for (index, output, len) in linear_segments(*start, request.len(), shape[varying])? {
                 decode_flat(index, shape, &mut coord)?;
                 emit(Progression {
@@ -701,6 +722,7 @@ mod tests {
             };
             assert!(request.cursor(&[3]).is_err());
         }
+
         let request = BatchRequest {
             kind: RequestKind::FlatRuns(vec![Progression {
                 output: 0,
@@ -738,12 +760,15 @@ mod tests {
                 (0..axis.len()).map(|i| axis.at(i)).collect::<Vec<_>>()
             );
         }
+
         let mut scratch = Coord::new();
+
         for (flat, offset, len) in linear_segments(5, 17, 7).unwrap() {
             decode_flat(flat, &[4, 7], &mut scratch).unwrap();
             assert_eq!(flat, 5 + offset as u64);
             assert!(scratch[1] + len as u64 <= 7);
         }
+
         let mut huge = linear_segments(0, usize::MAX, 1).unwrap();
         assert_eq!(
             huge.by_ref().take(3).collect::<Vec<_>>(),

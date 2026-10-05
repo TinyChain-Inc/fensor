@@ -35,6 +35,7 @@ where
                 "replacement source geometry differs".into(),
             ));
         }
+
         Ok(TensorView {
             tensor: source,
             mapping: self.mapping,
@@ -47,6 +48,7 @@ where
                 "storage geometry differs from view source".into(),
             ));
         }
+
         Ok(())
     }
 
@@ -77,6 +79,7 @@ where
                 "update source and destination shapes differ".into(),
             ));
         }
+
         let geometry = geometry.clone();
         let mapping = self.mapping.clone();
         Ok(
@@ -103,8 +106,10 @@ where
         let Some((lo, hi)) = self.mapping.flat_bounds()? else {
             return Ok(0..0);
         };
+
         let mut lower = Vec::with_capacity(self.tensor.shape().len());
         let mut upper = Vec::with_capacity(self.tensor.shape().len());
+
         for (&len, &stride) in self.tensor.shape().iter().zip(self.tensor.strides()) {
             let (start, end) = (lo / stride, hi / stride);
             if start / len == end / len {
@@ -115,6 +120,7 @@ where
                 upper.push(len - 1);
             }
         }
+
         Ok(geometry.block_position(&lower)?.0..geometry.block_position(&upper)?.0 + 1)
     }
 
@@ -178,6 +184,7 @@ where
         read_coordinate_blocks,
         read_sparse_elements_in_order
     );
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
             let request = crate::request::BatchRequest::point(coord);
@@ -246,6 +253,7 @@ where
         {
             return Ok(slice.stream());
         }
+
         match self
             .mapping
             .storage_slice(self.tensor.shape(), self.tensor.strides())?

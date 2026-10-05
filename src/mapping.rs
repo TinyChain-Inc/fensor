@@ -117,6 +117,7 @@ impl GatherOffsets {
             self.index(start)
                 .ok_or_else(|| Error::InvalidLayout("gather slice out of bounds".into()))?
         };
+
         let step = if len <= 1 {
             1
         } else {
@@ -124,6 +125,7 @@ impl GatherOffsets {
                 .checked_mul(step)
                 .ok_or_else(|| Error::InvalidLayout("gather stride overflow".into()))?
         };
+
         Ok(Self {
             offsets: self.offsets.clone(),
             start,
@@ -168,9 +170,11 @@ impl CoordinateMap {
             let AxisContrib::Stride(stride) = contribution else {
                 return Ok(None);
             };
+
             let Ok(stride) = u64::try_from(*stride) else {
                 return Ok(None);
             };
+
             if stride == 0 {
                 return Ok(None);
             }
@@ -252,11 +256,13 @@ impl CoordinateMap {
         let mut input = Coord::new();
         let mut mapped = Coord::new();
         let mut position = 0;
+
         while cursor.next_into(&mut input) {
             self.resolve_into(&input, base_shape, base_strides, &mut mapped)?;
             visit(position, &mut mapped)?;
             position += 1;
         }
+
         Ok(())
     }
 
@@ -284,8 +290,10 @@ impl CoordinateMap {
         if self.shape.contains(&0) {
             return Ok(None);
         }
+
         let overflow = || Error::InvalidCoord("mapping bounds overflow".into());
         let (mut lo, mut hi) = (self.base_offset, self.base_offset);
+
         for (axis, &len) in self.axes.iter().zip(&self.shape) {
             let (min, max) = match axis {
                 AxisContrib::Stride(step) => {
@@ -296,6 +304,7 @@ impl CoordinateMap {
                 AxisContrib::Gather(offsets) => {
                     let mut min = i128::MAX;
                     let mut max = i128::MIN;
+
                     for index in 0..offsets.len {
                         let value = *offsets.get(index).ok_or_else(overflow)?;
                         min = min.min(value);
@@ -307,6 +316,7 @@ impl CoordinateMap {
             lo = lo.checked_add(min).ok_or_else(overflow)?;
             hi = hi.checked_add(max).ok_or_else(overflow)?;
         }
+
         Ok(Some((
             u64::try_from(lo).map_err(|_| overflow())?,
             u64::try_from(hi).map_err(|_| overflow())?,
@@ -352,6 +362,7 @@ impl CoordinateMap {
         let Ok(expected) = schema::contiguous_strides(&self.shape) else {
             return false;
         };
+
         self.axes
             .iter()
             .zip(expected.iter())
@@ -377,6 +388,7 @@ impl CoordinateMap {
                     .to_string(),
             ));
         }
+
         let strides = schema::contiguous_strides(&shape)?;
         Ok(Self {
             base_offset: self.base_offset,
@@ -547,6 +559,7 @@ impl CoordinateMap {
                 "squeeze requires a non-empty list of axes".to_string(),
             ));
         }
+
         if axes.len() == ndim {
             return Err(Error::InvalidLayout(
                 "squeeze cannot remove every axis; rank-0 tensors are not supported".to_string(),
@@ -561,11 +574,13 @@ impl CoordinateMap {
                     "squeeze axis {axis} is out of bounds for rank {ndim}"
                 )));
             }
+
             if remove[axis] {
                 return Err(Error::InvalidLayout(format!(
                     "squeeze axis {axis} specified more than once"
                 )));
             }
+
             if self.shape[axis] != 1 {
                 return Err(Error::InvalidLayout(format!(
                     "cannot squeeze axis {axis} with dimension {}",
@@ -615,6 +630,7 @@ impl CoordinateMap {
                     "unsqueeze axis {axis} is out of bounds for rank {old_ndim}"
                 )));
             }
+
             if insert_before[axis] {
                 return Err(Error::InvalidLayout(format!(
                     "unsqueeze axis {axis} specified more than once"
@@ -678,6 +694,7 @@ fn slice_bound_at(current: &AxisContrib, dim: u64, index: u64, axis_index: usize
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
+
     match current {
         AxisContrib::Stride(s) => (index as i128).checked_mul(*s).ok_or_else(mapping_overflow),
         AxisContrib::Broadcast(c) => Ok(*c),
@@ -708,6 +725,7 @@ fn slice_bound_in(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
+
     let extent = if start == stop {
         0
     } else {
@@ -751,6 +769,7 @@ fn slice_bound_of(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
+
     match current {
         AxisContrib::Broadcast(c) => Ok(AxisContrib::Broadcast(*c)),
         AxisContrib::Stride(s) => {

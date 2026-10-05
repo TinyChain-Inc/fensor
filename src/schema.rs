@@ -67,11 +67,13 @@ impl TensorSchema {
             ) => true,
             _ => false,
         };
+
         if !supported {
             return Err(Error::InvalidSchema(format!(
                 "unsupported tensor dtype: {dtype}"
             )));
         }
+
         let strides = contiguous_strides(shape.as_slice())?;
         Ok(Self {
             dtype,

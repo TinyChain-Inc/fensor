@@ -638,6 +638,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             length - 3
         ])];
         let expected_coords = vec![vec![(length - 5)], vec![(length - 3)], vec![(length - 1)]];
+
         async fn check(
             reader: &impl TensorRead<DType = f32>,
             length: u64,

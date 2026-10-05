@@ -1,14 +1,16 @@
 //! Regression fixtures which deliberately inspect or corrupt private native storage.
 
 mod matrix_unary {
+    use futures::TryStreamExt;
+    use number_general::DType;
+    use smallvec::smallvec;
+
     use crate::test_support::cleanup;
     use crate::test_support::{FsEntry, new_dir};
     use crate::{
         AxisRange, Error, Layout, Tensor, TensorMatrixUnary, TensorRead, TensorSchema, TensorWrite,
     };
-    use futures::TryStreamExt;
-    use number_general::DType;
-    use smallvec::smallvec;
+
     #[tokio::test]
     async fn huge_selected_diagonal_and_corrupt_blocks() {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -61,11 +63,13 @@ mod matrix_unary {
 }
 
 mod math_unary {
-    use crate::test_support::{self as common, FsEntry, new_dir};
-    use crate::{AxisRange, Layout, Tensor, TensorRead, TensorSchema, TensorUnary, TensorWrite};
     use futures::TryStreamExt;
     use ha_ndarray::{axes, range, shape};
     use number_general::{FloatType, NumberType};
+
+    use crate::test_support::{self as common, FsEntry, new_dir};
+    use crate::{AxisRange, Layout, Tensor, TensorRead, TensorSchema, TensorUnary, TensorWrite};
+
     #[tokio::test]
     async fn sparse_range_reads_only_selected_storage() {
         let (root, dir) = new_dir("sparse_range_corruption").await;
@@ -82,6 +86,7 @@ mod math_unary {
         tensor.corrupt_sparse_payload(7).await;
         let view = tensor.view();
         let unary = view.round().await.unwrap().exp().await.unwrap();
+
         async fn check(reader: &impl TensorRead<DType = f32>) {
             let rows: Vec<_> = reader
                 .read_sparse_elements_in_order(range![AxisRange::At(0)], axes![0])
@@ -105,10 +110,12 @@ mod math_unary {
 }
 
 mod storage_source {
+    use number_general::FloatType;
+
     use crate::test_support::cleanup;
     use crate::test_support::{FsEntry, new_dir};
     use crate::{Layout, NumberType, Tensor, TensorRead, TensorSchema, TensorWrite};
-    use number_general::FloatType;
+
     #[tokio::test]
     async fn replacement_preserves_shared_sparse_pages_and_zero_deletions() {
         let (root, dir) = new_dir("logical_sparse").await;
@@ -191,14 +198,16 @@ mod storage_source {
 }
 
 mod matmul {
+    use futures::TryStreamExt;
+    use ha_ndarray::{axes, range, shape};
+    use number_general::DType;
+
     use crate::test_support::{self as common, FsEntry, new_dir};
     use crate::{
         AxisRange, Layout, Tensor, TensorMatMul, TensorRead, TensorSchema, TensorTransform,
         TensorWrite,
     };
-    use futures::TryStreamExt;
-    use ha_ndarray::{axes, range, shape};
-    use number_general::DType;
+
     #[tokio::test]
     async fn huge_selected_outputs_and_corruption_boundaries() {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -260,14 +269,16 @@ mod matmul {
 }
 
 mod math_binary {
+    use futures::TryStreamExt;
+    use ha_ndarray::{axes, range, shape};
+    use number_general::DType;
+
     use crate::test_support::{self as common, FsEntry, new_dir};
     use crate::{
         AxisRange, Layout, Tensor, TensorBooleanScalar, TensorMath, TensorRead, TensorSchema,
         TensorUnary, TensorWhere, TensorWrite,
     };
-    use futures::TryStreamExt;
-    use ha_ndarray::{axes, range, shape};
-    use number_general::DType;
+
     #[tokio::test]
     async fn selected_range_propagates_corruption_only_when_read() {
         let (_dir_root, dir) = new_dir("binary_corruption").await;
@@ -396,14 +407,16 @@ mod math_binary {
 }
 
 mod reduce {
+    use futures::TryStreamExt;
+    use ha_ndarray::{axes, range, shape};
+    use number_general::DType;
+
     use crate::test_support::{FsEntry, new_dir};
     use crate::{
         AxisRange, Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
         TensorSchema, TensorUnary, TensorWrite,
     };
-    use futures::TryStreamExt;
-    use ha_ndarray::{axes, range, shape};
-    use number_general::DType;
+
     #[tokio::test]
     async fn selected_output_range_and_corruption_boundaries() {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -500,6 +513,7 @@ mod bulk_mutation {
                             CURRENT.with(|m| m.borrow().block_updates) - before,
                             geometry.block_count() as usize
                         );
+
                         for id in 0..geometry.block_count() {
                             let block = tensor.read_logical_block(id).await.unwrap();
                             let mut valid = vec![false; geometry.block_len()];
@@ -510,6 +524,7 @@ mod bulk_mutation {
                                 offsets,
                                 expected.iter().map(|(i, _)| *i).collect::<Vec<_>>()
                             );
+
                             for offset in offsets {
                                 valid[offset] = true;
                                 assert!(
@@ -525,6 +540,7 @@ mod bulk_mutation {
                             );
                         }
                     }
+
                     let range = vec![
                         AxisRange::Of(vec![8, 0, 8]),
                         AxisRange::Of(vec![128, 1, 128]),

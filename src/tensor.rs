@@ -13,7 +13,6 @@ use std::sync::Arc;
 use freqfs::{Dir, DirLock, FileLoad, FileLock, FileReadGuardOwned};
 use futures::{StreamExt, TryStreamExt};
 use get_size::GetSize;
-
 #[cfg(test)]
 use number_general::FloatType;
 use number_general::NumberType;
@@ -219,6 +218,7 @@ where
             }
             guard.create_dir(BLOCKS.to_string())?
         };
+
         let schema = geometry.schema.clone();
         let storage = match geometry.layout() {
             Layout::Dense => Storage::Dense(DenseStorage {
@@ -229,6 +229,7 @@ where
                 Storage::Sparse(adaptive::SparseStorage::create(&dir, blocks, geometry).await?)
             }
         };
+
         Ok(Self {
             directory: dir,
             storage: Arc::new(storage),
@@ -255,27 +256,34 @@ where
         let values = values.fuse();
         futures::pin_mut!(values);
         let mut received = 0u64;
+
         loop {
             let mut batch = Vec::new();
+
             while batch.len() < crate::expression::MAX_BATCH_ELEMENTS {
                 let Some(value) = values.try_next().await? else {
                     break;
                 };
+
                 if received + batch.len() as u64 >= expected {
                     return Err(Error::InvalidLayout("too many Tensor values".into()).into());
                 }
                 batch.push(value);
             }
+
             if batch.is_empty() {
                 break;
             }
+
             let request = BatchRequest::linear(received, batch.len())?;
             received += batch.len() as u64;
             output.stage(request, batch).await?;
         }
+
         if received != expected {
             return Err(Error::InvalidLayout("too few Tensor values".into()).into());
         }
+
         Ok(output.finish().await?)
     }
 
@@ -298,6 +306,7 @@ where
                 Error::InvalidLayout("sparse construction requires sparse layout".into()).into(),
             );
         }
+
         let output = Self::unpublished(dir, schema, layout, max_capacity).await?;
         construction::sparse(output, entries).await
     }
@@ -337,6 +346,7 @@ where
                 .await?;
             return construction::sparse(output, entries).await;
         }
+
         let output = construction::Dense(output);
         let mut blocks = source.read_coordinate_blocks()?;
         let expected = crate::schema::checked_product(source.shape())?;
@@ -400,6 +410,7 @@ where
                 Storage::Sparse(adaptive::SparseStorage::load(&dir, blocks, geometry)?)
             }
         };
+
         let tensor = Self {
             directory: dir,
             storage: Arc::new(storage),
@@ -422,6 +433,7 @@ where
                 }
             }
         }
+
         Ok(())
     }
 
@@ -493,6 +505,7 @@ where
                 .create_file(block_id.to_string(), values, bound)
                 .await?;
         }
+
         Ok(())
     }
 
@@ -501,6 +514,7 @@ where
             Storage::Sparse(sparse) => sparse.update(id, updates).await?,
             Storage::Dense(dense) => dense.update(id, updates).await?,
         }
+
         #[cfg(test)]
         copy_metrics::record(|m| m.block_updates += 1);
         Ok(())
@@ -550,8 +564,10 @@ where
                 sparse.healthy()?;
                 let groups = self.read_groups(request, mapping)?;
                 let mut values = vec![T::ZERO; request.len()];
+
                 for (id, runs) in groups {
                     let (_, block) = sparse.read(id).await?;
+
                     for run in runs {
                         run.scatter(&block, &mut values)?;
                     }
@@ -560,6 +576,7 @@ where
             }
             Storage::Dense(dense) => dense,
         };
+
         let groups = self.read_groups(request, mapping)?;
 
         let mut values = vec![T::ZERO; request.len()];
@@ -634,6 +651,7 @@ where
         read_coordinate_blocks,
         read_sparse_elements_in_order
     );
+
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move { Ok(self.read_batch(&BatchRequest::point(coord), None).await?[0]) })
     }
@@ -680,6 +698,7 @@ impl<FE> DenseStorage<FE> {
         if id >= self.storage_schema.shape.iter().product::<u64>() {
             return Err(Error::InvalidCoord("logical block out of bounds".into()));
         }
+
         Ok(())
     }
 
@@ -748,10 +767,12 @@ where
             if values.is_empty() {
                 return Ok(());
             }
+
             let view = self.view().slice(range)?;
             let geometry = self.storage_geometry();
             let mut values = values.into_iter();
             let mut start = 0;
+
             loop {
                 let batch: Vec<_> = values
                     .by_ref()
@@ -760,7 +781,9 @@ where
                 if batch.is_empty() {
                     break;
                 }
+
                 let len = batch.len() as u64;
+
                 for (id, updates) in view.plan_updates(&geometry, start, batch)? {
                     self.write_block_updates(id, &updates).await?;
                 }
@@ -775,13 +798,16 @@ where
         Box::pin(async move {
             use crate::TensorSource;
             let geometry = self.storage_geometry();
+
             for id in 0..geometry.block_count() {
                 // Validate the selected stored block before overwriting it, as scalar writes do.
                 let mut values = self.read_logical_block(id).await?;
                 values.fill(T::ZERO);
+
                 for offset in geometry.block_offsets(id)? {
                     values[offset] = value;
                 }
+
                 self.replace_logical_block(id, values).await?;
             }
 
@@ -802,6 +828,7 @@ fn validate_stored_length<T>(block: &[T], expected: usize) -> Result<()> {
     if block.len() != expected {
         return Err(Error::InvalidLayout("invalid stored block length".into()));
     }
+
     Ok(())
 }
 
@@ -827,12 +854,15 @@ fn apply_block_updates<T: Copy>(
     updates: &[(usize, T)],
 ) -> Result<()> {
     validate_stored_length(block, expected)?;
+
     for &(offset, _) in updates {
         validate::ensure_offset_in_bounds(offset, block.len())?;
     }
+
     for &(offset, value) in updates {
         block[offset] = value;
     }
+
     Ok(())
 }
 
@@ -911,6 +941,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
             let Some(&last) = keys.last() else {
                 return Ok::<_, Error>(None);
             };
+
             Ok(Some((
                 futures::stream::iter(keys.into_iter().map(Ok)),
                 (tensor, Some(last)),
@@ -947,6 +978,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
             Storage::Sparse(sparse) => sparse.replace(id, block).await?,
             Storage::Dense(dense) => dense.replace(id, block).await?,
         }
+
         #[cfg(test)]
         copy_metrics::record(|m| m.block_updates += 1);
         Ok(())

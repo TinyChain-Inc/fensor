@@ -6,9 +6,8 @@ use fensor::{
 };
 use ha_ndarray::shape;
 
-use common::{FsEntry, cleanup, fixture, numbers::same};
-
 use crate::test_support as common;
+use common::{FsEntry, cleanup, fixture, numbers::same};
 
 async fn storage<T: TensorElement>(samples: Option<[T; 2]>)
 where
@@ -22,17 +21,20 @@ where
         } else {
             65
         };
+
         let mut expected: Vec<T> = (0..len)
             .map(|i| if i % 3 == 0 { T::ZERO } else { T::ONE })
             .collect();
         if let Some(samples) = samples {
             expected[2..4].copy_from_slice(&samples);
         }
+
         let cache = if matches!(layout, Layout::Dense) {
             2048
         } else {
             1_000_000
         };
+
         let root = common::Directory::new("dtype_storage").await;
         let dir = freqfs::Cache::<FsEntry>::new(cache, None, 0, std::time::Duration::from_secs(1))
             .load(root.to_path_buf())
@@ -73,6 +75,7 @@ where
             // Sample point access independently of the complete stream comparison.
             // Cover special values, every block boundary, and the write-through value.
             let block_len = tensor.block_len();
+
             for (i, &value) in expected.iter().enumerate() {
                 if i < 4 || i + 1 == len || i % block_len <= 1 || i % block_len + 1 == block_len {
                     assert!(same(tensor.read_value(&[i as u64]).await.unwrap(), value));
@@ -92,6 +95,7 @@ where
         } else {
             assert!(Tensor::<FsEntry, f64>::load(dir.clone()).await.is_err());
         }
+
         let tensor = Tensor::<FsEntry, T>::load(dir.clone()).await.unwrap();
         assert_eq!(
             tensor.schema(),
@@ -222,6 +226,7 @@ storage_case!(complex64_storage, fensor::complex::Complex64);
 #[test]
 fn concrete_schema_feature_boundary() {
     use number_general::{ComplexType, NumberType};
+
     for class in [ComplexType::C32, ComplexType::C64] {
         let schema = TensorSchema::new(NumberType::Complex(class), shape![2]);
         assert_eq!(schema.is_ok(), cfg!(feature = "complex"));

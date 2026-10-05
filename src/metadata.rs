@@ -28,6 +28,7 @@ impl<T: TensorElement> TensorMetadata<T> {
                 "block shape rank differs from tensor rank".into(),
             ));
         }
+
         let capacity = crate::schema::checked_product(&block_shape)?;
         if capacity == 0 || capacity > crate::schema::MAX_BLOCK_CAPACITY as u64 {
             return Err(Error::InvalidSchema("invalid block capacity".into()));
@@ -44,9 +45,11 @@ impl<T: TensorElement> TensorMetadata<T> {
     pub fn shape(&self) -> &Shape {
         &self.shape
     }
+
     pub fn layout(&self) -> Layout {
         self.layout
     }
+
     pub fn block_shape(&self) -> &Shape {
         &self.block_shape
     }
@@ -71,23 +74,29 @@ impl<T> GetSize for TensorMetadata<T> {
 
 // Dimension decoding is bounded by the adapter, independently of storage capacity.
 struct Dimensions(Shape);
+
 impl de::FromStream for Dimensions {
     type Context = usize;
+
     async fn from_stream<D: de::Decoder>(
         limit: usize,
         decoder: &mut D,
     ) -> std::result::Result<Self, D::Error> {
         struct Visitor(usize);
+
         impl de::Visitor for Visitor {
             type Value = Dimensions;
+
             fn expecting() -> &'static str {
                 "bounded tensor dimensions"
             }
+
             async fn visit_seq<A: de::SeqAccess>(
                 self,
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 let mut dimensions = Shape::new();
+
                 while let Some(dimension) = seq.next_element::<u64>(()).await? {
                     if dimensions.len() == self.0 {
                         return Err(de::Error::custom(
@@ -96,6 +105,7 @@ impl de::FromStream for Dimensions {
                     }
                     dimensions.push(dimension);
                 }
+
                 Ok(Dimensions(dimensions))
             }
         }
@@ -111,11 +121,14 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
         decoder: &mut D,
     ) -> std::result::Result<Self, D::Error> {
         struct Visitor<T>(usize, PhantomData<T>);
+
         impl<T: TensorElement> de::Visitor for Visitor<T> {
             type Value = TensorMetadata<T>;
+
             fn expecting() -> &'static str {
                 "typed tensor geometry"
             }
+
             async fn visit_seq<A: de::SeqAccess>(
                 self,
                 mut seq: A,
@@ -137,6 +150,7 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
                 } else {
                     return Err(de::Error::custom("dense metadata contains a sparse axis"));
                 };
+
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
                     return Err(de::Error::custom("unexpected metadata field"));
                 }

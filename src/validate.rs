@@ -1,5 +1,6 @@
 use crate::schema::Coord;
 use crate::{Axes, AxisRange, Error, Range, Result, Shape};
+
 pub(crate) fn validate_coord(shape: &[u64], coord: &[u64]) -> Result<()> {
     if coord.len() != shape.len() {
         return Err(Error::InvalidCoord(
@@ -33,6 +34,7 @@ pub(crate) fn ensure_offset_in_bounds(offset: usize, block_len: usize) -> Result
 pub fn broadcast_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
     let mut shape = Shape::from_elem(1, left.len().max(right.len()));
     let rank = shape.len();
+
     for i in 0..rank {
         let l = left.len().checked_sub(i + 1).map(|a| left[a]).unwrap_or(1);
         let r = right
@@ -47,6 +49,7 @@ pub fn broadcast_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
         }
         shape[rank - i - 1] = l.max(r);
     }
+
     Ok(shape)
 }
 
@@ -58,6 +61,7 @@ pub fn matmul_broadcast_shapes(left: &[u64], right: &[u64]) -> Result<(Shape, Sh
             "matmul requires rank at least two".into(),
         ));
     }
+
     let mut left_shape = broadcast_shape(&left[..left.len() - 2], &right[..right.len() - 2])?;
     let mut right_shape = left_shape.clone();
     left_shape.extend_from_slice(&left[left.len() - 2..]);
@@ -72,6 +76,7 @@ pub fn reduction_axes(rank: usize, mut axes: Axes) -> Result<Axes> {
     if axes.iter().any(|&axis| axis >= rank) {
         return Err(Error::InvalidLayout("reduction axis out of bounds".into()));
     }
+
     Ok(axes)
 }
 
@@ -82,8 +87,10 @@ pub fn broadcast_reduce_axes(source: &[u64], target: &[u64]) -> Result<Axes> {
             "broadcast reduction increases rank".into(),
         ));
     }
+
     let prefix = source.len() - target.len();
     let mut axes: Axes = (0..prefix).collect();
+
     for (axis, (&source, &target)) in source[prefix..].iter().zip(target).enumerate() {
         if target == 1 && source != 1 {
             axes.push(prefix + axis);
@@ -93,6 +100,7 @@ pub fn broadcast_reduce_axes(source: &[u64], target: &[u64]) -> Result<Axes> {
             ));
         }
     }
+
     Ok(axes)
 }
 
@@ -165,6 +173,7 @@ pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoo
         crate::schema::checked_product(&lengths)
             .map_err(|_| Error::InvalidLayout("range size overflow".into()))?
     };
+
     Ok(RangeCoords {
         range: range.clone(),
         coord: Coord::from_elem(0, range.len()),
@@ -274,6 +283,7 @@ mod tests {
             );
         }
         assert!(reduction_axes(3, vec![3, 0, 3].into()).is_err());
+
         for (source, target, expected) in [
             (vec![2, 3, 4], vec![1, 4], vec![0, 1]),
             (vec![2, 3], vec![2, 3], vec![]),

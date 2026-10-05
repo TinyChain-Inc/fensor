@@ -5,7 +5,6 @@ use fensor::{
     TensorWrite,
 };
 use ha_ndarray::{axes, shape};
-
 use number_general::DType;
 
 macro_rules! indexed_dtype {

@@ -34,6 +34,7 @@ impl Slice {
                 .try_fold(1u64, |n, axis| n.checked_mul(axis.len()))
                 .ok_or_else(|| Error::InvalidLayout("slice cardinality overflow".into()))?
         };
+
         Ok(Self {
             shape: shape.iter().copied().collect(),
             axes,
@@ -185,11 +186,10 @@ impl std::iter::FusedIterator for SliceRequests {}
 mod tests {
     use futures::TryStreamExt;
     use ha_ndarray::{axes, shape};
-
-    use crate::AxisRange;
     use number_general::DType;
 
     use super::*;
+    use crate::AxisRange;
     use crate::test_support::{FsEntry, new_dir};
     use crate::{
         Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,

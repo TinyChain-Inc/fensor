@@ -12,6 +12,7 @@ fn add<E: de::Error>(left: usize, right: usize) -> Result<usize, E> {
     left.checked_add(right)
         .ok_or_else(|| E::custom("file allocation bound overflow"))
 }
+
 fn bytes<E: de::Error>(count: usize, width: usize) -> Result<usize, E> {
     count
         .checked_mul(width)
@@ -35,18 +36,23 @@ struct Count {
     len: usize,
     capacity: usize,
 }
+
 impl de::FromStream for Count {
     type Context = (usize, usize);
+
     async fn from_stream<D: de::Decoder>(
         (width, limit): Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
         struct Visitor(usize, usize);
+
         impl de::Visitor for Visitor {
             type Value = Count;
+
             fn expecting() -> &'static str {
                 "bounded file sequence"
             }
+
             async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Count, A::Error> {
                 let hint = seq.size_hint();
                 let mut len = 0;
@@ -67,15 +73,20 @@ impl de::FromStream for Count {
 }
 
 struct Rows(usize);
+
 impl de::FromStream for Rows {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         struct Visitor;
+
         impl de::Visitor for Visitor {
             type Value = Rows;
+
             fn expecting() -> &'static str {
                 "bounded native index rows"
             }
+
             async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Rows, A::Error> {
                 let hint = seq.size_hint();
                 let mut len = 0;
@@ -101,19 +112,24 @@ impl de::FromStream for Rows {
 }
 
 struct NodeSize(usize);
+
 impl de::FromStream for NodeSize {
     // None is the integer index; Some(width) is a typed sparse node.
     type Context = Option<usize>;
+
     async fn from_stream<D: de::Decoder>(
         width: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
         struct Visitor(Option<usize>);
+
         impl de::Visitor for Visitor {
             type Value = NodeSize;
+
             fn expecting() -> &'static str {
                 "native node allocation bound"
             }
+
             async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<NodeSize, A::Error> {
                 let leaf = seq.expect_next::<bool>(()).await?;
                 let mut bound = size_of::<b_table::Node<u64>>();
@@ -156,15 +172,20 @@ impl de::FromStream for NodeSize {
 }
 
 struct MetadataSize(usize);
+
 impl de::FromStream for MetadataSize {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         struct Visitor;
+
         impl de::Visitor for Visitor {
             type Value = MetadataSize;
+
             fn expecting() -> &'static str {
                 "native metadata allocation bound"
             }
+
             async fn visit_seq<A: de::SeqAccess>(
                 self,
                 mut seq: A,
@@ -203,13 +224,17 @@ impl de::FromStream for MetadataSize {
 
 impl de::FromStream for Size {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         struct Visitor;
+
         impl de::Visitor for Visitor {
             type Value = Size;
+
             fn expecting() -> &'static str {
                 "tagged file allocation bound"
             }
+
             async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Size, A::Error> {
                 let tag = seq.expect_next::<u8>(()).await?;
                 let payload = match tag {

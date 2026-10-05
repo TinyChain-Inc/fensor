@@ -169,6 +169,7 @@ where
         Some(requests) => requests,
         None => Box::new(request::linear_requests(expression.shape())?),
     };
+
     Ok(
         evaluation_futures(expression, futures::stream::iter(requests.map(Ok)))
             .buffer_unordered(num_cpus::get().max(1)),
@@ -250,6 +251,7 @@ pub fn union_support(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Result<Op
     for mask in [&left, &right].into_iter().flatten() {
         validate_bound("support union", mask.len())?;
     }
+
     match (left, right) {
         (Some(mut left), Some(right)) => {
             validate_len("support union", right.len(), left.len())?;
@@ -322,6 +324,7 @@ pub(crate) fn sparse_elements<T: TensorElement>(
         }
         _ => Coordinates::Compact(request.into_cursor(shape.into())?),
     };
+
     let mut scratch = crate::schema::Coord::new();
     Ok(batch
         .values
@@ -339,6 +342,7 @@ pub(crate) fn sparse_elements<T: TensorElement>(
                 if value == T::default() {
                     return None;
                 }
+
                 #[cfg(test)]
                 crate::read_metrics::record(|m| m.expanded_coordinates += 1);
                 Some(Ok((scratch.to_vec(), value)))
@@ -493,9 +497,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::counters::Counter;
-
     use super::*;
+    use crate::test_support::counters::Counter;
 
     // Wrap real storage only to observe dispatch; numerical reads still delegate.
     #[derive(Clone)]
@@ -626,6 +629,7 @@ mod tests {
                 .into_iter(),
             )))
         };
+
         let error: Provide = |_| Err(Error::Unsupported("support provider failure".into()));
         let (root, tensor) = crate::test_support::fixture::source(
             "support_providers",
@@ -663,6 +667,7 @@ mod tests {
             assert_eq!(calls.each_ref().map(|n| n.read()), expected);
             if let Ok(mut requests) = requests {
                 let mut coordinates = Vec::new();
+
                 while let Some(request) = requests.try_next().await.unwrap() {
                     assert!(request.len() <= MAX_BATCH_ELEMENTS);
                     coordinates.extend(request.into_coordinates(&[6]).unwrap());
@@ -670,6 +675,7 @@ mod tests {
                 assert_eq!(coordinates, (0..6).map(|i| vec![i]).collect::<Vec<_>>());
             }
         }
+
         for (providers, expected) in [([error, none], [1, 0]), ([none, error], [1, 1])] {
             let calls = [Counter::new(), Counter::new()];
             let [left, right] = std::array::from_fn(|i| Provider {
@@ -764,6 +770,7 @@ mod tests {
                 &[0., -0.][..],
             ),
         ];
+
         for (name, request, shape, pattern) in cases {
             let explicit = matches!(request.kind(), RequestKind::Explicit(_));
             let expected_coords = request.coordinates(&shape).unwrap();
@@ -774,6 +781,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
+
             let values: Vec<_> = (0..request.len())
                 .map(|i| pattern[i % pattern.len()])
                 .collect();
@@ -801,6 +809,7 @@ mod tests {
                     });
                     let output = output.collect::<Result<Vec<_>>>().unwrap();
                     assert_eq!(output.len(), expected.len(), "{name}");
+
                     for ((coord, value), (i, expected_coord, bits)) in output.iter().zip(&expected)
                     {
                         assert_eq!(coord, expected_coord, "{name}");

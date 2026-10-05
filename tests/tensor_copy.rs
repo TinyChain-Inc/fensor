@@ -1,12 +1,13 @@
 //! One storage constructor consumes base tensors and geometric views as readers.
 
-use common::{FsEntry, new_dir};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema,
     TensorTransform, TensorWrite,
 };
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType, UIntType};
+
+use common::{FsEntry, new_dir};
 
 mod common;
 
@@ -323,22 +324,28 @@ struct SparseOnce {
     drops: std::sync::atomic::AtomicUsize,
     malformed: bool,
 }
+
 impl TensorGeometry for SparseOnce {
     type DType = f64;
+
     fn dtype(&self) -> NumberType {
         NumberType::Float(FloatType::F64)
     }
+
     fn shape(&self) -> &[u64] {
         &[2, 8193]
     }
+
     fn layout(&self) -> Layout {
         Layout::Sparse { axis: Some(1) }
     }
 }
+
 impl TensorRead for SparseOnce {
     fn read_value<'a>(&'a self, _: &'a [u64]) -> fensor::BoxFuture<'a, fensor::Result<f64>> {
         Box::pin(async { panic!("copy must consume the sparse stream once") })
     }
+
     fn read_sparse_elements_in_order<'a>(
         &'a self,
         _: fensor::Range,
@@ -348,7 +355,9 @@ impl TensorRead for SparseOnce {
         Box::pin(async move {
             self.starts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
             struct Lease<'a>(&'a std::sync::atomic::AtomicUsize);
+
             impl Drop for Lease<'_> {
                 fn drop(&mut self) {
                     self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -376,6 +385,7 @@ impl TensorRead for SparseOnce {
         })
     }
 }
+
 #[tokio::test]
 async fn sparse_copy_consumes_once_releases_source_and_rejects_duplicates() {
     for malformed in [false, true] {

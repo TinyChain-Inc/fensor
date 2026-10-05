@@ -28,12 +28,15 @@ struct Source {
 
 impl TensorGeometry for Source {
     type DType = f64;
+
     fn dtype(&self) -> NumberType {
         self.tensor.dtype()
     }
+
     fn layout(&self) -> Layout {
         self.tensor.layout()
     }
+
     fn shape(&self) -> &[u64] {
         self.tensor.shape()
     }
@@ -43,6 +46,7 @@ impl TensorArray for Source {
     fn schema(&self) -> &TensorSchema {
         self.tensor.schema()
     }
+
     fn strides(&self) -> &[u64] {
         self.tensor.strides()
     }
@@ -52,6 +56,7 @@ impl TensorSource for Source {
     fn storage_geometry(&self) -> StorageGeometry {
         self.tensor.storage_geometry()
     }
+
     fn read_logical_block(&self, id: u64) -> BoxFuture<'_, fensor::Result<Vec<f64>>> {
         Box::pin(async move {
             self.lease.fetch_add(1, Ordering::Relaxed);
@@ -65,6 +70,7 @@ impl TensorSource for Source {
             }
         })
     }
+
     fn occupied_regions(
         &self,
         after: Option<[u64; 2]>,

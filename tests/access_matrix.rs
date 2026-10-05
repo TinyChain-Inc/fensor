@@ -1366,20 +1366,26 @@ mod section_d_bulk_io {
     async fn copy_dense_values_to_sparse() {
         let (dense_root, dense, _) = create_dense("d_wt_dense", shape![2, 3, 4], 4).await;
         seed_values(&dense).await;
+
         // A caller-provided reader chooses sparse materialization at the copy boundary.
         struct SparseReader<'a>(&'a Tensor<FsEntry, f32>);
+
         impl fensor::TensorGeometry for SparseReader<'_> {
             type DType = f32;
+
             fn dtype(&self) -> NumberType {
                 self.0.dtype()
             }
+
             fn shape(&self) -> &[u64] {
                 self.0.shape()
             }
+
             fn layout(&self) -> Layout {
                 Layout::Sparse { axis: Some(1) }
             }
         }
+
         impl TensorRead for SparseReader<'_> {
             fn read_value<'a>(
                 &'a self,

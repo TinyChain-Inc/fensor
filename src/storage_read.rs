@@ -200,6 +200,7 @@ impl StorageShape<'_> {
                 }
             }
         }
+
         if end != request.len() {
             return Err(invalid());
         }
@@ -278,6 +279,7 @@ impl StorageShape<'_> {
             let mut stride = 0i128;
 
             decode_flat(flat, self.shape, coord)?;
+
             for (i, c) in coord.iter().enumerate() {
                 let low = *c / self.block_shape[i] * self.block_shape[i];
                 let high = low + (self.block_shape[i] - 1).min(self.shape[i] - 1 - low);
@@ -315,9 +317,8 @@ impl StorageShape<'_> {
 mod tests {
     use ha_ndarray::{axes, range, shape};
 
-    use crate::AxisRange;
-
     use super::*;
+    use crate::AxisRange;
     use crate::mapping::AxisContrib;
     use crate::request::{Axis, Cartesian};
     use crate::schema::contiguous_strides;
@@ -482,6 +483,7 @@ mod tests {
             block_strides: &[8, 1],
             grid_strides: &[1, 1],
         };
+
         let identity = CoordinateMap::identity(shape![8, 8], &[8, 1]);
 
         for (map, expected_runs) in [
@@ -527,6 +529,7 @@ mod tests {
                 1,
             ],
         };
+
         let request = BatchRequest::linear(999_999_999_999_999_968, 32).unwrap();
         assert!(huge.plan(&request, None).unwrap().len() <= 2);
     }

@@ -1,8 +1,9 @@
 //! Copy-specific transposed fixtures, including blocks revisited across batches.
 
-use super::{benchmark, common};
 use fensor::{Layout, TensorTransform};
 use ha_ndarray::shape;
+
+use super::{benchmark, common};
 
 pub async fn run() {
     for (rows, cols, caches) in [(9, 17, [8192, 1_000_000]), (65, 65, [32768, 1_000_000])] {

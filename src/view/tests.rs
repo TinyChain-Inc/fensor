@@ -2,11 +2,10 @@ use fensor::AxisRange;
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
+use super::*;
 use crate::schema::row_major_coords;
 use crate::test_support::{FsEntry as TestFE, cleanup, new_dir};
 use crate::{Error, Layout, Shape, Tensor, TensorSchema};
-
-use super::*;
 
 async fn create_dense(
     name: &str,
@@ -1238,6 +1237,7 @@ async fn unsqueeze_then_squeeze_round_trip() {
 #[tokio::test]
 async fn update_planning_matches_coordinates_without_affine_expansion() {
     use crate::TensorSource;
+
     for layout in [Layout::Dense, Layout::Sparse { axis: Some(1) }] {
         for block_shape in [shape![2, 3], shape![4, 64]] {
             let (root, dir) = new_dir("update_plans").await;
@@ -1263,12 +1263,15 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
                     ])
                     .unwrap(),
             ];
+
             for (index, view) in views.into_iter().enumerate() {
                 let coordinates: Vec<_> = row_major_coords(view.shape()).unwrap().collect();
+
                 for start in (0..coordinates.len()).step_by(73) {
                     let len = (coordinates.len() - start).min(73);
                     let values: Vec<_> = (start..start + len).map(|i| i as f32).collect();
                     let mut expected = crate::BlockUpdates::new();
+
                     for (coord, value) in coordinates[start..start + len].iter().zip(&values) {
                         let mapped = view.resolve_base_coord(coord).unwrap();
                         let (id, offset) = geometry.block_position(&mapped).unwrap();
@@ -1307,6 +1310,7 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
                     .is_err()
                 );
             }
+
             let wrong = crate::StorageGeometry::new(
                 tensor.schema().clone(),
                 if matches!(layout, Layout::Dense) {
@@ -1329,28 +1333,36 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
 
 #[tokio::test]
 async fn update_stream_evaluates_once_and_owns_its_source() {
-    use crate::{TensorExpression, TensorSource};
-    use futures::TryStreamExt;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    use futures::TryStreamExt;
+
+    use crate::{TensorExpression, TensorSource};
+
     struct Counted {
         calls: Arc<AtomicUsize>,
         fail: bool,
     }
+
     impl TensorGeometry for Counted {
         type DType = f32;
+
         fn dtype(&self) -> NumberType {
             NumberType::Float(FloatType::F32)
         }
+
         fn layout(&self) -> Layout {
             Layout::Dense
         }
+
         fn shape(&self) -> &[u64] {
             &[8193]
         }
     }
+
     impl crate::expression::Expression for Counted {
         fn build<'a>(
             &'a self,
@@ -1362,6 +1374,7 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
                 if self.fail {
                     return Err(Error::InvalidLayout("injected source error".into()));
                 }
+
                 Ok(crate::expression::Batch {
                     _allocation: None,
                     array: crate::expression::batch_array(vec![1.; request.len()])?,
@@ -1370,7 +1383,9 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
             })
         }
     }
+
     let (root, tensor) = create_dense("update_stream", shape![8193], 64).await;
+
     for fail in [false, true] {
         let calls = Arc::new(AtomicUsize::new(0));
         let source = TensorExpression::new(Counted {
@@ -1387,6 +1402,7 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
             assert!(stream.try_next().await.is_err());
         } else {
             let mut count = 0;
+
             while let Some(updates) = stream.try_next().await.unwrap() {
                 let n: usize = updates.values().map(Vec::len).sum();
                 assert!(n <= crate::expression::MAX_BATCH_ELEMENTS);
@@ -1414,17 +1430,21 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
 
 #[tokio::test]
 async fn owned_transforms_use_compact_runs_through_native_consumption() {
-    use crate::{TensorExpression, TensorSource};
     use futures::TryStreamExt;
+
+    use crate::{TensorExpression, TensorSource};
     let (root, tensor) = create_dense("owned_compact_runs", shape![3, 4097], 256).await;
     let geometry = tensor.storage_geometry();
+
     for id in 0..geometry.block_count() {
         let mut values = vec![0.; geometry.block_len()];
+
         for (offset, coord) in crate::test_support::block_entries(&geometry, id) {
             values[offset] = (coord[0] * 4097 + coord[1]) as f32;
         }
         tensor.replace_logical_block(id, values).await.unwrap();
     }
+
     let expected = tensor
         .view()
         .transpose(None)

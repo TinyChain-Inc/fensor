@@ -12,18 +12,16 @@ use std::path::{Path, PathBuf};
 
 use b_table::Node;
 use destream::{de, en};
-pub mod file_size;
-mod sparse_codec;
 use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
 use freqfs::{Cache, DirLock};
 use get_size::GetSize;
 use safecast::as_type;
 
 pub mod counters;
-
+pub mod file_size;
 pub mod fixture;
-
 pub mod numbers;
+mod sparse_codec;
 
 const MAX_METADATA_RANK: usize = 4096;
 
@@ -386,6 +384,7 @@ impl Directory {
 
 impl std::ops::Deref for Directory {
     type Target = Path;
+
     fn deref(&self) -> &Path {
         &self.0
     }

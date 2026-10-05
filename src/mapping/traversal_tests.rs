@@ -21,6 +21,7 @@ fn mapped_visits_preserve_request_order_and_reset_scratch() {
         BatchRequest::linear(0, 0).unwrap(),
         BatchRequest::rectangles(vec![]).unwrap(),
     ];
+
     for request in requests {
         let expected: Vec<_> = request
             .coordinates(&mapping.shape)
@@ -105,6 +106,7 @@ fn compact_mapped_requests_match_coordinate_reference() {
     let shape = smallvec::smallvec![2, 3, 4];
     let strides = schema::contiguous_strides(&shape).unwrap();
     let base = CoordinateMap::identity(shape.clone(), &strides);
+
     for mapping in [
         base.clone(),
         base.clone().transpose(None).unwrap().flip(0).unwrap(),
@@ -143,6 +145,7 @@ fn compact_mapped_requests_match_coordinate_reference() {
             ])
             .unwrap(),
         ];
+
         for request in requests {
             let expected: Vec<_> = request
                 .coordinates(&mapping.shape)

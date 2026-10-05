@@ -28,7 +28,14 @@ the line above the statement.
 
 ## Formatting
 
-- Run `cargo fmt` locally
+- Separate Rust items and methods with one blank line. Keep attributes and
+  documentation attached to their item.
+- Within functions, separate distinct processing steps with one blank line;
+  keep related declarations and operations together.
+- Run `cargo fmt` locally. Stable rustfmt does not enforce all import grouping
+  or item-spacing rules, so review those explicitly.
+- Python benchmark imports group standard-library modules before local modules,
+  sorting `import` and `from` statements alphabetically within each group.
 
 ## Crate-specific notes
 

@@ -1,9 +1,10 @@
 """Runner schema checks, without starting benchmark processes."""
+
 import csv
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from compare import CSV_FIELDS, main, records, summarize

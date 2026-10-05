@@ -317,6 +317,7 @@ fn linear_plans(start: u64, len: usize, shape: &[u64]) -> Result<Vec<MatrixPlan>
         crate::request::decode_flat(flat, shape, &mut coord)?;
         let row = coord[rank - 2];
         let mut done = 0;
+
         while done < length {
             let column = coord[rank - 1] + done as u64;
             let mut key = coord.to_vec();
@@ -330,6 +331,7 @@ fn linear_plans(start: u64, len: usize, shape: &[u64]) -> Result<Vec<MatrixPlan>
             done += count;
         }
     }
+
     Ok(tiles
         .into_iter()
         .map(|(mut prefix, segments)| {
@@ -478,6 +480,7 @@ where
         } else {
             Box::new(request::tiled_requests(shape)?)
         };
+
         Ok(expression::traversal::Preferred::Ready(Some(requests)))
     }
 
@@ -767,6 +770,7 @@ mod tests {
                 } else {
                     Box::new(request::linear_requests(&shape).unwrap())
                 };
+
                 let mut operands = 0;
                 let mut calls = 0;
 

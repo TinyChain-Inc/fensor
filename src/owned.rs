@@ -61,6 +61,7 @@ impl<T: TensorElement> Drop for Handle<T> {
     fn drop(&mut self) {
         let mut pending = Vec::new();
         self.detach(&mut pending);
+
         while let Some(source) = pending.pop() {
             source.drain(&mut pending);
         }
@@ -110,12 +111,15 @@ impl<T: TensorElement> TensorExpression<T> {
 
 impl<T: TensorElement> TensorGeometry for TensorExpression<T> {
     type DType = T;
+
     fn dtype(&self) -> crate::NumberType {
         <T as number_general::DType>::dtype()
     }
+
     fn layout(&self) -> Layout {
         self.source.owned().layout
     }
+
     fn shape(&self) -> &[u64] {
         &self.mapping.shape
     }
@@ -184,6 +188,7 @@ impl<T: TensorElement> Expression for TensorExpression<T> {
             if self.is_identity(&strides) {
                 return context.batch(self.source(), request).await;
             }
+
             let mapped = request.mapped(&self.mapping, self.source().shape(), &strides)?;
             context
                 .batch(self.source(), std::sync::Arc::new(mapped))

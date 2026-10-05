@@ -5,10 +5,9 @@ use std::sync::Mutex;
 use futures::{TryStreamExt, channel::oneshot};
 use number_general::DType;
 
+use super::*;
 use crate::test_support::{self, FsEntry, counters::Counter};
 use crate::{TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
-
-use super::*;
 
 struct Source<'a, T: TensorElement>
 where
@@ -88,6 +87,7 @@ where
             } else if self.fail_at == Some(index) {
                 return Err(Error::Unsupported("injected later batch failure".into()));
             }
+
             let batch = self.tensor.build(context, request).await?;
             self.completed.increment();
             Ok(batch)
@@ -182,6 +182,7 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             );
         } else {
             release.send(Ok(())).unwrap();
+
             for i in 0..count {
                 let (_, batch) = stream.try_next().await.unwrap().unwrap();
                 assert_eq!(batch.values, vec![(i % 255) as u8]);
@@ -237,6 +238,7 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
     let count = num_cpus::get().max(2) + 3;
     let values: Vec<_> = (0..count).map(|i| (i % 255) as u8).collect();
     let (root, tensor) = stored("unordered_slots", &values, false).await;
+
     for window in [1, 2, num_cpus::get().max(1)] {
         let (source, release) = delayed(&tensor);
         let requests = (0..count).map(|i| BatchRequest::explicit(vec![vec![i as u64]]));
@@ -265,6 +267,7 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
             assert!(stream.next().now_or_never().is_none());
         }
         release.send(Ok(())).unwrap();
+
         while let Some((request, batch)) = stream.try_next().await.unwrap() {
             let index = request.into_coordinates(source.shape()).unwrap()[0][0] as usize;
             assert_eq!(batch.values, vec![values[index]]);
@@ -315,6 +318,7 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(pairs.len(), count);
+
         for (i, (coord, value)) in pairs.into_iter().enumerate() {
             assert_eq!(coord, vec![i as u64]);
             assert_eq!(value, values[i]);
@@ -394,6 +398,7 @@ async fn numeric_terminals_accept_completion_schedules() {
 
     for sparse in [false, true] {
         let (root, tensor) = stored("unordered_integer", &[255u8, 2, 3], sparse).await;
+
         for release_first in [false, true] {
             for (operation, expected) in [4, 250, 2, 255].into_iter().enumerate() {
                 let (source, release) = delayed(&tensor);
@@ -418,10 +423,12 @@ async fn numeric_terminals_accept_completion_schedules() {
     let scale = values.iter().map(|v| v.abs()).sum::<f64>();
     let ku = 8. * values.len() as f64 * (f64::EPSILON / 2.);
     let (root, tensor) = stored("unordered_float", &values, false).await;
+
     for release_first in [false, true] {
         let (source, release) = delayed(&tensor);
         let actual = scheduled(&source, release, 0, release_first).await.unwrap();
         assert!((actual - exact.to_f64().unwrap()).abs() <= ku / (1. - ku) * scale);
+
         for (operation, expected) in [(2, -1e16), (3, 1e16)] {
             let (source, release) = delayed(&tensor);
             assert_eq!(
@@ -441,6 +448,7 @@ async fn numeric_terminals_accept_completion_schedules() {
         [1., f32::NAN, f32::INFINITY],
     ] {
         let (root, tensor) = stored("unordered_float_edges", &values, false).await;
+
         for release_first in [false, true] {
             for operation in 0..4 {
                 let (source, release) = delayed(&tensor);

@@ -64,6 +64,7 @@ where
     reserve(&mut pending, 1)?;
     pending.push(Box::new(move || source.preferred_step(shape)));
     let mut visited = 0;
+
     while let Some(next) = pending.pop() {
         visit(&mut visited)?;
         match next()? {
@@ -75,6 +76,7 @@ where
             }
         }
     }
+
     Ok(None)
 }
 
@@ -84,6 +86,7 @@ where
 {
     let mut step = source.selection_step(slice)?;
     let mut visited = 0;
+
     loop {
         visit(&mut visited)?;
         step = match step {
@@ -102,12 +105,14 @@ where
         Leaf(usize),
         Union(Vec<usize>),
     }
+
     let mut pending: Vec<(usize, usize, Deferred<'_, Support<'_>>)> = Vec::new();
     let mut nodes = vec![Node::Union(vec![0])];
     let mut streams = Vec::new();
     reserve(&mut pending, 1)?;
     pending.push((0, 0, Box::new(move || source.support_step(slice))));
     let mut visited = 0;
+
     while let Some((parent, slot, next)) = pending.pop() {
         visit(&mut visited)?;
         let index = nodes.len();
@@ -133,9 +138,11 @@ where
             }
         }
     }
+
     let mut ordered = Vec::new();
     reserve(&mut ordered, streams.len())?;
     let mut traversal = vec![0];
+
     while let Some(index) = traversal.pop() {
         match &nodes[index] {
             Node::Leaf(stream) => {
@@ -147,9 +154,11 @@ where
             }
         }
     }
+
     if ordered.len() == 1 {
         return Ok(ordered.pop().expect("one support stream"));
     }
+
     Ok(merge(ordered, source.shape().into()))
 }
 
@@ -163,6 +172,7 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
         ready: bool,
         done: bool,
     }
+
     let inputs: Vec<_> = streams
         .into_iter()
         .map(|stream| Input {
@@ -183,8 +193,10 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
         ),
         |(mut inputs, shape, mut previous, mut budget)| async move {
             let mut output = Vec::with_capacity(MAX_BATCH_ELEMENTS);
+
             while output.len() < MAX_BATCH_ELEMENTS {
                 let mut first: Option<usize> = None;
+
                 for i in 0..inputs.len() {
                     futures::future::poll_fn(|cx| budget.poll(cx)).await;
                     let input = &mut inputs[i];
@@ -199,6 +211,7 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
                         if input.ready {
                             continue;
                         }
+
                         if let Some(request) = input.stream.try_next().await? {
                             input.coordinates = Some(request.into_cursor(Arc::clone(&shape))?);
                         } else {
@@ -206,18 +219,22 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
                             input.done = true;
                         }
                     }
+
                     if input.ready && first.is_none_or(|first| inputs[i].next < inputs[first].next)
                     {
                         first = Some(i);
                     }
                 }
+
                 let Some(first) = first else {
                     break;
                 };
+
                 let coord = &inputs[first].next;
                 output.push(coord.to_vec());
                 previous.get_or_insert_with(Coord::new).clone_from(coord);
             }
+
             if output.is_empty() {
                 Ok(None)
             } else {
@@ -270,10 +287,12 @@ mod tests {
                 .scope(RefCell::new(Metrics::default()), async {
                     let mut stream = merge(streams, shape.clone());
                     let mut count = 0;
+
                     while let Some(request) = stream.try_next().await.unwrap() {
                         assert!(request.len() <= MAX_BATCH_ELEMENTS);
                         let mut cursor = request.cursor(&shape).unwrap();
                         let mut coord = Coord::new();
+
                         while cursor.next_into(&mut coord) {
                             assert!(coord[..rank - 1].iter().all(|&n| n == 0));
                             assert_eq!(coord[rank - 1], count);

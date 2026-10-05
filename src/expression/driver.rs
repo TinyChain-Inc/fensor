@@ -142,6 +142,7 @@ where
         pending: Arc::new(Mutex::new(None)),
         live: Arc::new(AtomicUsize::new(0)),
     };
+
     let root_context = context.clone();
     let (send, receive) = oneshot::channel();
     let root = Box::pin(async move {
@@ -168,10 +169,12 @@ impl<T: TensorElement> Future for Driver<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+
         loop {
             if this.work.poll(cx).is_pending() {
                 return Poll::Pending;
             }
+
             let pending = this
                 .context
                 .pending
@@ -184,6 +187,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                         "expression evaluation exceeds frame limit".into(),
                     )));
                 }
+
                 if let Err(error) = this.frames.try_reserve(1) {
                     return Poll::Ready(Err(Error::Unsupported(format!(
                         "expression frame allocation: {error}"
@@ -191,6 +195,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                 }
                 this.frames.push(frame);
             }
+
             let Some(frame) = this.frames.last_mut() else {
                 return Pin::new(&mut this.receive).poll(cx).map(|result| {
                     result.unwrap_or_else(|_| {
@@ -198,6 +203,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                     })
                 });
             };
+
             match frame.as_mut().poll(cx) {
                 Poll::Ready(()) => {
                     this.frames.pop();
@@ -229,6 +235,7 @@ impl<T: TensorElement> Drop for Driver<'_, T> {
             .expect("evaluation driver poisoned")
             .take();
         drop(pending);
+
         while self.frames.pop().is_some() {}
     }
 }
@@ -243,6 +250,7 @@ mod tests {
             pending: Arc::new(Mutex::new(None)),
             live: Arc::new(AtomicUsize::new(0)),
         };
+
         let capacity = MAX_LIVE_BATCH_BYTES / (std::mem::size_of::<f64>() + 1);
         let allocation = context.reserve::<f64>(capacity).unwrap();
         assert!(context.reserve::<f64>(1).is_err());
@@ -255,6 +263,7 @@ mod tests {
             array: super::super::batch_array(vec![1_f64]).unwrap(),
             support: Some(vec![1]),
         };
+
         let values = batch.realize().unwrap().into_evaluated().unwrap();
         assert_eq!(context.live.load(Ordering::Relaxed), 9);
         assert_eq!(values.values, [1.]);

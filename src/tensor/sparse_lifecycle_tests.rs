@@ -1,12 +1,11 @@
-use crate::TensorSource;
 use std::collections::BTreeMap;
 
-use crate::Shape;
 use ha_ndarray::shape;
 
-use crate::test_support::{Directory, FsEntry as TestFE, cleanup, new_dir, open_dir};
-
 use super::*;
+use crate::Shape;
+use crate::TensorSource;
+use crate::test_support::{Directory, FsEntry as TestFE, cleanup, new_dir, open_dir};
 
 async fn create_sparse(
     name: &str,
@@ -209,6 +208,7 @@ async fn sparse_capacity_spans_grids_without_axis_padding() {
             .await;
             assert_eq!(tensor.block_shape()[axis.unwrap_or(0)], 1);
             assert!(tensor.block_len() <= capacity);
+
             for (coord, value) in [([0, 0, 0], 1.), ([2, 4, MAX_BLOCK_CAPACITY as u64], 2.)] {
                 tensor.write_value(&coord, value).await.unwrap();
                 assert_eq!(tensor.read_value(&coord).await.unwrap(), value);
@@ -250,6 +250,7 @@ async fn slice_index_pages_resume_within_and_between_coordinates() {
         } else {
             entries as u64 - 1
         };
+
         let owner = tensor.storage.sparse().unwrap();
         let first = owner.slice_index_page(None, 0, hi).await.unwrap();
         assert_eq!(first.len(), SPARSE_INDEX_PAGE_ENTRIES);
@@ -572,6 +573,7 @@ async fn copy_batches_group_logical_blocks() {
         })
         .await;
     let tensor = output.finish().await.unwrap();
+
     for (coord, value) in coords.iter().zip([3., 2., 1., 4.]) {
         assert_eq!(tensor.read_value(coord).await.unwrap(), value);
     }
@@ -589,12 +591,14 @@ async fn copy_batches_group_logical_blocks() {
 async fn copy_batches_coalesce_existing_logical_blocks() {
     // Row-major input repeatedly interleaves many destination blocks.
     let (root, source) = create_sparse("copy_interleaved", shape![65, 33], 4096, Some(1)).await;
+
     for id in 0..source.num_blocks() {
         source
             .replace_logical_block(id, vec![1.; source.block_len()])
             .await
             .unwrap();
     }
+
     let (out_root, dir) = new_dir("copy_interleaved_output").await;
     let output = copy_metrics::CURRENT
         .scope(Default::default(), async {
@@ -714,6 +718,7 @@ async fn sparse_copy_zeros_do_not_create_storage() {
     assert_eq!(tensor.storage.blocks().read().await.files().count(), 1); // metadata only
     cleanup(&root).await;
 }
+
 #[tokio::test]
 async fn ordered_sparse_consumers_visit_occupied_regions_and_keep_zero_support() {
     use crate::{TensorExpression, TensorMath, TensorMathScalar, TensorStatistics};

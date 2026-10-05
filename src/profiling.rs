@@ -1,4 +1,5 @@
 //! Same workload code with task-local observations; absent from production builds.
+
 use crate::test_support as common;
 
 #[path = "../tests/common/benchmark.rs"]
@@ -20,6 +21,7 @@ async fn observe(
                 let count = work.await;
                 crate::read_metrics::CURRENT.with(|m| {
                     let m = m.borrow();
+
                     for (metric, value) in [
                         ("slice_requests", m.slice_requests as u128),
                         ("index_entries", m.index_entries as u128),
@@ -39,6 +41,7 @@ async fn observe(
                 });
                 crate::tensor::copy_metrics::CURRENT.with(|m| {
                     let m = m.borrow();
+
                     for (metric, value) in [
                         ("copy_groups", m.groups as u128),
                         ("copy_block_updates", m.block_updates as u128),

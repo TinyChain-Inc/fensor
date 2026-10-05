@@ -89,6 +89,7 @@ pub trait TensorRead: TensorGeometry {
                     }
                     return Ok(None);
                 };
+
                 if values.len() > crate::expression::MAX_BATCH_ELEMENTS {
                     return Err(Error::InvalidLayout(format!(
                         "coordinate block: expected at most {} values, got {}",
@@ -163,11 +164,17 @@ pub trait TensorWriteBulk: TensorWrite {
 /// Implementers provide every transformation and validate its supported geometry.
 pub trait TensorTransform: TensorGeometry + Sized {
     fn reshape(self, shape: Shape) -> Result<Self>;
+
     fn broadcast(self, shape: Shape) -> Result<Self>;
+
     fn flip(self, axis: usize) -> Result<Self>;
+
     fn slice(self, range: Range) -> Result<Self>;
+
     fn squeeze(self, axes: Axes) -> Result<Self>;
+
     fn transpose(self, permutation: Option<Axes>) -> Result<Self>;
+
     fn unsqueeze(self, axes: Axes) -> Result<Self>;
 }
 

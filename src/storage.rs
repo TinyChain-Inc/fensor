@@ -25,6 +25,7 @@ pub(crate) fn plan_updates<T: Copy>(
             "write request/value length mismatch".into(),
         ));
     }
+
     let shape = crate::storage_read::StorageShape {
         shape: geometry.schema.shape(),
         strides: geometry.schema.strides(),
@@ -32,10 +33,13 @@ pub(crate) fn plan_updates<T: Copy>(
         block_strides: &geometry.storage.block_schema.strides,
         grid_strides: &geometry.storage.strides,
     };
+
     let groups = shape.plan(request, mapping)?;
     let mut updates = BlockUpdates::new();
+
     for (id, runs) in groups {
         let block = updates.entry(id).or_default();
+
         for run in runs {
             // The storage planner validates both source positions and block offsets.
             for i in 0..run.len {
@@ -44,6 +48,7 @@ pub(crate) fn plan_updates<T: Copy>(
             }
         }
     }
+
     Ok(updates)
 }
 
@@ -86,6 +91,7 @@ impl<'a> BlockCursor<'a> {
     #[inline(always)]
     fn advance(&mut self) {
         let mut axis = self.coord.len();
+
         loop {
             if axis == 0 {
                 self.done = true;
@@ -98,6 +104,7 @@ impl<'a> BlockCursor<'a> {
             if self.coord[axis] < self.bounds[axis].1 {
                 break;
             }
+
             self.offset -= (self.bounds[axis].1 - self.bounds[axis].0) as usize * stride;
             self.coord[axis] = self.bounds[axis].0;
         }
@@ -115,6 +122,7 @@ impl StorageGeometry {
                 "invalid storage block geometry".into(),
             ));
         }
+
         let storage = StorageSchema::from_block_shape(schema.shape(), layout, block_shape)?;
         Ok(Self { schema, storage })
     }
@@ -122,15 +130,19 @@ impl StorageGeometry {
     pub fn schema(&self) -> &TensorSchema {
         &self.schema
     }
+
     pub fn layout(&self) -> Layout {
         self.storage.layout
     }
+
     pub fn block_shape(&self) -> &[u64] {
         &self.storage.block_schema.shape
     }
+
     pub fn block_len(&self) -> usize {
         self.storage.block_schema.shape.iter().product::<u64>() as usize
     }
+
     pub fn block_count(&self) -> u64 {
         self.storage.shape.iter().product()
     }
@@ -150,6 +162,7 @@ impl StorageGeometry {
         if id >= self.block_count() {
             return Err(Error::InvalidCoord("logical block out of bounds".into()));
         }
+
         Ok((0..self.schema.shape().len())
             .map(|axis| {
                 let grid = (id / self.storage.strides[axis]) % self.storage.shape[axis];
@@ -224,17 +237,21 @@ where
                 grid_strides: &geometry.storage.strides,
                 // Logical blocks already combine every sparse key in their region.
             };
+
             let groups = shape.plan(read.request, read.mapping)?;
             let mut values = vec![Self::DType::default(); read.request.len()];
+
             for (id, runs) in groups {
                 let block = self.read_logical_block(id).await?;
                 if block.len() != geometry.block_len() {
                     return Err(Error::InvalidLayout("invalid logical block length".into()));
                 }
+
                 for run in runs {
                     run.scatter(&block, &mut values)?;
                 }
             }
+
             Ok(values)
         })
     }
@@ -296,6 +313,7 @@ where
         pending: None,
         overflow: None,
     };
+
     Ok(futures::stream::try_unfold(
         (cursor, slice, mapping, geometry),
         move |(mut cursor, slice, mapping, geometry)| async move {
@@ -324,10 +342,12 @@ where
                 let Some(keys) = &mut cursor.keys else {
                     break;
                 };
+
                 let Some(row) = keys.try_next().await? else {
                     cursor.keys = None;
                     break;
                 };
+
                 let mut bounds = geometry.block_bounds(row[1])?;
 
                 let coord = row[0];
@@ -369,6 +389,7 @@ where
     let Some(sparse_axis) = geometry.sparse_axis() else {
         return Ok(slice.stream());
     };
+
     if source.shape()[..sparse_axis].iter().any(|&dim| dim != 1)
         || mapping.axes.windows(2).any(|axes| axes[0].0 >= axes[1].0)
     {
@@ -377,6 +398,7 @@ where
     // A region must be a contiguous row-major run. Earlier axes are singleton;
     // after the first multi-element axis all block extents cover the full axis.
     let mut spans = false;
+
     for (axis, (&block, &dim)) in geometry
         .block_shape()
         .iter()
@@ -386,6 +408,7 @@ where
         if axis == sparse_axis {
             continue;
         }
+
         if spans && block < dim {
             return Ok(slice.stream());
         }
@@ -396,8 +419,9 @@ where
 
 #[cfg(test)]
 mod traversal_tests {
-    use super::*;
     use number_general::DType;
+
+    use super::*;
 
     #[test]
     fn block_consumers_share_order_padding_and_rank_scratch() {
@@ -406,6 +430,7 @@ mod traversal_tests {
         high[0] = 3;
         let mut high_block = high.clone();
         high_block[0] = 2;
+
         for (shape, block) in [
             (smallvec::smallvec![1], smallvec::smallvec![1]),
             (smallvec::smallvec![5], smallvec::smallvec![3]),
@@ -421,6 +446,7 @@ mod traversal_tests {
                     block.clone(),
                 )
                 .unwrap();
+
                 for id in 0..geometry.block_count() {
                     let bounds = geometry.block_bounds(id).unwrap();
                     let expected: Vec<_> = crate::schema::row_major_coords(&shape)
@@ -447,6 +473,7 @@ mod traversal_tests {
                     );
                     let mut cursor = BlockCursor::new(&geometry, id).unwrap();
                     let address = cursor.coord.as_ptr();
+
                     for (offset, coord) in &expected {
                         let (actual, scratch) = cursor.current().unwrap();
                         assert_eq!(actual, *offset);

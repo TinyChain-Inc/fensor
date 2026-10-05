@@ -1,13 +1,14 @@
 """Alternate frozen benchmark executables; emit validated long-form records."""
+
 import argparse
-from collections import defaultdict
 import csv
 import hashlib
 import os
-from pathlib import Path
-from statistics import median
 import subprocess
 import tempfile
+from collections import defaultdict
+from pathlib import Path
+from statistics import median
 
 FIELDS = ["workload", "operation", "temperature", "metric", "unit", "value"]
 CSV_FIELDS = ["revision", "executable_sha256", "phase", "threads", "pair", *FIELDS]
