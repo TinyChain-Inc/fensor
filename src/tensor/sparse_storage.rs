@@ -4,7 +4,6 @@ use std::ops::{
     Bound::{Excluded, Included},
     Range,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use b_table::{ColumnRange, TableLock, collate::Collator};
 use freqfs::DirLock;
@@ -20,17 +19,33 @@ type Blocks<F, T> = TableLock<PayloadSchema<T>, PayloadSchema<T>, Collator<Spars
 pub(super) struct SparseStorage<F, T> {
     pub blocks: DirLock<F>,
     pub geometry: Box<StorageGeometry>,
-    pub gate: RwLock<()>,
-    invalid: AtomicBool,
+    pub gate: RwLock<Health>,
     pub(super) values: Blocks<F, T>,
 }
 
-struct Mutation<'a>(&'a AtomicBool, bool);
+#[derive(Default)]
+pub(super) struct Health {
+    invalid: bool,
+}
+
+impl Health {
+    pub(super) fn check(&self) -> Result<()> {
+        if self.invalid {
+            Err(Error::InvalidLayout(
+                "sparse owner invalidated by interrupted mutation; caller recovery required".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct Mutation<'a>(&'a mut Health, bool);
 
 impl Drop for Mutation<'_> {
     fn drop(&mut self) {
         if !self.1 {
-            self.0.store(true, Ordering::Release);
+            self.0.invalid = true;
         }
     }
 }
@@ -51,8 +66,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             .await?,
             blocks,
             geometry: Box::new(geometry),
-            gate: RwLock::new(()),
-            invalid: AtomicBool::new(false),
+            gate: RwLock::new(Health::default()),
         })
     }
 
@@ -82,19 +96,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             )?,
             blocks,
             geometry: Box::new(geometry),
-            gate: RwLock::new(()),
-            invalid: AtomicBool::new(false),
+            gate: RwLock::new(Health::default()),
         })
-    }
-
-    pub fn healthy(&self) -> Result<()> {
-        if self.invalid.load(Ordering::Acquire) {
-            Err(Error::InvalidLayout(
-                "sparse owner invalidated by interrupted mutation; caller recovery required".into(),
-            ))
-        } else {
-            Ok(())
-        }
     }
 
     fn validate_payload(&self, id: u64, values: &[T]) -> Result<bool> {
@@ -239,6 +242,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     async fn replace_block(
         &self,
+        health: &mut Health,
         id: u64,
         values: Vec<T>,
         nonzero: bool,
@@ -250,7 +254,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             return Ok(());
         }
 
-        let mut mutation = Mutation(&self.invalid, false);
+        let mut mutation = Mutation(health, false);
         if nonzero {
             self.put(id, values).await?;
         } else {
@@ -268,25 +272,27 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                     "invalid replacement block length".into(),
                 ));
             }
-            let _guard = self.gate.write().await;
-            self.healthy()?;
+            let mut health = self.gate.write().await;
+            health.check()?;
             let nonzero = self.validate_payload(id, &values)?;
             let present = self.read_row(id).await?.is_some();
-            self.replace_block(id, values, nonzero, present).await
+            self.replace_block(&mut health, id, values, nonzero, present)
+                .await
         })
     }
 
     pub fn update<'a>(&'a self, id: u64, updates: &'a [(usize, T)]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.geometry.block_bounds(id)?;
-            let _guard = self.gate.write().await;
-            self.healthy()?;
+            let mut health = self.gate.write().await;
+            health.check()?;
             let previous = self.read_row(id).await?;
             let present = previous.is_some();
             let mut values = previous.unwrap_or_else(|| vec![T::ZERO; self.geometry.block_len()]);
             super::apply_block_updates(&mut values, self.geometry.block_len(), updates)?;
             let nonzero = self.validate_payload(id, &values)?;
-            self.replace_block(id, values, nonzero, present).await
+            self.replace_block(&mut health, id, values, nonzero, present)
+                .await
         })
     }
 
@@ -294,7 +300,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     where
         F: freqfs::FileSave + Clone,
     {
-        let _guard = self.gate.write().await;
+        let health = self.gate.write().await;
+        health.check()?;
         self.sync_contents().await
     }
 
@@ -302,7 +309,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     where
         F: freqfs::FileSave + Clone,
     {
-        let _guard = self.gate.write().await;
+        let health = self.gate.write().await;
+        health.check()?;
         self.sync_contents().await?;
         directory.sync_all().await?;
         Ok(())
@@ -312,7 +320,6 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     where
         F: freqfs::FileSave + Clone,
     {
-        self.healthy()?;
         self.values.sync().await?;
         self.blocks.sync().await?;
         Ok(())
@@ -320,7 +327,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     pub fn validate(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            self.healthy()?;
+            let health = self.gate.read().await;
+            health.check()?;
             self.values.validate().await?;
             {
                 let blocks = self.blocks.read().await;
@@ -358,8 +366,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                 "occupied block range out of bounds".into(),
             ));
         }
-        let _guard = self.gate.read().await;
-        self.healthy()?;
+        let health = self.gate.read().await;
+        health.check()?;
         if range.is_empty() {
             return Ok(Vec::new());
         }
@@ -438,8 +446,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                 m.max_staging_batch = m.max_staging_batch.max(values.len());
             });
             let owner = self.tensor.storage.sparse().expect("sparse construction");
-            let _guard = owner.gate.write().await;
-            owner.healthy()?;
+            let mut health = owner.gate.write().await;
+            health.check()?;
             if let Some((current, _)) = &self.current {
                 let mut previous = *current;
                 // Validate the bounded source batch before native ingestion can mutate.
@@ -454,7 +462,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                     previous = Some(id);
                 }
             }
-            let mut mutation = Mutation(&owner.invalid, false);
+            let mut mutation = Mutation(&mut health, false);
             if let Some((current, block)) = &mut self.current {
                 let rows = futures::stream::try_unfold(
                     (coords.iter().zip(values), current, block),
@@ -520,9 +528,9 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
         Box::pin(async move {
             {
                 let owner = self.tensor.storage.sparse().expect("sparse construction");
-                let _guard = owner.gate.write().await;
-                owner.healthy()?;
-                let mut mutation = Mutation(&owner.invalid, false);
+                let mut health = owner.gate.write().await;
+                health.check()?;
+                let mut mutation = Mutation(&mut health, false);
                 match self.current.take() {
                     Some((Some(id), values)) if owner.validate_payload(id, &values)? => {
                         let row = (vec![SparseCell::Key(id)], vec![SparseCell::Payload(values)]);
@@ -626,14 +634,17 @@ mod validation_tests {
         ));
         assert!(storage.replace(1, vec![1.; 4]).now_or_never().is_none());
         drop(guard);
-        storage.healthy().unwrap();
+        storage.gate.read().await.check().unwrap();
         assert!(matches!(
             storage.replace(1, vec![1.; 4]).await,
             Err(Error::InvalidLayout(message)) if message == "nonzero logical block padding"
         ));
-        storage.healthy().unwrap();
+        storage.gate.read().await.check().unwrap();
 
-        drop(Mutation(&storage.invalid, false));
+        {
+            let mut health = storage.gate.write().await;
+            drop(Mutation(&mut health, false));
+        }
         assert!(matches!(
             storage.replace(1, vec![1.; 4]).await,
             Err(Error::InvalidLayout(message)) if message.contains("owner invalidated")

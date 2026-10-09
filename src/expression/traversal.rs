@@ -14,15 +14,14 @@ use crate::{Error, Result, TensorElement};
 
 pub type Deferred<'a, T> = Box<dyn FnOnce() -> Result<T> + Send + 'a>;
 
-pub enum Preferred<'a> {
-    Ready(Option<RequestIterator>),
-    Sources(Vec<Deferred<'a, Preferred<'a>>>),
+/// Deferred children are visited left to right without recursive calls.
+pub enum Step<'a, T> {
+    Ready(T),
+    Sources(Vec<Deferred<'a, Step<'a, T>>>),
 }
 
-pub enum Ordered<'a> {
-    Ready(Requests<'static>),
-    Sources(Vec<Deferred<'a, Ordered<'a>>>),
-}
+pub type Preferred<'a> = Step<'a, Option<RequestIterator>>;
+pub type Ordered<'a> = Step<'a, Requests<'static>>;
 
 pub enum Selection<'a> {
     Ready(Requests<'a>),
@@ -55,24 +54,25 @@ fn reserve<T>(items: &mut Vec<T>, additional: usize) -> Result<()> {
         .map_err(|_| Error::Unsupported("expression traversal allocation failed".into()))
 }
 
-pub fn preferred<'a, E: Expression + ?Sized>(
-    source: &'a E,
-    shape: &'a [u64],
-) -> Result<Option<RequestIterator>>
-where
-    E::DType: TensorElement,
-{
-    let mut pending: Vec<Deferred<'a, Preferred<'a>>> = Vec::new();
+/// Stop at the first leaf accepted by the consumer, or visit every leaf.
+fn walk<'a, T, R>(
+    root: Deferred<'a, Step<'a, T>>,
+    mut consume: impl FnMut(T) -> Result<Option<R>>,
+) -> Result<Option<R>> {
+    let mut pending = Vec::new();
     reserve(&mut pending, 1)?;
-    pending.push(Box::new(move || source.preferred_step(shape)));
+    pending.push(root);
     let mut visited = 0;
 
     while let Some(next) = pending.pop() {
         visit(&mut visited)?;
         match next()? {
-            Preferred::Ready(Some(requests)) => return Ok(Some(requests)),
-            Preferred::Ready(None) => {}
-            Preferred::Sources(children) => {
+            Step::Ready(value) => {
+                if let Some(result) = consume(value)? {
+                    return Ok(Some(result));
+                }
+            }
+            Step::Sources(children) => {
                 reserve(&mut pending, children.len())?;
                 pending.extend(children.into_iter().rev());
             }
@@ -80,6 +80,16 @@ where
     }
 
     Ok(None)
+}
+
+pub fn preferred<'a, E: Expression + ?Sized>(
+    source: &'a E,
+    shape: &'a [u64],
+) -> Result<Option<RequestIterator>>
+where
+    E::DType: TensorElement,
+{
+    walk(Box::new(move || source.preferred_step(shape)), Ok)
 }
 
 pub fn selection<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Requests<'_>>
@@ -102,25 +112,12 @@ pub fn ordered<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Reque
 where
     E::DType: TensorElement,
 {
-    let mut pending: Vec<Deferred<'_, Ordered<'_>>> = Vec::new();
     let mut streams = Vec::new();
-    reserve(&mut pending, 1)?;
-    pending.push(Box::new(move || source.ordered_step(slice)));
-    let mut visited = 0;
-
-    while let Some(next) = pending.pop() {
-        visit(&mut visited)?;
-        match next()? {
-            Ordered::Ready(stream) => {
-                reserve(&mut streams, 1)?;
-                streams.push(stream);
-            }
-            Ordered::Sources(children) => {
-                reserve(&mut pending, children.len())?;
-                pending.extend(children.into_iter().rev());
-            }
-        }
-    }
+    walk(Box::new(move || source.ordered_step(slice)), |stream| {
+        reserve(&mut streams, 1)?;
+        streams.push(stream);
+        Ok(None::<()>)
+    })?;
 
     if streams.len() == 1 {
         return Ok(streams.pop().expect("one candidate stream"));

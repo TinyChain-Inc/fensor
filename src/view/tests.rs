@@ -1383,10 +1383,7 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
                     return Err(Error::InvalidLayout("injected source error".into()));
                 }
 
-                Ok(crate::expression::Batch {
-                    _allocation: None,
-                    array: crate::expression::batch_array(vec![1.; request.len()])?,
-                })
+                crate::expression::Batch::from_values(vec![1.; request.len()])
             })
         }
     }

@@ -180,7 +180,7 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
                 Some(Err(Error::InvalidLayout(_)))
             ));
             drop(held);
-            assert!(owner.healthy().is_ok());
+            assert!(owner.gate.read().await.check().is_ok());
             assert_eq!(
                 tensor.read_logical_block(0).await.unwrap(),
                 vec![1.; len as usize]
@@ -195,7 +195,7 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
         }
         drop(guard);
         assert!(owner.gate.try_write().is_ok());
-        assert!(owner.healthy().is_ok());
+        assert!(owner.gate.read().await.check().is_ok());
         assert_eq!(
             clone.read_logical_block(0).await.unwrap(),
             vec![1.; len as usize]
@@ -826,9 +826,11 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
         }
 
         assert!(owner.gate.try_write().is_ok());
-        assert!(owner.healthy().is_err());
+        assert!(owner.gate.read().await.check().is_err());
         assert!(probe.read_logical_block(0).await.is_err());
         assert!(probe.sync().await.is_err());
+        assert!(probe.sync_all().await.is_err());
+        assert!(probe.validate().await.is_err());
         assert!(Tensor::<TestFE, f32>::load(dir).await.is_err());
         cleanup(&root).await;
     }

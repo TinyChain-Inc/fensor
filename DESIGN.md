@@ -83,10 +83,13 @@ numerical support mask is retained.
 The evaluation driver owns suspended parent futures and polls only its active
 frame. A child request suspends its parent and appends one frame; storage I/O can
 then suspend the driver normally. Operand requests remain sequential inside a
-batch. Elementwise kernels use ha-ndarray's `into_read` to retain a native bounded
-buffer, including its platform, rather than building another unbounded backend
-chain. Owned mappings and diagonal projection forward completed batches without
-another numerical realization. Only value consumers convert results to host values.
+batch. Batch construction completes numerical operations with ha-ndarray's
+`into_read`, retaining a native bounded buffer and its platform rather than an
+unbounded backend chain. Host-value construction uses its already completed
+buffer directly. The driver attaches a private batch reservation; concrete
+operations do not manage admission bookkeeping. Owned mappings and diagonal
+projection forward completed batches without another numerical realization.
+Only value consumers convert results to host values.
 
 Frames retain bounded requests and any completed sibling batches until their
 parent finishes. Their allocation is checked independently of batch cardinality,
@@ -94,8 +97,14 @@ with a private frame limit. The driver separately admits batch payload bytes,
 charging dtype width before submitting each child. Outputs are
 reserved conservatively while their inputs remain live, and the charge follows
 a returned batch until it is consumed or dropped. This bounds retained siblings
-independently of expression depth. Numerical kernels and conversion scratch are
-bounded separately by a fixed multiple of the execution batch; this admission
+independently of expression depth. Tokio owned semaphore permits account for
+admitted bytes and return capacity when batches are dropped, including cancellation
+and unwinding. Acquisition is
+nonblocking: waiting for capacity while retaining intermediate results could
+prevent those results from being released. The semaphore is independent of
+pending evaluation frames because completed batches can outlive the driver.
+Numerical kernels and conversion scratch are bounded separately by a fixed
+multiple of the execution batch; this admission
 is not a total-process memory guarantee. Runtime expression construction also checks retained
 description size; repeated shared operands count at each occurrence. These are
 resource limits, not assumptions about a safe machine-stack depth. Metadata at
@@ -112,7 +121,8 @@ child task, nested executor, or recursive evaluation fallback.
 
 Expression methods provide actual bounded request iterators, not strategy tags.
 Concrete expressions implement shallow `preferred_step`, `ordered_step`, and
-`selection_step` hooks. Shared traversal consumes these hooks in one direction;
+`selection_step` hooks. A shared bounded walker consumes preferred and ordered
+hooks left to right;
 default hooks return a leaf result without reentering traversal. Preferred traversal
 returns an iterator or no preference. Matrix products
 generate tiles for the consuming expression's current shape, using linear requests
@@ -120,9 +130,12 @@ below rank two. Unary/scalar nodes delegate; binary nodes consult left then righ
 conditionals consult condition, then, else. The first iterator or error ends the
 search. Geometric sources and reductions have no preference, so their consumers
 generate linear requests. Reduction output remains a traversal boundary even over
-a matrix source. Output mappings are independent of request traversal. Provider
-steps use explicit work lists with fallible allocation and the expression
-description limit, preserving first-provider and first-error precedence.
+a matrix source. Output mappings are independent of request traversal. The walker
+owns deferred-child ordering, fallible stack allocation, and the
+expression traversal limit. Its consumers retain first-provider selection and
+ordered union respectively; single-child selection remains an explicit loop.
+Concrete operations own mathematics, native storage owns address discovery,
+and shared consumers own bounded stack-safe execution.
 
 Ordered providers use the same operand order as evaluation: left before right,
 and condition before then and else. One work list flattens their leaf streams;
@@ -424,6 +437,11 @@ corruption remains outside the selection. Replacement and read-modify-write
 hold one native ownership guard; helpers never reacquire it. Table guards are
 released before entering another domain. Interrupted mutation invalidates the owner
 and requires caller recovery. Native storage retains no history or recovery protocol.
+
+Sparse-owner health is protected by its existing ownership lock. Mutations borrow
+that health state through the write guard and mark it invalid on error or
+cancellation before releasing ownership. Readers and synchronization check health
+through their guards; helpers do not reacquire the ownership lock.
 
 Strict loading requires typed metadata, directories, every dense file, and a valid
 sparse table. It validates structure, ordering, geometry, payloads, and block IDs

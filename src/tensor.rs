@@ -432,7 +432,6 @@ where
     pub async fn validate(&self) -> Result<()> {
         match self.storage.as_ref() {
             Storage::Sparse(sparse) => {
-                let _guard = sparse.gate.read().await;
                 sparse.validate().await?;
             }
             Storage::Dense(dense) => {
@@ -568,8 +567,8 @@ where
     ) -> Result<Vec<T>> {
         let dense = match self.storage.as_ref() {
             Storage::Sparse(sparse) => {
-                let _guard = sparse.gate.read().await;
-                sparse.healthy()?;
+                let health = sparse.gate.read().await;
+                health.check()?;
                 let groups = self.read_groups(request, mapping)?;
                 let mut values = vec![T::ZERO; request.len()];
 
@@ -723,7 +722,14 @@ impl<FE> DenseStorage<FE> {
                 "invalid replacement block length".into(),
             ));
         }
-        replace_payload(&self.blocks, id, block, self.block_len()).await
+
+        let file = required_file(&*self.blocks.read().await, id)?;
+        let mut stored = file
+            .write::<Vec<T>>(block_allocation::<FE, T>(&block))
+            .await?;
+        validate_stored_length(&stored, self.block_len())?;
+        *stored = block;
+        Ok(())
     }
 
     async fn update<T>(&self, id: u64, updates: &[(usize, T)]) -> Result<()>
@@ -842,21 +848,6 @@ fn validate_stored_length<T>(block: &[T], expected: usize) -> Result<()> {
     Ok(())
 }
 
-async fn replace_payload<FE: TensorFileEntry<T>, T: TensorElement>(
-    blocks: &DirLock<FE>,
-    id: u64,
-    values: Vec<T>,
-    expected: usize,
-) -> Result<()> {
-    let file = required_file(&*blocks.read().await, id)?;
-    let mut block = file
-        .write::<Vec<T>>(block_allocation::<FE, T>(&values))
-        .await?;
-    validate_stored_length(&block, expected)?;
-    *block = values;
-    Ok(())
-}
-
 // Validate all offsets before applying a bounded batch in its original order.
 fn apply_block_updates<T: Copy>(
     block: &mut [T],
@@ -963,8 +954,8 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
         Box::pin(async move {
             match self.storage.as_ref() {
                 Storage::Sparse(sparse) => {
-                    let _guard = sparse.gate.read().await;
-                    sparse.healthy()?;
+                    let health = sparse.gate.read().await;
+                    health.check()?;
                     sparse.read(id).await
                 }
                 Storage::Dense(dense) => {

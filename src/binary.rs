@@ -346,11 +346,7 @@ where
             let left = context.batch(&self.left, coords.clone()).await?;
             let right = context.batch(&self.right, coords).await?;
 
-            Batch {
-                _allocation: None,
-                array: self.op.apply(left.array, right.array)?,
-            }
-            .realize()
+            Batch::from_array(self.op.apply(left.array, right.array)?)
         })
     }
 }

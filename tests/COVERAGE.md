@@ -28,7 +28,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Recursive operand order, first-error propagation, and final-argument ownership | Mapping unit `recursive_transforms_stop_at_first_error_and_move_the_final_argument` |
 | Transform input rejection and structured sparse-order errors | Public access integration cases; view unit tests retain mapping/write-through contracts |
 | Sparse axis bounds on creation and reload | `foundations::public_create_rejects_invalid_sparse_axis_hint`, `storage_codec::reload_rejects_out_of_bounds_sparse_axis` |
-| Request-provider precedence, errors and single invocation | Expression units `request_providers_delegate_once_in_order_and_propagate_errors`, `ordered_providers_visit_operands_left_to_right` |
+| Shared preferred/ordered walker: precedence, errors and single invocation | Expression units `request_providers_delegate_once_in_order_and_propagate_errors`, `ordered_providers_visit_operands_left_to_right` |
 | Tiled propagation, reduction boundaries and transformed current-shape coverage | Matrix `coordinate_traversal_propagates_and_preserves_coverage` |
 | Full-shape linear batches and invalid shapes | Request unit `linear_batches_preserve_boundaries_and_validate_shape`; reduction tests retain boolean error boundaries |
 | Request-to-update parity, affine allocation bounds, owned source consumption and release | View unit `update_planning_matches_coordinates_without_affine_expansion`, `update_stream_evaluates_once_and_owns_its_source` |
@@ -38,6 +38,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Completion-order progress, slot replenishment, one-slot window, pairing and cancellation | Expression unit `completion_order_replenishes_slots_and_preserves_pairs` |
 | Dynamic expression depth on normal worker stacks, shared operands, sparse values, cancellation/error and unpolled-drop source release | `expression_depth` isolated subprocesses in default and complex suites; also run the target in release |
 | Wide sparse candidate merging, high-rank compact request retention, duplicates, empty requests, EOF/error/cancellation cleanup | Expression traversal `wide_sparse_candidates_retain_compact_requests_and_release_sources`, `ready_sparse_candidates_can_be_cancelled_and_errors_release_sources` |
+| Permit refunds, closed admission, and cleanup during unwinding | Expression driver units `batch_admission_follows_retained_values_and_refunds_on_drop`, `admission_refunds_during_unwind_and_rejects_closed_budget`, and `poisoned_driver_rejects_polling_and_releases_pending_work` |
 | Ready expression cancellation and peer-task progress | `expression_depth` ready-cancel subprocess case; expression traversal cancellation test |
 | Owned/borrowed consumer parity, transformed values and nonfinite values | `storage_source::owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_values` |
 | Owned source release after errors | Expression unit `owned_stream_error_releases_pending_evaluation_on_drop` |

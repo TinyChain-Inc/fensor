@@ -322,10 +322,7 @@ where
                 }
             }
 
-            Ok(Batch {
-                _allocation: None,
-                array: expression::batch_array(values)?,
-            })
+            Batch::from_values(values)
         })
     }
 }

@@ -5,6 +5,7 @@ use std::ops::Deref;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{Array, ArrayAccess, Buffer, NDArray, NDArrayRead, Number};
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::request::{self, BatchRequest};
 use crate::traits::BoxFuture;
@@ -173,7 +174,7 @@ where
 }
 
 pub struct Batch<T: TensorElement> {
-    pub(crate) _allocation: Option<driver::Allocation>,
+    _reservation: Option<OwnedSemaphorePermit>,
     pub array: ArrayAccess<'static, T>,
 }
 
@@ -185,6 +186,23 @@ pub fn batch_array<T: TensorElement>(values: Vec<T>) -> Result<ArrayAccess<'stat
 }
 
 impl<T: TensorElement> Batch<T> {
+    /// Complete a numerical operation before another expression layer can use it.
+    pub(crate) fn from_array(array: ArrayAccess<'static, T>) -> Result<Self> {
+        validate_bound("batch expression", array.size())?;
+        Ok(Self {
+            _reservation: None,
+            array: ArrayAccess::from(array.into_read()?),
+        })
+    }
+
+    /// Host values already own their completed buffer; do not realize them again.
+    pub(crate) fn from_values(values: Vec<T>) -> Result<Self> {
+        Ok(Self {
+            _reservation: None,
+            array: batch_array(values)?,
+        })
+    }
+
     fn validate(&self, expected: usize) -> Result<()> {
         validate_bound("batch expression", self.array.size())?;
         validate_len("batch expression", self.array.size(), expected)
@@ -194,19 +212,11 @@ impl<T: TensorElement> Batch<T> {
         let expected = self.array.size();
         self.validate(expected)?;
         let batch = EvaluatedBatch {
-            _allocation: self._allocation,
+            _reservation: self._reservation,
             values: self.array.buffer()?.to_slice()?.into_vec(),
         };
         batch.validate(expected)?;
         Ok(batch)
-    }
-
-    pub(crate) fn realize(self) -> Result<Self> {
-        self.validate(self.array.size())?;
-        Ok(Self {
-            _allocation: self._allocation,
-            array: ArrayAccess::from(self.array.into_read()?),
-        })
     }
 }
 
@@ -222,7 +232,7 @@ where
 }
 
 pub struct EvaluatedBatch<T> {
-    pub(crate) _allocation: Option<driver::Allocation>,
+    _reservation: Option<OwnedSemaphorePermit>,
     pub values: Vec<T>,
 }
 
@@ -363,10 +373,7 @@ where
         Box::pin(async move {
             let values = self.read_batch(&coords).await?;
 
-            Ok(Batch {
-                _allocation: None,
-                array: batch_array(values)?,
-            })
+            Batch::from_values(values)
         })
     }
 }
@@ -396,10 +403,7 @@ where
     ) -> BoxFuture<'a, Result<Batch<T>>> {
         Box::pin(async move {
             let values = self.read_batch(&coords, None).await?;
-            Ok(Batch {
-                _allocation: None,
-                array: batch_array(values)?,
-            })
+            Batch::from_values(values)
         })
     }
 }
@@ -707,7 +711,7 @@ mod tests {
                     let output = sparse_elements(
                         request,
                         EvaluatedBatch {
-                            _allocation: None,
+                            _reservation: None,
                             values,
                         },
                         &shape,
@@ -742,7 +746,7 @@ mod tests {
     #[test]
     fn sparse_output_rejects_mismatched_values_and_invalid_requests() {
         let batch = EvaluatedBatch {
-            _allocation: None,
+            _reservation: None,
             values: vec![1u8, 2],
         };
         assert!(matches!(
@@ -759,7 +763,7 @@ mod tests {
             .unwrap(),
         ] {
             let batch = EvaluatedBatch {
-                _allocation: None,
+                _reservation: None,
                 values: vec![0u8; request.len()],
             };
             assert!(matches!(
@@ -795,18 +799,22 @@ mod tests {
     #[test]
     fn malformed_batches_fail_closed() {
         assert!(batch_array(vec![0u8; MAX_BATCH_ELEMENTS + 1]).is_err());
-        let batch = Batch {
-            _allocation: None,
-            array: batch_array(vec![1u8, 2]).unwrap(),
-        };
+        assert!(Batch::from_values(vec![0u8; MAX_BATCH_ELEMENTS + 1]).is_err());
+        let oversized = Array::new(
+            Buffer::from(vec![0u8; MAX_BATCH_ELEMENTS + 1]),
+            ha_ndarray::shape![MAX_BATCH_ELEMENTS + 1],
+        )
+        .unwrap();
+        assert!(Batch::from_array(ArrayAccess::from(oversized)).is_err());
+        let batch = Batch::from_values(vec![1u8, 2]).unwrap();
         assert!(batch.validate(1).is_err());
         let evaluated = EvaluatedBatch {
-            _allocation: None,
+            _reservation: None,
             values: vec![1u8],
         };
         assert!(evaluated.validate(2).is_err());
         let evaluated = EvaluatedBatch {
-            _allocation: None,
+            _reservation: None,
             values: vec![0u8; MAX_BATCH_ELEMENTS + 1],
         };
         assert!(evaluated.validate(MAX_BATCH_ELEMENTS + 1).is_err());

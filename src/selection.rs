@@ -212,11 +212,9 @@ where
             let then = context.batch(&self.then, coords.clone()).await?;
             let or_else = context.batch(&self.or_else, coords).await?;
 
-            Batch {
-                _allocation: None,
-                array: ArrayAccess::from(condition.array.cond(then.array, or_else.array)?),
-            }
-            .realize()
+            Batch::from_array(ArrayAccess::from(
+                condition.array.cond(then.array, or_else.array)?,
+            ))
         })
     }
 }

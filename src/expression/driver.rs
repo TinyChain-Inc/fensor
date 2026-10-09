@@ -3,11 +3,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use futures::channel::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::{Batch, EvaluatedBatch, Expression};
 use crate::request::BatchRequest;
@@ -43,40 +43,38 @@ impl WorkBudget {
     }
 }
 
-pub(crate) struct Allocation {
-    bytes: usize,
-    live: Arc<AtomicUsize>,
-}
-
-impl Drop for Allocation {
-    fn drop(&mut self) {
-        self.live.fetch_sub(self.bytes, Ordering::Relaxed);
-    }
-}
-
 type Frame<'a> = BoxFuture<'a, ()>;
 
 #[derive(Clone)]
 pub struct Context<'a> {
     pending: Arc<Mutex<Option<Frame<'a>>>>,
-    live: Arc<AtomicUsize>,
+    budget: Arc<Semaphore>,
 }
 
 impl<'a> Context<'a> {
-    fn reserve<T: TensorElement>(&self, len: usize) -> Result<Allocation> {
+    fn reserve<T: TensorElement>(&self, len: usize) -> Result<OwnedSemaphorePermit> {
         let bytes = len
             .checked_mul(std::mem::size_of::<T>())
             .ok_or_else(|| Error::Unsupported("expression batch allocation overflow".into()))?;
-        self.live
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-                live.checked_add(bytes)
-                    .filter(|&total| total <= MAX_LIVE_BATCH_BYTES)
+
+        if bytes > MAX_LIVE_BATCH_BYTES {
+            return Err(Error::Unsupported(
+                "expression live batch limit exceeded".into(),
+            ));
+        }
+
+        let permits = u32::try_from(bytes)
+            .map_err(|_| Error::Unsupported("expression batch allocation overflow".into()))?;
+        Arc::clone(&self.budget)
+            .try_acquire_many_owned(permits)
+            .map_err(|cause| match cause {
+                TryAcquireError::NoPermits => {
+                    Error::Unsupported("expression live batch limit exceeded".into())
+                }
+                TryAcquireError::Closed => {
+                    Error::InvalidLayout("expression admission closed".into())
+                }
             })
-            .map_err(|_| Error::Unsupported("expression live batch limit exceeded".into()))?;
-        Ok(Allocation {
-            bytes,
-            live: Arc::clone(&self.live),
-        })
     }
 
     pub async fn batch<E>(
@@ -90,14 +88,14 @@ impl<'a> Context<'a> {
     {
         request.validate(source.shape())?;
         let expected = request.len();
-        let allocation = self.reserve::<E::DType>(expected)?;
+        let reservation = self.reserve::<E::DType>(expected)?;
         let (send, receive) = oneshot::channel();
         let context = self.clone();
         let frame = Box::pin(async move {
             let result = async {
                 let mut batch = source.build(context, request).await?;
                 batch.validate(expected)?;
-                batch._allocation = Some(allocation);
+                batch._reservation = Some(reservation);
                 Ok(batch)
             }
             .await;
@@ -143,7 +141,7 @@ where
 {
     let context = Context {
         pending: Arc::new(Mutex::new(None)),
-        live: Arc::new(AtomicUsize::new(0)),
+        budget: Arc::new(Semaphore::new(MAX_LIVE_BATCH_BYTES)),
     };
 
     let root_context = context.clone();
@@ -252,14 +250,14 @@ mod tests {
     fn poisoned_driver_rejects_polling_and_releases_pending_work() {
         let context = Context {
             pending: Arc::new(Mutex::new(None)),
-            live: Arc::new(AtomicUsize::new(0)),
+            budget: Arc::new(Semaphore::new(MAX_LIVE_BATCH_BYTES)),
         };
         let lease = Arc::new(());
         let retained = Arc::downgrade(&lease);
         let child_context = context.clone();
-        let allocation = context.reserve::<f64>(1).unwrap();
+        let reservation = context.reserve::<f64>(1).unwrap();
         *context.pending.lock().unwrap() = Some(Box::pin(async move {
-            let _owned = (lease, child_context, allocation);
+            let _owned = (lease, child_context, reservation);
             std::future::pending::<()>().await;
         }));
         assert!(
@@ -291,7 +289,7 @@ mod tests {
             .is_err()
         );
         assert!(retained.upgrade().is_none());
-        assert_eq!(context.live.load(Ordering::Relaxed), 0);
+        assert_eq!(context.budget.available_permits(), MAX_LIVE_BATCH_BYTES);
         assert!(context.pending.is_poisoned());
         assert_eq!(Arc::strong_count(&context.pending), 1);
     }
@@ -300,25 +298,61 @@ mod tests {
     fn batch_admission_follows_retained_values_and_refunds_on_drop() {
         let context = Context {
             pending: Arc::new(Mutex::new(None)),
-            live: Arc::new(AtomicUsize::new(0)),
+            budget: Arc::new(Semaphore::new(MAX_LIVE_BATCH_BYTES)),
         };
 
         let capacity = MAX_LIVE_BATCH_BYTES / (std::mem::size_of::<f64>());
-        let allocation = context.reserve::<f64>(capacity).unwrap();
-        assert!(context.reserve::<f64>(1).is_err());
-        assert!(context.reserve::<f64>(usize::MAX).is_err());
-        drop(allocation);
-        assert_eq!(context.live.load(Ordering::Relaxed), 0);
+        let reservation = context.reserve::<f64>(capacity).unwrap();
+        for len in [1, capacity + 1] {
+            assert!(matches!(
+                context.reserve::<f64>(len),
+                Err(Error::Unsupported(message)) if message == "expression live batch limit exceeded"
+            ));
+            assert_eq!(context.budget.available_permits(), 0);
+        }
+        assert!(matches!(
+            context.reserve::<f64>(usize::MAX),
+            Err(Error::Unsupported(message)) if message == "expression batch allocation overflow"
+        ));
+        drop(context.reserve::<f64>(0).unwrap());
+        assert_eq!(context.budget.available_permits(), 0);
+        drop(reservation);
+        assert_eq!(context.budget.available_permits(), MAX_LIVE_BATCH_BYTES);
 
-        let batch = Batch {
-            _allocation: Some(context.reserve::<f64>(1).unwrap()),
-            array: super::super::batch_array(vec![1_f64]).unwrap(),
-        };
+        let mut batch = Batch::from_array(super::super::batch_array(vec![1_f64]).unwrap()).unwrap();
+        batch._reservation = Some(context.reserve::<f64>(1).unwrap());
 
-        let values = batch.realize().unwrap().into_evaluated().unwrap();
-        assert_eq!(context.live.load(Ordering::Relaxed), 8);
+        let values = batch.into_evaluated().unwrap();
+        assert_eq!(context.budget.available_permits(), MAX_LIVE_BATCH_BYTES - 8);
         assert_eq!(values.values, [1.]);
         drop(values);
-        assert_eq!(context.live.load(Ordering::Relaxed), 0);
+        assert_eq!(context.budget.available_permits(), MAX_LIVE_BATCH_BYTES);
+    }
+
+    #[test]
+    fn admission_refunds_during_unwind_and_rejects_closed_budget() {
+        let context = Context {
+            pending: Arc::new(Mutex::new(None)),
+            budget: Arc::new(Semaphore::new(MAX_LIVE_BATCH_BYTES)),
+        };
+        let reservation = context.reserve::<f64>(1).unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _reservation = reservation;
+                panic!("injected outer unwind");
+            }))
+            .is_err()
+        );
+        assert_eq!(context.budget.available_permits(), MAX_LIVE_BATCH_BYTES);
+        drop(context.reserve::<f64>(MAX_LIVE_BATCH_BYTES / 8).unwrap());
+        assert_eq!(Arc::strong_count(&context.budget), 1);
+
+        context.budget.close();
+        for len in [0, 1] {
+            assert!(matches!(
+                context.reserve::<f64>(len),
+                Err(Error::InvalidLayout(message)) if message == "expression admission closed"
+            ));
+        }
     }
 }

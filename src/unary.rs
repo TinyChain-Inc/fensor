@@ -416,11 +416,7 @@ where
     ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             let source = context.batch(&self.source, coords).await?;
-            Batch {
-                _allocation: None,
-                array: self.op.apply(source.array)?,
-            }
-            .realize()
+            Batch::from_array(self.op.apply(source.array)?)
         })
     }
 }
