@@ -25,6 +25,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Dense<F, T> {
                     .await
                     .get_file(&id.to_string())
                     .cloned();
+
                 if let Some(file) = file {
                     let mut block = file.write::<Vec<T>>(0).await?;
                     super::apply_block_updates(&mut block, tensor.block_len(), &updates)?;
@@ -51,6 +52,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Dense<F, T> {
 
     pub async fn finish(self) -> Result<Tensor<F, T>> {
         self.0.persist_metadata().await?;
+
         Ok(self.0)
     }
 }
@@ -85,6 +87,7 @@ where
                 )
                 .into());
             }
+
             previous = Some(coord.clone());
             coords.push(coord);
             values.push(value);
@@ -93,6 +96,7 @@ where
         if values.is_empty() {
             break;
         }
+
         output.stage(&coords, values).await?;
     }
 

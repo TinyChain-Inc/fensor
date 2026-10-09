@@ -38,6 +38,7 @@ impl<'a> Context<'a> {
     {
         request.validate(source.shape())?;
         let expected = request.len();
+
         let (send, receive) = oneshot::channel();
         let context = self.clone();
         let frame = Box::pin(async move {
@@ -45,18 +46,23 @@ impl<'a> Context<'a> {
                 batch.validate(expected)?;
                 Ok(batch)
             });
+
             let _ = send.send(result);
         });
+
         {
             let mut pending = self
                 .pending
                 .lock()
                 .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?;
+
             if pending.is_some() {
                 return Err(Error::InvalidLayout("concurrent child evaluation".into()));
             }
+
             *pending = Some(frame as Frame<'a>);
         }
+
         receive
             .await
             .map_err(|_| Error::InvalidLayout("evaluation driver closed".into()))?
@@ -73,6 +79,7 @@ impl<'a> Context<'a> {
     {
         #[cfg(test)]
         crate::read_metrics::record(|m| m.slice_requests += 1);
+
         self.batch(source, request).await?.into_evaluated()
     }
 }
@@ -95,6 +102,7 @@ where
     let root = Box::pin(async move {
         let _ = send.send(root_context.evaluate(source, request).await);
     });
+
     Driver {
         context,
         frames: vec![root],
@@ -124,6 +132,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                 .lock()
                 .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?
                 .take();
+
             if let Some(frame) = pending {
                 if this.frames.len() == MAX_FRAMES {
                     return Poll::Ready(Err(Error::Unsupported(
@@ -136,6 +145,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                         "expression frame allocation: {error}"
                     ))));
                 }
+
                 this.frames.push(frame);
                 progress.made_progress();
             }
@@ -163,6 +173,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                     {
                         return Poll::Pending;
                     }
+
                     progress.made_progress();
                 }
             }

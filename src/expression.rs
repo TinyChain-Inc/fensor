@@ -13,6 +13,7 @@ use crate::traits::BoxFuture;
 use crate::{Error, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView};
 
 mod driver;
+
 pub use driver::Context;
 pub(crate) use driver::evaluate_batch;
 
@@ -198,10 +199,12 @@ impl<T: TensorElement> Batch<T> {
     fn into_evaluated(self) -> Result<EvaluatedBatch<T>> {
         let expected = self.array.size();
         self.validate(expected)?;
+
         let batch = EvaluatedBatch {
             values: self.array.buffer()?.to_slice()?.into_vec(),
         };
         batch.validate(expected)?;
+
         Ok(batch)
     }
 }

@@ -23,6 +23,7 @@ pub struct TensorMetadata<T> {
 impl<T: TensorElement> TensorMetadata<T> {
     pub fn new(shape: Shape, layout: Layout, block_shape: Shape) -> Result<Self> {
         TensorSchema::new(T::dtype(), shape.clone())?;
+
         if shape.len() != block_shape.len() {
             return Err(Error::InvalidSchema(
                 "block shape rank differs from tensor rank".into(),
@@ -79,16 +80,20 @@ async fn decode_shape<D: de::Decoder>(
 ) -> std::result::Result<Shape, D::Error> {
     let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
     let mut shape = Shape::new();
+
     while sequence.slot() != de::Slot::End {
         let dimension = <u64 as de::FromStream>::from_stream((), decoder).await?;
         decoder.finish_child(&mut sequence).await?;
+
         if shape.len() == limit {
             return Err(de::Error::custom(
                 "tensor metadata exceeds the adapter rank limit",
             ));
         }
+
         shape.push(dimension);
     }
+
     Ok(shape)
 }
 
@@ -140,6 +145,7 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
         if sequence.slot() != de::Slot::End {
             return Err(de::Error::custom("unexpected metadata field"));
         }
+
         TensorMetadata::new(shape, layout, block_shape).map_err(de::Error::custom)
     }
 }
@@ -158,6 +164,7 @@ impl<'en, T: TensorElement> en::ToStream<'en> for TensorMetadata<T> {
                     .map_err(en::Error::custom)?,
             ),
         };
+
         en::IntoStream::into_stream(
             (
                 self.shape.as_slice(),

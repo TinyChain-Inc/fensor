@@ -97,6 +97,7 @@ fn walk<'a, I, T, R>(
         let Some((source, input)) = pending.pop() else {
             return Ok(None);
         };
+
         visit(&mut visited)?;
         step = advance(source, input)?;
     }
@@ -125,6 +126,7 @@ where
 
     loop {
         visit(&mut visited)?;
+
         step = match step {
             Selection::Ready(requests) => return Ok(requests),
             Selection::Source(source, slice) => source.selection_step(slice)?,
@@ -137,6 +139,7 @@ where
     E::DType: TensorElement,
 {
     let mut streams = Vec::new();
+
     walk(
         source.ordered_step(slice)?,
         |source, slice| source.ordered_step(slice),

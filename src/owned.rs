@@ -68,6 +68,7 @@ impl<T: TensorElement> TensorExpression<T> {
         let zero = source.implicit_zero();
         let strides = crate::contiguous_strides(source.shape())?;
         let mapping = CoordinateMap::identity(source.shape().into(), &strides);
+
         Ok(Self {
             source: Some(Arc::new(Owned {
                 expression: Box::new(source),
@@ -165,6 +166,7 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
             return Ok(expression::traversal::Selection::Ready(slice.stream()));
         }
         let strides = crate::contiguous_strides(self.source().shape())?;
+
         Ok(if self.is_identity(&strides) {
             expression::traversal::Selection::Source(self.source(), slice)
         } else {
@@ -180,6 +182,7 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
             return Ok(expression::traversal::Ordered::Ready(slice.stream()));
         }
         let strides = crate::contiguous_strides(self.source().shape())?;
+
         Ok(if self.is_identity(&strides) {
             expression::traversal::Ordered::Sources(vec![(self.source(), slice)])
         } else {

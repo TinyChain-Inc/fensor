@@ -30,6 +30,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         geometry: StorageGeometry,
     ) -> Result<Self> {
         let values = dir.try_write()?.create_dir("values".into())?;
+
         Ok(Self {
             values: TableLock::create(
                 PayloadSchema::new(geometry.block_len()),
@@ -49,6 +50,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         geometry: StorageGeometry,
     ) -> Result<Self> {
         let dir = dir.try_read()?;
+
         if dir
             .iter()
             .any(|(name, _)| name != "blocks" && name != "values")
@@ -57,10 +59,12 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                 "unexpected sparse storage entry".into(),
             ));
         }
+
         let values = dir
             .get_dir("values")
             .cloned()
             .ok_or_else(|| Error::InvalidLayout("missing sparse values".into()))?;
+
         Ok(Self {
             values: TableLock::load(
                 PayloadSchema::new(geometry.block_len()),
@@ -75,6 +79,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     fn validate_payload(&self, id: u64, values: &[T]) -> Result<bool> {
         self.geometry.validate_block(id, values)?;
+
         Ok(values.iter().any(|v| *v != T::ZERO))
     }
 
@@ -82,12 +87,15 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         if row.len() != 2 || row[0] != SparseCell::Key(id) {
             return Err(Error::InvalidLayout("invalid sparse block key".into()));
         }
+
         let Some(SparseCell::Payload(values)) = row.pop() else {
             return Err(Error::InvalidLayout("invalid sparse payload".into()));
         };
+
         if !self.validate_payload(id, &values)? {
             return Err(Error::InvalidLayout("empty sparse payload".into()));
         }
+
         Ok(values)
     }
 
@@ -97,12 +105,14 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             #[cfg(test)]
             crate::read_metrics::record(|m| m.logical_payload_reads += 1);
             self.geometry.block_bounds(id)?;
+
             let row = self
                 .values
                 .read()
                 .await
                 .get_row(&[SparseCell::Key(id)])
                 .await?;
+
             row.map(|row| self.row_payload(id, row)).transpose()
         })
     }
@@ -117,6 +127,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let mut ids = groups.keys().copied().peekable();
+
             while let Some(first) = ids.next() {
                 let mut last = first;
                 while let Some(&next) = ids.peek() {
@@ -150,6 +161,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                 let table = self.values.read().await;
                 let mut rows = table.rows(selection, &[], false, None).await?;
                 let mut previous = None;
+
                 while let Some(row) = rows.try_next().await? {
                     let Some(SparseCell::Key(id)) = row.first() else {
                         return Err(Error::InvalidLayout("invalid sparse block key".into()));
@@ -165,6 +177,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                     previous = Some(id);
                 }
             }
+
             Ok(())
         })
     }
@@ -324,6 +337,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                 }
                 previous = Some(*id);
             }
+
             Ok(())
         })
     }
@@ -334,6 +348,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                 "occupied block range out of bounds".into(),
             ));
         }
+
         let _guard = self.gate.read().await;
 
         if range.is_empty() {
@@ -354,6 +369,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             .rows(selection, &[], false, Some(&["block".into()]))
             .await?;
         let mut keys = Vec::new();
+
         while let Some(row) = rows.try_next().await? {
             let [SparseCell::Key(id)] = row.as_slice() else {
                 return Err(Error::InvalidLayout("invalid sparse block key".into()));
@@ -370,6 +386,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             }
             keys.push(*id);
         }
+
         Ok(keys)
     }
 }
@@ -396,6 +413,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
             .position(|&n| n > 1)
             .is_none_or(|first| block[first + 1..] == shape[first + 1..]);
         let current = contiguous.then(|| (None, vec![T::ZERO; geometry.block_len()]));
+
         Self { tensor, current }
     }
 
@@ -489,6 +507,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                     }
                 }
             }
+
             Ok(())
         })
     }
