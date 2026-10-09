@@ -1,20 +1,17 @@
-use std::path::PathBuf;
-
 use fensor::AxisRange;
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
+use super::*;
 use crate::schema::row_major_coords;
 use crate::test_support::{FsEntry as TestFE, cleanup, new_dir};
-use crate::{Error, Layout, Tensor, TensorSchema};
-
-use super::*;
+use crate::{Error, Layout, Shape, Tensor, TensorSchema};
 
 async fn create_dense(
     name: &str,
     shape: Shape,
     max_capacity: usize,
-) -> (PathBuf, Tensor<TestFE, f32>) {
+) -> (crate::test_support::Directory, Tensor<TestFE, f32>) {
     let (root, dir) = new_dir(name).await;
     let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema");
     let tensor = Tensor::<TestFE, f32>::create(dir, schema, Layout::Dense, max_capacity)
@@ -30,7 +27,7 @@ async fn flat_offset_identity() {
     // [4,5,6], strides [30,6,1], coord [2,1,3] → k = 2*30 + 1*6 + 3*1 = 69
     let (root, tensor) = create_dense("flat_offset_identity", shape![4, 5, 6], 1000).await;
     let view = tensor.view();
-    assert_eq!(view.flat_offset(&[2, 1, 3]).expect("offset"), 69);
+    assert_eq!(view.mapping.flat_offset(&[2, 1, 3]).expect("offset"), 69);
     cleanup(&root).await;
 }
 
@@ -41,7 +38,7 @@ async fn flat_offset_reshape_rank_reducing() {
         create_dense("flat_offset_reshape_rank_reducing", shape![2, 3, 4], 1000).await;
     let view = tensor.view();
     let reshaped = view.reshape(shape![6, 4]).expect("reshape");
-    assert_eq!(reshaped.flat_offset(&[3, 2]).expect("offset"), 14);
+    assert_eq!(reshaped.mapping.flat_offset(&[3, 2]).expect("offset"), 14);
     cleanup(&root).await;
 }
 
@@ -52,7 +49,10 @@ async fn flat_offset_reshape_rank_increasing() {
         create_dense("flat_offset_reshape_rank_increasing", shape![6, 4], 1000).await;
     let view = tensor.view();
     let reshaped = view.reshape(shape![2, 3, 4]).expect("reshape");
-    assert_eq!(reshaped.flat_offset(&[1, 0, 2]).expect("offset"), 14);
+    assert_eq!(
+        reshaped.mapping.flat_offset(&[1, 0, 2]).expect("offset"),
+        14
+    );
     cleanup(&root).await;
 }
 
@@ -62,7 +62,7 @@ async fn flat_offset_reshape_same_rank() {
     let (root, tensor) = create_dense("flat_offset_reshape_same_rank", shape![6, 4], 1000).await;
     let view = tensor.view();
     let reshaped = view.reshape(shape![4, 6]).expect("reshape");
-    assert_eq!(reshaped.flat_offset(&[2, 3]).expect("offset"), 15);
+    assert_eq!(reshaped.mapping.flat_offset(&[2, 3]).expect("offset"), 15);
     cleanup(&root).await;
 }
 
@@ -84,7 +84,7 @@ async fn slice_then_resolve() {
     ];
     let sliced = view.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 3]);
-    assert_eq!(sliced.flat_offset(&[1, 2]).expect("offset"), 82);
+    assert_eq!(sliced.mapping.flat_offset(&[1, 2]).expect("offset"), 82);
     cleanup(&root).await;
 }
 
@@ -96,7 +96,10 @@ async fn transpose_arbitrary_permutation() {
         create_dense("transpose_arbitrary_permutation", shape![3, 4, 5], 1000).await;
     let view = tensor.view();
     let transposed = view.transpose(Some(axes![2, 0, 1])).expect("transpose");
-    assert_eq!(transposed.flat_offset(&[1, 2, 3]).expect("offset"), 56);
+    assert_eq!(
+        transposed.mapping.flat_offset(&[1, 2, 3]).expect("offset"),
+        56
+    );
     cleanup(&root).await;
 }
 
@@ -118,7 +121,7 @@ async fn compose_transpose_and_slice() {
     ];
     let sliced = transposed.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 2]);
-    assert_eq!(sliced.flat_offset(&[1, 1]).expect("offset"), 53);
+    assert_eq!(sliced.mapping.flat_offset(&[1, 1]).expect("offset"), 53);
     cleanup(&root).await;
 }
 
@@ -198,7 +201,7 @@ async fn step1_slice_then_reshape_valid() {
     let r = range![AxisRange::In(1, 4, 1), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
     let reshaped = sliced.reshape(shape![12]).expect("reshape must succeed");
-    assert_eq!(reshaped.flat_offset(&[5]).expect("offset"), 9);
+    assert_eq!(reshaped.mapping.flat_offset(&[5]).expect("offset"), 9);
     cleanup(&root).await;
 }
 
@@ -212,7 +215,7 @@ async fn at_first_axis_then_reshape_valid() {
     let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
     let reshaped = sliced.reshape(shape![2, 2]).expect("reshape must succeed");
-    assert_eq!(reshaped.flat_offset(&[1, 1]).expect("offset"), 7);
+    assert_eq!(reshaped.mapping.flat_offset(&[1, 1]).expect("offset"), 7);
     cleanup(&root).await;
 }
 
@@ -231,7 +234,7 @@ async fn reshape_then_slice_flat_offset() {
     ];
     let sliced = reshaped.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 2, 4]);
-    assert_eq!(sliced.flat_offset(&[1, 1, 2]).expect("offset"), 18);
+    assert_eq!(sliced.mapping.flat_offset(&[1, 1, 2]).expect("offset"), 18);
     cleanup(&root).await;
 }
 
@@ -252,8 +255,14 @@ async fn flat_offset_broadcast_rank_preserving() {
     let broadcasted = view
         .broadcast(shape![2, 3, 4])
         .expect("broadcast must be supported");
-    assert_eq!(broadcasted.flat_offset(&[0, 2, 3]).expect("offset"), 11);
-    assert_eq!(broadcasted.flat_offset(&[1, 2, 3]).expect("offset"), 11);
+    assert_eq!(
+        broadcasted.mapping.flat_offset(&[0, 2, 3]).expect("offset"),
+        11
+    );
+    assert_eq!(
+        broadcasted.mapping.flat_offset(&[1, 2, 3]).expect("offset"),
+        11
+    );
     cleanup(&root).await;
 }
 
@@ -268,8 +277,14 @@ async fn flat_offset_broadcast_rank_expanding() {
     let broadcasted = view
         .broadcast(shape![2, 3, 4])
         .expect("broadcast must be supported");
-    assert_eq!(broadcasted.flat_offset(&[0, 2, 3]).expect("offset"), 11);
-    assert_eq!(broadcasted.flat_offset(&[1, 2, 3]).expect("offset"), 11);
+    assert_eq!(
+        broadcasted.mapping.flat_offset(&[0, 2, 3]).expect("offset"),
+        11
+    );
+    assert_eq!(
+        broadcasted.mapping.flat_offset(&[1, 2, 3]).expect("offset"),
+        11
+    );
     cleanup(&root).await;
 }
 
@@ -296,8 +311,14 @@ async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
     let broadcasted = sliced
         .broadcast(shape![7, 5, 6])
         .expect("broadcast must be supported");
-    assert_eq!(broadcasted.flat_offset(&[0, 2, 4]).expect("offset"), 106);
-    assert_eq!(broadcasted.flat_offset(&[6, 2, 4]).expect("offset"), 106);
+    assert_eq!(
+        broadcasted.mapping.flat_offset(&[0, 2, 4]).expect("offset"),
+        106
+    );
+    assert_eq!(
+        broadcasted.mapping.flat_offset(&[6, 2, 4]).expect("offset"),
+        106
+    );
 
     for k in 0..7u64 {
         let v = broadcasted
@@ -388,8 +409,20 @@ async fn broadcast_expands_middle_or_trailing_axis_with_rank_increase() {
         .broadcast(shape![2, 3, 5, 4])
         .expect("broadcast must be supported");
     assert_eq!(broadcasted.shape(), &[2, 3, 5, 4]);
-    assert_eq!(broadcasted.flat_offset(&[1, 2, 3, 2]).expect("offset"), 10);
-    assert_eq!(broadcasted.flat_offset(&[0, 2, 0, 2]).expect("offset"), 10);
+    assert_eq!(
+        broadcasted
+            .mapping
+            .flat_offset(&[1, 2, 3, 2])
+            .expect("offset"),
+        10
+    );
+    assert_eq!(
+        broadcasted
+            .mapping
+            .flat_offset(&[0, 2, 0, 2])
+            .expect("offset"),
+        10
+    );
 
     for i in 0..2u64 {
         for k in 0..5u64 {
@@ -436,7 +469,7 @@ async fn broadcast_twice_passes_through_existing_broadcast_axis() {
         for j in 0..5u64 {
             for k in 0..4u64 {
                 assert_eq!(
-                    twice.flat_offset(&[i, j, k]).expect("offset"),
+                    twice.mapping.flat_offset(&[i, j, k]).expect("offset"),
                     12 + k as i128,
                     "i={i} j={j} k={k}"
                 );
@@ -471,7 +504,7 @@ async fn broadcast_then_transpose_preserves_constant() {
     for k in 0..4u64 {
         for j in 0..5u64 {
             assert_eq!(
-                transposed.flat_offset(&[k, j]).expect("offset"),
+                transposed.mapping.flat_offset(&[k, j]).expect("offset"),
                 12 + k as i128,
                 "k={k} j={j}"
             );
@@ -502,7 +535,7 @@ async fn slice_of_after_broadcast_preserves_constant() {
     for x in 0..2u64 {
         for y in 0..4u64 {
             assert_eq!(
-                sliced.flat_offset(&[x, y]).expect("offset"),
+                sliced.mapping.flat_offset(&[x, y]).expect("offset"),
                 y as i128,
                 "x={x} y={y}"
             );
@@ -521,8 +554,8 @@ async fn flip_stride_axis_reverses_offset() {
         create_dense("flip_stride_axis_reverses_offset", shape![4, 5, 6], 1000).await;
     let view = tensor.view();
     let flipped = view.flip(2).expect("flip");
-    assert_eq!(flipped.flat_offset(&[0, 0, 0]).expect("offset"), 5);
-    assert_eq!(flipped.flat_offset(&[0, 0, 5]).expect("offset"), 0);
+    assert_eq!(flipped.mapping.flat_offset(&[0, 0, 0]).expect("offset"), 5);
+    assert_eq!(flipped.mapping.flat_offset(&[0, 0, 5]).expect("offset"), 0);
     cleanup(&root).await;
 }
 
@@ -542,8 +575,8 @@ async fn flip_then_flip_is_identity() {
 
     for c in coords {
         assert_eq!(
-            flipped_twice.flat_offset(&c).expect("offset"),
-            view.flat_offset(&c).expect("offset"),
+            flipped_twice.mapping.flat_offset(&c).expect("offset"),
+            view.mapping.flat_offset(&c).expect("offset"),
             "{c:?}"
         );
     }
@@ -559,11 +592,11 @@ async fn flip_on_broadcast_axis_is_noop() {
         .broadcast(shape![3, 4])
         .expect("broadcast must be supported");
     let before: Vec<i128> = (0..3u64)
-        .map(|x| broadcasted.flat_offset(&[x, 2]).expect("offset"))
+        .map(|x| broadcasted.mapping.flat_offset(&[x, 2]).expect("offset"))
         .collect();
     let flipped = broadcasted.flip(0).expect("flip");
     let after: Vec<i128> = (0..3u64)
-        .map(|x| flipped.flat_offset(&[x, 2]).expect("offset"))
+        .map(|x| flipped.mapping.flat_offset(&[x, 2]).expect("offset"))
         .collect();
     assert_eq!(before, after);
     cleanup(&root).await;
@@ -580,11 +613,11 @@ async fn flip_on_gather_axis_reverses_table() {
         .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
     let before: Vec<i128> = (0..2u64)
-        .map(|a| gathered.flat_offset(&[a, 0]).expect("offset"))
+        .map(|a| gathered.mapping.flat_offset(&[a, 0]).expect("offset"))
         .collect();
     let flipped = gathered.flip(0).expect("flip");
     let after: Vec<i128> = (0..2u64)
-        .map(|a| flipped.flat_offset(&[a, 0]).expect("offset"))
+        .map(|a| flipped.mapping.flat_offset(&[a, 0]).expect("offset"))
         .collect();
     let expected: Vec<i128> = before.into_iter().rev().collect();
     assert_eq!(after, expected);
@@ -652,7 +685,7 @@ async fn at_slice_on_broadcast_axis() {
     assert_eq!(sliced.shape(), &[4]);
 
     for y in 0..4u64 {
-        assert_eq!(sliced.flat_offset(&[y]).expect("offset"), y as i128);
+        assert_eq!(sliced.mapping.flat_offset(&[y]).expect("offset"), y as i128);
         let v = sliced.read_value(&[y]).await.expect("read");
         assert_eq!(v, y as f32 * 2.0, "y={y}");
     }
@@ -683,7 +716,7 @@ async fn in_slice_on_broadcast_axis() {
     for a in 0..3u64 {
         for y in 0..4u64 {
             assert_eq!(
-                sliced.flat_offset(&[a, y]).expect("offset"),
+                sliced.mapping.flat_offset(&[a, y]).expect("offset"),
                 y as i128,
                 "a={a} y={y}"
             );
@@ -719,7 +752,7 @@ async fn at_slice_on_gather_axis() {
 
     for y in 0..4u64 {
         assert_eq!(
-            sliced.flat_offset(&[y]).expect("offset"),
+            sliced.mapping.flat_offset(&[y]).expect("offset"),
             12 + y as i128,
             "y={y}"
         );
@@ -753,7 +786,7 @@ async fn in_slice_on_gather_axis() {
 
     for y in 0..4u64 {
         assert_eq!(
-            sliced.flat_offset(&[0, y]).expect("offset"),
+            sliced.mapping.flat_offset(&[0, y]).expect("offset"),
             12 + y as i128,
             "y={y}"
         );
@@ -791,12 +824,12 @@ async fn of_slice_on_gather_axis() {
 
     for y in 0..4u64 {
         assert_eq!(
-            sliced.flat_offset(&[0, y]).expect("offset"),
+            sliced.mapping.flat_offset(&[0, y]).expect("offset"),
             12 + y as i128,
             "y={y}"
         );
         assert_eq!(
-            sliced.flat_offset(&[1, y]).expect("offset"),
+            sliced.mapping.flat_offset(&[1, y]).expect("offset"),
             4 + y as i128,
             "y={y}"
         );
@@ -896,8 +929,11 @@ async fn squeeze_stride_axis_folds_zero_offset() {
     // so flat_offset on squeezed [x,z] should match original [x,0,z]
     for x in 0..3u64 {
         for z in 0..4u64 {
-            let orig_offset = view.flat_offset(&[x, 0, z]).expect("orig offset");
-            let squeeze_offset = squeezed.flat_offset(&[x, z]).expect("squeeze offset");
+            let orig_offset = view.mapping.flat_offset(&[x, 0, z]).expect("orig offset");
+            let squeeze_offset = squeezed
+                .mapping
+                .flat_offset(&[x, z])
+                .expect("squeeze offset");
             assert_eq!(orig_offset, squeeze_offset, "x={}, z={}", x, z);
         }
     }
@@ -930,7 +966,7 @@ async fn squeeze_gather_singleton_folds_offset() {
 
     for y in 0..4u64 {
         assert_eq!(
-            squeezed.flat_offset(&[y]).expect("offset"),
+            squeezed.mapping.flat_offset(&[y]).expect("offset"),
             12 + y as i128,
             "y={}",
             y
@@ -978,7 +1014,7 @@ async fn squeeze_broadcast_axis_folds_constant() {
     for y in 0..5u64 {
         for z in 0..6u64 {
             assert_eq!(
-                squeezed.flat_offset(&[y, z]).expect("offset"),
+                squeezed.mapping.flat_offset(&[y, z]).expect("offset"),
                 90 + 6 * y as i128 + z as i128,
                 "y={y} z={z}"
             );
@@ -1044,12 +1080,18 @@ async fn unsqueeze_uses_contiguous_stride_at_insertion_point() {
     // Verify expected strides via flat_offset calculations
     // flat_offset([0,1,0,2]) should be 1*4 + 2*1 = 6
     assert_eq!(
-        unsqueezed.flat_offset(&[0, 1, 0, 2]).expect("offset"),
+        unsqueezed
+            .mapping
+            .flat_offset(&[0, 1, 0, 2])
+            .expect("offset"),
         6,
         "flat_offset([0,1,0,2])"
     );
     assert_eq!(
-        unsqueezed.flat_offset(&[0, 2, 0, 3]).expect("offset"),
+        unsqueezed
+            .mapping
+            .flat_offset(&[0, 2, 0, 3])
+            .expect("offset"),
         2 * 4 + 3,
         "flat_offset([0,2,0,3])"
     );
@@ -1149,8 +1191,8 @@ async fn squeeze_then_unsqueeze_round_trip() {
 
     for c in coords {
         assert_eq!(
-            restored.flat_offset(&c).expect("restored offset"),
-            view.flat_offset(&c).expect("original offset"),
+            restored.mapping.flat_offset(&c).expect("restored offset"),
+            view.mapping.flat_offset(&c).expect("original offset"),
             "{:?}",
             c
         );
@@ -1183,11 +1225,278 @@ async fn unsqueeze_then_squeeze_round_trip() {
 
     for c in coords {
         assert_eq!(
-            restored.flat_offset(&c).expect("restored offset"),
-            view.flat_offset(&c).expect("original offset"),
+            restored.mapping.flat_offset(&c).expect("restored offset"),
+            view.mapping.flat_offset(&c).expect("original offset"),
             "{:?}",
             c
         );
     }
+    cleanup(&root).await;
+}
+
+#[tokio::test]
+async fn update_planning_matches_coordinates_without_affine_expansion() {
+    use crate::TensorSource;
+
+    for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
+        for block_shape in [shape![2, 3], shape![4, 64]] {
+            let (root, dir) = new_dir("update_plans").await;
+            let geometry = crate::StorageGeometry::new(
+                TensorSchema::new(NumberType::Float(FloatType::F32), shape![5, 131]).unwrap(),
+                layout,
+                if matches!(layout, Layout::Dense) {
+                    block_shape
+                } else {
+                    shape![1, block_shape[1]]
+                },
+            )
+            .unwrap();
+            let tensor = Tensor::<TestFE, f32>::create_with_geometry(dir, geometry.clone())
+                .await
+                .unwrap();
+            let base = tensor.view();
+            let views = [
+                base.clone(),
+                base.clone().transpose(None).unwrap(),
+                base.clone().flip(1).unwrap(),
+                base.clone().reshape(shape![131, 5]).unwrap(),
+                base.clone()
+                    .slice(range![
+                        AxisRange::Of(vec![4, 0, 4]),
+                        AxisRange::In(1, 131, 3)
+                    ])
+                    .unwrap(),
+            ];
+
+            for (index, view) in views.into_iter().enumerate() {
+                let coordinates: Vec<_> = row_major_coords(view.shape()).unwrap().collect();
+
+                for start in (0..coordinates.len()).step_by(73) {
+                    let len = (coordinates.len() - start).min(73);
+                    let values: Vec<_> = (start..start + len).map(|i| i as f32).collect();
+                    let mut expected = crate::BlockUpdates::new();
+
+                    for (coord, value) in coordinates[start..start + len].iter().zip(&values) {
+                        let mapped = view.resolve_base_coord(coord).unwrap();
+                        let (id, offset) = geometry.block_position(&mapped).unwrap();
+                        expected.entry(id).or_default().push((offset, *value));
+                    }
+                    crate::read_metrics::CURRENT
+                        .scope(Default::default(), async {
+                            assert_eq!(
+                                view.plan_updates(&geometry, start as u64, values).unwrap(),
+                                expected
+                            );
+                            crate::read_metrics::CURRENT.with(|m| {
+                                assert_eq!(m.borrow().expanded_coordinates, 0);
+                                if index < 4 {
+                                    assert_eq!(m.borrow().coordinate_resolutions, 0);
+                                }
+                            });
+                        })
+                        .await;
+                }
+                assert!(
+                    view.plan_updates(&geometry, view.size().unwrap(), vec![])
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    view.plan_updates(&geometry, view.size().unwrap(), vec![1.])
+                        .is_err()
+                );
+                assert!(
+                    view.plan_updates(
+                        &geometry,
+                        0,
+                        vec![0.; crate::expression::MAX_BATCH_ELEMENTS + 1]
+                    )
+                    .is_err()
+                );
+            }
+
+            let wrong = crate::StorageGeometry::new(
+                tensor.schema().clone(),
+                if matches!(layout, Layout::Dense) {
+                    Layout::Sparse { axis: Some(0) }
+                } else {
+                    Layout::Dense
+                },
+                if matches!(layout, Layout::Dense) {
+                    shape![1, geometry.block_shape()[1]]
+                } else {
+                    geometry.block_shape().into()
+                },
+            )
+            .unwrap();
+            assert!(base.plan_updates(&wrong, 0, vec![1.]).is_err());
+            assert_eq!(
+                tensor.storage_geometry().block_shape(),
+                geometry.block_shape()
+            );
+            cleanup(&root).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn update_stream_evaluates_once_and_owns_its_source() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use futures::TryStreamExt;
+
+    use crate::{TensorExpression, TensorSource};
+
+    struct Counted {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl TensorGeometry for Counted {
+        type DType = f32;
+
+        fn dtype(&self) -> NumberType {
+            NumberType::Float(FloatType::F32)
+        }
+
+        fn layout(&self) -> Layout {
+            Layout::Dense
+        }
+
+        fn shape(&self) -> &[u64] {
+            &[8193]
+        }
+    }
+
+    impl crate::expression::traversal::Plan for Counted {}
+
+    impl crate::expression::Expression for Counted {
+        fn build<'a>(
+            &'a self,
+            _context: crate::expression::Context<'a>,
+            request: std::sync::Arc<crate::request::BatchRequest>,
+        ) -> crate::BoxFuture<'a, crate::Result<crate::expression::Batch<f32>>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.fail {
+                    return Err(Error::InvalidLayout("injected source error".into()));
+                }
+
+                crate::expression::Batch::from_values(vec![1.; request.len()])
+            })
+        }
+    }
+
+    let (root, tensor) = create_dense("update_stream", shape![8193], 64).await;
+
+    for fail in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = TensorExpression::new(Counted {
+            calls: calls.clone(),
+            fail,
+        })
+        .unwrap();
+        let mut stream = tensor
+            .view()
+            .updates_from(&tensor.storage_geometry(), source)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        if fail {
+            assert!(stream.try_next().await.is_err());
+        } else {
+            let mut count = 0;
+
+            while let Some(updates) = stream.try_next().await.unwrap() {
+                let n: usize = updates.values().map(Vec::len).sum();
+                assert!(n <= crate::expression::MAX_BATCH_ELEMENTS);
+                count += n;
+            }
+            assert_eq!(count, 8193);
+            assert_eq!(calls.load(Ordering::Relaxed), 3);
+        }
+        drop(stream);
+        assert_eq!(Arc::strong_count(&calls), 1);
+        let source = TensorExpression::new(Counted {
+            calls: calls.clone(),
+            fail,
+        })
+        .unwrap();
+        let stream = tensor
+            .view()
+            .updates_from(&tensor.storage_geometry(), source)
+            .unwrap();
+        drop(stream);
+        assert_eq!(Arc::strong_count(&calls), 1);
+    }
+    cleanup(&root).await;
+}
+
+#[tokio::test]
+async fn owned_transforms_use_compact_runs_through_native_consumption() {
+    use futures::TryStreamExt;
+
+    use crate::{TensorExpression, TensorSource};
+    let (root, tensor) = create_dense("owned_compact_runs", shape![3, 4097], 256).await;
+    let geometry = tensor.storage_geometry();
+
+    for id in 0..geometry.block_count() {
+        let mut values = vec![0.; geometry.block_len()];
+
+        for (offset, coord) in crate::test_support::block_entries(&geometry, id) {
+            values[offset] = (coord[0] * 4097 + coord[1]) as f32;
+        }
+        tensor.replace_logical_block(id, values).await.unwrap();
+    }
+
+    let expected = tensor
+        .view()
+        .transpose(None)
+        .unwrap()
+        .flip(0)
+        .unwrap()
+        .read_blocks()
+        .unwrap()
+        .try_concat()
+        .await
+        .unwrap();
+    crate::read_metrics::CURRENT
+        .scope(Default::default(), async {
+            let value = TensorExpression::new(tensor.view())
+                .unwrap()
+                .transpose(None)
+                .unwrap()
+                .flip(0)
+                .unwrap();
+            let actual = value
+                .clone()
+                .into_blocks()
+                .unwrap()
+                .try_concat()
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            // Force a second nonidentity owned mapping over the first.
+            let nested = TensorExpression::new(value).unwrap().flip(0).unwrap();
+            let actual = nested.into_blocks().unwrap().try_concat().await.unwrap();
+            let expected = tensor
+                .view()
+                .transpose(None)
+                .unwrap()
+                .read_blocks()
+                .unwrap()
+                .try_concat()
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            crate::read_metrics::CURRENT.with(|m| {
+                let m = m.borrow();
+                assert!(m.mapped_runs > 0);
+                assert_eq!(m.expanded_coordinates, 0);
+            });
+        })
+        .await;
     cleanup(&root).await;
 }

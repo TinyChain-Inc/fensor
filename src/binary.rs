@@ -1,14 +1,15 @@
 //! Typed, read-only elementwise expressions over two sources.
 
-use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{ArrayAccess, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, Real};
+use ha_ndarray::{
+    ArrayAccess, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, NDArrayRead, Number, Real,
+};
 
 use crate::expression::{self, Batch, Expression};
-use crate::request::{self, BatchRequest};
-use crate::traits::{BoxFuture, SparseElementStream, ValueBlockStream};
+use crate::request::BatchRequest;
+use crate::traits::BoxFuture;
 use crate::{
-    Axes, Error, Layout, Range, Result, Shape, TensorBoolean, TensorCompare, TensorElement,
-    TensorGeometry, TensorMath, TensorRead, TensorTransform, TensorViewSemantics,
+    Error, Layout, Result, TensorBoolean, TensorCompare, TensorElement, TensorGeometry, TensorMath,
+    TensorRead, TensorTransform, TensorViewSemantics,
 };
 
 mod sealed {
@@ -18,6 +19,8 @@ mod sealed {
 /// A sealed operation building an ndarray expression without evaluating it.
 pub trait BinaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     type Output: TensorElement;
+
+    const NAME: &'static str;
 
     fn apply(
         &self,
@@ -98,13 +101,25 @@ pub trait BinaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
 /// ) { let _ = a.view().eq(&b.view()).await; }
 /// ```
 #[derive(Clone)]
-pub struct BinaryView<Left, Right, Op> {
+pub struct BinaryView<Left, Right, Op>
+where
+    Left: TensorGeometry,
+    Left::DType: TensorElement,
+    Op: BinaryOp<Left::DType>,
+{
     left: Left,
     right: Right,
     op: Op,
+    zero: Op::Output,
 }
 
-impl<L: crate::TensorGeometry, R: crate::TensorGeometry, O> BinaryView<L, R, O> {
+impl<L, R, O> BinaryView<L, R, O>
+where
+    L: Expression,
+    R: Expression<DType = L::DType>,
+    L::DType: TensorElement,
+    O: BinaryOp<L::DType>,
+{
     fn new(left: L, right: R, op: O) -> Result<Self> {
         if left.shape() != right.shape() {
             return Err(Error::InvalidSchema(format!(
@@ -114,7 +129,25 @@ impl<L: crate::TensorGeometry, R: crate::TensorGeometry, O> BinaryView<L, R, O> 
             )));
         }
 
-        Ok(Self { left, right, op })
+        let zero = if matches!(left.layout(), Layout::Sparse { .. })
+            && matches!(right.layout(), Layout::Sparse { .. })
+        {
+            let left_zero = expression::batch_array(vec![left.implicit_zero()])?;
+            let right_zero = expression::batch_array(vec![right.implicit_zero()])?;
+            let zero = op.apply(left_zero, right_zero)?.read_value(&[0])?;
+            if zero != O::Output::ZERO {
+                return Err(Error::WouldDensify { operation: O::NAME });
+            }
+            zero
+        } else {
+            O::Output::ZERO
+        };
+        Ok(Self {
+            left,
+            right,
+            op,
+            zero,
+        })
     }
 }
 
@@ -129,6 +162,8 @@ macro_rules! binary_op {
 
         impl<$ty: $($bounds)+> BinaryOp<$ty> for $name {
             type Output = $output;
+
+            const NAME: &'static str = stringify!($method);
 
             fn apply(
                 &self,
@@ -178,10 +213,12 @@ binary_op!(
 
 // Expand only members of the explicit public-trait implementation below.
 macro_rules! binary_constructor {
-    ($output:ident, $method:ident, $op:ident, $rhs:ty) => {
-        type $output = BinaryView<Self, $rhs, $op>;
+    ($output:ident, $method:ident, $op:ident, $rhs:ty $(; where [$($bounds:tt)+])?) => {
+        type $output = BinaryView<Self, $rhs, $op> $(where $($bounds)+)?;
 
-        fn $method<'a>(&'a self, rhs: &'a $rhs) -> BoxFuture<'a, Result<Self::$output>> {
+        fn $method<'a>(&'a self, rhs: &'a $rhs) -> BoxFuture<'a, Result<Self::$output>>
+        $(where $($bounds)+)?
+        {
             Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), $op) })
         }
     };
@@ -203,29 +240,9 @@ where
 
     binary_constructor!(PowOutput, pow, Pow, R);
 
-    type LogOutput
-        = BinaryView<Self, R, Log>
-    where
-        L::DType: Float;
+    binary_constructor!(LogOutput, log, Log, R; where [L::DType: Float]);
 
-    type RemOutput
-        = BinaryView<Self, R, Rem>
-    where
-        L::DType: Real;
-
-    fn rem<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::RemOutput>>
-    where
-        L::DType: Real,
-    {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Rem) })
-    }
-
-    fn log<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LogOutput>>
-    where
-        L::DType: Float,
-    {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Log) })
-    }
+    binary_constructor!(RemOutput, rem, Rem, R; where [L::DType: Real]);
 }
 
 impl<L, R, O> TensorGeometry for BinaryView<L, R, O>
@@ -263,9 +280,45 @@ where
     fn is_base_tensor(&self) -> bool {
         false
     }
+}
 
-    fn supports_write_through(&self) -> bool {
-        false
+impl<L, R, O> crate::expression::traversal::Plan for BinaryView<L, R, O>
+where
+    L: Expression,
+    R: Expression<DType = L::DType>,
+    L::DType: TensorElement,
+    O: BinaryOp<L::DType>,
+{
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Selection<'_>> {
+        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
+    }
+
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+        }
+
+        let left_slice = slice.clone();
+        Ok(expression::traversal::Ordered::Sources(vec![
+            (&self.left, left_slice),
+            (&self.right, slice),
+        ]))
+    }
+
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
+        Ok(expression::traversal::Preferred::Sources(vec![
+            (&self.left, shape),
+            (&self.right, shape),
+        ]))
     }
 }
 
@@ -276,24 +329,32 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
-    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
-        match self.left.preferred_requests(shape)? {
-            Some(requests) => Ok(Some(requests)),
-            None => self.right.preferred_requests(shape),
-        }
+    fn implicit_zero(&self) -> Self::DType {
+        self.zero
     }
 
-    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
-        Box::pin(async move {
-            let left = self.left.build(coords).await?;
-            let right = self.right.build(coords).await?;
-            let support = expression::union_support(left.support, right.support)?;
+    fn expression_nodes(&self) -> Result<usize> {
+        crate::expression::traversal::node_count([
+            self.left.expression_nodes()?,
+            self.right.expression_nodes()?,
+        ])
+    }
 
-            Batch {
-                array: self.op.apply(left.array, right.array)?,
-                support,
-            }
-            .masked()
+    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
+        self.left.detach_sources(pending);
+        self.right.detach_sources(pending);
+    }
+
+    fn build<'a>(
+        &'a self,
+        context: expression::Context<'a>,
+        coords: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+        Box::pin(async move {
+            let left = context.batch(&self.left, coords.clone()).await?;
+            let right = context.batch(&self.right, coords).await?;
+
+            Batch::from_array(self.op.apply(left.array, right.array)?)
         })
     }
 }
@@ -305,50 +366,12 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
-    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
-        expression::coordinate_blocks(self)
-    }
-
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Ok(
-                expression::evaluate_batch(self, &BatchRequest::point(coord))
-                    .await?
-                    .values[0],
-            )
-        })
-    }
-
-    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = request::linear_requests(self.shape())?;
-
-        Ok(expression::ordered_batches(self, coords)
-            .map_ok(|(_, batch)| batch.values)
-            .boxed())
-    }
-
-    fn read_sparse_elements_in_order<'a>(
-        &'a self,
-        range: Range,
-        requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        Box::pin(async move {
-            let coords = crate::traits::sparse_coords(self, range, requested_order)?;
-
-            Ok(
-                expression::ordered_batches(self, request::explicit_requests(coords))
-                    .and_then(move |(coords, values)| async move {
-                        Ok(futures::stream::iter(expression::sparse_elements(
-                            coords,
-                            values,
-                            self.shape(),
-                        )?))
-                    })
-                    .try_flatten()
-                    .boxed(),
-            )
-        })
-    }
+    crate::expression::reader_members!(
+        read_value,
+        read_blocks,
+        read_coordinate_blocks,
+        read_sparse_elements_in_order
+    );
 }
 
 impl<L, R, O> TensorTransform for BinaryView<L, R, O>
@@ -358,61 +381,7 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            left: self.left.reshape(shape.clone())?,
-            right: self.right.reshape(shape)?,
-            op: self.op,
-        })
-    }
-
-    fn broadcast(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            left: self.left.broadcast(shape.clone())?,
-            right: self.right.broadcast(shape)?,
-            op: self.op,
-        })
-    }
-
-    fn flip(self, axis: usize) -> Result<Self> {
-        Ok(Self {
-            left: self.left.flip(axis)?,
-            right: self.right.flip(axis)?,
-            op: self.op,
-        })
-    }
-
-    fn slice(self, range: Range) -> Result<Self> {
-        Ok(Self {
-            left: self.left.slice(range.clone())?,
-            right: self.right.slice(range)?,
-            op: self.op,
-        })
-    }
-
-    fn squeeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            left: self.left.squeeze(axes.clone())?,
-            right: self.right.squeeze(axes)?,
-            op: self.op,
-        })
-    }
-
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        Ok(Self {
-            left: self.left.transpose(permutation.clone())?,
-            right: self.right.transpose(permutation)?,
-            op: self.op,
-        })
-    }
-
-    fn unsqueeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            left: self.left.unsqueeze(axes.clone())?,
-            right: self.right.unsqueeze(axes)?,
-            op: self.op,
-        })
-    }
+    crate::mapping::transform_methods!(operands: left, right; preserve_rest);
 }
 
 binary_op!(
@@ -455,53 +424,13 @@ where
 
     binary_constructor!(NeOutput, ne, Ne, R);
 
-    type GtOutput
-        = BinaryView<Self, R, Gt>
-    where
-        L::DType: Real;
+    binary_constructor!(GtOutput, gt, Gt, R; where [L::DType: Real]);
 
-    fn gt<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::GtOutput>>
-    where
-        L::DType: Real,
-    {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Gt) })
-    }
+    binary_constructor!(GeOutput, ge, Ge, R; where [L::DType: Real]);
 
-    type GeOutput
-        = BinaryView<Self, R, Ge>
-    where
-        L::DType: Real;
+    binary_constructor!(LtOutput, lt, Lt, R; where [L::DType: Real]);
 
-    fn ge<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::GeOutput>>
-    where
-        L::DType: Real,
-    {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Ge) })
-    }
-
-    type LtOutput
-        = BinaryView<Self, R, Lt>
-    where
-        L::DType: Real;
-
-    fn lt<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LtOutput>>
-    where
-        L::DType: Real,
-    {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Lt) })
-    }
-
-    type LeOutput
-        = BinaryView<Self, R, Le>
-    where
-        L::DType: Real;
-
-    fn le<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::LeOutput>>
-    where
-        L::DType: Real,
-    {
-        Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), Le) })
-    }
+    binary_constructor!(LeOutput, le, Le, R; where [L::DType: Real]);
 }
 
 binary_op!(

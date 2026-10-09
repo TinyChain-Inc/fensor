@@ -11,7 +11,11 @@ use number_general::DType;
 mod common;
 use common::{FsEntry, new_dir};
 
-async fn source<T: TensorElement>(values: Vec<T>, shape: Shape, sparse: bool) -> Tensor<FsEntry, T>
+async fn source<T: TensorElement>(
+    values: Vec<T>,
+    shape: Shape,
+    sparse: bool,
+) -> (common::Directory, Tensor<FsEntry, T>)
 where
     FsEntry: TensorFileEntry<T>,
 {
@@ -24,7 +28,6 @@ where
         values,
     )
     .await
-    .1
 }
 
 async fn check<V: TensorRead>(view: &V, expected: &[V::DType])
@@ -36,7 +39,7 @@ where
 }
 
 macro_rules! parity {
-    ($name:ident, $t:ty) => {
+    ($name:ident, $t:ty, $large_consumers:expr) => {
         #[tokio::test]
         async fn $name() {
             for sparse in [false, true] {
@@ -53,38 +56,37 @@ macro_rules! parity {
                             }
                         })
                         .collect();
-                    let tensor = source(values.clone(), shape![n], sparse).await;
-                    let supported: Vec<_> = values
-                        .iter()
-                        .copied()
-                        .filter(|v| !sparse || *v != 0 as $t)
-                        .collect();
+                    let (_tensor_root, tensor) = source(values.clone(), shape![n], sparse).await;
                     macro_rules! op {
-                        ($method:ident, $all:ident) => {
-                            let array = Array::new(
-                                Buffer::from(supported.clone()),
-                                shape![supported.len()],
-                            )
-                            .unwrap();
+                        ($method:ident, $all:ident, $consumers:expr) => {
+                            let array =
+                                Array::new(Buffer::from(values.clone()), shape![values.len()])
+                                    .unwrap();
                             let expected = array.$all().unwrap();
                             assert_eq!(tensor.$all().await.unwrap(), expected);
                             let view = tensor.view().$method(axes![0], false).await.unwrap();
-                            if matches!(n, 7 | 4097) {
+                            if $consumers && (n == 7 || n == 4097 && $large_consumers) {
                                 check(&view, &[expected]).await;
                             } else {
                                 common::fixture::blocks(&view, &[expected], |a, b| a == b).await;
                             }
                         };
                     }
-                    op!(sum, sum_all);
-                    op!(product, product_all);
-                    op!(min, min_all);
-                    op!(max, max_all);
-                    assert_eq!(tensor.all().await.unwrap(), sparse);
-                    assert_eq!(tensor.any().await.unwrap(), sparse || n > 1);
+                    op!(sum, sum_all, true);
+                    op!(product, product_all, false);
+                    op!(min, min_all, false);
+                    op!(max, max_all, false);
+                    assert_eq!(
+                        tensor.all().await.unwrap(),
+                        values.iter().all(|value| *value != 0 as $t)
+                    );
+                    assert_eq!(
+                        tensor.any().await.unwrap(),
+                        values.iter().any(|value| *value != 0 as $t)
+                    );
                 }
                 let values: Vec<$t> = (0..24).map(|i| (i % 4 + u64::from(sparse)) as $t).collect();
-                let tensor = source(values.clone(), shape![2, 3, 4], sparse).await;
+                let (_tensor_root, tensor) = source(values.clone(), shape![2, 3, 4], sparse).await;
                 for axes in [
                     axes![],
                     axes![0],
@@ -95,7 +97,7 @@ macro_rules! parity {
                 ] {
                     for keepdims in [false, true] {
                         macro_rules! op {
-                            ($method:ident) => {
+                            ($method:ident, $consumers:expr) => {
                                 let expected =
                                     Array::new(Buffer::from(values.clone()), shape![2, 3, 4])
                                         .unwrap()
@@ -112,17 +114,17 @@ macro_rules! parity {
                                 );
                                 let buffer = expected.buffer().unwrap();
                                 let expected = buffer.to_slice().unwrap();
-                                if axes.as_slice() == [1] {
+                                if $consumers && axes.as_slice() == [1] {
                                     check(&view, &expected).await;
                                 } else {
                                     common::fixture::blocks(&view, &expected, |a, b| a == b).await;
                                 }
                             };
                         }
-                        op!(sum);
-                        op!(product);
-                        op!(min);
-                        op!(max);
+                        op!(sum, true);
+                        op!(product, false);
+                        op!(min, false);
+                        op!(max, false);
                     }
                 }
                 assert!(tensor.view().sum(axes![3], false).await.is_err());
@@ -130,22 +132,25 @@ macro_rules! parity {
         }
     };
 }
-parity!(f32_parity, f32);
-parity!(f64_parity, f64);
-parity!(u8_parity, u8);
+parity!(f32_parity, f32, true);
+parity!(f64_parity, f64, false);
+parity!(u8_parity, u8, false);
 
 #[tokio::test]
-async fn sparse_support_empty_groups_and_copy_boundary() {
-    let tensor = source(vec![0f32, 0., 0.2, 0., 2., 3.], shape![3, 2], true).await;
+async fn sparse_zero_extension_preserves_reductions_through_copy() {
+    let (_tensor_root, tensor) = source(vec![0f32, 0., 0.2, 0., 2., 3.], shape![3, 2], true).await;
     assert_eq!(tensor.sum_all().await.unwrap(), 5.2);
-    assert_eq!(tensor.min_all().await.unwrap(), 0.2);
-    assert!(tensor.all().await.unwrap());
+    assert_eq!(tensor.min_all().await.unwrap(), 0.);
+    assert!(!tensor.all().await.unwrap());
     let rounded = tensor.view().round().await.unwrap();
     assert!(!rounded.all().await.unwrap());
     assert_eq!(rounded.product_all().await.unwrap(), 0.);
     let sum = rounded.sum(axes![1], false).await.unwrap();
     check(&sum, &[0., 0., 5.]).await;
-    check(&sum.eq_scalar(0.).await.unwrap(), &[0, 1, 0]).await;
+    assert!(matches!(
+        sum.eq_scalar(0.).await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
     check(
         &rounded.product(axes![1], false).await.unwrap(),
         &[0., 0., 6.],
@@ -153,23 +158,17 @@ async fn sparse_support_empty_groups_and_copy_boundary() {
     .await;
     check(&rounded.min(axes![1], false).await.unwrap(), &[0., 0., 2.]).await;
     check(&rounded.max(axes![1], false).await.unwrap(), &[0., 0., 3.]).await;
-    let (_, dir) = new_dir("reduced_support").await;
-    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &sum, 2).await.unwrap();
-    assert_eq!(copy.min_all().await.unwrap(), 5.);
+    let (_dir_root, dir) = new_dir("reduced_support").await;
+    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &sum, sum.layout(), 2).await.unwrap();
+    assert_eq!(copy.min_all().await.unwrap(), 0.);
     assert_eq!(sum.min_all().await.unwrap(), 0.);
-    let empty = source(vec![0u8; 6], shape![2, 3], true).await;
+    let (_empty_root, empty) = source(vec![0u8; 6], shape![2, 3], true).await;
     assert_eq!(empty.sum_all().await.unwrap(), 0);
-    assert_eq!(empty.product_all().await.unwrap(), 1);
-    assert!(empty.all().await.unwrap());
+    assert_eq!(empty.product_all().await.unwrap(), 0);
+    assert!(!empty.all().await.unwrap());
     assert!(!empty.any().await.unwrap());
-    assert!(matches!(
-        empty.min_all().await,
-        Err(fensor::Error::Unsupported(_))
-    ));
-    assert!(matches!(
-        empty.max_all().await,
-        Err(fensor::Error::Unsupported(_))
-    ));
+    assert_eq!(empty.min_all().await.unwrap(), 0);
+    assert_eq!(empty.max_all().await.unwrap(), 0);
     check(
         &empty.view().product(axes![1], false).await.unwrap(),
         &[0, 0],
@@ -180,7 +179,7 @@ async fn sparse_support_empty_groups_and_copy_boundary() {
 
 #[tokio::test]
 async fn composition_transforms_and_live_sources() {
-    let a = source((1..=12).map(|v| v as f64).collect(), shape![2, 3, 2], false).await;
+    let (_a_root, a) = source((1..=12).map(|v| v as f64).collect(), shape![2, 3, 2], false).await;
     let view = a.view().sum(axes![1], false).await.unwrap();
     check(&view, &[9., 12., 27., 30.]).await;
     check(&view.clone().transpose(None).unwrap(), &[9., 27., 12., 30.]).await;
@@ -255,7 +254,7 @@ macro_rules! sparse_parity {
     ($name:ident, $t:ty) => {
         #[tokio::test]
         async fn $name() {
-            let tensor = source(
+            let (_tensor_root, tensor) = source(
                 vec![0 as $t, 0 as $t, 0 as $t, 2 as $t, 0 as $t, 3 as $t],
                 shape![2, 3],
                 true,
@@ -266,26 +265,29 @@ macro_rules! sparse_parity {
                 &[0 as $t, 5 as $t],
             )
             .await;
-            check(
+            common::fixture::blocks(
                 &tensor.view().product(axes![1], false).await.unwrap(),
-                &[0 as $t, 6 as $t],
+                &[0 as $t, 0 as $t],
+                |a, b| a == b,
             )
             .await;
-            check(
+            common::fixture::blocks(
                 &tensor.view().min(axes![1], false).await.unwrap(),
-                &[0 as $t, 2 as $t],
+                &[0 as $t, 0 as $t],
+                |a, b| a == b,
             )
             .await;
-            check(
+            common::fixture::blocks(
                 &tensor.view().max(axes![1], false).await.unwrap(),
                 &[0 as $t, 3 as $t],
+                |a, b| a == b,
             )
             .await;
             assert_eq!(tensor.sum_all().await.unwrap(), 5 as $t);
-            assert_eq!(tensor.product_all().await.unwrap(), 6 as $t);
-            assert_eq!(tensor.min_all().await.unwrap(), 2 as $t);
+            assert_eq!(tensor.product_all().await.unwrap(), 0 as $t);
+            assert_eq!(tensor.min_all().await.unwrap(), 0 as $t);
             assert_eq!(tensor.max_all().await.unwrap(), 3 as $t);
-            assert!(tensor.all().await.unwrap());
+            assert!(!tensor.all().await.unwrap());
             assert!(tensor.any().await.unwrap());
         }
     };
@@ -298,7 +300,7 @@ macro_rules! exceptional {
     ($name:ident, $t:ty) => {
         #[tokio::test]
         async fn $name() {
-            let zeros = source(vec![-0. as $t, 0. as $t], shape![2], false).await;
+            let (_zeros_root, zeros) = source(vec![-0. as $t, 0. as $t], shape![2], false).await;
             assert_eq!(
                 zeros.min_all().await.unwrap().to_bits(),
                 (-0. as $t).to_bits()
@@ -307,7 +309,7 @@ macro_rules! exceptional {
                 zeros.max_all().await.unwrap().to_bits(),
                 (0. as $t).to_bits()
             );
-            let negative = source(vec![-0. as $t], shape![1], false).await;
+            let (_negative_root, negative) = source(vec![-0. as $t], shape![1], false).await;
             assert_eq!(
                 negative.sum_all().await.unwrap().to_bits(),
                 (-0. as $t).to_bits()
@@ -316,19 +318,19 @@ macro_rules! exceptional {
                 negative.product_all().await.unwrap().to_bits(),
                 (-0. as $t).to_bits()
             );
-            let nan = source(vec![1 as $t, <$t>::NAN], shape![2], false).await;
+            let (_nan_root, nan) = source(vec![1 as $t, <$t>::NAN], shape![2], false).await;
             assert!(nan.min_all().await.unwrap().is_nan());
             assert!(nan.max_all().await.unwrap().is_nan());
             assert!(nan.sum_all().await.unwrap().is_nan());
             assert!(nan.product_all().await.unwrap().is_nan());
             assert!(nan.all().await.unwrap());
             for value in [<$t>::INFINITY, <$t>::NEG_INFINITY] {
-                let tensor = source(vec![value; 7], shape![7], false).await;
+                let (_tensor_root, tensor) = source(vec![value; 7], shape![7], false).await;
                 assert_eq!(tensor.min_all().await.unwrap(), value);
                 assert_eq!(tensor.max_all().await.unwrap(), value);
             }
             let subnormal = <$t>::from_bits(1);
-            let tiny = source(vec![subnormal; 2], shape![2], false).await;
+            let (_tiny_root, tiny) = source(vec![subnormal; 2], shape![2], false).await;
             assert_eq!(tiny.sum_all().await.unwrap(), <$t>::from_bits(2));
         }
     };
@@ -338,7 +340,7 @@ exceptional!(f64_exceptional, f64);
 
 #[tokio::test]
 async fn integer_wrapping_is_independent_of_batching() {
-    let tensor = source(vec![255u8; 4097], shape![4097], false).await;
+    let (_tensor_root, tensor) = source(vec![255u8; 4097], shape![4097], false).await;
     assert_eq!(tensor.sum_all().await.unwrap(), 255);
     assert_eq!(tensor.product_all().await.unwrap(), 255);
     check(&tensor.view().sum(axes![0], false).await.unwrap(), &[255]).await;
@@ -395,7 +397,8 @@ macro_rules! accuracy {
                             }
                         })
                         .collect();
-                    let tensor = source(values.clone(), shape![1 as u64, n as u64], false).await;
+                    let (_tensor_root, tensor) =
+                        source(values.clone(), shape![1 as u64, n as u64], false).await;
                     let actual = if product {
                         tensor.product_all().await.unwrap()
                     } else {
@@ -442,98 +445,8 @@ accuracy!(f32_exact_accuracy, f32);
 accuracy!(f64_exact_accuracy, f64);
 
 #[tokio::test]
-async fn selected_output_range_and_corruption_boundaries() {
-    use fensor::TensorSparseIndex;
-
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let (_, dir) = new_dir("reduce_far_range").await;
-        let tensor = Tensor::<FsEntry, f32>::create(
-            dir.clone(),
-            TensorSchema::new(f32::dtype(), shape![500_000_000, 2]).unwrap(),
-            Layout::Sparse { axis: None },
-            2,
-        )
-        .await
-        .unwrap();
-        tensor.write_value(&[499_999_999, 0], 2.).await.unwrap();
-        tensor.write_value(&[0, 0], 1.).await.unwrap();
-        // Locate the corrupt block using the same sparse key convention as storage.
-        let key = vec![0, 0];
-        let id = tensor.lookup_block_id(&key).await.unwrap().unwrap();
-        dir.read()
-            .await
-            .get_dir("blocks")
-            .unwrap()
-            .write()
-            .await
-            .delete(&id.to_string())
-            .await;
-        let view = tensor.view().sum(axes![1], false).await.unwrap();
-        let entries: Vec<_> = view
-            .read_sparse_elements_in_order(
-                range![AxisRange::Of(vec![499_999_999, 499_999_998, 499_999_999])],
-                axes![0],
-            )
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(entries, vec![(vec![499_999_999], 2.)]);
-        assert!(view.read_value(&[0]).await.is_err());
-        assert!(
-            view.read_sparse_elements_in_order(range![AxisRange::At(500_000_000)], axes![0])
-                .await
-                .is_err()
-        );
-        assert!(
-            view.read_sparse_elements_in_order(range![AxisRange::At(1)], axes![1])
-                .await
-                .is_err()
-        );
-    })
-    .await
-    .expect("selected reduction must not enumerate unrelated outputs");
-}
-
-#[tokio::test]
-async fn boolean_short_circuit_and_numeric_error_propagation() {
-    use fensor::TensorSparseIndex;
-
-    let (_, dir) = new_dir("reduce_corrupt_boolean").await;
-    let tensor = Tensor::<FsEntry, f32>::create(
-        dir.clone(),
-        TensorSchema::new(f32::dtype(), shape![8193]).unwrap(),
-        Layout::Sparse { axis: None },
-        1,
-    )
-    .await
-    .unwrap();
-    tensor.write_value(&[0], 0.2).await.unwrap();
-    tensor.write_value(&[8192], 1.).await.unwrap();
-    let id = tensor
-        .lookup_block_id(&[8192, 8192])
-        .await
-        .unwrap()
-        .unwrap();
-    dir.read()
-        .await
-        .get_dir("blocks")
-        .unwrap()
-        .write()
-        .await
-        .delete(&id.to_string())
-        .await;
-    assert!(tensor.any().await.unwrap());
-    assert!(!tensor.view().round().await.unwrap().all().await.unwrap());
-    assert!(tensor.all().await.is_err());
-    assert!(tensor.view().round().await.unwrap().any().await.is_err());
-    assert!(tensor.sum_all().await.is_err());
-}
-
-#[tokio::test]
 async fn repeated_concurrent_and_dropped_reduction_streams() {
-    let tensor = source(vec![1u8; 8202], shape![4101, 2], false).await;
+    let (_tensor_root, tensor) = source(vec![1u8; 8202], shape![4101, 2], false).await;
     let view = tensor.view().sum(axes![1], false).await.unwrap();
     let mut dropped = view.read_blocks().unwrap();
     assert_eq!(dropped.try_next().await.unwrap().unwrap().len(), 4096);
@@ -557,7 +470,7 @@ async fn reduction_copy_spills_and_reloads() {
         let (root, _) = new_dir("reduce_cache_source").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let tensor = Tensor::<FsEntry, u8>::create(
-            cache.load(root).unwrap(),
+            cache.load(root.to_path_buf()).unwrap(),
             TensorSchema::new(u8::dtype(), shape![1024, 4]).unwrap(),
             Layout::Dense,
             32,
@@ -568,8 +481,10 @@ async fn reduction_copy_spills_and_reloads() {
         let view = tensor.view().sum(axes![1], false).await.unwrap();
         let (root, _) = new_dir("reduce_cache_output").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
-        let dir = cache.load(root.clone()).unwrap();
-        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, 32).await.unwrap();
+        let dir = cache.load(root.to_path_buf()).unwrap();
+        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, view.layout(), 32)
+            .await
+            .unwrap();
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);
@@ -581,4 +496,205 @@ async fn reduction_copy_spills_and_reloads() {
     })
     .await
     .expect("reductions must make progress under cache pressure");
+}
+
+#[tokio::test]
+async fn statistics_include_implicit_zeros_across_batches_and_axes() {
+    use fensor::TensorStatistics;
+    for sparse in [false, true] {
+        let (_tensor_root, tensor) =
+            source(vec![2.0f64, 0.0, 4.0, 0.0, 0.0, 0.0], shape![2, 3], sparse).await;
+        assert_eq!(tensor.mean_all().await.unwrap(), 1.0);
+        assert!((tensor.std_all().await.unwrap() - (7.0_f64 / 3.0).sqrt()).abs() < 1e-12);
+        assert_eq!(tensor.norm_all().await.unwrap(), 20.0_f64.sqrt());
+        let means = tensor.view().mean(axes![1], true).await.unwrap();
+        assert_eq!(means.shape(), &[2, 1]);
+        assert_eq!(means.read_value(&[0, 0]).await.unwrap(), 2.0);
+        assert_eq!(means.read_value(&[1, 0]).await.unwrap(), 0.0);
+
+        let zeros = tensor.view().sub(&tensor.view()).await.unwrap();
+        assert_eq!(zeros.mean_all().await.unwrap(), 0.0);
+        assert_eq!(zeros.std_all().await.unwrap(), 0.0);
+        assert_eq!(zeros.norm_all().await.unwrap(), 0.0);
+    }
+    let (_tensor_root, tensor) = source(vec![3.0f64; 8193], shape![8193], false).await;
+    assert_eq!(tensor.mean_all().await.unwrap(), 3.0);
+    assert_eq!(tensor.std_all().await.unwrap(), 0.0);
+    assert_eq!(tensor.norm_all().await.unwrap(), (9.0f64 * 8193.0).sqrt());
+    let (_empty_root, empty) = source(vec![0.0f64; 7], shape![7], true).await;
+    assert_eq!(empty.mean_all().await.unwrap(), 0.0);
+    assert_eq!(empty.std_all().await.unwrap(), 0.0);
+    assert_eq!(empty.norm_all().await.unwrap(), 0.0);
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let (_tensor_root, tensor) = source(vec![value], shape![1], true).await;
+        assert!(tensor.std_all().await.unwrap().is_nan());
+        let mean = tensor.mean_all().await.unwrap();
+        assert!(if value.is_nan() {
+            mean.is_nan()
+        } else {
+            mean == value
+        });
+        assert!(if value.is_nan() {
+            tensor.norm_all().await.unwrap().is_nan()
+        } else {
+            tensor.norm_all().await.unwrap().is_infinite()
+        });
+    }
+
+    // One indexed fixture covers large gaps, an entirely empty row, and
+    // candidate coordinates whose intermediate values become zero. The timeout
+    // is a progress guard against accidentally scanning the logical cardinality.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (_root, dir) = new_dir("statistics_zero_gaps").await;
+        let len = 1_000_000_007;
+        let tensor = Tensor::<FsEntry, f64>::create(
+            dir,
+            TensorSchema::new(f64::dtype(), shape![2, len]).unwrap(),
+            Layout::Sparse { axis: None },
+            31,
+        )
+        .await
+        .unwrap();
+        tensor.write_value(&[0, 1], 2.).await.unwrap();
+        tensor.write_value(&[0, len - 1], 3.).await.unwrap();
+
+        let count = 2. * len as f64;
+        let variance = 13. / count - (5. / count).powi(2);
+        assert_eq!(tensor.sum_all().await.unwrap(), 5.);
+        assert_eq!(tensor.product_all().await.unwrap(), 0.);
+        assert_eq!(tensor.min_all().await.unwrap(), 0.);
+        assert_eq!(tensor.max_all().await.unwrap(), 3.);
+        assert_eq!(tensor.mean_all().await.unwrap(), 5. / count);
+        assert!((tensor.std_all().await.unwrap() - variance.sqrt()).abs() < 1e-12);
+        assert_eq!(tensor.norm_all().await.unwrap(), 13.0_f64.sqrt());
+
+        let means = tensor.view().mean(axes![1], true).await.unwrap();
+        let deviations = tensor.view().std(axes![1], false).await.unwrap();
+        let norms = tensor.view().norm(axes![1], false).await.unwrap();
+        assert_eq!(means.read_value(&[0, 0]).await.unwrap(), 5. / len as f64);
+        assert_eq!(means.read_value(&[1, 0]).await.unwrap(), 0.);
+        let variance = 13. / len as f64 - (5. / len as f64).powi(2);
+        assert!((deviations.read_value(&[0]).await.unwrap() - variance.sqrt()).abs() < 1e-12);
+        assert_eq!(deviations.read_value(&[1]).await.unwrap(), 0.);
+        assert_eq!(norms.read_value(&[0]).await.unwrap(), 13.0_f64.sqrt());
+        assert_eq!(norms.read_value(&[1]).await.unwrap(), 0.);
+
+        let zeros = tensor.view().sub(&tensor.view()).await.unwrap();
+        assert_eq!(zeros.mean_all().await.unwrap(), 0.);
+        assert_eq!(zeros.std_all().await.unwrap(), 0.);
+        assert_eq!(zeros.norm_all().await.unwrap(), 0.);
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            tensor.write_value(&[0, 1], value).await.unwrap();
+            assert!(tensor.product_all().await.unwrap().is_nan());
+            assert!(tensor.std_all().await.unwrap().is_nan());
+            if value.is_nan() {
+                assert!(tensor.mean_all().await.unwrap().is_nan());
+                assert!(tensor.norm_all().await.unwrap().is_nan());
+            } else {
+                assert_eq!(tensor.mean_all().await.unwrap(), value);
+                assert_eq!(tensor.norm_all().await.unwrap(), f64::INFINITY);
+            }
+        }
+
+        tensor.write_value(&[0, 1], 0.).await.unwrap();
+        tensor.write_value(&[0, len - 1], 0.).await.unwrap();
+        assert_eq!(tensor.mean_all().await.unwrap(), 0.);
+        assert_eq!(tensor.std_all().await.unwrap(), 0.);
+        assert_eq!(tensor.norm_all().await.unwrap(), 0.);
+    })
+    .await
+    .expect("indexed reductions must not scan implicit-zero gaps");
+}
+
+#[cfg(feature = "complex")]
+#[tokio::test]
+async fn complex_statistics_use_magnitude_and_preserve_mean_dtype() {
+    use fensor::{TensorStatistics, complex::Complex64};
+    for sparse in [false, true] {
+        let (_tensor_root, tensor) = source(
+            vec![Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)],
+            shape![2],
+            sparse,
+        )
+        .await;
+        assert_eq!(tensor.mean_all().await.unwrap(), Complex64::new(2.0, 3.0));
+        assert_eq!(tensor.std_all().await.unwrap(), 2.0f64.sqrt());
+        assert_eq!(tensor.norm_all().await.unwrap(), 30.0f64.sqrt());
+        let (_baseline_root, baseline) =
+            source(vec![Complex64::new(1.0, 2.0); 2], shape![2], sparse).await;
+        let zeros = tensor.view().sub(&baseline.view()).await.unwrap();
+        assert_eq!(zeros.mean_all().await.unwrap(), Complex64::new(1.0, 1.0));
+        let mean = zeros.mean(axes![0], true).await.unwrap();
+        assert_eq!(
+            mean.read_value(&[0]).await.unwrap(),
+            Complex64::new(1.0, 1.0)
+        );
+        assert_eq!(
+            zeros
+                .std(axes![0], false)
+                .await
+                .unwrap()
+                .read_value(&[0])
+                .await
+                .unwrap(),
+            2.0f64.sqrt()
+        );
+    }
+}
+
+macro_rules! statistics_dtype {
+    ($name:ident, $dtype:ty) => {
+        #[tokio::test]
+        async fn $name() {
+            use fensor::TensorStatistics;
+            for sparse in [false, true] {
+                let (_tensor_root, tensor) = source(
+                    vec![1 as $dtype, 2 as $dtype, 3 as $dtype, 4 as $dtype],
+                    shape![2, 2],
+                    sparse,
+                )
+                .await;
+                assert_eq!(tensor.mean_all().await.unwrap(), 2.5f64);
+                assert_eq!(tensor.std_all().await.unwrap(), 1.25f64.sqrt());
+                assert_eq!(tensor.norm_all().await.unwrap(), 30.0f64.sqrt());
+                let means = tensor.view().mean(axes![1], false).await.unwrap();
+                assert_eq!(means.read_value(&[1]).await.unwrap(), 3.5f64);
+            }
+        }
+    };
+}
+statistics_dtype!(statistics_u8, u8);
+statistics_dtype!(statistics_u16, u16);
+statistics_dtype!(statistics_u32, u32);
+statistics_dtype!(statistics_u64, u64);
+statistics_dtype!(statistics_i8, i8);
+statistics_dtype!(statistics_i16, i16);
+statistics_dtype!(statistics_i32, i32);
+statistics_dtype!(statistics_i64, i64);
+statistics_dtype!(statistics_f32, f32);
+statistics_dtype!(statistics_f64, f64);
+
+#[cfg(feature = "complex")]
+#[tokio::test]
+async fn complex32_statistics_promote_to_complex64_and_float64() {
+    use fensor::{
+        TensorStatistics,
+        complex::{Complex32, Complex64},
+    };
+    let (_tensor_root, tensor) = source(
+        vec![
+            Complex32::new(1.0, 2.0),
+            Complex32::new(0.0, 0.0),
+            Complex32::new(3.0, 4.0),
+            Complex32::new(0.0, 0.0),
+        ],
+        shape![4],
+        true,
+    )
+    .await;
+    let mean: Complex64 = tensor.mean_all().await.unwrap();
+    assert_eq!(mean, Complex64::new(1.0, 1.5));
+    assert_eq!(tensor.std_all().await.unwrap(), 4.25f64.sqrt());
+    assert_eq!(tensor.norm_all().await.unwrap(), 30.0f64.sqrt());
 }

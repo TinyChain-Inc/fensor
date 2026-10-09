@@ -4,13 +4,13 @@ use std::io;
 use std::path::Path;
 
 use fensor::{
-    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorGeometry, TensorMatMul,
-    TensorMath, TensorMathScalar, TensorMetadata, TensorRead, TensorReduce, TensorReduceAll,
-    TensorSchema, TensorTransform, TensorWhere, TensorWrite,
+    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorExpression,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMetadata, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorWhere, TensorWrite,
 };
-
 use freqfs::{Cache, FileLoad, FileSave};
 use futures::TryStreamExt;
+use get_size::GetSize;
 use ha_ndarray::shape;
 use safecast::AsType;
 use tokio::io::AsyncWriteExt;
@@ -48,7 +48,24 @@ where
     }
 }
 
+impl GetSize for JsonEntry {
+    fn get_heap_size(&self) -> usize {
+        self.0.get_heap_size()
+    }
+}
+
 impl FileLoad for JsonEntry {
+    async fn load_size(
+        _: &Path,
+        file: &mut tokio::fs::File,
+        _: &std::fs::Metadata,
+    ) -> io::Result<usize> {
+        destream_json::de::read_from::<_, common::file_size::Size>((), file)
+            .await
+            .map(|bound| bound.0)
+            .map_err(io::Error::other)
+    }
+
     async fn load(_: &Path, file: tokio::fs::File, _: std::fs::Metadata) -> io::Result<Self> {
         destream_json::de::read_from((), file)
             .await
@@ -72,16 +89,81 @@ impl FileSave for JsonEntry {
 }
 
 #[tokio::test]
+async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
+    let rank = fensor::Shape::new().inline_size() + 1;
+    let entries = [
+        FsEntry::U8(vec![3; 7]),
+        FsEntry::F64(vec![0.; 65]),
+        FsEntry::MetadataF32(
+            TensorMetadata::new(vec![1; rank].into(), Layout::Dense, vec![1; rank].into()).unwrap(),
+        ),
+        FsEntry::SparseF64(b_table::Node::Leaf(vec![
+            vec![
+                fensor::SparseCell::Key(1),
+                fensor::SparseCell::Payload(vec![3.]),
+            ];
+            17
+        ])),
+    ];
+    for entry in entries {
+        let json: FsEntry =
+            destream_json::de::try_decode((), destream_json::en::encode(&entry).unwrap())
+                .await
+                .unwrap();
+        let bound: common::file_size::Size =
+            destream_json::de::try_decode((), destream_json::en::encode(&entry).unwrap())
+                .await
+                .unwrap();
+        assert!(bound.0 >= json.get_size());
+        let tbon: FsEntry = tbon::de::try_decode((), tbon::en::encode(&entry).unwrap())
+            .await
+            .unwrap();
+        let bound: common::file_size::Size =
+            tbon::de::try_decode((), tbon::en::encode(&entry).unwrap())
+                .await
+                .unwrap();
+        assert!(bound.0 >= tbon.get_size());
+    }
+    // This decoded page fits 16 KiB including retained row and payload capacities.
+    // Preflight must cover the owned containers, independently of encoded bytes.
+    let tiny_page = FsEntry::SparseF64(b_table::Node::Leaf(vec![
+        vec![
+            fensor::SparseCell::Key(1),
+            fensor::SparseCell::Payload(vec![3.]),
+        ];
+        128
+    ]));
+    let bound: common::file_size::Size =
+        tbon::de::try_decode((), tbon::en::encode(&tiny_page).unwrap())
+            .await
+            .unwrap();
+    let decoded: FsEntry = tbon::de::try_decode((), tbon::en::encode(&tiny_page).unwrap())
+        .await
+        .unwrap();
+    assert!(bound.0 >= decoded.get_size());
+    assert!(bound.0 <= 16 * 1024);
+
+    let oversized = (1u8, vec![0f32; fensor::MAX_BLOCK_CAPACITY + 1]);
+    assert!(
+        tbon::de::try_decode::<_, _, common::file_size::Size>(
+            (),
+            tbon::en::encode(&oversized).unwrap()
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn json_storage_supports_dense_sparse_copy_and_reload() {
     for layout in [
         Layout::Dense,
         Layout::Sparse { axis: None },
         Layout::Sparse { axis: Some(0) },
     ] {
-        let root = common::unique_tmp_dir("json_storage");
-        tokio::fs::create_dir(&root).await.unwrap();
+        let root = common::Directory::new("json_storage").await;
         let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
-        let dir = cache.clone().load(root.clone()).unwrap();
+        let dir = cache.clone().load(root.to_path_buf()).unwrap();
         let tensor = Tensor::<JsonEntry, f32>::create(
             dir.clone(),
             TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
@@ -96,7 +178,7 @@ async fn json_storage_supports_dense_sparse_copy_and_reload() {
         drop(dir);
         drop(cache);
         let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
-        let dir = cache.clone().load(root.clone()).unwrap();
+        let dir = cache.clone().load(root.to_path_buf()).unwrap();
         assert!(Tensor::<JsonEntry, u8>::load(dir.clone()).await.is_err());
         let tensor = Tensor::<JsonEntry, f32>::load(dir).await.unwrap();
         assert_eq!(tensor.read_value(&[4]).await.unwrap(), 7.5);
@@ -104,7 +186,7 @@ async fn json_storage_supports_dense_sparse_copy_and_reload() {
         assert_eq!(tensor.layout(), layout);
         let (copy_root, copy_dir) = common::new_dir("json_to_tbon").await;
         let cast = tensor.view().cast().await.unwrap();
-        let copy = Tensor::<FsEntry, f64>::copy_from(copy_dir.clone(), &cast, 2)
+        let copy = Tensor::<FsEntry, f64>::copy_from(copy_dir.clone(), &cast, cast.layout(), 2)
             .await
             .unwrap();
 
@@ -122,40 +204,90 @@ async fn json_storage_supports_dense_sparse_copy_and_reload() {
 }
 
 #[tokio::test]
+async fn metadata_decoding_uses_the_adapters_rank_limit_for_both_shapes() {
+    for (rank, limit) in [(1, 0), (1, 1), (2, 1), (2, 2), (2, 3)] {
+        let metadata =
+            TensorMetadata::<f32>::new(vec![1; rank].into(), Layout::Dense, vec![1; rank].into())
+                .unwrap();
+        let json: Result<TensorMetadata<f32>, _> =
+            destream_json::de::try_decode(limit, destream_json::en::encode(&metadata).unwrap())
+                .await;
+        let tbon: Result<TensorMetadata<f32>, _> =
+            tbon::de::try_decode(limit, tbon::en::encode(&metadata).unwrap()).await;
+        assert_eq!(json.is_ok(), rank <= limit);
+        assert_eq!(tbon.is_ok(), rank <= limit);
+    }
+    // The block shape has its own bound, before rank/geometry validation.
+    let oversized_block_shape = (vec![1u64], false, None::<u64>, vec![1u64, 1]);
+    let error = tbon::de::try_decode::<_, _, TensorMetadata<f32>>(
+        1,
+        tbon::en::encode(&oversized_block_shape).unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("rank limit"));
+}
+
+#[tokio::test]
 async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
     for layout in [
         Layout::Dense,
         Layout::Sparse { axis: None },
         Layout::Sparse { axis: Some(1) },
     ] {
-        let metadata = TensorMetadata::<f32>::new(shape![3, 4], layout, shape![1, 2]).unwrap();
+        let block_shape = if layout == Layout::Dense {
+            shape![1, 2]
+        } else {
+            shape![1, 1]
+        };
+        let metadata = TensorMetadata::<f32>::new(shape![3, 4], layout, block_shape).unwrap();
         let json: TensorMetadata<f32> =
-            destream_json::de::try_decode((), destream_json::en::encode(&metadata).unwrap())
+            destream_json::de::try_decode(2, destream_json::en::encode(&metadata).unwrap())
                 .await
                 .unwrap();
         let tbon: TensorMetadata<f32> =
-            tbon::de::try_decode((), tbon::en::encode(&metadata).unwrap())
+            tbon::de::try_decode(2, tbon::en::encode(&metadata).unwrap())
                 .await
                 .unwrap();
         assert_eq!(json, metadata);
         assert_eq!(tbon, metadata);
     }
 
-    // The pre-migration representation already stored u64 dimensions in this tuple.
-    let fixture = (vec![3u64, 4], true, Some(1u64), vec![1u64, 2]);
+    let extra = (vec![3u64, 4], true, Some(1u64), vec![1u64, 1], 0u64);
+    assert!(
+        tbon::de::try_decode::<_, _, TensorMetadata<f32>>(2, tbon::en::encode(&extra).unwrap())
+            .await
+            .is_err()
+    );
+    let fixture = (vec![3u64, 4], true, Some(1u64), vec![1u64, 1]);
     let expected =
-        TensorMetadata::<f32>::new(shape![3, 4], Layout::Sparse { axis: Some(1) }, shape![1, 2])
+        TensorMetadata::<f32>::new(shape![3, 4], Layout::Sparse { axis: Some(1) }, shape![1, 1])
             .unwrap();
-    let decoded: TensorMetadata<f32> =
-        tbon::de::try_decode((), tbon::en::encode(&fixture).unwrap())
-            .await
-            .unwrap();
+    let decoded: TensorMetadata<f32> = tbon::de::try_decode(2, tbon::en::encode(&fixture).unwrap())
+        .await
+        .unwrap();
     assert_eq!(decoded, expected);
-    let encoded: (Vec<u64>, bool, Option<u64>, Vec<u64>) =
-        tbon::de::try_decode((), tbon::en::encode(&expected).unwrap())
-            .await
-            .unwrap();
-    assert_eq!(encoded, fixture);
+
+    // Missing fields and wrong container kinds remain decoding errors when
+    // metadata uses the decoder's shallow container interface.
+    for input in [
+        "[]",
+        "[[1]]",
+        "[[1],false]",
+        "[[1],false,null]",
+        "{}",
+        "[1,false,null,[1]]",
+        "[[1],false,null,1]",
+        "[[1],false,null,[1],0]",
+    ] {
+        let bytes = futures::stream::iter([Ok::<_, io::Error>(input.as_bytes().to_vec().into())]);
+        assert!(
+            destream_json::de::try_decode::<_, _, TensorMetadata<f32>>(2, bytes)
+                .await
+                .is_err(),
+            "{input}"
+        );
+    }
 
     let malformed = [
         (vec![3u64, 4], false, None, vec![2u64]),
@@ -167,7 +299,7 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
 
     for value in malformed {
         let decoded: Result<TensorMetadata<f32>, _> =
-            destream_json::de::try_decode((), destream_json::en::encode(&value).unwrap()).await;
+            destream_json::de::try_decode(2, destream_json::en::encode(&value).unwrap()).await;
 
         assert!(decoded.is_err());
     }
@@ -175,12 +307,11 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
 
 #[tokio::test]
 async fn reload_rejects_out_of_bounds_sparse_axis() {
-    let root = common::unique_tmp_dir("json_invalid_axis");
-    tokio::fs::create_dir(&root).await.unwrap();
+    let root = common::Directory::new("json_invalid_axis").await;
     {
         let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
         let tensor = Tensor::<JsonEntry, f32>::create(
-            cache.load(root.clone()).unwrap(),
+            cache.load(root.to_path_buf()).unwrap(),
             TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![3, 4]).unwrap(),
             Layout::Sparse { axis: Some(1) },
             2,
@@ -194,7 +325,7 @@ async fn reload_rejects_out_of_bounds_sparse_axis() {
     let metadata = root.join("blocks").join("metadata");
     // Preserve the adapter envelope and valid geometry; corrupt only the axis.
     let original = tokio::fs::read(&metadata).await.unwrap();
-    let malformed = (2u8, (vec![3u64, 4], true, Some(2u64), vec![1u64, 2]));
+    let malformed = (2u8, (vec![3u64, 4], true, Some(2u64), vec![1u64, 1]));
     let mut bytes = Vec::new();
     let mut encoded = destream_json::en::encode(&malformed).unwrap();
 
@@ -204,21 +335,21 @@ async fn reload_rejects_out_of_bounds_sparse_axis() {
     tokio::fs::write(&metadata, &bytes).await.unwrap();
     {
         let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
-        let error = Tensor::<JsonEntry, f32>::load(cache.load(root.clone()).unwrap())
+        let error = Tensor::<JsonEntry, f32>::load(cache.load(root.to_path_buf()).unwrap())
             .await
             .err()
             .expect("invalid persisted axis must fail closed");
         // Decoding is owned by the adapter and reaches fensor as an I/O error.
         assert!(matches!(error, fensor::Error::Io(_)), "{error:?}");
         assert!(
-            error.to_string().contains("sparse axis hint out of bounds"),
+            error.to_string().contains("sparse axis out of bounds"),
             "{error}"
         );
     }
     assert_eq!(tokio::fs::read(&metadata).await.unwrap(), bytes);
     tokio::fs::write(&metadata, original).await.unwrap();
     let cache = Cache::<JsonEntry>::new(1_000_000, None, 0, std::time::Duration::from_secs(1));
-    let tensor = Tensor::<JsonEntry, f32>::load(cache.load(root.clone()).unwrap())
+    let tensor = Tensor::<JsonEntry, f32>::load(cache.load(root.to_path_buf()).unwrap())
         .await
         .unwrap();
     assert_eq!(tensor.read_value(&[1, 2]).await.unwrap(), 7.);
@@ -228,10 +359,9 @@ async fn reload_rejects_out_of_bounds_sparse_axis() {
 // A binary expression can borrow sources with different adapters and block shapes.
 #[tokio::test]
 async fn binary_sources_use_independent_codecs() {
-    let a_root = common::unique_tmp_dir("binary_json");
-    tokio::fs::create_dir(&a_root).await.unwrap();
+    let a_root = common::Directory::new("binary_json").await;
     let cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
-    let a_dir = cache.load(a_root).unwrap();
+    let a_dir = cache.load(a_root.to_path_buf()).unwrap();
     let a = Tensor::<JsonEntry, f32>::create(
         a_dir.clone(),
         TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
@@ -240,7 +370,7 @@ async fn binary_sources_use_independent_codecs() {
     )
     .await
     .unwrap();
-    let (_, b_dir) = common::new_dir("binary_tbon").await;
+    let (_b_dir_root, b_dir) = common::new_dir("binary_tbon").await;
     let b = Tensor::<FsEntry, f32>::create(
         b_dir,
         TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
@@ -253,8 +383,11 @@ async fn binary_sources_use_independent_codecs() {
     b.write_value(&[4], 3.5).await.unwrap();
     a.sync().await.unwrap();
     let expression = a.view().add(&b.view()).await.unwrap().clone();
-    let (_, output_dir) = common::new_dir("binary_codecs_copy").await;
-    let output: Tensor<FsEntry, f32> = Tensor::copy_from(output_dir, &expression, 4).await.unwrap();
+    let (_output_dir_root, output_dir) = common::new_dir("binary_codecs_copy").await;
+    let output: Tensor<FsEntry, f32> =
+        Tensor::copy_from(output_dir, &expression, expression.layout(), 4)
+            .await
+            .unwrap();
 
     assert_eq!(output.read_value(&[4]).await.unwrap(), 6.);
     assert_eq!(output.read_value(&[0]).await.unwrap(), 0.);
@@ -263,18 +396,17 @@ async fn binary_sources_use_independent_codecs() {
 // Conditional expressions and predicates retain independent source/destination adapters.
 #[tokio::test]
 async fn conditional_sources_and_output_use_independent_codecs() {
-    let a_root = common::unique_tmp_dir("conditional_json");
-    tokio::fs::create_dir(&a_root).await.unwrap();
+    let a_root = common::Directory::new("conditional_json").await;
     let cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
     let a = Tensor::<JsonEntry, f32>::create(
-        cache.load(a_root).unwrap(),
+        cache.load(a_root.to_path_buf()).unwrap(),
         TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
         Layout::Sparse { axis: None },
         2,
     )
     .await
     .unwrap();
-    let (_, b_dir) = common::new_dir("conditional_tbon").await;
+    let (_b_dir_root, b_dir) = common::new_dir("conditional_tbon").await;
     let b = Tensor::<FsEntry, f32>::create(
         b_dir,
         TensorSchema::new(<f32 as number_general::DType>::dtype(), shape![5]).unwrap(),
@@ -293,23 +425,25 @@ async fn conditional_sources_and_output_use_independent_codecs() {
         .and_scalar(127)
         .await
         .unwrap();
-    let expression = condition
-        .cond(&a.view().add_scalar(1.).await.unwrap(), &b.view())
-        .await
+    let shifted = TensorExpression::new(a.view())
         .unwrap()
-        .clone();
-    let out_root = common::unique_tmp_dir("conditional_json_output");
-    tokio::fs::create_dir(&out_root).await.unwrap();
-    let out_cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
-    let out_dir = out_cache.load(out_root.clone()).unwrap();
-    let output: Tensor<JsonEntry, f32> = Tensor::copy_from(out_dir.clone(), &expression, 4)
+        .into_dense()
+        .add_scalar(1.)
         .await
         .unwrap();
+    let expression = condition.cond(&shifted, &b.view()).await.unwrap().clone();
+    let out_root = common::Directory::new("conditional_json_output").await;
+    let out_cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
+    let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
+    let output: Tensor<JsonEntry, f32> =
+        Tensor::copy_from(out_dir.clone(), &expression, expression.layout(), 4)
+            .await
+            .unwrap();
     output.sync().await.unwrap();
     drop(output);
     drop(out_dir);
     let reload_cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
-    let output = Tensor::<JsonEntry, f32>::load(reload_cache.load(out_root).unwrap())
+    let output = Tensor::<JsonEntry, f32>::load(reload_cache.load(out_root.to_path_buf()).unwrap())
         .await
         .unwrap();
     assert_eq!(output.read_value(&[0]).await.unwrap(), 0.);
@@ -317,8 +451,10 @@ async fn conditional_sources_and_output_use_independent_codecs() {
     assert_eq!(output.read_value(&[4]).await.unwrap(), 3.);
     let reduced = expression.sum(ha_ndarray::axes![0], false).await.unwrap();
     assert_eq!(reduced.sum_all().await.unwrap(), 6.);
-    let (_, dir) = common::new_dir("reduced_independent_codec").await;
-    let reduced_copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &reduced, 1).await.unwrap();
+    let (_dir_root, dir) = common::new_dir("reduced_independent_codec").await;
+    let reduced_copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &reduced, reduced.layout(), 1)
+        .await
+        .unwrap();
     assert_eq!(reduced_copy.read_value(&[0]).await.unwrap(), 6.);
     let matrix = a
         .view()
@@ -327,7 +463,9 @@ async fn conditional_sources_and_output_use_independent_codecs() {
         .matmul(&b.view().reshape(ha_ndarray::shape![5, 1]).unwrap())
         .await
         .unwrap();
-    let (_, dir) = common::new_dir("matmul_independent_codec").await;
-    let product: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &matrix, 1).await.unwrap();
+    let (_dir_root, dir) = common::new_dir("matmul_independent_codec").await;
+    let product: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &matrix, matrix.layout(), 1)
+        .await
+        .unwrap();
     assert_eq!(product.read_value(&[0, 0]).await.unwrap(), 0.);
 }

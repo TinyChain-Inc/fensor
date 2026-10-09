@@ -10,21 +10,36 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use b_table::Node;
 use destream::{de, en};
 use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
 use freqfs::{Cache, DirLock};
+use get_size::GetSize;
 use safecast::as_type;
 
 pub mod counters;
-
+pub mod file_size;
 pub mod fixture;
-
 pub mod numbers;
+mod sparse_codec;
+
+const MAX_METADATA_RANK: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub enum FsEntry {
-    Node(Node<u64>),
+    SparseU8(fensor::SparseNode<u8>),
+    SparseU16(fensor::SparseNode<u16>),
+    SparseU32(fensor::SparseNode<u32>),
+    SparseU64(fensor::SparseNode<u64>),
+    SparseI8(fensor::SparseNode<i8>),
+    SparseI16(fensor::SparseNode<i16>),
+    SparseI32(fensor::SparseNode<i32>),
+    SparseI64(fensor::SparseNode<i64>),
+    SparseF32(fensor::SparseNode<f32>),
+    SparseF64(fensor::SparseNode<f64>),
+    #[cfg(feature = "complex")]
+    SparseC32(fensor::SparseNode<fensor::complex::Complex32>),
+    #[cfg(feature = "complex")]
+    SparseC64(fensor::SparseNode<fensor::complex::Complex64>),
     F32(Vec<f32>),
     MetadataF32(fensor::TensorMetadata<f32>),
     U8(Vec<u8>),
@@ -55,12 +70,103 @@ pub enum FsEntry {
     MetadataC64(fensor::TensorMetadata<fensor::complex::Complex64>),
 }
 
+impl GetSize for FsEntry {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::U8(values) => values.capacity() * std::mem::size_of::<u8>(),
+            Self::MetadataU8(metadata) => metadata.get_heap_size(),
+            Self::SparseU8(node) => node.get_heap_size(),
+            Self::U16(values) => values.capacity() * std::mem::size_of::<u16>(),
+            Self::MetadataU16(metadata) => metadata.get_heap_size(),
+            Self::SparseU16(node) => node.get_heap_size(),
+            Self::U32(values) => values.capacity() * std::mem::size_of::<u32>(),
+            Self::MetadataU32(metadata) => metadata.get_heap_size(),
+            Self::SparseU32(node) => node.get_heap_size(),
+            Self::U64(values) => values.capacity() * std::mem::size_of::<u64>(),
+            Self::MetadataU64(metadata) => metadata.get_heap_size(),
+            Self::SparseU64(node) => node.get_heap_size(),
+            Self::I8(values) => values.capacity() * std::mem::size_of::<i8>(),
+            Self::MetadataI8(metadata) => metadata.get_heap_size(),
+            Self::SparseI8(node) => node.get_heap_size(),
+            Self::I16(values) => values.capacity() * std::mem::size_of::<i16>(),
+            Self::MetadataI16(metadata) => metadata.get_heap_size(),
+            Self::SparseI16(node) => node.get_heap_size(),
+            Self::I32(values) => values.capacity() * std::mem::size_of::<i32>(),
+            Self::MetadataI32(metadata) => metadata.get_heap_size(),
+            Self::SparseI32(node) => node.get_heap_size(),
+            Self::I64(values) => values.capacity() * std::mem::size_of::<i64>(),
+            Self::MetadataI64(metadata) => metadata.get_heap_size(),
+            Self::SparseI64(node) => node.get_heap_size(),
+            Self::F32(values) => values.capacity() * std::mem::size_of::<f32>(),
+            Self::MetadataF32(metadata) => metadata.get_heap_size(),
+            Self::SparseF32(node) => node.get_heap_size(),
+            Self::F64(values) => values.capacity() * std::mem::size_of::<f64>(),
+            Self::MetadataF64(metadata) => metadata.get_heap_size(),
+            Self::SparseF64(node) => node.get_heap_size(),
+            #[cfg(feature = "complex")]
+            Self::C32(values) => {
+                values.capacity() * std::mem::size_of::<fensor::complex::Complex32>()
+            }
+            #[cfg(feature = "complex")]
+            Self::MetadataC32(metadata) => metadata.get_heap_size(),
+            #[cfg(feature = "complex")]
+            Self::SparseC32(node) => node.get_heap_size(),
+            #[cfg(feature = "complex")]
+            Self::C64(values) => {
+                values.capacity() * std::mem::size_of::<fensor::complex::Complex64>()
+            }
+            #[cfg(feature = "complex")]
+            Self::MetadataC64(metadata) => metadata.get_heap_size(),
+            #[cfg(feature = "complex")]
+            Self::SparseC64(node) => node.get_heap_size(),
+        }
+    }
+}
+
 impl<'en> en::ToStream<'en> for FsEntry {
     fn to_stream<E: en::Encoder<'en>>(
         &'en self,
         encoder: E,
     ) -> std::result::Result<E::Ok, E::Error> {
         match self {
+            Self::SparseU8(node) => {
+                en::IntoStream::into_stream((30u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseU16(node) => {
+                en::IntoStream::into_stream((31u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseU32(node) => {
+                en::IntoStream::into_stream((32u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseU64(node) => {
+                en::IntoStream::into_stream((33u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseI8(node) => {
+                en::IntoStream::into_stream((34u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseI16(node) => {
+                en::IntoStream::into_stream((35u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseI32(node) => {
+                en::IntoStream::into_stream((36u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseI64(node) => {
+                en::IntoStream::into_stream((37u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseF32(node) => {
+                en::IntoStream::into_stream((38u8, sparse_codec::Encoded(node)), encoder)
+            }
+            Self::SparseF64(node) => {
+                en::IntoStream::into_stream((39u8, sparse_codec::Encoded(node)), encoder)
+            }
+            #[cfg(feature = "complex")]
+            Self::SparseC32(node) => {
+                en::IntoStream::into_stream((40u8, sparse_codec::Encoded(node)), encoder)
+            }
+            #[cfg(feature = "complex")]
+            Self::SparseC64(node) => {
+                en::IntoStream::into_stream((41u8, sparse_codec::Encoded(node)), encoder)
+            }
             Self::U16(value) => en::IntoStream::into_stream((7u8, value), encoder),
             Self::MetadataU16(value) => en::IntoStream::into_stream((8u8, value), encoder),
             Self::U32(value) => en::IntoStream::into_stream((9u8, value), encoder),
@@ -89,7 +195,6 @@ impl<'en> en::ToStream<'en> for FsEntry {
             ),
             #[cfg(feature = "complex")]
             Self::MetadataC64(value) => en::IntoStream::into_stream((24u8, value), encoder),
-            Self::Node(value) => en::IntoStream::into_stream((0u8, value), encoder),
             Self::F32(value) => en::IntoStream::into_stream((1u8, value), encoder),
             Self::MetadataF32(value) => en::IntoStream::into_stream((2u8, value), encoder),
             Self::U8(value) => en::IntoStream::into_stream((3u8, value), encoder),
@@ -114,27 +219,48 @@ impl de::Visitor for FsEntryVisitor {
         mut seq: A,
     ) -> std::result::Result<Self::Value, A::Error> {
         let entry = match seq.expect_next::<u8>(()).await? {
-            0 => FsEntry::Node(seq.expect_next(()).await?),
+            30 => FsEntry::SparseU8(seq.expect_next::<sparse_codec::Decoded<u8>>(()).await?.0),
+            31 => FsEntry::SparseU16(seq.expect_next::<sparse_codec::Decoded<u16>>(()).await?.0),
+            32 => FsEntry::SparseU32(seq.expect_next::<sparse_codec::Decoded<u32>>(()).await?.0),
+            33 => FsEntry::SparseU64(seq.expect_next::<sparse_codec::Decoded<u64>>(()).await?.0),
+            34 => FsEntry::SparseI8(seq.expect_next::<sparse_codec::Decoded<i8>>(()).await?.0),
+            35 => FsEntry::SparseI16(seq.expect_next::<sparse_codec::Decoded<i16>>(()).await?.0),
+            36 => FsEntry::SparseI32(seq.expect_next::<sparse_codec::Decoded<i32>>(()).await?.0),
+            37 => FsEntry::SparseI64(seq.expect_next::<sparse_codec::Decoded<i64>>(()).await?.0),
+            38 => FsEntry::SparseF32(seq.expect_next::<sparse_codec::Decoded<f32>>(()).await?.0),
+            39 => FsEntry::SparseF64(seq.expect_next::<sparse_codec::Decoded<f64>>(()).await?.0),
+            #[cfg(feature = "complex")]
+            40 => FsEntry::SparseC32(
+                seq.expect_next::<sparse_codec::Decoded<fensor::complex::Complex32>>(())
+                    .await?
+                    .0,
+            ),
+            #[cfg(feature = "complex")]
+            41 => FsEntry::SparseC64(
+                seq.expect_next::<sparse_codec::Decoded<fensor::complex::Complex64>>(())
+                    .await?
+                    .0,
+            ),
             1 => FsEntry::F32(seq.expect_next(()).await?),
-            2 => FsEntry::MetadataF32(seq.expect_next(()).await?),
+            2 => FsEntry::MetadataF32(seq.expect_next(MAX_METADATA_RANK).await?),
             3 => FsEntry::U8(seq.expect_next(()).await?),
             4 => FsEntry::F64(seq.expect_next(()).await?),
-            5 => FsEntry::MetadataU8(seq.expect_next(()).await?),
-            6 => FsEntry::MetadataF64(seq.expect_next(()).await?),
+            5 => FsEntry::MetadataU8(seq.expect_next(MAX_METADATA_RANK).await?),
+            6 => FsEntry::MetadataF64(seq.expect_next(MAX_METADATA_RANK).await?),
             7 => FsEntry::U16(seq.expect_next(()).await?),
-            8 => FsEntry::MetadataU16(seq.expect_next(()).await?),
+            8 => FsEntry::MetadataU16(seq.expect_next(MAX_METADATA_RANK).await?),
             9 => FsEntry::U32(seq.expect_next(()).await?),
-            10 => FsEntry::MetadataU32(seq.expect_next(()).await?),
+            10 => FsEntry::MetadataU32(seq.expect_next(MAX_METADATA_RANK).await?),
             11 => FsEntry::U64(seq.expect_next(()).await?),
-            12 => FsEntry::MetadataU64(seq.expect_next(()).await?),
+            12 => FsEntry::MetadataU64(seq.expect_next(MAX_METADATA_RANK).await?),
             13 => FsEntry::I8(seq.expect_next(()).await?),
-            14 => FsEntry::MetadataI8(seq.expect_next(()).await?),
+            14 => FsEntry::MetadataI8(seq.expect_next(MAX_METADATA_RANK).await?),
             15 => FsEntry::I16(seq.expect_next(()).await?),
-            16 => FsEntry::MetadataI16(seq.expect_next(()).await?),
+            16 => FsEntry::MetadataI16(seq.expect_next(MAX_METADATA_RANK).await?),
             17 => FsEntry::I32(seq.expect_next(()).await?),
-            18 => FsEntry::MetadataI32(seq.expect_next(()).await?),
+            18 => FsEntry::MetadataI32(seq.expect_next(MAX_METADATA_RANK).await?),
             19 => FsEntry::I64(seq.expect_next(()).await?),
-            20 => FsEntry::MetadataI64(seq.expect_next(()).await?),
+            20 => FsEntry::MetadataI64(seq.expect_next(MAX_METADATA_RANK).await?),
             #[cfg(feature = "complex")]
             21 => FsEntry::C32(
                 seq.expect_next::<Vec<(f32, f32)>>(())
@@ -144,7 +270,7 @@ impl de::Visitor for FsEntryVisitor {
                     .collect(),
             ),
             #[cfg(feature = "complex")]
-            22 => FsEntry::MetadataC32(seq.expect_next(()).await?),
+            22 => FsEntry::MetadataC32(seq.expect_next(MAX_METADATA_RANK).await?),
             #[cfg(feature = "complex")]
             23 => FsEntry::C64(
                 seq.expect_next::<Vec<(f64, f64)>>(())
@@ -154,7 +280,7 @@ impl de::Visitor for FsEntryVisitor {
                     .collect(),
             ),
             #[cfg(feature = "complex")]
-            24 => FsEntry::MetadataC64(seq.expect_next(()).await?),
+            24 => FsEntry::MetadataC64(seq.expect_next(MAX_METADATA_RANK).await?),
             tag => return Err(de::Error::custom(format!("unknown entry tag {tag}"))),
         };
 
@@ -177,7 +303,6 @@ impl de::FromStream for FsEntry {
     }
 }
 
-as_type!(FsEntry, Node, Node<u64>);
 as_type!(FsEntry, F32, Vec<f32>);
 as_type!(FsEntry, MetadataF32, fensor::TensorMetadata<f32>);
 as_type!(FsEntry, U8, Vec<u8>);
@@ -238,9 +363,41 @@ pub fn unique_tmp_dir(name: &str) -> PathBuf {
     path
 }
 
-pub async fn new_dir(name: &str) -> (PathBuf, DirLock<FsEntry>) {
-    let root = unique_tmp_dir(name);
-    tokio::fs::create_dir(&root).await.expect("create tmp dir");
+/// Own the fixture directory until every source and view in its case is dropped.
+/// Explicit cleanup remains useful for reopen/corruption fixtures; Drop also
+/// releases ordinary numerical fixtures when an assertion unwinds.
+pub struct Directory(PathBuf);
+
+impl Directory {
+    pub async fn new(name: &str) -> Self {
+        let root = unique_tmp_dir(name);
+        tokio::fs::create_dir(&root).await.expect("create tmp dir");
+        Self(root)
+    }
+}
+
+impl std::ops::Deref for Directory {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Directory {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Directory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub async fn new_dir(name: &str) -> (Directory, DirLock<FsEntry>) {
+    let root = Directory::new(name).await;
     let dir = open_dir(&root).expect("load tmp dir");
     (root, dir)
 }
@@ -252,6 +409,23 @@ pub fn open_dir(root: &Path) -> io::Result<DirLock<FsEntry>> {
 
 pub async fn cleanup(root: &Path) {
     let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+pub fn block_entries(
+    geometry: &fensor::StorageGeometry,
+    id: u64,
+) -> impl Iterator<Item = (usize, Vec<u64>)> + '_ {
+    let bounds = geometry.block_bounds(id).unwrap();
+    let shape: Vec<_> = bounds.iter().map(|(start, end)| end - start).collect();
+    geometry
+        .block_offsets(id)
+        .unwrap()
+        .zip(iter_coords(&shape).map(move |mut coord| {
+            for (position, (start, _)) in coord.iter_mut().zip(&bounds) {
+                *position += start;
+            }
+            coord
+        }))
 }
 
 pub fn iter_coords(shape: &[u64]) -> CoordIter {
@@ -336,6 +510,17 @@ where
 }
 
 impl freqfs::FileLoad for FsEntry {
+    async fn load_size(
+        _: &Path,
+        file: &mut tokio::fs::File,
+        _: &std::fs::Metadata,
+    ) -> io::Result<usize> {
+        tbon::de::read_from::<_, file_size::Size>((), file)
+            .await
+            .map(|bound| bound.0)
+            .map_err(io::Error::other)
+    }
+
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
@@ -353,6 +538,7 @@ impl freqfs::FileSave for FsEntry {
         counters::record_save();
         use futures::TryStreamExt;
         use tokio::io::AsyncWriteExt;
+        let mut file = tokio::io::BufWriter::new(file);
         let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
         let mut size = 0;
 
@@ -361,6 +547,30 @@ impl freqfs::FileSave for FsEntry {
             size += chunk.len() as u64;
         }
 
+        file.flush().await?;
         Ok(size)
     }
 }
+
+safecast::as_type!(FsEntry, SparseU8, fensor::SparseNode<u8>);
+safecast::as_type!(FsEntry, SparseU16, fensor::SparseNode<u16>);
+safecast::as_type!(FsEntry, SparseU32, fensor::SparseNode<u32>);
+safecast::as_type!(FsEntry, SparseU64, fensor::SparseNode<u64>);
+safecast::as_type!(FsEntry, SparseI8, fensor::SparseNode<i8>);
+safecast::as_type!(FsEntry, SparseI16, fensor::SparseNode<i16>);
+safecast::as_type!(FsEntry, SparseI32, fensor::SparseNode<i32>);
+safecast::as_type!(FsEntry, SparseI64, fensor::SparseNode<i64>);
+safecast::as_type!(FsEntry, SparseF32, fensor::SparseNode<f32>);
+safecast::as_type!(FsEntry, SparseF64, fensor::SparseNode<f64>);
+#[cfg(feature = "complex")]
+safecast::as_type!(
+    FsEntry,
+    SparseC32,
+    fensor::SparseNode<fensor::complex::Complex32>
+);
+#[cfg(feature = "complex")]
+safecast::as_type!(
+    FsEntry,
+    SparseC64,
+    fensor::SparseNode<fensor::complex::Complex64>
+);

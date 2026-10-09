@@ -1,16 +1,13 @@
 //! Concrete filesystem fixtures and consumer checks. Comparators belong to the
 //! numerical case: exact equality, signed zeros, NaNs, and tolerances differ.
 
-use std::path::PathBuf;
-
 use fensor::{
     AxisRange, Layout, Shape, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
-    TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::Number;
 
-use super::{FsEntry, cleanup, iter_coords, new_dir, open_dir, unique_tmp_dir};
+use super::{Directory, FsEntry, cleanup, iter_coords, new_dir, open_dir};
 
 pub fn layout(sparse: bool) -> Layout {
     if sparse {
@@ -20,39 +17,47 @@ pub fn layout(sparse: bool) -> Layout {
     }
 }
 
-pub async fn source<T: TensorElement>(
+pub async fn source<T: TensorElement, I: IntoIterator<Item = T>>(
     name: &str,
     shape: Shape,
     layout: Layout,
     capacity: usize,
     cache: usize,
-    values: impl IntoIterator<Item = T>,
-) -> (PathBuf, Tensor<FsEntry, T>)
+    values: I,
+) -> (Directory, Tensor<FsEntry, T>)
 where
     FsEntry: TensorFileEntry<T>,
+    I::IntoIter: Send,
 {
-    let root = unique_tmp_dir(name);
-    tokio::fs::create_dir(&root)
-        .await
-        .expect("create fixture dir");
+    let root = Directory::new(name).await;
     let dir = freqfs::Cache::new(cache, None, 0, std::time::Duration::from_secs(1))
-        .load(root.clone())
+        .load(root.to_path_buf())
         .unwrap();
-    let tensor = Tensor::create(
-        dir,
-        TensorSchema::new(T::dtype(), shape.clone()).unwrap(),
-        layout,
-        capacity,
-    )
-    .await
-    .unwrap();
+    let schema = TensorSchema::new(T::dtype(), shape.clone()).unwrap();
     let mut values = values.into_iter();
-    for coord in iter_coords(&shape) {
-        let value = values.next().expect("fixture value for every coordinate");
-        if matches!(layout, Layout::Dense) || value != T::ZERO {
-            tensor.write_value(&coord, value).await.unwrap();
+    let tensor = match layout {
+        Layout::Dense => {
+            let input = futures::stream::iter(values.by_ref().map(Ok::<_, fensor::Error>));
+            Tensor::from_values(dir, schema, capacity, input)
+                .await
+                .unwrap()
         }
-    }
+        Layout::Sparse { .. } => {
+            let entries = iter_coords(&shape).filter_map(|coord| {
+                let value = values.next().expect("fixture value for every coordinate");
+                (value != T::ZERO).then_some(Ok::<_, fensor::Error>((coord, value)))
+            });
+            Tensor::from_sparse_elements(
+                dir,
+                schema,
+                layout,
+                capacity,
+                futures::stream::iter(entries),
+            )
+            .await
+            .unwrap()
+        }
+    };
     assert!(values.next().is_none(), "excess fixture values");
     (root, tensor)
 }
@@ -82,13 +87,11 @@ pub async fn blocks<V: TensorRead>(
     assert_eq!(offset, expected.len(), "output count");
 }
 
-pub async fn consumers<V: TensorRead>(
+pub async fn reads<V: TensorRead>(
     view: &V,
     expected: &[V::DType],
     equal: impl Fn(V::DType, V::DType) -> bool,
-    copied_equal: impl Fn(V::DType, V::DType) -> bool,
 ) where
-    FsEntry: TensorFileEntry<V::DType>,
     V::DType: TensorElement,
 {
     blocks(view, expected, &equal).await;
@@ -99,18 +102,6 @@ pub async fn consumers<V: TensorRead>(
             "at {coord:?}: {actual:?} != {value:?}"
         );
     }
-    let (root, dir) = new_dir("consumer_copy").await;
-    let copy: Tensor<FsEntry, V::DType> = Tensor::copy_from(dir.clone(), view, 17).await.unwrap();
-    copy.sync().await.unwrap();
-    drop(copy);
-    drop(dir);
-    let copy = Tensor::<FsEntry, V::DType>::load(open_dir(&root).unwrap())
-        .await
-        .unwrap();
-    blocks(&copy, expected, copied_equal).await;
-    drop(copy);
-    cleanup(&root).await;
-
     if matches!(view.layout(), Layout::Sparse { .. }) {
         let mut entries = view
             .read_sparse_elements_in_order(
@@ -135,4 +126,40 @@ pub async fn consumers<V: TensorRead>(
         }
         assert!(entries.try_next().await.unwrap().is_none());
     }
+}
+
+pub async fn copied<V: TensorRead>(
+    view: &V,
+    expected: &[V::DType],
+    equal: impl Fn(V::DType, V::DType) -> bool,
+) where
+    FsEntry: TensorFileEntry<V::DType>,
+    V::DType: TensorElement,
+{
+    let (root, dir) = new_dir("consumer_copy").await;
+    let copy: Tensor<FsEntry, V::DType> = Tensor::copy_from(dir.clone(), view, view.layout(), 17)
+        .await
+        .unwrap();
+    copy.sync().await.unwrap();
+    drop(copy);
+    drop(dir);
+    let copy = Tensor::<FsEntry, V::DType>::load(open_dir(&root).unwrap())
+        .await
+        .unwrap();
+    blocks(&copy, expected, equal).await;
+    drop(copy);
+    cleanup(&root).await;
+}
+
+pub async fn consumers<V: TensorRead>(
+    view: &V,
+    expected: &[V::DType],
+    equal: impl Fn(V::DType, V::DType) -> bool,
+    copied_equal: impl Fn(V::DType, V::DType) -> bool,
+) where
+    FsEntry: TensorFileEntry<V::DType>,
+    V::DType: TensorElement,
+{
+    reads(view, expected, equal).await;
+    copied(view, expected, copied_equal).await;
 }

@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
 use destream::{de, en};
+use get_size::GetSize;
 
 use crate::schema::{StorageSchema, TensorSchema};
 use crate::{Error, Layout, Result, Shape, TensorElement};
@@ -9,7 +10,8 @@ use crate::{Error, Layout, Result, Shape, TensorElement};
 ///
 /// The adapter must preserve the element type when saving and loading entries, for
 /// example with distinct variants for `TensorMetadata<f32>` and `TensorMetadata<u8>`.
-/// The destream representation contains geometry only; it does not encode `T`.
+/// The destream representation contains geometry; it does not encode `T`.
+/// Decoding requires the adapter's maximum metadata rank as its `usize` context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TensorMetadata<T> {
     shape: Shape,
@@ -26,6 +28,7 @@ impl<T: TensorElement> TensorMetadata<T> {
                 "block shape rank differs from tensor rank".into(),
             ));
         }
+
         let capacity = crate::schema::checked_product(&block_shape)?;
         if capacity == 0 || capacity > crate::schema::MAX_BLOCK_CAPACITY as u64 {
             return Err(Error::InvalidSchema("invalid block capacity".into()));
@@ -42,9 +45,11 @@ impl<T: TensorElement> TensorMetadata<T> {
     pub fn shape(&self) -> &Shape {
         &self.shape
     }
+
     pub fn layout(&self) -> Layout {
         self.layout
     }
+
     pub fn block_shape(&self) -> &Shape {
         &self.block_shape
     }
@@ -55,27 +60,70 @@ impl<T: TensorElement> TensorMetadata<T> {
             StorageSchema::from_block_shape(&self.shape, self.layout, self.block_shape.clone())?,
         ))
     }
+}
 
-    pub(crate) fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + [&self.shape, &self.block_shape]
-                .into_iter()
-                .filter(|s| s.spilled())
-                .map(|s| s.capacity() * std::mem::size_of::<u64>())
-                .sum::<usize>()
+impl<T> GetSize for TensorMetadata<T> {
+    fn get_heap_size(&self) -> usize {
+        [&self.shape, &self.block_shape]
+            .into_iter()
+            .filter(|shape| shape.spilled())
+            .map(|shape| shape.capacity() * std::mem::size_of::<u64>())
+            .sum()
+    }
+}
+
+// Dimension decoding is bounded by the adapter, independently of storage capacity.
+async fn decode_shape<D: de::Decoder>(
+    limit: usize,
+    decoder: &mut D,
+) -> std::result::Result<Shape, D::Error> {
+    let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
+    let mut shape = Shape::new();
+    while sequence.slot() != de::Slot::End {
+        let dimension = <u64 as de::FromStream>::from_stream((), decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+        if shape.len() == limit {
+            return Err(de::Error::custom(
+                "tensor metadata exceeds the adapter rank limit",
+            ));
+        }
+        shape.push(dimension);
+    }
+    Ok(shape)
+}
+
+fn require_field<E: de::Error>(sequence: &de::Container) -> std::result::Result<(), E> {
+    if sequence.slot() == de::Slot::End {
+        Err(E::custom("missing tensor metadata field"))
+    } else {
+        Ok(())
     }
 }
 
 impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
-    type Context = ();
+    type Context = usize;
 
     async fn from_stream<D: de::Decoder>(
-        _: (),
+        limit: usize,
         decoder: &mut D,
     ) -> std::result::Result<Self, D::Error> {
-        let (shape, sparse, axis, block_shape): (Vec<u64>, bool, Option<u64>, Vec<u64>) =
-            <(Vec<u64>, bool, Option<u64>, Vec<u64>) as de::FromStream>::from_stream((), decoder)
-                .await?;
+        let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
+        require_field::<D::Error>(&sequence)?;
+        let shape = decode_shape(limit, decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+
+        require_field::<D::Error>(&sequence)?;
+        let sparse = bool::from_stream((), decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+
+        require_field::<D::Error>(&sequence)?;
+        let axis = Option::<u64>::from_stream((), decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+
+        require_field::<D::Error>(&sequence)?;
+        let block_shape = decode_shape(limit, decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+
         let layout = if sparse {
             Layout::Sparse {
                 axis: axis
@@ -88,7 +136,11 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
         } else {
             return Err(de::Error::custom("dense metadata contains a sparse axis"));
         };
-        Self::new(shape.into(), layout, block_shape.into()).map_err(de::Error::custom)
+
+        if sequence.slot() != de::Slot::End {
+            return Err(de::Error::custom("unexpected metadata field"));
+        }
+        TensorMetadata::new(shape, layout, block_shape).map_err(de::Error::custom)
     }
 }
 

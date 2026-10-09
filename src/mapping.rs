@@ -1,5 +1,13 @@
 //! Coordinate mapping shared by geometric storage and reduction views.
 
+#[cfg(test)]
+#[path = "../tests/unit/mapping/delegation_tests.rs"]
+mod delegation_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/mapping/traversal_tests.rs"]
+mod traversal_tests;
+
 use std::{iter, sync::Arc};
 
 use smallvec::SmallVec;
@@ -111,6 +119,7 @@ impl GatherOffsets {
             self.index(start)
                 .ok_or_else(|| Error::InvalidLayout("gather slice out of bounds".into()))?
         };
+
         let step = if len <= 1 {
             1
         } else {
@@ -118,6 +127,7 @@ impl GatherOffsets {
                 .checked_mul(step)
                 .ok_or_else(|| Error::InvalidLayout("gather stride overflow".into()))?
         };
+
         Ok(Self {
             offsets: self.offsets.clone(),
             start,
@@ -162,21 +172,28 @@ impl CoordinateMap {
             let AxisContrib::Stride(stride) = contribution else {
                 return Ok(None);
             };
+
             let Ok(stride) = u64::try_from(*stride) else {
                 return Ok(None);
             };
+
             if stride == 0 {
                 return Ok(None);
             }
 
-            let base = (0..shape.len()).rev().find(|&base| {
+            let eligible = |base: usize| {
                 !axes.iter().any(|(axis, _)| *axis == base)
                     && stride.is_multiple_of(strides[base])
                     && (stride / strides[base])
                         .checked_mul(dim - 1)
                         .and_then(|delta| origins[base].checked_add(delta))
                         .is_some_and(|last| last < shape[base])
-            });
+            };
+            // A singleton's extent cannot distinguish its axis from a stepped
+            // later axis. Preserve exact strides first, in logical axis order.
+            let base = (0..shape.len())
+                .find(|&base| stride == strides[base] && eligible(base))
+                .or_else(|| (0..shape.len()).rev().find(|&base| eligible(base)));
             let Some(base) = base else {
                 return Ok(None);
             };
@@ -233,6 +250,29 @@ impl CoordinateMap {
         Ok(Some((offset, strides)))
     }
 
+    /// Visit mapped coordinates in request order using two reusable scratch buffers.
+    /// The callback may modify its borrowed coordinate; the next resolution resets it.
+    pub(crate) fn visit_mapped(
+        &self,
+        request: &crate::request::BatchRequest,
+        base_shape: &[u64],
+        base_strides: &[u64],
+        mut visit: impl FnMut(usize, &mut Coord) -> Result<()>,
+    ) -> Result<()> {
+        let mut cursor = request.cursor(&self.shape)?;
+        let mut input = Coord::new();
+        let mut mapped = Coord::new();
+        let mut position = 0;
+
+        while cursor.next_into(&mut input) {
+            self.resolve_into(&input, base_shape, base_strides, &mut mapped)?;
+            visit(position, &mut mapped)?;
+            position += 1;
+        }
+
+        Ok(())
+    }
+
     pub fn resolve_into(
         &self,
         coord: &[u64],
@@ -250,6 +290,44 @@ impl CoordinateMap {
         out.clear();
         out.extend(strides.iter().zip(shape).map(|(s, d)| (offset / *s) % *d));
         Ok(())
+    }
+
+    /// Bounds derived from rank-sized mapping and explicit gather metadata.
+    pub(crate) fn flat_bounds(&self) -> Result<Option<(u64, u64)>> {
+        if self.shape.contains(&0) {
+            return Ok(None);
+        }
+
+        let overflow = || Error::InvalidCoord("mapping bounds overflow".into());
+        let (mut lo, mut hi) = (self.base_offset, self.base_offset);
+
+        for (axis, &len) in self.axes.iter().zip(&self.shape) {
+            let (min, max) = match axis {
+                AxisContrib::Stride(step) => {
+                    let end = step.checked_mul(i128::from(len - 1)).ok_or_else(overflow)?;
+                    (end.min(0), end.max(0))
+                }
+                AxisContrib::Broadcast(offset) => (*offset, *offset),
+                AxisContrib::Gather(offsets) => {
+                    let mut min = i128::MAX;
+                    let mut max = i128::MIN;
+
+                    for index in 0..offsets.len {
+                        let value = *offsets.get(index).ok_or_else(overflow)?;
+                        min = min.min(value);
+                        max = max.max(value);
+                    }
+                    (min, max)
+                }
+            };
+            lo = lo.checked_add(min).ok_or_else(overflow)?;
+            hi = hi.checked_add(max).ok_or_else(overflow)?;
+        }
+
+        Ok(Some((
+            u64::try_from(lo).map_err(|_| overflow())?,
+            u64::try_from(hi).map_err(|_| overflow())?,
+        )))
     }
 
     pub fn flat_offset(&self, coord: &[u64]) -> Result<i128> {
@@ -291,6 +369,7 @@ impl CoordinateMap {
         let Ok(expected) = schema::contiguous_strides(&self.shape) else {
             return false;
         };
+
         self.axes
             .iter()
             .zip(expected.iter())
@@ -316,6 +395,7 @@ impl CoordinateMap {
                     .to_string(),
             ));
         }
+
         let strides = schema::contiguous_strides(&shape)?;
         Ok(Self {
             base_offset: self.base_offset,
@@ -486,6 +566,7 @@ impl CoordinateMap {
                 "squeeze requires a non-empty list of axes".to_string(),
             ));
         }
+
         if axes.len() == ndim {
             return Err(Error::InvalidLayout(
                 "squeeze cannot remove every axis; rank-0 tensors are not supported".to_string(),
@@ -500,11 +581,13 @@ impl CoordinateMap {
                     "squeeze axis {axis} is out of bounds for rank {ndim}"
                 )));
             }
+
             if remove[axis] {
                 return Err(Error::InvalidLayout(format!(
                     "squeeze axis {axis} specified more than once"
                 )));
             }
+
             if self.shape[axis] != 1 {
                 return Err(Error::InvalidLayout(format!(
                     "cannot squeeze axis {axis} with dimension {}",
@@ -554,6 +637,7 @@ impl CoordinateMap {
                     "unsqueeze axis {axis} is out of bounds for rank {old_ndim}"
                 )));
             }
+
             if insert_before[axis] {
                 return Err(Error::InvalidLayout(format!(
                     "unsqueeze axis {axis} specified more than once"
@@ -617,6 +701,7 @@ fn slice_bound_at(current: &AxisContrib, dim: u64, index: u64, axis_index: usize
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
+
     match current {
         AxisContrib::Stride(s) => (index as i128).checked_mul(*s).ok_or_else(mapping_overflow),
         AxisContrib::Broadcast(c) => Ok(*c),
@@ -647,6 +732,7 @@ fn slice_bound_in(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
+
     let extent = if start == stop {
         0
     } else {
@@ -690,6 +776,7 @@ fn slice_bound_of(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
+
     match current {
         AxisContrib::Broadcast(c) => Ok(AxisContrib::Broadcast(*c)),
         AxisContrib::Stride(s) => {
@@ -738,103 +825,66 @@ fn flip_axis_contrib(current: &AxisContrib, dim: u64) -> Result<(i128, AxisContr
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signed_mapping_overflow_is_a_structured_error() {
-        let map = CoordinateMap {
-            base_offset: i128::MAX,
-            axes: vec![AxisContrib::Stride(i128::MAX)],
-            shape: smallvec::smallvec![3],
-        };
-        assert!(matches!(map.flat_offset(&[2]), Err(Error::InvalidCoord(_))));
-        assert!(matches!(map.clone().flip(0), Err(Error::InvalidLayout(_))));
-        assert!(matches!(
-            map.clone()
-                .slice(smallvec::smallvec![AxisRange::In(0, 3, 2)]),
-            Err(Error::InvalidLayout(_))
-        ));
-        assert!(matches!(
-            map.slice(smallvec::smallvec![AxisRange::Of(vec![2])]),
-            Err(Error::InvalidLayout(_))
-        ));
-    }
-
-    #[test]
-    fn gather_transforms_share_the_original_table() {
-        let original = GatherOffsets::from(vec![9, 2, 9, 4, 7, 3]);
-        let sliced = original.slice(1, 2, 3).unwrap();
-        let flipped = sliced.flipped();
-        let nested = flipped.slice(1, 1, 2).unwrap();
-
-        for view in [&sliced, &flipped, &nested] {
-            assert!(Arc::ptr_eq(&original.offsets, &view.offsets));
+// Mechanical transforms preserve each value's distinct source and write capabilities.
+macro_rules! transform_methods {
+    (operands: $first:ident $(, $rest:ident)* $(; $preserve:ident)?) => {
+        $crate::mapping::transform_methods!(@owned reshape, shape, $crate::Shape; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned broadcast, shape, $crate::Shape; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned slice, range, $crate::Range; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned transpose, permutation, Option<$crate::Axes>; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned squeeze, axes, $crate::Axes; $first $(, $rest)* $(; $preserve)?);
+        $crate::mapping::transform_methods!(@owned unsqueeze, axes, $crate::Axes; $first $(, $rest)* $(; $preserve)?);
+        fn flip(self, axis: usize) -> $crate::Result<Self> {
+            let $first = self.$first.flip(axis)?;
+            $(let $rest = self.$rest.flip(axis)?;)*
+            Ok($crate::mapping::transform_methods!(@construct self; [$first $(, $rest)*] $(; $preserve)?))
         }
-        assert_eq!(
-            (0..3).map(|i| *flipped.get(i).unwrap()).collect::<Vec<_>>(),
-            [3, 4, 2]
-        );
-        assert_eq!(
-            (0..2).map(|i| *nested.get(i).unwrap()).collect::<Vec<_>>(),
-            [4, 2]
-        );
-        assert_eq!(*original.get(0).unwrap(), *original.get(2).unwrap());
-        assert_eq!(
-            *nested
-                .slice(1, usize::MAX, 1)
-                .unwrap()
-                .flipped()
-                .get(0)
-                .unwrap(),
-            2
-        );
-    }
+    };
+    (@owned $method:ident, $arg:ident, $ty:ty; $first:ident $(, $rest:ident)* $(; $preserve:ident)?) => {
+        fn $method(self, $arg: $ty) -> $crate::Result<Self> {
+            $crate::mapping::transform_methods!(@bind self, $method, $arg; $first $(, $rest)*);
+            Ok($crate::mapping::transform_methods!(@construct self; [$first $(, $rest)*] $(; $preserve)?))
+        }
+    };
+    (@construct $value:ident; [$($field:ident),+]) => {
+        Self { $($field,)+ }
+    };
+    (@construct $value:ident; [$($field:ident),+]; preserve_rest) => {
+        Self { $($field,)+ ..$value }
+    };
+    (@bind $value:ident, $method:ident, $arg:ident; $last:ident) => {
+        let $last = $value.$last.$method($arg)?;
+    };
+    (@bind $value:ident, $method:ident, $arg:ident; $first:ident, $($rest:ident),+) => {
+        let $first = $value.$first.$method($arg.clone())?;
+        $crate::mapping::transform_methods!(@bind $value, $method, $arg; $($rest),+);
+    };
+
+    ($($clone:ident)?) => {
+        $crate::mapping::transform_methods!(reshape, shape, $crate::Shape $(; $clone)?);
+        $crate::mapping::transform_methods!(broadcast, shape, $crate::Shape $(; $clone)?);
+        $crate::mapping::transform_methods!(slice, range, $crate::Range $(; $clone)?);
+        $crate::mapping::transform_methods!(transpose, permutation, Option<$crate::Axes> $(; $clone)?);
+        $crate::mapping::transform_methods!(flip, axis, usize $(; $clone)?);
+        $crate::mapping::transform_methods!(squeeze, axes, $crate::Axes $(; $clone)?);
+        $crate::mapping::transform_methods!(unsqueeze, axes, $crate::Axes $(; $clone)?);
+    };
+    ($method:ident, $arg:ident, $ty:ty $(; $clone:ident)?) => {
+        fn $method(mut self, $arg: $ty) -> $crate::Result<Self> {
+            self.mapping = $crate::mapping::transform_methods!(@mapping self.mapping $(; $clone)?).$method($arg)?;
+            Ok(self)
+        }
+    };
+    (@mapping $mapping:expr) => { $mapping };
+    // Drop owners cannot move fields out; clone only mapping metadata.
+    (@mapping $mapping:expr; clone_mapping) => { $mapping.clone() };
 }
+pub(crate) use transform_methods;
 
 #[cfg(test)]
-mod compact_tests {
-    use super::*;
+#[path = "../tests/unit/mapping/tests.rs"]
+mod tests;
 
-    #[test]
-    fn identity_is_structural_and_mapping_reuses_scratch() {
-        let shape = ha_ndarray::shape![3, 4];
-        let strides = schema::contiguous_strides(&shape).unwrap();
-        let map = CoordinateMap::identity(shape.clone(), &strides);
-        assert!(map.is_identity(&shape, &strides));
-        let flipped = map.clone().flip(1).unwrap();
-        assert!(!flipped.is_identity(&shape, &strides));
-        assert!(
-            flipped
-                .clone()
-                .flip(1)
-                .unwrap()
-                .is_identity(&shape, &strides)
-        );
-        let mut out = Coord::with_capacity(2);
-        let ptr = out.as_ptr();
-
-        for row in 0..3 {
-            for col in 0..4 {
-                flipped
-                    .resolve_into(&[row, col], &shape, &strides, &mut out)
-                    .unwrap();
-                assert_eq!(out.as_slice(), &[row, 3 - col]);
-                assert_eq!(out.as_ptr(), ptr);
-            }
-        }
-
-        let mut bad = map;
-        bad.base_offset = 12;
-        assert!(
-            bad.resolve_into(&[0, 0], &shape, &strides, &mut out)
-                .is_err()
-        );
-        bad.base_offset = i128::MAX;
-        assert!(
-            bad.resolve_into(&[2, 3], &shape, &strides, &mut out)
-                .is_err()
-        );
-    }
-}
+#[cfg(test)]
+#[path = "../tests/unit/mapping/compact_tests.rs"]
+mod compact_tests;

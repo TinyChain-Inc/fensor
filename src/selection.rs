@@ -1,17 +1,15 @@
 //! Lazy conditional selection over three expression sources.
 
-use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{ArrayAccess, NDArrayWhere};
 
 use crate::expression::{self, Batch, Expression};
-use crate::request::{self, BatchRequest};
+use crate::request::BatchRequest;
 use crate::{
-    Axes, BoxFuture, Error, Layout, Range, Result, Shape, SparseElementStream, TensorElement,
-    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, TensorWhere,
-    ValueBlockStream,
+    BoxFuture, Error, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
+    TensorViewSemantics, TensorWhere,
 };
 
-/// Read-only selection retaining support from the condition and both branches.
+/// Read-only selection over the condition and both branches.
 ///
 /// A zero condition selects `or_else`; every nonzero condition selects `then`.
 /// Both branches are read, so errors in an unselected branch still propagate.
@@ -60,10 +58,15 @@ use crate::{
 /// ) { let _ = c.view().cond(&a.view(), &b.view()).await; }
 /// ```
 #[derive(Clone)]
-pub struct WhereView<Condition, Then, Else> {
+pub struct WhereView<Condition, Then, Else>
+where
+    Then: TensorGeometry,
+    Then::DType: TensorElement,
+{
     condition: Condition,
     then: Then,
     or_else: Else,
+    zero: Then::DType,
 }
 
 impl<C, L, R> TensorWhere<L, R> for C
@@ -87,6 +90,7 @@ where
             }
 
             Ok(WhereView {
+                zero: or_else.implicit_zero(),
                 condition: self.clone(),
                 then: then.clone(),
                 or_else: or_else.clone(),
@@ -136,9 +140,48 @@ where
     fn is_base_tensor(&self) -> bool {
         false
     }
+}
 
-    fn supports_write_through(&self) -> bool {
-        false
+impl<C, L, R> crate::expression::traversal::Plan for WhereView<C, L, R>
+where
+    C: Expression<DType = u8>,
+    L: Expression,
+    R: Expression<DType = L::DType>,
+    L::DType: TensorElement,
+{
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Selection<'_>> {
+        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
+    }
+
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+        }
+
+        let condition_slice = slice.clone();
+        let then_slice = slice.clone();
+        Ok(expression::traversal::Ordered::Sources(vec![
+            (&self.condition, condition_slice),
+            (&self.then, then_slice),
+            (&self.or_else, slice),
+        ]))
+    }
+
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
+        Ok(expression::traversal::Preferred::Sources(vec![
+            (&self.condition, shape),
+            (&self.then, shape),
+            (&self.or_else, shape),
+        ]))
     }
 }
 
@@ -149,31 +192,37 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<expression::RequestIterator>> {
-        if let Some(requests) = self.condition.preferred_requests(shape)? {
-            return Ok(Some(requests));
-        }
-        match self.then.preferred_requests(shape)? {
-            Some(requests) => Ok(Some(requests)),
-            None => self.or_else.preferred_requests(shape),
-        }
+    fn implicit_zero(&self) -> Self::DType {
+        self.zero
     }
 
-    fn build<'a>(&'a self, coords: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
-        Box::pin(async move {
-            let condition = self.condition.build(coords).await?;
-            let then = self.then.build(coords).await?;
-            let or_else = self.or_else.build(coords).await?;
-            let support = expression::union_support(
-                condition.support,
-                expression::union_support(then.support, or_else.support)?,
-            )?;
+    fn expression_nodes(&self) -> Result<usize> {
+        crate::expression::traversal::node_count([
+            self.condition.expression_nodes()?,
+            self.then.expression_nodes()?,
+            self.or_else.expression_nodes()?,
+        ])
+    }
 
-            Batch {
-                array: ArrayAccess::from(condition.array.cond(then.array, or_else.array)?),
-                support,
-            }
-            .masked()
+    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
+        self.condition.detach_sources(pending);
+        self.then.detach_sources(pending);
+        self.or_else.detach_sources(pending);
+    }
+
+    fn build<'a>(
+        &'a self,
+        context: expression::Context<'a>,
+        coords: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
+        Box::pin(async move {
+            let condition = context.batch(&self.condition, coords.clone()).await?;
+            let then = context.batch(&self.then, coords.clone()).await?;
+            let or_else = context.batch(&self.or_else, coords).await?;
+
+            Batch::from_array(ArrayAccess::from(
+                condition.array.cond(then.array, or_else.array)?,
+            ))
         })
     }
 }
@@ -185,50 +234,12 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn read_coordinate_blocks(&self) -> Result<crate::CoordinateBlockStream<'_, Self::DType>> {
-        expression::coordinate_blocks(self)
-    }
-
-    fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move {
-            Ok(
-                expression::evaluate_batch(self, &BatchRequest::point(coord))
-                    .await?
-                    .values[0],
-            )
-        })
-    }
-
-    fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
-        let coords = request::linear_requests(self.shape())?;
-
-        Ok(expression::ordered_batches(self, coords)
-            .map_ok(|(_, batch)| batch.values)
-            .boxed())
-    }
-
-    fn read_sparse_elements_in_order<'a>(
-        &'a self,
-        range: Range,
-        requested_order: Axes,
-    ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>> {
-        Box::pin(async move {
-            let coords = crate::traits::sparse_coords(self, range, requested_order)?;
-
-            Ok(
-                expression::ordered_batches(self, request::explicit_requests(coords))
-                    .and_then(move |(coords, values)| async move {
-                        Ok(futures::stream::iter(expression::sparse_elements(
-                            coords,
-                            values,
-                            self.shape(),
-                        )?))
-                    })
-                    .try_flatten()
-                    .boxed(),
-            )
-        })
-    }
+    crate::expression::reader_members!(
+        read_value,
+        read_blocks,
+        read_coordinate_blocks,
+        read_sparse_elements_in_order
+    );
 }
 
 impl<C, L, R> TensorTransform for WhereView<C, L, R>
@@ -238,59 +249,5 @@ where
     R: TensorTransform<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn reshape(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            condition: self.condition.reshape(shape.clone())?,
-            then: self.then.reshape(shape.clone())?,
-            or_else: self.or_else.reshape(shape)?,
-        })
-    }
-
-    fn broadcast(self, shape: Shape) -> Result<Self> {
-        Ok(Self {
-            condition: self.condition.broadcast(shape.clone())?,
-            then: self.then.broadcast(shape.clone())?,
-            or_else: self.or_else.broadcast(shape)?,
-        })
-    }
-
-    fn flip(self, axis: usize) -> Result<Self> {
-        Ok(Self {
-            condition: self.condition.flip(axis)?,
-            then: self.then.flip(axis)?,
-            or_else: self.or_else.flip(axis)?,
-        })
-    }
-
-    fn slice(self, range: Range) -> Result<Self> {
-        Ok(Self {
-            condition: self.condition.slice(range.clone())?,
-            then: self.then.slice(range.clone())?,
-            or_else: self.or_else.slice(range)?,
-        })
-    }
-
-    fn squeeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            condition: self.condition.squeeze(axes.clone())?,
-            then: self.then.squeeze(axes.clone())?,
-            or_else: self.or_else.squeeze(axes)?,
-        })
-    }
-
-    fn transpose(self, permutation: Option<Axes>) -> Result<Self> {
-        Ok(Self {
-            condition: self.condition.transpose(permutation.clone())?,
-            then: self.then.transpose(permutation.clone())?,
-            or_else: self.or_else.transpose(permutation)?,
-        })
-    }
-
-    fn unsqueeze(self, axes: Axes) -> Result<Self> {
-        Ok(Self {
-            condition: self.condition.unsqueeze(axes.clone())?,
-            then: self.then.unsqueeze(axes.clone())?,
-            or_else: self.or_else.unsqueeze(axes)?,
-        })
-    }
+    crate::mapping::transform_methods!(operands: condition, then, or_else; preserve_rest);
 }

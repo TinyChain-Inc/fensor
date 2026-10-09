@@ -28,7 +28,14 @@ the line above the statement.
 
 ## Formatting
 
-- Run `cargo fmt` locally
+- Separate Rust items and methods with one blank line. Keep attributes and
+  documentation attached to their item.
+- Within functions, separate distinct processing steps with one blank line;
+  keep related declarations and operations together.
+- Run `cargo fmt` locally. Stable rustfmt does not enforce all import grouping
+  or item-spacing rules, so review those explicitly.
+- Python benchmark imports group standard-library modules before local modules,
+  sorting `import` and `from` statements alphabetically within each group.
 
 ## Crate-specific notes
 
@@ -43,7 +50,7 @@ consistency remains automatic.
   Their `PORTABLE_INLINE_RANK` capacity is an allocation optimization, not a rank limit.
 - Use `Range` for rank-sized slice bounds; explicit `AxisRange::Of` selections own
   `Vec<u64>` and preserve order and duplicates. Shared gather tables retain `Arc`.
-- Use `Vec` for values, support masks, batches, runs, scatter lists, public
+- Use `Vec` for values, batches, runs, scatter lists, public
   coordinate payloads, and adapter buffers. Prefer slices when borrowing and
   arrays for fixed-cardinality structures such as sparse keys.
 - Keep large axis descriptors, signed affine coefficient vectors, and matrix map
@@ -58,10 +65,13 @@ consistency remains automatic.
 ## Local operation macros
 
 Private `macro_rules!` macros may generate mechanically identical operation
-declarations and constructor members inside explicit trait implementations. Keep
-public trait declarations, behavioral control flow, and unusual bounds directly
-readable. Preserve each operation's documentation and explicit backend mapping;
-do not introduce an operation registry or generate execution implementations.
+declarations, constructors, recursive operand transforms, and reader forwarding
+members inside explicit trait implementations. Keep public trait declarations,
+behavioral control flow, and unusual bounds directly readable. Preserve each
+operation's documentation and explicit backend mapping. Forwarding macros delegate
+to ordinary functions which own execution; do not generate request planning, buffering, numerical algorithms, candidate traversal,
+or error-control logic. Keep macros beside their owning subsystem, with explicit
+method lists and bounds at invocation sites. Do not introduce an operation registry.
 
 ## Numeric limits
 
@@ -71,3 +81,25 @@ refer to the owner; public documentation links to DESIGN.md's bound table, which
 records current values. Boundary tests use the owning constant and adjacent
 values where accessible; explicit numerical and benchmark fixtures retain their
 inputs. Do not expose private limits solely for documentation or tests.
+
+## Panics and errors
+
+Return structured errors for invalid input, storage failures, resource limits,
+and poisoned execution state. Assertions and `expect` require an internal
+invariant established by validation or local control flow; external operations
+are fallible. Destructors must avoid introducing panics during cleanup. Tests
+may assert and unwrap expected results.
+
+## Futures and streams
+
+- Concrete operations own mathematics; shared consumers own stack-safe polling,
+  batching, and delivery order. Transaction leases belong to the caller.
+- Prefer `async fn`, stream combinators, and `try_unfold`. Handwritten polling
+  belongs to scheduling, cooperative progress, or resource release. Ready-item
+  loops must yield cooperatively; an `await` need not return `Pending`.
+- Use `pin!` for local consumption. Keep `BoxFuture` and `BoxStream` at owned,
+  erased, or documented stack-size boundaries. Local pinning cannot replace an
+  escaping boxed future, and boxing recursion does not make polling stack-safe.
+- Only the outer consumer buffers evaluation. Preserve ordered versus
+  completion-order delivery explicitly. Streams retain their sources; cancellation
+  drops active work without background ingestion tasks.

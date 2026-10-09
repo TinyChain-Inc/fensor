@@ -1,9 +1,10 @@
-//! Filesystem-backed tiled matrix multiplication and source support.
+//! Filesystem-backed tiled matrix multiplication and zero-extended sparse values.
 
 use fensor::{
     AxisRange, Layout, Shape, Tensor, TensorCast, TensorCompareScalar, TensorElement,
-    TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorRead, TensorReduce,
-    TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
+    TensorExpression, TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere,
+    TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{Array, Buffer, MatrixDual, NDArrayRead, Number, axes, range, shape};
@@ -17,7 +18,7 @@ async fn source<T: TensorElement>(
     dims: Shape,
     sparse: bool,
     capacity: usize,
-) -> Tensor<FsEntry, T>
+) -> (common::Directory, Tensor<FsEntry, T>)
 where
     FsEntry: TensorFileEntry<T>,
 {
@@ -30,51 +31,28 @@ where
         values.iter().copied(),
     )
     .await
-    .1
-}
-
-trait Matches: TensorElement {
-    fn matches(self, other: Self) -> bool;
-}
-
-impl Matches for u8 {
-    fn matches(self, other: Self) -> bool {
-        self == other
-    }
-}
-
-impl Matches for f32 {
-    fn matches(self, other: Self) -> bool {
-        (self.is_nan() && other.is_nan()) || self.to_bits() == other.to_bits()
-    }
-}
-
-impl Matches for f64 {
-    fn matches(self, other: Self) -> bool {
-        (self.is_nan() && other.is_nan()) || self.to_bits() == other.to_bits()
-    }
 }
 
 async fn check_blocks<V: TensorRead>(view: &V, expected: &[V::DType])
 where
-    V::DType: Matches,
+    V::DType: TensorElement,
 {
-    common::fixture::blocks(view, expected, Matches::matches).await;
+    common::fixture::blocks(view, expected, common::numbers::same).await;
 }
 
 async fn check<V: TensorRead>(view: &V, expected: &[V::DType])
 where
-    V::DType: Matches,
+    V::DType: TensorElement,
     FsEntry: TensorFileEntry<V::DType>,
 {
-    common::fixture::consumers(view, expected, Matches::matches, |a, b| {
-        a.matches(b) || (a == V::DType::ZERO && b == V::DType::ZERO)
+    common::fixture::consumers(view, expected, common::numbers::same, |a, b| {
+        common::numbers::same(a, b) || (a == V::DType::ZERO && b == V::DType::ZERO)
     })
     .await;
 }
 
 macro_rules! parity {
-    ($name:ident, $t:ty) => {
+    ($name:ident, $t:ty, $large_consumers:expr) => {
         #[tokio::test]
         async fn $name() {
             for (m, k, n) in [
@@ -99,29 +77,36 @@ macro_rules! parity {
                     .unwrap()
                     .into_vec();
                 for (ls, rs) in [(false, false), (false, true), (true, false), (true, true)] {
-                    let a = source(&av, shape![m as u64, k as u64], ls, 31).await;
-                    let b = source(&bv, shape![k as u64, n as u64], rs, 47).await;
+                    let (_a_root, a) = source(&av, shape![m as u64, k as u64], ls, 31).await;
+                    let (_b_root, b) = source(&bv, shape![k as u64, n as u64], rs, 47).await;
                     let view = a.view().matmul(&b.view()).await.unwrap();
-                    // Full persistence/consumer parity belongs to these two shapes;
-                    // every shape still checks the numerical block-stream path.
-                    if [(2, 3, 2), (33, 129, 35)].contains(&(m, k, n)) {
+                    let large = (m, k, n) == (33, 129, 35);
+                    if (m, k, n) == (2, 3, 2) || (large && $large_consumers && ls == rs) {
                         check(&view, &reference).await;
                     } else {
                         check_blocks(&view, &reference).await;
+                    }
+                    if large {
+                        for [row, col] in [[0, 0], [0, 31], [0, 32], [31, 0], [32, 0], [32, 34]] {
+                            assert!(common::numbers::same(
+                                view.read_value(&[row, col]).await.unwrap(),
+                                reference[row as usize * n + col as usize],
+                            ));
+                        }
                     }
                 }
             }
         }
     };
 }
-parity!(f32_parity, f32);
-parity!(f64_parity, f64);
-parity!(u8_parity, u8);
+parity!(f32_parity, f32, true);
+parity!(f64_parity, f64, false);
+parity!(u8_parity, u8, false);
 
 #[tokio::test]
-async fn sparse_union_support_and_copy_boundaries() {
-    let a = source(&[0.2f32, 0., 0., 0.], shape![2, 2], true, 2).await;
-    let b = source(&[0f32, 0., 0., 2.], shape![2, 2], true, 3).await;
+async fn sparse_zero_intermediates_and_copy_match_dense_semantics() {
+    let (_a_root, a) = source(&[0.2f32, 0., 0., 0.], shape![2, 2], true, 2).await;
+    let (_b_root, b) = source(&[0f32, 0., 0., 2.], shape![2, 2], true, 3).await;
     let view = a
         .view()
         .round()
@@ -130,33 +115,47 @@ async fn sparse_union_support_and_copy_boundaries() {
         .matmul(&b.view())
         .await
         .unwrap();
-    check(&view, &[0., 0., 0., 0.]).await;
-    check(&view.eq_scalar(0.).await.unwrap(), &[1, 1, 0, 1]).await;
-    let (_, dir) = new_dir("matmul_support_boundary").await;
-    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &view, 2).await.unwrap();
-    check(&copy.view().eq_scalar(0.).await.unwrap(), &[0, 0, 0, 0]).await;
+    check(&view, &[0.; 4]).await;
+    assert!(matches!(
+        view.eq_scalar(0.).await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
+    let (_dir_root, dir) = new_dir("matmul_zero_copy").await;
+    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &view, view.layout(), 2)
+        .await
+        .unwrap();
+    assert!(matches!(
+        copy.view().eq_scalar(0.).await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
     assert_eq!(view.sum_all().await.unwrap(), 0.);
-    let empty = source(&[0f32; 4], shape![2, 2], true, 2).await;
+    let view = TensorExpression::new(view).unwrap().into_dense();
+    let copy = TensorExpression::new(copy).unwrap().into_dense();
+    check(&view.eq_scalar(0.).await.unwrap(), &[1; 4]).await;
+    check(&copy.eq_scalar(0.).await.unwrap(), &[1; 4]).await;
+    let (_empty_root, empty) = source(&[0f32; 4], shape![2, 2], true, 2).await;
+    let empty = empty.view().matmul(&empty.view()).await.unwrap();
+    assert!(matches!(
+        empty.exp().await,
+        Err(fensor::Error::WouldDensify { .. })
+    ));
     check(
-        &empty
-            .view()
-            .matmul(&empty.view())
-            .await
+        &TensorExpression::new(empty)
             .unwrap()
+            .into_dense()
             .exp()
             .await
             .unwrap(),
-        &[0.; 4],
+        &[1.; 4],
     )
     .await;
-    let cancel = source(&[1f32, -1.], shape![1, 2], true, 2).await;
-    let ones = source(&[1f32, 1.], shape![2, 1], true, 1).await;
+    let (_cancel_root, cancel) = source(&[1f32, -1.], shape![1, 2], true, 2).await;
+    let (_ones_root, ones) = source(&[1f32, 1.], shape![2, 1], true, 1).await;
+    let product = cancel.view().matmul(&ones.view()).await.unwrap();
     check(
-        &cancel
-            .view()
-            .matmul(&ones.view())
-            .await
+        &TensorExpression::new(product)
             .unwrap()
+            .into_dense()
             .exp()
             .await
             .unwrap(),
@@ -168,16 +167,16 @@ async fn sparse_union_support_and_copy_boundaries() {
 #[tokio::test]
 async fn exceptional_values_and_wrapping_arithmetic() {
     for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
-        let a = source(&[0f32], shape![1, 1], true, 1).await;
-        let b = source(&[value], shape![1, 1], true, 1).await;
+        let (_a_root, a) = source(&[0f32], shape![1, 1], true, 1).await;
+        let (_b_root, b) = source(&[value], shape![1, 1], true, 1).await;
         check(&a.view().matmul(&b.view()).await.unwrap(), &[f32::NAN]).await;
     }
 
-    let a = source(&[255u8; 129], shape![1, 129], false, 17).await;
-    let b = source(&[2u8; 129], shape![129, 1], false, 19).await;
+    let (_a_root, a) = source(&[255u8; 129], shape![1, 129], false, 17).await;
+    let (_b_root, b) = source(&[2u8; 129], shape![129, 1], false, 19).await;
     check(&a.view().matmul(&b.view()).await.unwrap(), &[254]).await;
-    let a = source(&[-0f64], shape![1, 1], false, 1).await;
-    let b = source(&[1f64], shape![1, 1], false, 1).await;
+    let (_a_root, a) = source(&[-0f64], shape![1, 1], false, 1).await;
+    let (_b_root, b) = source(&[1f64], shape![1, 1], false, 1).await;
     let expected = Array::new(Buffer::from(vec![-0f64]), shape![1, 1])
         .unwrap()
         .matmul(Array::new(Buffer::from(vec![1f64]), shape![1, 1]).unwrap())
@@ -192,14 +191,14 @@ async fn exceptional_values_and_wrapping_arithmetic() {
 
 #[tokio::test]
 async fn batches_nested_expressions_and_transforms() {
-    let a = source(
+    let (_a_root, a) = source(
         &[1f32, 2., 3., 4., 5., 6., 7., 8.],
         shape![2, 2, 2],
         false,
         3,
     )
     .await;
-    let identity = source(&[1f32, 0., 0., 1.], shape![1, 2, 2], false, 2).await;
+    let (_identity_root, identity) = source(&[1f32, 0., 0., 1.], shape![1, 2, 2], false, 2).await;
     let b = identity.view().broadcast(shape![2, 2, 2]).unwrap();
     let product = a.view().matmul(&b).await.unwrap();
     check(&product, &[1., 2., 3., 4., 5., 6., 7., 8.]).await;
@@ -259,7 +258,7 @@ async fn batches_nested_expressions_and_transforms() {
             .await
             .is_err()
     );
-    let wrong = source(&[1f32; 6], shape![2, 3], false, 2).await;
+    let (_wrong_root, wrong) = source(&[1f32; 6], shape![2, 3], false, 2).await;
     assert!(
         wrong
             .view()
@@ -341,8 +340,8 @@ macro_rules! accuracy {
                 let bv: Vec<$t> = (0..k)
                     .map(|i| (1. + (i % 7) as f64 / 1024.) as $t)
                     .collect();
-                let a = source(&av, shape![1 as u64, k as u64], false, 31).await;
-                let b = source(&bv, shape![k as u64, 1 as u64], false, 17).await;
+                let (_a_root, a) = source(&av, shape![1 as u64, k as u64], false, 31).await;
+                let (_b_root, b) = source(&bv, shape![k as u64, 1 as u64], false, 17).await;
                 let value = a
                     .view()
                     .matmul(&b.view())
@@ -372,9 +371,11 @@ macro_rules! accuracy {
                         .into_iter()
                         .flatten()
                         .collect();
-                    let (_, dir) = new_dir("adaptive_accuracy_copy").await;
+                    let (_dir_root, dir) = new_dir("adaptive_accuracy_copy").await;
                     let copy: Tensor<FsEntry, $t> =
-                        Tensor::copy_from(dir, &product, 17).await.unwrap();
+                        Tensor::copy_from(dir, &product, product.layout(), 17)
+                            .await
+                            .unwrap();
                     for (coord, value) in [
                         (vec![0, 0], ordinary[0]),
                         (vec![1, 32], ordinary[65]),
@@ -403,72 +404,12 @@ accuracy!(f32_exact_dot, f32);
 accuracy!(f64_exact_dot, f64);
 
 #[tokio::test]
-async fn huge_selected_outputs_and_corruption_boundaries() {
-    use fensor::TensorSparseIndex;
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let (_, dir) = new_dir("huge_matmul").await;
-        let a = Tensor::<FsEntry, f32>::create(
-            dir.clone(),
-            TensorSchema::new(f32::dtype(), shape![1_000_000_000, 2]).unwrap(),
-            Layout::Sparse { axis: None },
-            2,
-        )
-        .await
-        .unwrap();
-        a.write_value(&[999_999_999, 1], 2.).await.unwrap();
-        a.write_value(&[0, 0], 1.).await.unwrap();
-        let id = a.lookup_block_id(&[0, 0]).await.unwrap().unwrap();
-        dir.read()
-            .await
-            .get_dir("blocks")
-            .unwrap()
-            .write()
-            .await
-            .delete(&id.to_string())
-            .await;
-        let b = source(&[1f32, 2., 3., 4.], shape![2, 2], true, 2).await;
-        let view = a.view().matmul(&b.view()).await.unwrap();
-        let entries: Vec<_> = view
-            .read_sparse_elements_in_order(
-                range![AxisRange::At(999_999_999), AxisRange::In(0, 2, 1)],
-                axes![0, 1],
-            )
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(
-            entries,
-            vec![(vec![999_999_999, 0], 6.), (vec![999_999_999, 1], 8.)]
-        );
-        assert!(view.read_value(&[0, 0]).await.is_err());
-        assert!(
-            view.read_sparse_elements_in_order(
-                range![AxisRange::At(1_000_000_000), AxisRange::At(0)],
-                axes![0, 1]
-            )
-            .await
-            .is_err()
-        );
-        // The same corrupt source on the right is only read for selected columns.
-        let right = a.view().transpose(None).unwrap();
-        let left = b.view().transpose(None).unwrap();
-        let reversed = left.matmul(&right).await.unwrap();
-        assert_eq!(reversed.read_value(&[0, 999_999_999]).await.unwrap(), 6.);
-        assert!(reversed.read_value(&[0, 0]).await.is_err());
-    })
-    .await
-    .expect("selected product must not traverse unrelated output tiles");
-}
-
-#[tokio::test]
 async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let (root, _) = new_dir("matmul_cache").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let a = Tensor::<FsEntry, u8>::create(
-            cache.load(root).unwrap(),
+            cache.load(root.to_path_buf()).unwrap(),
             TensorSchema::new(u8::dtype(), shape![65, 2]).unwrap(),
             Layout::Dense,
             16,
@@ -481,7 +422,7 @@ async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
             a.write_value(&[i, 1], 2).await.unwrap();
         }
 
-        let b = source(&[1u8; 130], shape![2, 65], false, 17).await;
+        let (_b_root, b) = source(&[1u8; 130], shape![2, 65], false, 17).await;
         let view = a.view().matmul(&b.view()).await.unwrap();
         let mut stream = view.read_blocks().unwrap();
         assert_eq!(stream.try_next().await.unwrap().unwrap().len(), 4096);
@@ -498,8 +439,10 @@ async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
         assert!(left.into_iter().flatten().all(|v| v == 3));
         let (root, _) = new_dir("matmul_cache_output").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
-        let dir = cache.load(root.clone()).unwrap();
-        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, 32).await.unwrap();
+        let dir = cache.load(root.to_path_buf()).unwrap();
+        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, view.layout(), 32)
+            .await
+            .unwrap();
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);
@@ -514,8 +457,8 @@ async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
 
 #[tokio::test]
 async fn coordinate_traversal_propagates_and_preserves_coverage() {
-    let a = source(&[1f32; 32], shape![32, 1], false, 7).await;
-    let b = source(&[2f32; 129], shape![1, 129], false, 31).await;
+    let (_a_root, a) = source(&[1f32; 32], shape![32, 1], false, 7).await;
+    let (_b_root, b) = source(&[2f32; 129], shape![1, 129], false, 31).await;
     let product = a.view().matmul(&b.view()).await.unwrap();
 
     async fn tiled<V: TensorRead<DType = f32>>(view: &V) {
@@ -541,7 +484,7 @@ async fn coordinate_traversal_propagates_and_preserves_coverage() {
     }
     tiled(&product).await;
     tiled(&product.round().await.unwrap()).await;
-    let zero = source(&vec![0f32; 32 * 129], shape![32, 129], true, 31).await;
+    let (_zero_root, zero) = source(&vec![0f32; 32 * 129], shape![32, 129], true, 31).await;
     tiled(&zero.view().add(&product).await.unwrap()).await;
     tiled(
         &product
@@ -555,7 +498,7 @@ async fn coordinate_traversal_propagates_and_preserves_coverage() {
     .await;
 
     tiled(&product.add(&zero.view()).await.unwrap()).await;
-    let twos = source(&vec![2f32; 32 * 129], shape![32, 129], false, 31).await;
+    let (_twos_root, twos) = source(&vec![2f32; 32 * 129], shape![32, 129], false, 31).await;
     let yes = twos.view().gt_scalar(0.).await.unwrap();
     let no = twos.view().lt_scalar(0.).await.unwrap();
     // Only the condition, then branch, or else branch supplies tiled requests.

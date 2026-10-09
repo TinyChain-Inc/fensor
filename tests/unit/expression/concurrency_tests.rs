@@ -5,10 +5,9 @@ use std::sync::Mutex;
 use futures::{TryStreamExt, channel::oneshot};
 use number_general::DType;
 
-use crate::test_support::{self, FsEntry, counters::Counter};
-use crate::{TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
-
 use super::*;
+use crate::test_support::{self, FsEntry, counters::Counter};
+use crate::{Layout, TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
 
 struct Source<'a, T: TensorElement>
 where
@@ -49,17 +48,18 @@ where
     }
 }
 
-impl<T: TensorElement> Expression for Source<'_, T>
+impl<T: TensorElement> crate::expression::traversal::Plan for Source<'_, T>
 where
     FsEntry: TensorFileEntry<T>,
 {
-    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<RequestIterator>> {
-        Ok(Some(Box::new(crate::schema::row_major_coords(shape)?.map(
-            |coord| BatchRequest::explicit(vec![coord]).unwrap(),
+    fn preferred_step<'a>(&'a self, shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
+        Ok(traversal::Preferred::Ready(Some(Box::new(
+            crate::schema::row_major_coords(shape)?
+                .map(|coord| BatchRequest::explicit(vec![coord]).unwrap()),
         ))))
     }
 
-    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
+    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
         // Test-only singleton batches preserve the validated slice selection.
         let requests = slice.requests().flat_map(|request| {
             request
@@ -68,10 +68,21 @@ where
                 .into_iter()
                 .map(|coord| BatchRequest::explicit(vec![coord]))
         });
-        Ok(futures::stream::iter(requests).boxed())
+        Ok(traversal::Selection::Ready(
+            futures::stream::iter(requests).boxed(),
+        ))
     }
+}
 
-    fn build<'a>(&'a self, request: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<T>>> {
+impl<T: TensorElement> Expression for Source<'_, T>
+where
+    FsEntry: TensorFileEntry<T>,
+{
+    fn build<'a>(
+        &'a self,
+        context: super::Context<'a>,
+        request: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<T>>> {
         Box::pin(async move {
             let index = self.started.increment();
             let _finished = Finish(&self.finished);
@@ -81,7 +92,8 @@ where
             } else if self.fail_at == Some(index) {
                 return Err(Error::Unsupported("injected later batch failure".into()));
             }
-            let batch = self.tensor.build(request).await?;
+
+            let batch = self.tensor.build(context, request).await?;
             self.completed.increment();
             Ok(batch)
         })
@@ -142,10 +154,16 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             .unwrap();
     }
 
-    for cancel in [false, true] {
+    for (owned, cancel) in [(false, false), (false, true), (true, false), (true, true)] {
         let (source, release) = delayed(&tensor);
+        let source = std::sync::Arc::new(source);
+        let weak = std::sync::Arc::downgrade(&source);
         let requests = (0..count).map(|i| BatchRequest::explicit(vec![vec![i as u64]]).unwrap());
-        let mut stream = ordered_batches(&source, requests);
+        let mut stream = if owned {
+            ordered_requests(source.clone(), futures::stream::iter(requests.map(Ok)))
+        } else {
+            ordered_batches(&*source, requests)
+        };
         // Tokio's cooperative I/O budget may yield before the window finishes.
         futures::future::poll_fn(|cx| {
             assert!(stream.as_mut().poll_next(cx).is_pending());
@@ -169,6 +187,7 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             );
         } else {
             release.send(Ok(())).unwrap();
+
             for i in 0..count {
                 let (_, batch) = stream.try_next().await.unwrap().unwrap();
                 assert_eq!(batch.values, vec![(i % 255) as u8]);
@@ -176,7 +195,13 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             assert!(stream.try_next().await.unwrap().is_none());
             assert_eq!(source.started.read(), count as u64);
             assert_eq!(source.finished.read(), count as u64);
+            drop(stream);
         }
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "stream retained its source after drop"
+        );
     }
 
     test_support::cleanup(&root).await;
@@ -186,7 +211,7 @@ async fn stored<T: TensorElement>(
     name: &str,
     values: &[T],
     sparse: bool,
-) -> (std::path::PathBuf, Tensor<FsEntry, T>)
+) -> (crate::test_support::Directory, Tensor<FsEntry, T>)
 where
     FsEntry: TensorFileEntry<T>,
 {
@@ -218,6 +243,7 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
     let count = num_cpus::get().max(2) + 3;
     let values: Vec<_> = (0..count).map(|i| (i % 255) as u8).collect();
     let (root, tensor) = stored("unordered_slots", &values, false).await;
+
     for window in [1, 2, num_cpus::get().max(1)] {
         let (source, release) = delayed(&tensor);
         let requests = (0..count).map(|i| BatchRequest::explicit(vec![vec![i as u64]]));
@@ -246,6 +272,7 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
             assert!(stream.next().now_or_never().is_none());
         }
         release.send(Ok(())).unwrap();
+
         while let Some((request, batch)) = stream.try_next().await.unwrap() {
             let index = request.into_coordinates(source.shape()).unwrap()[0][0] as usize;
             assert_eq!(batch.values, vec![values[index]]);
@@ -296,6 +323,7 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(pairs.len(), count);
+
         for (i, (coord, value)) in pairs.into_iter().enumerate() {
             assert_eq!(coord, vec![i as u64]);
             assert_eq!(value, values[i]);
@@ -375,6 +403,7 @@ async fn numeric_terminals_accept_completion_schedules() {
 
     for sparse in [false, true] {
         let (root, tensor) = stored("unordered_integer", &[255u8, 2, 3], sparse).await;
+
         for release_first in [false, true] {
             for (operation, expected) in [4, 250, 2, 255].into_iter().enumerate() {
                 let (source, release) = delayed(&tensor);
@@ -399,10 +428,12 @@ async fn numeric_terminals_accept_completion_schedules() {
     let scale = values.iter().map(|v| v.abs()).sum::<f64>();
     let ku = 8. * values.len() as f64 * (f64::EPSILON / 2.);
     let (root, tensor) = stored("unordered_float", &values, false).await;
+
     for release_first in [false, true] {
         let (source, release) = delayed(&tensor);
         let actual = scheduled(&source, release, 0, release_first).await.unwrap();
         assert!((actual - exact.to_f64().unwrap()).abs() <= ku / (1. - ku) * scale);
+
         for (operation, expected) in [(2, -1e16), (3, 1e16)] {
             let (source, release) = delayed(&tensor);
             assert_eq!(
@@ -422,6 +453,7 @@ async fn numeric_terminals_accept_completion_schedules() {
         [1., f32::NAN, f32::INFINITY],
     ] {
         let (root, tensor) = stored("unordered_float_edges", &values, false).await;
+
         for release_first in [false, true] {
             for operation in 0..4 {
                 let (source, release) = delayed(&tensor);
@@ -440,4 +472,24 @@ async fn numeric_terminals_accept_completion_schedules() {
         }
         test_support::cleanup(&root).await;
     }
+}
+
+#[tokio::test]
+async fn owned_stream_error_releases_pending_evaluation_on_drop() {
+    let (root, tensor) = stored("owned_error", &[1u8, 2], false).await;
+    let (source, release) = delayed(&tensor);
+    let source = std::sync::Arc::new(source);
+    let weak = std::sync::Arc::downgrade(&source);
+    let requests = futures::stream::iter([Ok(BatchRequest::point(&[0]))]);
+    let mut stream = ordered_requests(source, requests);
+    release
+        .send(Err(Error::InvalidLayout("test read failure".into())))
+        .unwrap();
+    assert!(matches!(
+        stream.try_next().await,
+        Err(Error::InvalidLayout(_))
+    ));
+    drop(stream);
+    assert!(weak.upgrade().is_none());
+    test_support::cleanup(&root).await;
 }
