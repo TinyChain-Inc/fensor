@@ -492,6 +492,8 @@ impl TensorGeometry for CompactSource<'_> {
     }
 }
 
+impl crate::expression::traversal::Plan for CompactSource<'_> {}
+
 impl crate::expression::Expression for CompactSource<'_> {
     fn build<'a>(
         &'a self,

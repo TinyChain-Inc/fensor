@@ -142,6 +142,49 @@ where
     }
 }
 
+impl<C, L, R> crate::expression::traversal::Plan for WhereView<C, L, R>
+where
+    C: Expression<DType = u8>,
+    L: Expression,
+    R: Expression<DType = L::DType>,
+    L::DType: TensorElement,
+{
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Selection<'_>> {
+        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
+    }
+
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+        }
+
+        let condition_slice = slice.clone();
+        let then_slice = slice.clone();
+        Ok(expression::traversal::Ordered::Sources(vec![
+            (&self.condition, condition_slice),
+            (&self.then, then_slice),
+            (&self.or_else, slice),
+        ]))
+    }
+
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
+        Ok(expression::traversal::Preferred::Sources(vec![
+            (&self.condition, shape),
+            (&self.then, shape),
+            (&self.or_else, shape),
+        ]))
+    }
+}
+
 impl<C, L, R> Expression for WhereView<C, L, R>
 where
     C: Expression<DType = u8>,
@@ -165,41 +208,6 @@ where
         self.condition.detach_sources(pending);
         self.then.detach_sources(pending);
         self.or_else.detach_sources(pending);
-    }
-
-    fn selection_step(
-        &self,
-        slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Selection<'_>> {
-        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
-    }
-
-    fn ordered_step(
-        &self,
-        slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Ordered<'_>> {
-        if matches!(self.layout(), Layout::Dense) {
-            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
-        }
-
-        let condition_slice = slice.clone();
-        let then_slice = slice.clone();
-        Ok(expression::traversal::Ordered::Sources(vec![
-            Box::new(move || self.condition.ordered_step(condition_slice)),
-            Box::new(move || self.then.ordered_step(then_slice)),
-            Box::new(move || self.or_else.ordered_step(slice)),
-        ]))
-    }
-
-    fn preferred_step<'a>(
-        &'a self,
-        shape: &'a [u64],
-    ) -> Result<expression::traversal::Preferred<'a>> {
-        Ok(expression::traversal::Preferred::Sources(vec![
-            Box::new(move || self.condition.preferred_step(shape)),
-            Box::new(move || self.then.preferred_step(shape)),
-            Box::new(move || self.or_else.preferred_step(shape)),
-        ]))
     }
 
     fn build<'a>(

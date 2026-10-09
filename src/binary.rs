@@ -282,6 +282,46 @@ where
     }
 }
 
+impl<L, R, O> crate::expression::traversal::Plan for BinaryView<L, R, O>
+where
+    L: Expression,
+    R: Expression<DType = L::DType>,
+    L::DType: TensorElement,
+    O: BinaryOp<L::DType>,
+{
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Selection<'_>> {
+        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
+    }
+
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        if matches!(self.layout(), Layout::Dense) {
+            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+        }
+
+        let left_slice = slice.clone();
+        Ok(expression::traversal::Ordered::Sources(vec![
+            (&self.left, left_slice),
+            (&self.right, slice),
+        ]))
+    }
+
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
+        Ok(expression::traversal::Preferred::Sources(vec![
+            (&self.left, shape),
+            (&self.right, shape),
+        ]))
+    }
+}
+
 impl<L, R, O> Expression for BinaryView<L, R, O>
 where
     L: Expression,
@@ -303,38 +343,6 @@ where
     fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
         self.left.detach_sources(pending);
         self.right.detach_sources(pending);
-    }
-
-    fn selection_step(
-        &self,
-        slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Selection<'_>> {
-        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
-    }
-
-    fn ordered_step(
-        &self,
-        slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Ordered<'_>> {
-        if matches!(self.layout(), Layout::Dense) {
-            return Ok(expression::traversal::Ordered::Ready(slice.stream()));
-        }
-
-        let left_slice = slice.clone();
-        Ok(expression::traversal::Ordered::Sources(vec![
-            Box::new(move || self.left.ordered_step(left_slice)),
-            Box::new(move || self.right.ordered_step(slice)),
-        ]))
-    }
-
-    fn preferred_step<'a>(
-        &'a self,
-        shape: &'a [u64],
-    ) -> Result<expression::traversal::Preferred<'a>> {
-        Ok(expression::traversal::Preferred::Sources(vec![
-            Box::new(move || self.left.preferred_step(shape)),
-            Box::new(move || self.right.preferred_step(shape)),
-        ]))
     }
 
     fn build<'a>(

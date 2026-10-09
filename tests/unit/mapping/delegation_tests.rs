@@ -32,6 +32,8 @@ impl TensorGeometry for Operand {
     }
 }
 
+impl crate::expression::traversal::Plan for Operand {}
+
 impl Expression for Operand {
     fn build<'a>(
         &'a self,

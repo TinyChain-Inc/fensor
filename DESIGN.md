@@ -93,27 +93,18 @@ then suspend the driver normally. Operand requests remain sequential inside a
 batch. Batch construction completes numerical operations with ha-ndarray's
 `into_read`, retaining a native bounded buffer and its platform rather than an
 unbounded backend chain. Host-value construction uses its already completed
-buffer directly. The driver attaches a private batch reservation; concrete
-operations do not manage admission bookkeeping. Owned mappings and diagonal
-projection forward completed batches without another numerical realization.
-Only value consumers convert results to host values.
+buffer directly. Owned mappings and diagonal projection forward completed batches
+without another numerical realization. Only value consumers convert results to host values.
 
-Frames retain bounded requests and any completed sibling batches until their
-parent finishes. Their allocation is checked independently of batch cardinality,
-with a private frame limit. The driver separately admits batch payload bytes,
-charging dtype width before submitting each child. Outputs are
-reserved conservatively while their inputs remain live, and the charge follows
-a returned batch until it is consumed or dropped. This bounds retained siblings
-independently of expression depth. Tokio owned semaphore permits account for
-admitted bytes and return capacity when batches are dropped, including cancellation
-and unwinding. Acquisition is
-nonblocking: waiting for capacity while retaining intermediate results could
-prevent those results from being released. The semaphore is independent of
-pending evaluation frames because completed batches can outlive the driver.
-Numerical kernels and conversion scratch are bounded separately by a fixed
-multiple of the execution batch; this admission
-is not a total-process memory guarantee. Runtime expression construction also checks retained
-description size; repeated shared operands count at each occurrence. These are
+Frames retain bounded requests and completed sibling batches until their parent
+finishes. Their allocation is checked independently of batch cardinality, with a
+private frame limit. Numerical kernels and conversion scratch are bounded by a
+fixed multiple of the execution batch. There is no aggregate intermediate-payload
+admission limit: retained numerical memory can grow with expression structure even
+though each batch is bounded. Rust ownership releases these buffers on completion,
+error, or cancellation; Tokio cooperation controls scheduling, not memory use.
+Runtime expression construction also checks retained description size; repeated
+shared operands count at each occurrence. These are
 resource limits, not assumptions about a safe machine-stack depth. Metadata at
 owned value boundaries is retained directly, so inspecting dtype, layout, or
 shape does not descend through runtime composition.
@@ -131,9 +122,9 @@ child task, nested executor, or recursive evaluation fallback.
 ## Request providers and concurrency
 
 Expression methods provide actual bounded request iterators, not strategy tags.
-Concrete expressions implement shallow `preferred_step`, `ordered_step`, and
+A private, dtype-independent planning interface provides shallow `preferred_step`, `ordered_step`, and
 `selection_step` hooks. A shared bounded walker consumes preferred and ordered
-hooks left to right;
+hooks left to right, following borrowed operands and their request arguments;
 default hooks return a leaf result without reentering traversal. Preferred traversal
 returns an iterator or no preference. Matrix products
 generate tiles for the consuming expression's current shape, using linear requests
@@ -142,7 +133,7 @@ conditionals consult condition, then, else. The first iterator or error ends the
 search. Geometric sources and reductions have no preference, so their consumers
 generate linear requests. Reduction output remains a traversal boundary even over
 a matrix source. Output mappings are independent of request traversal. The walker
-owns deferred-child ordering, fallible stack allocation, and the
+owns borrowed-child ordering, fallible stack allocation, and the
 expression traversal limit. Its consumers retain first-provider selection and
 ordered union respectively; single-child selection remains an explicit loop.
 Concrete operations own mathematics, native storage owns address discovery,
@@ -157,7 +148,7 @@ coordinate cursor per leaf, plus one output batch. Each cursor supplies row-majo
 positions to collate's flat ordered union; only distinct output positions become
 coordinates. Implicit requests retain compact metadata, and explicit requests
 retain their caller-provided bounded coordinates. Request metadata and rank-sized
-scratch scale with admitted leaf count, separately from numerical payload admission.
+scratch scale with the bounded leaf count, separately from numerical payloads.
 Both union polling and empty-request traversal yield cooperatively.
 
 Borrowed and owned block streams share request selection and ordered consumption;
@@ -353,7 +344,6 @@ do not couple independent bounds.
 |---|---|---:|
 | Execution elements / Fourier axis length | `expression::MAX_BATCH_ELEMENTS` | 4096 |
 | Active evaluation frames | `expression::driver::MAX_FRAMES` | 16384 |
-| Admitted batch payload bytes per driver | `expression::driver::MAX_LIVE_BATCH_BYTES` | 16 MiB |
 | Runtime description admission / planning steps | `expression::traversal::MAX_EXPRESSION_NODES` | 65536 |
 | Sparse-index page entries | `tensor::SPARSE_INDEX_PAGE_ENTRIES` | 4096 |
 | Values per storage block | `schema::MAX_BLOCK_CAPACITY` | 4096 |

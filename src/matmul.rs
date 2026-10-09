@@ -453,6 +453,26 @@ fn combine_partial<T: TensorElement>(
     Ok(())
 }
 
+impl<L, R> crate::expression::traversal::Plan for MatMulView<L, R>
+where
+    L: Expression,
+    R: Expression<DType = L::DType>,
+    L::DType: TensorElement,
+{
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
+        let requests: expression::RequestIterator = if shape.len() < 2 {
+            Box::new(request::linear_requests(shape)?)
+        } else {
+            Box::new(request::tiled_requests(shape)?)
+        };
+
+        Ok(expression::traversal::Preferred::Ready(Some(requests)))
+    }
+}
+
 impl<L, R> Expression for MatMulView<L, R>
 where
     L: Expression,
@@ -469,19 +489,6 @@ where
     fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
         self.left.detach_sources(pending);
         self.right.detach_sources(pending);
-    }
-
-    fn preferred_step<'a>(
-        &'a self,
-        shape: &'a [u64],
-    ) -> Result<expression::traversal::Preferred<'a>> {
-        let requests: expression::RequestIterator = if shape.len() < 2 {
-            Box::new(request::linear_requests(shape)?)
-        } else {
-            Box::new(request::tiled_requests(shape)?)
-        };
-
-        Ok(expression::traversal::Preferred::Ready(Some(requests)))
     }
 
     fn build<'a>(

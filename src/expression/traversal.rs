@@ -1,4 +1,4 @@
-//! Shallow expression traversal. Deferred steps retain borrows, never nested consumers.
+//! Shallow expression traversal. Steps borrow operands, never nested consumers.
 
 use std::sync::Arc;
 use std::task::{Poll, ready};
@@ -12,21 +12,37 @@ use crate::schema::Coord;
 use crate::slice::{Requests, Slice};
 use crate::{Error, Result, TensorElement};
 
-pub type Deferred<'a, T> = Box<dyn FnOnce() -> Result<T> + Send + 'a>;
+/// Address discovery is independent of the numerical dtype. Borrowed children
+/// let planning remain iterative before the evaluation trampoline starts.
+pub trait Plan: Send + Sync {
+    /// Describe one preferred-request step for the consumer's logical shape.
+    /// None leaves request selection to another source or the consumer.
+    fn preferred_step<'a>(&'a self, _shape: &'a [u64]) -> Result<Preferred<'a>> {
+        Ok(Preferred::Ready(None))
+    }
 
-/// Deferred children are visited left to right without recursive calls.
-/// Planning must also be stack-safe before the evaluation trampoline starts.
-pub enum Step<'a, T> {
-    Ready(T),
-    Sources(Vec<Deferred<'a, Step<'a, T>>>),
+    /// Describe ordered occupied-request candidates, independent of numerical values.
+    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<Ordered<'_>> {
+        Ok(Ordered::Ready(slice.stream()))
+    }
+
+    /// Describe one selection step; native readers may retain storage order.
+    fn selection_step(&self, slice: crate::slice::Slice) -> Result<Selection<'_>> {
+        Ok(Selection::Ready(slice.stream()))
+    }
 }
 
-pub type Preferred<'a> = Step<'a, Option<RequestIterator>>;
-pub type Ordered<'a> = Step<'a, Requests<'static>>;
+pub enum Step<'a, I, T> {
+    Ready(T),
+    Sources(Vec<(&'a dyn Plan, I)>),
+}
+
+pub type Preferred<'a> = Step<'a, &'a [u64], Option<RequestIterator>>;
+pub type Ordered<'a> = Step<'a, Slice, Requests<'static>>;
 
 pub enum Selection<'a> {
     Ready(Requests<'a>),
-    Source(Deferred<'a, Selection<'a>>),
+    Source(&'a dyn Plan, Slice),
 }
 
 /// Runtime descriptions and candidate-planning work are bounded independently of batch width.
@@ -56,18 +72,17 @@ fn reserve<T>(items: &mut Vec<T>, additional: usize) -> Result<()> {
 }
 
 /// Stop at the first leaf accepted by the consumer, or visit every leaf.
-fn walk<'a, T, R>(
-    root: Deferred<'a, Step<'a, T>>,
+fn walk<'a, I, T, R>(
+    mut step: Step<'a, I, T>,
+    mut advance: impl FnMut(&'a dyn Plan, I) -> Result<Step<'a, I, T>>,
     mut consume: impl FnMut(T) -> Result<Option<R>>,
 ) -> Result<Option<R>> {
     let mut pending = Vec::new();
-    reserve(&mut pending, 1)?;
-    pending.push(root);
     let mut visited = 0;
+    visit(&mut visited)?;
 
-    while let Some(next) = pending.pop() {
-        visit(&mut visited)?;
-        match next()? {
+    loop {
+        match step {
             Step::Ready(value) => {
                 if let Some(result) = consume(value)? {
                     return Ok(Some(result));
@@ -78,9 +93,13 @@ fn walk<'a, T, R>(
                 pending.extend(children.into_iter().rev());
             }
         }
-    }
 
-    Ok(None)
+        let Some((source, input)) = pending.pop() else {
+            return Ok(None);
+        };
+        visit(&mut visited)?;
+        step = advance(source, input)?;
+    }
 }
 
 pub fn preferred<'a, E: Expression + ?Sized>(
@@ -90,7 +109,11 @@ pub fn preferred<'a, E: Expression + ?Sized>(
 where
     E::DType: TensorElement,
 {
-    walk(Box::new(move || source.preferred_step(shape)), Ok)
+    walk(
+        source.preferred_step(shape)?,
+        |source, shape| source.preferred_step(shape),
+        Ok,
+    )
 }
 
 pub fn selection<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Requests<'_>>
@@ -104,7 +127,7 @@ where
         visit(&mut visited)?;
         step = match step {
             Selection::Ready(requests) => return Ok(requests),
-            Selection::Source(next) => next()?,
+            Selection::Source(source, slice) => source.selection_step(slice)?,
         };
     }
 }
@@ -114,11 +137,15 @@ where
     E::DType: TensorElement,
 {
     let mut streams = Vec::new();
-    walk(Box::new(move || source.ordered_step(slice)), |stream| {
-        reserve(&mut streams, 1)?;
-        streams.push(stream);
-        Ok(None::<()>)
-    })?;
+    walk(
+        source.ordered_step(slice)?,
+        |source, slice| source.ordered_step(slice),
+        |stream| {
+            reserve(&mut streams, 1)?;
+            streams.push(stream);
+            Ok(None::<()>)
+        },
+    )?;
 
     if streams.len() == 1 {
         return Ok(streams.pop().expect("one candidate stream"));

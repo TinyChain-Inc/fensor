@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, ready};
 
 use futures::channel::oneshot;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::coop;
 
 use super::{Batch, EvaluatedBatch, Expression};
@@ -19,46 +18,15 @@ use crate::{BoxFuture, Error, Result, TensorElement};
 
 // Bounds continuation storage independently of the numerical batch bound.
 const MAX_FRAMES: usize = 16_384;
-const MAX_LIVE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 type Frame<'a> = BoxFuture<'a, ()>;
 
 #[derive(Clone)]
 pub struct Context<'a> {
     pending: Arc<Mutex<Option<Frame<'a>>>>,
-    // Intermediate arrays are outside the filesystem cache and may outlive frames.
-    // Owned permits bound their combined size and refund capacity on cancellation.
-    budget: Arc<Semaphore>,
 }
 
 impl<'a> Context<'a> {
-    fn reserve<T: TensorElement>(&self, len: usize) -> Result<OwnedSemaphorePermit> {
-        let bytes = len
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| Error::Unsupported("expression batch allocation overflow".into()))?;
-
-        if bytes > MAX_LIVE_BATCH_BYTES {
-            return Err(Error::Unsupported(
-                "expression live batch limit exceeded".into(),
-            ));
-        }
-
-        let permits = u32::try_from(bytes)
-            .map_err(|_| Error::Unsupported("expression batch allocation overflow".into()))?;
-        // Waiting could deadlock: retained operands may be released only after
-        // this operation finishes, so admission must reject immediately.
-        Arc::clone(&self.budget)
-            .try_acquire_many_owned(permits)
-            .map_err(|cause| match cause {
-                TryAcquireError::NoPermits => {
-                    Error::Unsupported("expression live batch limit exceeded".into())
-                }
-                TryAcquireError::Closed => {
-                    Error::InvalidLayout("expression admission closed".into())
-                }
-            })
-    }
-
     pub async fn batch<E>(
         &self,
         source: &'a E,
@@ -70,13 +38,11 @@ impl<'a> Context<'a> {
     {
         request.validate(source.shape())?;
         let expected = request.len();
-        let reservation = self.reserve::<E::DType>(expected)?;
         let (send, receive) = oneshot::channel();
         let context = self.clone();
         let frame = Box::pin(async move {
-            let result = source.build(context, request).await.and_then(|mut batch| {
+            let result = source.build(context, request).await.and_then(|batch| {
                 batch.validate(expected)?;
-                batch._reservation = Some(reservation);
                 Ok(batch)
             });
             let _ = send.send(result);
@@ -122,7 +88,6 @@ where
     let request = Arc::new(request.clone());
     let context = Context {
         pending: Arc::new(Mutex::new(None)),
-        budget: Arc::new(Semaphore::new(MAX_LIVE_BATCH_BYTES)),
     };
 
     let root_context = context.clone();

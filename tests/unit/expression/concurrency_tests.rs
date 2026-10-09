@@ -48,7 +48,7 @@ where
     }
 }
 
-impl<T: TensorElement> Expression for Source<'_, T>
+impl<T: TensorElement> crate::expression::traversal::Plan for Source<'_, T>
 where
     FsEntry: TensorFileEntry<T>,
 {
@@ -72,7 +72,12 @@ where
             futures::stream::iter(requests).boxed(),
         ))
     }
+}
 
+impl<T: TensorElement> Expression for Source<'_, T>
+where
+    FsEntry: TensorFileEntry<T>,
+{
     fn build<'a>(
         &'a self,
         context: super::Context<'a>,

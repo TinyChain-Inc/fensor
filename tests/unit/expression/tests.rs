@@ -26,7 +26,7 @@ impl TensorGeometry for Provider<'_> {
     }
 }
 
-impl Expression for Provider<'_> {
+impl crate::expression::traversal::Plan for Provider<'_> {
     fn preferred_step<'a>(&'a self, shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
         self.calls.increment();
         (self.provide)(shape).map(traversal::Preferred::Ready)
@@ -41,7 +41,9 @@ impl Expression for Provider<'_> {
             },
         ))
     }
+}
 
+impl Expression for Provider<'_> {
     fn build<'a>(
         &'a self,
         context: Context<'a>,
@@ -296,15 +298,7 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
             .collect();
         crate::read_metrics::CURRENT
             .scope(Default::default(), async {
-                let output = sparse_elements(
-                    request,
-                    EvaluatedBatch {
-                        _reservation: None,
-                        values,
-                    },
-                    &shape,
-                )
-                .unwrap();
+                let output = sparse_elements(request, EvaluatedBatch { values }, &shape).unwrap();
                 crate::read_metrics::CURRENT.with(|m| {
                     assert_eq!(m.borrow().expanded_coordinates, 0, "{name}");
                 });
@@ -333,7 +327,6 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
 #[test]
 fn sparse_output_rejects_mismatched_values_and_invalid_requests() {
     let batch = EvaluatedBatch {
-        _reservation: None,
         values: vec![1u8, 2],
     };
     assert!(matches!(
@@ -350,7 +343,6 @@ fn sparse_output_rejects_mismatched_values_and_invalid_requests() {
         .unwrap(),
     ] {
         let batch = EvaluatedBatch {
-            _reservation: None,
             values: vec![0u8; request.len()],
         };
         assert!(matches!(
@@ -395,13 +387,9 @@ fn malformed_batches_fail_closed() {
     assert!(Batch::from_array(ArrayAccess::from(oversized)).is_err());
     let batch = Batch::from_values(vec![1u8, 2]).unwrap();
     assert!(batch.validate(1).is_err());
-    let evaluated = EvaluatedBatch {
-        _reservation: None,
-        values: vec![1u8],
-    };
+    let evaluated = EvaluatedBatch { values: vec![1u8] };
     assert!(evaluated.validate(2).is_err());
     let evaluated = EvaluatedBatch {
-        _reservation: None,
         values: vec![0u8; MAX_BATCH_ELEMENTS + 1],
     };
     assert!(evaluated.validate(MAX_BATCH_ELEMENTS + 1).is_err());

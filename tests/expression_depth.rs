@@ -121,12 +121,16 @@ async fn exercise(case: &str) {
         }
         drop(leaf);
         let mut stream = expression.into_blocks().unwrap();
-        assert!(matches!(stream.try_next().await,
-            Err(fensor::Error::Unsupported(message)) if message.contains("live batch limit")));
+        let values = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(values.len(), 4096);
+        for pair in values.as_chunks::<2>().0 {
+            assert_eq!(*pair, [0., -2050.]);
+        }
+        assert!(stream.try_next().await.unwrap().is_none());
         drop(stream);
         assert!(
             weak.upgrade().is_none(),
-            "batch admission failure retained its source"
+            "completed wide expression retained its source"
         );
         eprintln!("completed {case}");
         return;

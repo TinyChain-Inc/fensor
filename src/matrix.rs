@@ -140,6 +140,13 @@ impl<S: TensorGeometry> TensorViewSemantics for DiagView<S> {
     }
 }
 
+impl<S> crate::expression::traversal::Plan for DiagView<S>
+where
+    S: Expression,
+    S::DType: TensorElement,
+{
+}
+
 impl<S> Expression for DiagView<S>
 where
     S: Expression,

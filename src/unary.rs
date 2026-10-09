@@ -364,6 +364,43 @@ where
     crate::mapping::transform_methods!(operands: source; preserve_rest);
 }
 
+impl<S, O> crate::expression::traversal::Plan for UnaryView<S, O>
+where
+    S: Expression,
+    S::DType: TensorElement,
+    O: UnaryOp<S::DType>,
+{
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Selection<'_>> {
+        Ok(expression::traversal::Selection::Source(
+            &self.source,
+            slice,
+        ))
+    }
+
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+    ) -> Result<expression::traversal::Ordered<'_>> {
+        Ok(expression::traversal::Ordered::Sources(vec![(
+            &self.source,
+            slice,
+        )]))
+    }
+
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+    ) -> Result<expression::traversal::Preferred<'a>> {
+        Ok(expression::traversal::Preferred::Sources(vec![(
+            &self.source,
+            shape,
+        )]))
+    }
+}
+
 impl<S, O> Expression for UnaryView<S, O>
 where
     S: Expression,
@@ -380,33 +417,6 @@ where
 
     fn detach_sources(&mut self, pending: &mut Vec<Box<dyn crate::owned::Drain>>) {
         self.source.detach_sources(pending);
-    }
-
-    fn selection_step(
-        &self,
-        slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Selection<'_>> {
-        Ok(expression::traversal::Selection::Source(Box::new(
-            move || self.source.selection_step(slice),
-        )))
-    }
-
-    fn ordered_step(
-        &self,
-        slice: crate::slice::Slice,
-    ) -> Result<expression::traversal::Ordered<'_>> {
-        Ok(expression::traversal::Ordered::Sources(vec![Box::new(
-            move || self.source.ordered_step(slice),
-        )]))
-    }
-
-    fn preferred_step<'a>(
-        &'a self,
-        shape: &'a [u64],
-    ) -> Result<expression::traversal::Preferred<'a>> {
-        Ok(expression::traversal::Preferred::Sources(vec![Box::new(
-            move || self.source.preferred_step(shape),
-        )]))
     }
 
     fn build<'a>(

@@ -36,9 +36,9 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Sequential copy backpressure, drop/error cancellation | `copy_pipeline` with a held filesystem block guard |
 | Ordered batch completion and concurrency bound | Expression unit `buffered_batches_are_bounded_ordered_and_cancelled_by_drop` for borrowed and owned handles |
 | Completion-order progress, slot replenishment, one-slot window, pairing and cancellation | Expression unit `completion_order_replenishes_slots_and_preserves_pairs` |
-| Dynamic expression depth on normal worker stacks, shared operands, sparse values, failed transforms, cancellation/error and unpolled-drop source release | `expression_depth` isolated subprocesses in default and complex suites; also run the target in release |
+| Dynamic expression depth on normal worker stacks, wide-expression numerical completion, shared operands, sparse values, failed transforms, cancellation/error and unpolled-drop source release | `expression_depth` isolated subprocesses in default and complex suites; also run the target in release |
 | Wide sparse candidate merging, high-rank compact request retention, duplicates, empty requests, EOF/error/cancellation cleanup | Expression traversal `wide_sparse_candidates_retain_compact_requests_and_release_sources`, `ready_sparse_candidates_can_be_cancelled_and_errors_release_sources` |
-| Permit refunds, closed admission, and cleanup during unwinding | Expression driver units `batch_admission_follows_retained_values_and_refunds_on_drop`, `admission_refunds_during_unwind_and_rejects_closed_budget`, and `poisoned_driver_rejects_polling_and_releases_pending_work` |
+| Pending-frame poison and cleanup during unwinding | Expression driver unit `poisoned_driver_rejects_polling_and_releases_pending_work`; permit-specific tests removed with aggregate admission |
 | Ready expression cancellation and peer-task progress | `expression_depth` ready-cancel subprocess case; expression traversal cancellation test |
 | Shared owned/borrowed block consumption, transformed values and nonfinite values | `storage_source::owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_values` |
 | Owned source release after errors | Expression unit `owned_stream_error_releases_pending_evaluation_on_drop` |

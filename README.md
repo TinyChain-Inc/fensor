@@ -295,8 +295,9 @@ same geometric views and expression evaluator. `StorageGeometry` describes bound
 logical tiles, and occupied-block streams use logical grid IDs. Views own their
 source handles; `TensorExpression<T>` owns dynamically composed read-only values.
 Borrowed reads and owned consuming streams share one bounded evaluator. Runtime
-expression descriptions, evaluation frames, and live batch payloads have separate
-checked admission limits, independently of logical tensor size; see the [bound table](DESIGN.md#bound-and-policy-constants).
+expression descriptions and evaluation frames have checked limits; each numerical
+batch is bounded, but aggregate retained intermediates grow with expression structure.
+There is no aggregate payload admission limit; see the [bound table](DESIGN.md#bound-and-policy-constants).
 Request and occupied-candidate traversal use explicit work lists, and final ownership release
 detaches operands before draining them. Dropping a stream cancels active evaluation
 and releases its retained source handles without following expression depth on the

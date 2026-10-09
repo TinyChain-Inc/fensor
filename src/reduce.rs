@@ -681,6 +681,14 @@ where
     }
 }
 
+impl<S, O> crate::expression::traversal::Plan for ReduceView<S, O>
+where
+    S: Expression,
+    S::DType: TensorElement,
+    O: ReduceOp<S::DType>,
+{
+}
+
 impl<S, O> Expression for ReduceView<S, O>
 where
     S: Expression,

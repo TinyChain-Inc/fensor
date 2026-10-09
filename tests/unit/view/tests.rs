@@ -1371,6 +1371,8 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
         }
     }
 
+    impl crate::expression::traversal::Plan for Counted {}
+
     impl crate::expression::Expression for Counted {
         fn build<'a>(
             &'a self,

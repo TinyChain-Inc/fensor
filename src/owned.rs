@@ -146,27 +146,14 @@ impl<T: TensorElement> TensorViewSemantics for TensorExpression<T> {
     }
 }
 
-impl<T: TensorElement> Expression for TensorExpression<T> {
-    fn implicit_zero(&self) -> Self::DType {
-        self.owned().zero
-    }
-
-    fn expression_nodes(&self) -> Result<usize> {
-        Ok(self.owned().nodes)
-    }
-
-    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn Drain>>) {
-        if let Some(source) = self.source.take() {
-            pending.push(Box::new(source));
-        }
-    }
-
+impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T> {
     fn preferred_step<'a>(
         &'a self,
         shape: &'a [u64],
     ) -> Result<expression::traversal::Preferred<'a>> {
-        Ok(expression::traversal::Preferred::Sources(vec![Box::new(
-            move || self.source().preferred_step(shape),
+        Ok(expression::traversal::Preferred::Sources(vec![(
+            self.source(),
+            shape,
         )]))
     }
 
@@ -179,9 +166,7 @@ impl<T: TensorElement> Expression for TensorExpression<T> {
         }
         let strides = crate::contiguous_strides(self.source().shape())?;
         Ok(if self.is_identity(&strides) {
-            expression::traversal::Selection::Source(Box::new(move || {
-                self.source().selection_step(slice)
-            }))
+            expression::traversal::Selection::Source(self.source(), slice)
         } else {
             expression::traversal::Selection::Ready(slice.stream())
         })
@@ -196,12 +181,26 @@ impl<T: TensorElement> Expression for TensorExpression<T> {
         }
         let strides = crate::contiguous_strides(self.source().shape())?;
         Ok(if self.is_identity(&strides) {
-            expression::traversal::Ordered::Sources(vec![Box::new(move || {
-                self.source().ordered_step(slice)
-            })])
+            expression::traversal::Ordered::Sources(vec![(self.source(), slice)])
         } else {
             expression::traversal::Ordered::Ready(slice.stream())
         })
+    }
+}
+
+impl<T: TensorElement> Expression for TensorExpression<T> {
+    fn implicit_zero(&self) -> Self::DType {
+        self.owned().zero
+    }
+
+    fn expression_nodes(&self) -> Result<usize> {
+        Ok(self.owned().nodes)
+    }
+
+    fn detach_sources(&mut self, pending: &mut Vec<Box<dyn Drain>>) {
+        if let Some(source) = self.source.take() {
+            pending.push(Box::new(source));
+        }
     }
 
     fn build<'a>(

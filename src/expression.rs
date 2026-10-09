@@ -7,7 +7,6 @@ use std::ops::Deref;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{Array, ArrayAccess, Buffer, NDArray, NDArrayRead, Number};
-use tokio::sync::OwnedSemaphorePermit;
 
 use crate::request::{self, BatchRequest};
 use crate::traits::BoxFuture;
@@ -43,7 +42,7 @@ fn validate_bound(context: &str, actual: usize) -> Result<()> {
 }
 
 // This module is private: callers cannot introduce arbitrary expression sources.
-pub trait Expression: TensorGeometry
+pub trait Expression: TensorGeometry + traversal::Plan
 where
     Self::DType: TensorElement,
 {
@@ -60,22 +59,6 @@ where
 
     /// Detach runtime-owned operands before releasing this expression description.
     fn detach_sources(&mut self, _pending: &mut Vec<Box<dyn crate::owned::Drain>>) {}
-
-    /// Describe one preferred-request step for the consumer's logical shape.
-    /// None leaves request selection to another source or the consumer.
-    fn preferred_step<'a>(&'a self, _shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
-        Ok(traversal::Preferred::Ready(None))
-    }
-
-    /// Describe ordered occupied-request candidates, independent of numerical values.
-    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
-        Ok(traversal::Ordered::Ready(slice.stream()))
-    }
-
-    /// Describe one selection step; native readers may retain storage order.
-    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
-        Ok(traversal::Selection::Ready(slice.stream()))
-    }
 
     fn build<'a>(
         &'a self,
@@ -181,7 +164,6 @@ where
 }
 
 pub struct Batch<T: TensorElement> {
-    _reservation: Option<OwnedSemaphorePermit>,
     pub array: ArrayAccess<'static, T>,
 }
 
@@ -197,7 +179,6 @@ impl<T: TensorElement> Batch<T> {
     pub(crate) fn from_array(array: ArrayAccess<'static, T>) -> Result<Self> {
         validate_bound("batch expression", array.size())?;
         Ok(Self {
-            _reservation: None,
             array: ArrayAccess::from(array.into_read()?),
         })
     }
@@ -205,7 +186,6 @@ impl<T: TensorElement> Batch<T> {
     /// Host values already own their completed buffer; do not realize them again.
     pub(crate) fn from_values(values: Vec<T>) -> Result<Self> {
         Ok(Self {
-            _reservation: None,
             array: batch_array(values)?,
         })
     }
@@ -219,7 +199,6 @@ impl<T: TensorElement> Batch<T> {
         let expected = self.array.size();
         self.validate(expected)?;
         let batch = EvaluatedBatch {
-            _reservation: self._reservation,
             values: self.array.buffer()?.to_slice()?.into_vec(),
         };
         batch.validate(expected)?;
@@ -228,7 +207,6 @@ impl<T: TensorElement> Batch<T> {
 }
 
 pub struct EvaluatedBatch<T> {
-    _reservation: Option<OwnedSemaphorePermit>,
     pub values: Vec<T>,
 }
 
@@ -347,7 +325,7 @@ where
     })
 }
 
-impl<S: crate::TensorSource> Expression for TensorView<S>
+impl<S: crate::TensorSource> crate::expression::traversal::Plan for TensorView<S>
 where
     S::DType: TensorElement,
 {
@@ -360,7 +338,12 @@ where
         self.ordered_storage_requests(slice)
             .map(traversal::Ordered::Ready)
     }
+}
 
+impl<S: crate::TensorSource> Expression for TensorView<S>
+where
+    S::DType: TensorElement,
+{
     fn build<'a>(
         &'a self,
         _context: Context<'a>,
@@ -374,7 +357,7 @@ where
     }
 }
 
-impl<FE, T> Expression for Tensor<FE, T>
+impl<FE, T> crate::expression::traversal::Plan for Tensor<FE, T>
 where
     FE: TensorFileEntry<T>,
     T: TensorElement,
@@ -391,7 +374,13 @@ where
         )
         .map(traversal::Ordered::Ready)
     }
+}
 
+impl<FE, T> Expression for Tensor<FE, T>
+where
+    FE: TensorFileEntry<T>,
+    T: TensorElement,
+{
     fn build<'a>(
         &'a self,
         _context: Context<'a>,

@@ -253,6 +253,14 @@ where
     }
 }
 
+impl<S, O> crate::expression::traversal::Plan for FourierView<S, O>
+where
+    S: Expression,
+    S::DType: TensorElement,
+    O: FourierOp<S::DType>,
+{
+}
+
 impl<S, O> Expression for FourierView<S, O>
 where
     S: Expression,
