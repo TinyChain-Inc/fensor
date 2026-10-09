@@ -1,13 +1,17 @@
-//! One explicit stack of native evaluation continuations. Child requests suspend
+//! A trampoline using an explicit continuation stack. Child requests suspend
 //! their caller; only this driver polls them. No nested executor or spawned task.
+//! Concrete operations still delegate to operands, as in v1; the trampoline prevents
+//! user-controlled expression depth from becoming call-stack depth. Boxing alone
+//! does not flatten nested future polling.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context as TaskContext, Poll};
+use std::task::{Context as TaskContext, Poll, ready};
 
 use futures::channel::oneshot;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::task::coop;
 
 use super::{Batch, EvaluatedBatch, Expression};
 use crate::request::BatchRequest;
@@ -17,37 +21,13 @@ use crate::{BoxFuture, Error, Result, TensorElement};
 const MAX_FRAMES: usize = 16_384;
 const MAX_LIVE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
-// Bound synchronous progress even when every child and numerical batch is ready.
-const READY_WORK_STEPS: usize = 128;
-
-pub(super) struct WorkBudget {
-    remaining: usize,
-}
-
-impl WorkBudget {
-    pub(super) fn new() -> Self {
-        Self {
-            remaining: READY_WORK_STEPS,
-        }
-    }
-
-    pub(super) fn poll(&mut self, cx: &mut TaskContext<'_>) -> Poll<()> {
-        if self.remaining == 0 {
-            self.remaining = READY_WORK_STEPS;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        } else {
-            self.remaining -= 1;
-            Poll::Ready(())
-        }
-    }
-}
-
 type Frame<'a> = BoxFuture<'a, ()>;
 
 #[derive(Clone)]
 pub struct Context<'a> {
     pending: Arc<Mutex<Option<Frame<'a>>>>,
+    // Intermediate arrays are outside the filesystem cache and may outlive frames.
+    // Owned permits bound their combined size and refund capacity on cancellation.
     budget: Arc<Semaphore>,
 }
 
@@ -65,6 +45,8 @@ impl<'a> Context<'a> {
 
         let permits = u32::try_from(bytes)
             .map_err(|_| Error::Unsupported("expression batch allocation overflow".into()))?;
+        // Waiting could deadlock: retained operands may be released only after
+        // this operation finishes, so admission must reject immediately.
         Arc::clone(&self.budget)
             .try_acquire_many_owned(permits)
             .map_err(|cause| match cause {
@@ -92,13 +74,11 @@ impl<'a> Context<'a> {
         let (send, receive) = oneshot::channel();
         let context = self.clone();
         let frame = Box::pin(async move {
-            let result = async {
-                let mut batch = source.build(context, request).await?;
+            let result = source.build(context, request).await.and_then(|mut batch| {
                 batch.validate(expected)?;
                 batch._reservation = Some(reservation);
                 Ok(batch)
-            }
-            .await;
+            });
             let _ = send.send(result);
         });
         {
@@ -131,14 +111,15 @@ impl<'a> Context<'a> {
     }
 }
 
-pub(super) async fn evaluate<E>(
+pub(crate) async fn evaluate_batch<E>(
     source: &E,
-    request: std::sync::Arc<BatchRequest>,
+    request: &BatchRequest,
 ) -> Result<EvaluatedBatch<E::DType>>
 where
     E: Expression + ?Sized,
     E::DType: TensorElement,
 {
+    let request = Arc::new(request.clone());
     let context = Context {
         pending: Arc::new(Mutex::new(None)),
         budget: Arc::new(Semaphore::new(MAX_LIVE_BATCH_BYTES)),
@@ -153,7 +134,6 @@ where
         context,
         frames: vec![root],
         receive,
-        work: WorkBudget::new(),
     }
     .await
 }
@@ -162,7 +142,6 @@ struct Driver<'a, T: TensorElement> {
     context: Context<'a>,
     frames: Vec<Frame<'a>>,
     receive: oneshot::Receiver<Result<EvaluatedBatch<T>>>,
-    work: WorkBudget,
 }
 
 impl<T: TensorElement> Future for Driver<'_, T> {
@@ -172,9 +151,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
         let this = self.get_mut();
 
         loop {
-            if this.work.poll(cx).is_pending() {
-                return Poll::Pending;
-            }
+            let progress = ready!(coop::poll_proceed(cx));
 
             let pending = this
                 .context
@@ -195,6 +172,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                     ))));
                 }
                 this.frames.push(frame);
+                progress.made_progress();
             }
 
             let Some(frame) = this.frames.last_mut() else {
@@ -208,6 +186,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
             match frame.as_mut().poll(cx) {
                 Poll::Ready(()) => {
                     this.frames.pop();
+                    progress.made_progress();
                 }
                 Poll::Pending => {
                     if this
@@ -219,6 +198,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                     {
                         return Poll::Pending;
                     }
+                    progress.made_progress();
                 }
             }
         }

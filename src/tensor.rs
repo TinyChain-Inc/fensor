@@ -567,8 +567,8 @@ where
     ) -> Result<Vec<T>> {
         let dense = match self.storage.as_ref() {
             Storage::Sparse(sparse) => {
-                let health = sparse.gate.read().await;
-                health.check()?;
+                let _guard = sparse.gate.read().await;
+
                 let groups = self.read_groups(request, mapping)?;
                 let mut values = vec![T::ZERO; request.len()];
 
@@ -958,8 +958,8 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
         Box::pin(async move {
             match self.storage.as_ref() {
                 Storage::Sparse(sparse) => {
-                    let health = sparse.gate.read().await;
-                    health.check()?;
+                    let _guard = sparse.gate.read().await;
+
                     sparse.read(id).await
                 }
                 Storage::Dense(dense) => {
@@ -974,7 +974,8 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
 impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
     /// Replace one complete logical block. Callers exclude related native writes.
     /// Sparse replacement serializes payload and index changes under the native ownership guard.
-    /// Interrupted mutation invalidates the owner; callers coordinate recovery.
+    /// After failed or cancelled mutation, callers must discard all handles to the
+    /// affected storage and coordinate recovery before reuse.
     /// Failure may leave partial changes; this method supplies no transaction policy.
     pub async fn replace_logical_block(&self, id: u64, block: Vec<T>) -> Result<()> {
         match self.storage.as_ref() {

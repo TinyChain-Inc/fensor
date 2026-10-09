@@ -205,8 +205,9 @@ no row. Omission changes physical storage only: every logical coordinate still
 has its ordinary numerical value.
 
 One native ownership guard coordinates reads, replacement, reclamation, and
-synchronization. Interrupted mutation invalidates the owner; callers coordinate
-recovery.
+synchronization. After a failed or cancelled mutation, callers must discard all
+handles to the affected storage and coordinate recovery before reuse. Native
+writes may have partially changed storage; cancellation returns no error.
 
 Physical block lengths are validated against bounded metadata. Adapters remain
 responsible for limiting decoding allocations before fensor receives a payload.

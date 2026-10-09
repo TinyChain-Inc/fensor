@@ -268,6 +268,27 @@ async fn metadata_is_codec_independent_and_rejects_invalid_geometry() {
         .unwrap();
     assert_eq!(decoded, expected);
 
+    // Missing fields and wrong container kinds remain decoding errors when
+    // metadata uses the decoder's shallow container interface.
+    for input in [
+        "[]",
+        "[[1]]",
+        "[[1],false]",
+        "[[1],false,null]",
+        "{}",
+        "[1,false,null,[1]]",
+        "[[1],false,null,1]",
+        "[[1],false,null,[1],0]",
+    ] {
+        let bytes = futures::stream::iter([Ok::<_, io::Error>(input.as_bytes().to_vec().into())]);
+        assert!(
+            destream_json::de::try_decode::<_, _, TensorMetadata<f32>>(2, bytes)
+                .await
+                .is_err(),
+            "{input}"
+        );
+    }
+
     let malformed = [
         (vec![3u64, 4], false, None, vec![2u64]),
         (vec![3, 4], false, None, vec![0, 2]),

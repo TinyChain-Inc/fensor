@@ -26,7 +26,6 @@ fn poisoned_driver_rejects_polling_and_releases_pending_work() {
         context: context.clone(),
         frames: vec![],
         receive,
-        work: WorkBudget::new(),
     };
     let waker = futures::task::noop_waker();
     let mut cx = TaskContext::from_waker(&waker);

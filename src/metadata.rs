@@ -73,43 +73,30 @@ impl<T> GetSize for TensorMetadata<T> {
 }
 
 // Dimension decoding is bounded by the adapter, independently of storage capacity.
-struct Dimensions(Shape);
-
-impl de::FromStream for Dimensions {
-    type Context = usize;
-
-    async fn from_stream<D: de::Decoder>(
-        limit: usize,
-        decoder: &mut D,
-    ) -> std::result::Result<Self, D::Error> {
-        struct Visitor(usize);
-
-        impl de::Visitor for Visitor {
-            type Value = Dimensions;
-
-            fn expecting() -> &'static str {
-                "bounded tensor dimensions"
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                let mut dimensions = Shape::new();
-
-                while let Some(dimension) = seq.next_element::<u64>(()).await? {
-                    if dimensions.len() == self.0 {
-                        return Err(de::Error::custom(
-                            "tensor metadata exceeds the adapter rank limit",
-                        ));
-                    }
-                    dimensions.push(dimension);
-                }
-
-                Ok(Dimensions(dimensions))
-            }
+async fn decode_shape<D: de::Decoder>(
+    limit: usize,
+    decoder: &mut D,
+) -> std::result::Result<Shape, D::Error> {
+    let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
+    let mut shape = Shape::new();
+    while sequence.slot() != de::Slot::End {
+        let dimension = <u64 as de::FromStream>::from_stream((), decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+        if shape.len() == limit {
+            return Err(de::Error::custom(
+                "tensor metadata exceeds the adapter rank limit",
+            ));
         }
-        decoder.decode_seq(Visitor(limit)).await
+        shape.push(dimension);
+    }
+    Ok(shape)
+}
+
+fn require_field<E: de::Error>(sequence: &de::Container) -> std::result::Result<(), E> {
+    if sequence.slot() == de::Slot::End {
+        Err(E::custom("missing tensor metadata field"))
+    } else {
+        Ok(())
     }
 }
 
@@ -120,44 +107,40 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
         limit: usize,
         decoder: &mut D,
     ) -> std::result::Result<Self, D::Error> {
-        struct Visitor<T>(usize, PhantomData<T>);
+        let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
+        require_field::<D::Error>(&sequence)?;
+        let shape = decode_shape(limit, decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
 
-        impl<T: TensorElement> de::Visitor for Visitor<T> {
-            type Value = TensorMetadata<T>;
+        require_field::<D::Error>(&sequence)?;
+        let sparse = bool::from_stream((), decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
 
-            fn expecting() -> &'static str {
-                "typed tensor geometry"
+        require_field::<D::Error>(&sequence)?;
+        let axis = Option::<u64>::from_stream((), decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+
+        require_field::<D::Error>(&sequence)?;
+        let block_shape = decode_shape(limit, decoder).await?;
+        decoder.finish_child(&mut sequence).await?;
+
+        let layout = if sparse {
+            Layout::Sparse {
+                axis: axis
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(de::Error::custom)?,
             }
+        } else if axis.is_none() {
+            Layout::Dense
+        } else {
+            return Err(de::Error::custom("dense metadata contains a sparse axis"));
+        };
 
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                let shape = seq.expect_next::<Dimensions>(self.0).await?.0;
-                let sparse: bool = seq.expect_next(()).await?;
-                let axis: Option<u64> = seq.expect_next(()).await?;
-                let block_shape = seq.expect_next::<Dimensions>(self.0).await?.0;
-
-                let layout = if sparse {
-                    Layout::Sparse {
-                        axis: axis
-                            .map(usize::try_from)
-                            .transpose()
-                            .map_err(de::Error::custom)?,
-                    }
-                } else if axis.is_none() {
-                    Layout::Dense
-                } else {
-                    return Err(de::Error::custom("dense metadata contains a sparse axis"));
-                };
-
-                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-                    return Err(de::Error::custom("unexpected metadata field"));
-                }
-                TensorMetadata::new(shape, layout, block_shape).map_err(de::Error::custom)
-            }
+        if sequence.slot() != de::Slot::End {
+            return Err(de::Error::custom("unexpected metadata field"));
         }
-        decoder.decode_seq(Visitor(limit, PhantomData)).await
+        TensorMetadata::new(shape, layout, block_shape).map_err(de::Error::custom)
     }
 }
 

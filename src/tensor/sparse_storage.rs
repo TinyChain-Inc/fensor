@@ -19,35 +19,8 @@ type Blocks<F, T> = TableLock<PayloadSchema<T>, PayloadSchema<T>, Collator<Spars
 pub(super) struct SparseStorage<F, T> {
     pub blocks: DirLock<F>,
     pub geometry: Box<StorageGeometry>,
-    pub gate: RwLock<Health>,
+    pub gate: RwLock<()>,
     pub(super) values: Blocks<F, T>,
-}
-
-#[derive(Default)]
-pub(super) struct Health {
-    invalid: bool,
-}
-
-impl Health {
-    pub(super) fn check(&self) -> Result<()> {
-        if self.invalid {
-            Err(Error::InvalidLayout(
-                "sparse owner invalidated by interrupted mutation; caller recovery required".into(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-struct Mutation<'a>(&'a mut Health, bool);
-
-impl Drop for Mutation<'_> {
-    fn drop(&mut self) {
-        if !self.1 {
-            self.0.invalid = true;
-        }
-    }
 }
 
 impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
@@ -66,7 +39,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             .await?,
             blocks,
             geometry: Box::new(geometry),
-            gate: RwLock::new(Health::default()),
+            gate: RwLock::new(()),
         })
     }
 
@@ -96,7 +69,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             )?,
             blocks,
             geometry: Box::new(geometry),
-            gate: RwLock::new(Health::default()),
+            gate: RwLock::new(()),
         })
     }
 
@@ -242,7 +215,6 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     async fn replace_block(
         &self,
-        health: &mut Health,
         id: u64,
         values: Vec<T>,
         nonzero: bool,
@@ -254,13 +226,11 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             return Ok(());
         }
 
-        let mut mutation = Mutation(health, false);
         if nonzero {
             self.put(id, values).await?;
         } else {
             self.remove(id).await?;
         }
-        mutation.1 = true;
         Ok(())
     }
 
@@ -272,27 +242,25 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                     "invalid replacement block length".into(),
                 ));
             }
-            let mut health = self.gate.write().await;
-            health.check()?;
+            let _guard = self.gate.write().await;
+
             let nonzero = self.validate_payload(id, &values)?;
             let present = self.read_row(id).await?.is_some();
-            self.replace_block(&mut health, id, values, nonzero, present)
-                .await
+            self.replace_block(id, values, nonzero, present).await
         })
     }
 
     pub fn update<'a>(&'a self, id: u64, updates: &'a [(usize, T)]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.geometry.block_bounds(id)?;
-            let mut health = self.gate.write().await;
-            health.check()?;
+            let _guard = self.gate.write().await;
+
             let previous = self.read_row(id).await?;
             let present = previous.is_some();
             let mut values = previous.unwrap_or_else(|| vec![T::ZERO; self.geometry.block_len()]);
             super::apply_block_updates(&mut values, self.geometry.block_len(), updates)?;
             let nonzero = self.validate_payload(id, &values)?;
-            self.replace_block(&mut health, id, values, nonzero, present)
-                .await
+            self.replace_block(id, values, nonzero, present).await
         })
     }
 
@@ -300,8 +268,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     where
         F: freqfs::FileSave + Clone,
     {
-        let health = self.gate.write().await;
-        health.check()?;
+        let _guard = self.gate.write().await;
+
         self.sync_contents().await
     }
 
@@ -309,8 +277,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     where
         F: freqfs::FileSave + Clone,
     {
-        let health = self.gate.write().await;
-        health.check()?;
+        let _guard = self.gate.write().await;
+
         self.sync_contents().await?;
         directory.sync_all().await?;
         Ok(())
@@ -327,8 +295,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     pub fn validate(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let health = self.gate.read().await;
-            health.check()?;
+            let _guard = self.gate.read().await;
+
             self.values.validate().await?;
             {
                 let blocks = self.blocks.read().await;
@@ -366,8 +334,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                 "occupied block range out of bounds".into(),
             ));
         }
-        let health = self.gate.read().await;
-        health.check()?;
+        let _guard = self.gate.read().await;
+
         if range.is_empty() {
             return Ok(Vec::new());
         }
@@ -406,6 +374,9 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     }
 }
 
+// Sparse-axis chunks may interleave in row-major input. Contiguous construction
+// needs one buffer; interleaved construction uses destination rows to avoid keeping
+// every incomplete block in memory. Scalar-sparse storage alone needs no such split.
 pub(super) struct Construction<F, T> {
     tensor: Tensor<F, T>,
     current: Option<(Option<u64>, Vec<T>)>,
@@ -446,8 +417,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                 m.max_staging_batch = m.max_staging_batch.max(values.len());
             });
             let owner = self.tensor.storage.sparse().expect("sparse construction");
-            let mut health = owner.gate.write().await;
-            health.check()?;
+            let _guard = owner.gate.write().await;
+
             if let Some((current, _)) = &self.current {
                 let mut previous = *current;
                 // Validate the bounded source batch before native ingestion can mutate.
@@ -462,7 +433,6 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                     previous = Some(id);
                 }
             }
-            let mut mutation = Mutation(&mut health, false);
             if let Some((current, block)) = &mut self.current {
                 let rows = futures::stream::try_unfold(
                     (coords.iter().zip(values), current, block),
@@ -519,7 +489,6 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                     }
                 }
             }
-            mutation.1 = true;
             Ok(())
         })
     }
@@ -528,9 +497,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
         Box::pin(async move {
             {
                 let owner = self.tensor.storage.sparse().expect("sparse construction");
-                let mut health = owner.gate.write().await;
-                health.check()?;
-                let mut mutation = Mutation(&mut health, false);
+                let _guard = owner.gate.write().await;
+
                 match self.current.take() {
                     Some((Some(id), values)) if owner.validate_payload(id, &values)? => {
                         let row = (vec![SparseCell::Key(id)], vec![SparseCell::Payload(values)]);
@@ -540,7 +508,6 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                 }
 
                 self.tensor.persist_metadata().await?;
-                mutation.1 = true;
             }
             Ok(self.tensor)
         })

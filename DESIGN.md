@@ -29,6 +29,13 @@ The copy caller selects destination layout; reader layout never selects allocati
 implicitly. Geometry validates block IDs, lengths, and padding for native storage
 and caller-owned logical-block replacements; storage owners retain payload and
 mutation validation.
+
+The private evaluation driver is a trampoline using an explicit continuation
+stack: concrete operations request children without recursively polling them.
+Request discovery has its own iterative traversal; owned expressions detach their
+operands for iterative destruction. Boxing futures does not flatten polling or
+destruction, and Tokio cooperation controls fairness rather than stack depth.
+
 Source-cache spill/reload is permitted. No result cache, shared cursor, or
 expression registry is part of execution.
 
@@ -112,8 +119,12 @@ owned value boundaries is retained directly, so inspecting dtype, layout, or
 shape does not descend through runtime composition.
 
 Cancellation detaches any queued child and drains active frames from child to
-parent. Owned expressions detach their shared operands before draining final
-owners iteratively; other references remain live. This same ownership path handles
+parent. `TensorExpression` owns its destructor directly. Its private optional
+source is a detachable slot, emptied before draining shared operands; detached
+values drop harmlessly. Consuming geometric transforms clone rank-sized mapping
+metadata because Rust prevents moving fields out of a Drop owner. Gather payloads
+remain shared, and tensor values are never cloned by these transforms.
+Final owners are drained iteratively; other references remain live. This path handles
 completed, failed, cancelled, and never-polled consumption. There is no spawned
 child task, nested executor, or recursive evaluation fallback.
 
@@ -149,6 +160,9 @@ retain their caller-provided bounded coordinates. Request metadata and rank-size
 scratch scale with admitted leaf count, separately from numerical payload admission.
 Both union polling and empty-request traversal yield cooperatively.
 
+Borrowed and owned block streams share request selection and ordered consumption;
+the owned stream retains its expression through an `Arc`.
+
 One unbuffered stream of evaluation futures retains each request with its evaluated
 batch. Outer consumers apply `buffered(num_cpus::get().max(1))` for row-major value,
 ordered sparse, and boolean reads, or `buffer_unordered` with the same limit for
@@ -156,11 +170,14 @@ coordinate streams and numeric terminals. No task is spawned. Request generation
 order therefore does not guarantee coordinate-batch delivery order.
 
 ha-ndarray owns numerical parallelism; fensor owns asynchronous batch concurrency.
-The evaluation driver and occupied-candidate merger share a cooperative budget of 128 ready
-steps. Frame polls and merger input/head advances consume this budget; exhausting
-it wakes the consumer and yields before continuing. This makes ready traversal
-cancellable without spawning tasks or changing request buffering. It does not
-preempt a synchronous numerical kernel or impose a wall-clock latency bound.
+The evaluation driver and occupied-candidate adapters cooperate with Tokio's
+per-task scheduler budget. Completed frames, queued children, and candidate
+advances record progress; pending operations refund their cooperation attempt.
+Tokio owns accounting and wakeups, with no fensor scheduling counter. This keeps
+ready traversal cancellable on Tokio without spawning tasks or changing request
+buffering. Outside Tokio (or in an unconstrained task), these hooks do not enforce
+fairness. They do not preempt a synchronous numerical kernel or impose a
+wall-clock latency bound.
 
 Synchronous backend evaluation occupies the polling thread and may use backend
 workers. Inner sources, reduction groups, and matrix contraction chunks do not
@@ -338,7 +355,6 @@ do not couple independent bounds.
 | Active evaluation frames | `expression::driver::MAX_FRAMES` | 16384 |
 | Admitted batch payload bytes per driver | `expression::driver::MAX_LIVE_BATCH_BYTES` | 16 MiB |
 | Runtime description admission / planning steps | `expression::traversal::MAX_EXPRESSION_NODES` | 65536 |
-| Ready traversal steps before yielding | `expression::driver::READY_WORK_STEPS` | 128 |
 | Sparse-index page entries | `tensor::SPARSE_INDEX_PAGE_ENTRIES` | 4096 |
 | Values per storage block | `schema::MAX_BLOCK_CAPACITY` | 4096 |
 | Sparse-node allocation hint | `schema::SPARSE_INDEX_BLOCK_BYTES` | 4096 |
@@ -435,13 +451,14 @@ incorrect block IDs are errors. Batch reads share a native table range for
 consecutive requested block IDs. Gaps retain separate reads so unrelated payload
 corruption remains outside the selection. Replacement and read-modify-write
 hold one native ownership guard; helpers never reacquire it. Table guards are
-released before entering another domain. Interrupted mutation invalidates the owner
-and requires caller recovery. Native storage retains no history or recovery protocol.
+released before entering another domain. Failed or cancelled mutation may leave partial changes. Callers must discard
+all handles to the affected storage and coordinate recovery before reuse. Native
+storage retains no history or recovery protocol.
 
-Sparse-owner health is protected by its existing ownership lock. Mutations borrow
-that health state through the write guard and mark it invalid on error or
-cancellation before releasing ownership. Readers and synchronization check health
-through their guards; helpers do not reacquire the ownership lock.
+The sparse ownership lock coordinates native access without tracking recovery
+state. Payload validation still reports corruption. Transaction abort-only state
+belongs to callers such as tc-collection; fensor neither marks clones invalid nor
+repairs partial writes.
 
 Strict loading requires typed metadata, directories, every dense file, and a valid
 sparse table. It validates structure, ordering, geometry, payloads, and block IDs

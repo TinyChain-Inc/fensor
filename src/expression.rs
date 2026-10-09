@@ -1,4 +1,6 @@
-//! Private batch construction shared by typed elementwise expressions.
+//! Shared bounded batch consumption; concrete operations own the mathematics.
+//! The driver evaluates continuations without recursive polling, traversal plans
+//! requests iteratively, and owned expressions detach their operands on destruction.
 
 use std::ops::Deref;
 
@@ -13,6 +15,7 @@ use crate::{Error, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometr
 
 mod driver;
 pub use driver::Context;
+pub(crate) use driver::evaluate_batch;
 
 pub(crate) mod traversal;
 
@@ -96,16 +99,20 @@ where
         .values[0])
 }
 
-pub(crate) fn read_blocks<E: Expression + ?Sized>(
-    source: &E,
-) -> Result<crate::ValueBlockStream<'_, E::DType>>
+pub(crate) fn read_blocks<'a, H>(
+    source: H,
+) -> Result<crate::ValueBlockStream<'a, <H::Target as TensorGeometry>::DType>>
 where
-    E::DType: TensorElement,
+    H: Deref + Clone + Send + Sync + 'a,
+    H::Target: Expression,
+    <H::Target as TensorGeometry>::DType: TensorElement,
 {
     let requests = request::linear_requests(source.shape())?;
-    Ok(ordered_batches(source, requests)
-        .map_ok(|(_, batch)| batch.values)
-        .boxed())
+    Ok(
+        ordered_requests(source, futures::stream::iter(requests.map(Ok)))
+            .map_ok(|(_, batch)| batch.values)
+            .boxed(),
+    )
 }
 
 macro_rules! reader_members {
@@ -218,17 +225,6 @@ impl<T: TensorElement> Batch<T> {
         batch.validate(expected)?;
         Ok(batch)
     }
-}
-
-pub async fn evaluate_batch<E>(
-    expression: &E,
-    coords: &BatchRequest,
-) -> Result<EvaluatedBatch<E::DType>>
-where
-    E: Expression + ?Sized,
-    E::DType: TensorElement,
-{
-    driver::evaluate(expression, std::sync::Arc::new(coords.clone())).await
 }
 
 pub struct EvaluatedBatch<T> {

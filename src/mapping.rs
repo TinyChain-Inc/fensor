@@ -860,23 +860,24 @@ macro_rules! transform_methods {
         $crate::mapping::transform_methods!(@bind $value, $method, $arg; $($rest),+);
     };
 
-    () => {
-        $crate::mapping::transform_methods!(reshape, shape, $crate::Shape);
-        $crate::mapping::transform_methods!(broadcast, shape, $crate::Shape);
-        $crate::mapping::transform_methods!(slice, range, $crate::Range);
-        $crate::mapping::transform_methods!(transpose, permutation, Option<$crate::Axes>);
-        $crate::mapping::transform_methods!(flip, axis, usize);
-        $crate::mapping::transform_methods!(squeeze, axes, $crate::Axes);
-        $crate::mapping::transform_methods!(unsqueeze, axes, $crate::Axes);
+    ($($clone:ident)?) => {
+        $crate::mapping::transform_methods!(reshape, shape, $crate::Shape $(; $clone)?);
+        $crate::mapping::transform_methods!(broadcast, shape, $crate::Shape $(; $clone)?);
+        $crate::mapping::transform_methods!(slice, range, $crate::Range $(; $clone)?);
+        $crate::mapping::transform_methods!(transpose, permutation, Option<$crate::Axes> $(; $clone)?);
+        $crate::mapping::transform_methods!(flip, axis, usize $(; $clone)?);
+        $crate::mapping::transform_methods!(squeeze, axes, $crate::Axes $(; $clone)?);
+        $crate::mapping::transform_methods!(unsqueeze, axes, $crate::Axes $(; $clone)?);
     };
-    ($method:ident, $arg:ident, $ty:ty) => {
-        fn $method(self, $arg: $ty) -> $crate::Result<Self> {
-            Ok(Self {
-                mapping: self.mapping.$method($arg)?,
-                ..self
-            })
+    ($method:ident, $arg:ident, $ty:ty $(; $clone:ident)?) => {
+        fn $method(mut self, $arg: $ty) -> $crate::Result<Self> {
+            self.mapping = $crate::mapping::transform_methods!(@mapping self.mapping $(; $clone)?).$method($arg)?;
+            Ok(self)
         }
     };
+    (@mapping $mapping:expr) => { $mapping };
+    // Drop owners cannot move fields out; clone only mapping metadata.
+    (@mapping $mapping:expr; clone_mapping) => { $mapping.clone() };
 }
 pub(crate) use transform_methods;
 

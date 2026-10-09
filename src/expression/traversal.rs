@@ -15,6 +15,7 @@ use crate::{Error, Result, TensorElement};
 pub type Deferred<'a, T> = Box<dyn FnOnce() -> Result<T> + Send + 'a>;
 
 /// Deferred children are visited left to right without recursive calls.
+/// Planning must also be stack-safe before the evaluation trampoline starts.
 pub enum Step<'a, T> {
     Ready(T),
     Sources(Vec<Deferred<'a, Step<'a, T>>>),
@@ -136,14 +137,14 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
             let shape = Arc::clone(&shape);
             let mut coordinates: Option<Cursor<BatchRequest, Arc<[u64]>>> = None;
             let mut scratch = Coord::new();
-            let mut budget = super::driver::WorkBudget::new();
             futures::stream::poll_fn(move |cx| {
                 loop {
-                    ready!(budget.poll(cx));
+                    let progress = ready!(tokio::task::coop::poll_proceed(cx));
                     if coordinates
                         .as_mut()
                         .is_some_and(|cursor| cursor.next_into(&mut scratch))
                     {
+                        progress.made_progress();
                         let flat = scratch.iter().zip(shape.iter()).try_fold(
                             0u64,
                             |flat, (coordinate, dimension)| {
@@ -157,7 +158,9 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
                         return Poll::Ready(Some(flat));
                     }
 
-                    match ready!(stream.poll_next_unpin(cx)) {
+                    let next = ready!(stream.poll_next_unpin(cx));
+                    progress.made_progress();
+                    match next {
                         Some(Ok(request)) => match request.into_cursor(Arc::clone(&shape)) {
                             Ok(cursor) => coordinates = Some(cursor),
                             Err(error) => return Poll::Ready(Some(Err(error))),

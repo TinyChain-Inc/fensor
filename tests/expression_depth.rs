@@ -132,7 +132,7 @@ async fn exercise(case: &str) {
         return;
     }
     let depth = match case {
-        "drop" | "unpolled" | "concurrent-drop" => 4096,
+        "drop" | "unpolled" | "concurrent-drop" | "transform-error" => 4096,
         "limit" => 20_000,
         "construction-limit" => 40_000,
         _ => 1024,
@@ -193,6 +193,7 @@ async fn exercise(case: &str) {
                 [-2.]
             );
         }
+        "transform-error" => assert!(expression.flip(usize::MAX).is_err()),
         "drop" => drop(expression),
         "unpolled" => drop(expression.into_blocks().unwrap()),
         "concurrent-drop" => {
@@ -352,6 +353,7 @@ async fn owned_expression_depth_is_independent_of_the_worker_stack() {
         "wide",
         "drop",
         "concurrent-drop",
+        "transform-error",
         "unpolled",
         "cancel",
         "ready-cancel",

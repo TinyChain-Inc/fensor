@@ -74,3 +74,80 @@ pub async fn run() {
         }
     }
 }
+
+// Isolate mapping construction from consumption; no filesystem setup is timed.
+pub async fn owned() {
+    use fensor::{AxisRange, Layout, TensorAbs, TensorExpression};
+
+    use super::common;
+
+    let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();
+    for sparse in [false, true] {
+        for (name, rank, gather) in [
+            ("ordinary", 2, false),
+            ("high_rank", 12, false),
+            ("gather", 2, true),
+        ] {
+            let mut shape = vec![1; rank];
+            shape[rank - 2] = 16;
+            shape[rank - 1] = 16;
+            let (_root, tensor) = common::fixture::source(
+                "owned_mapping",
+                shape.clone().into(),
+                if sparse {
+                    Layout::Sparse { axis: None }
+                } else {
+                    Layout::Dense
+                },
+                64,
+                1_000_000,
+                std::iter::repeat_n(1f32, 256),
+            )
+            .await;
+            let mut expression = TensorExpression::new(tensor).unwrap();
+            if gather {
+                expression = expression
+                    .slice(
+                        vec![
+                            AxisRange::Of((0..16).rev().collect()),
+                            AxisRange::In(0, 16, 1),
+                        ]
+                        .into(),
+                    )
+                    .unwrap();
+            }
+            for _ in 0..16 {
+                expression = TensorExpression::new(expression.abs().await.unwrap()).unwrap();
+            }
+            let name = format!("owned_{name}_{}", if sparse { "sparse" } else { "dense" });
+            let builds = if smoke { 2 } else { 50_000 };
+            benchmark::measure(&name, "transform", "warm", async {
+                for _ in 0..builds {
+                    std::hint::black_box(
+                        expression
+                            .clone()
+                            .flip(rank - 1)
+                            .unwrap()
+                            .transpose(None)
+                            .unwrap()
+                            .transpose(None)
+                            .unwrap(),
+                    );
+                }
+                builds
+            })
+            .await;
+            for mode in ["row", "coordinate"] {
+                benchmark::consume(&expression, mode).await;
+                benchmark::measure(&name, mode, "warm", async {
+                    let mut count = 0;
+                    for _ in 0..if smoke { 2 } else { 128 } {
+                        count += benchmark::consume(&expression, mode).await;
+                    }
+                    count
+                })
+                .await;
+            }
+        }
+    }
+}

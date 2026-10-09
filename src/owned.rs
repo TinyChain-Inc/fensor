@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures::stream::BoxStream;
 
 use crate::expression::{self, Batch, Expression};
 use crate::mapping::CoordinateMap;
-use crate::request::{self, BatchRequest};
+use crate::request::BatchRequest;
 use crate::{
     BoxFuture, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
     TensorViewSemantics,
@@ -21,7 +21,9 @@ use crate::{
 /// consumption bounds stack use. Clones retain the same sources and their leases.
 #[derive(Clone)]
 pub struct TensorExpression<T: TensorElement> {
-    source: Handle<T>,
+    // Detach before destruction: ordinary Arc/Box drop would recurse through the
+    // expression even with stack-safe evaluation. None makes detached drop inert.
+    source: Option<Arc<Owned<T>>>,
     mapping: CoordinateMap,
     dense: bool,
 }
@@ -33,9 +35,6 @@ struct Owned<T: TensorElement> {
     zero: T,
     layout: Layout,
 }
-
-#[derive(Clone)]
-struct Handle<T: TensorElement>(Option<Arc<Owned<T>>>);
 
 pub trait Drain: Send {
     fn drain(self: Box<Self>, pending: &mut Vec<Box<dyn Drain>>);
@@ -51,22 +50,10 @@ impl<T: TensorElement> Drain for Arc<Owned<T>> {
     }
 }
 
-impl<T: TensorElement> Handle<T> {
-    fn owned(&self) -> &Owned<T> {
-        self.0.as_deref().expect("live expression operand")
-    }
-
-    fn detach(&mut self, pending: &mut Vec<Box<dyn Drain>>) {
-        if let Some(source) = self.0.take() {
-            pending.push(Box::new(source));
-        }
-    }
-}
-
-impl<T: TensorElement> Drop for Handle<T> {
+impl<T: TensorElement> Drop for TensorExpression<T> {
     fn drop(&mut self) {
         let mut pending = Vec::new();
-        self.detach(&mut pending);
+        self.detach_sources(&mut pending);
 
         while let Some(source) = pending.pop() {
             source.drain(&mut pending);
@@ -82,12 +69,12 @@ impl<T: TensorElement> TensorExpression<T> {
         let strides = crate::contiguous_strides(source.shape())?;
         let mapping = CoordinateMap::identity(source.shape().into(), &strides);
         Ok(Self {
-            source: Handle(Some(Arc::new(Owned {
+            source: Some(Arc::new(Owned {
                 expression: Box::new(source),
                 nodes,
                 zero,
                 layout,
-            }))),
+            })),
             mapping,
             dense: false,
         })
@@ -100,8 +87,12 @@ impl<T: TensorElement> TensorExpression<T> {
         self
     }
 
+    fn owned(&self) -> &Owned<T> {
+        self.source.as_deref().expect("live expression operand")
+    }
+
     fn source(&self) -> &dyn Expression<DType = T> {
-        &*self.source.owned().expression
+        &*self.owned().expression
     }
 
     fn is_identity(&self, strides: &[u64]) -> bool {
@@ -110,12 +101,7 @@ impl<T: TensorElement> TensorExpression<T> {
 
     /// A pull-driven owned stream. Dropping it releases all source handles.
     pub fn into_blocks(self) -> Result<BoxStream<'static, Result<Vec<T>>>> {
-        let requests = request::linear_requests(self.shape())?;
-        Ok(
-            expression::ordered_requests(Arc::new(self), futures::stream::iter(requests.map(Ok)))
-                .map_ok(|(_, batch)| batch.values)
-                .boxed(),
-        )
+        expression::read_blocks(Arc::new(self))
     }
 
     pub fn into_sparse_elements(self) -> Result<crate::SparseElementStream<'static, T>> {
@@ -137,7 +123,7 @@ impl<T: TensorElement> TensorGeometry for TensorExpression<T> {
             return Layout::Dense;
         }
 
-        match self.source.owned().layout {
+        match self.owned().layout {
             Layout::Sparse { axis: Some(_) }
                 if self.mapping.base_offset != 0
                     || self.mapping.shape.as_slice() != self.source().shape()
@@ -162,15 +148,17 @@ impl<T: TensorElement> TensorViewSemantics for TensorExpression<T> {
 
 impl<T: TensorElement> Expression for TensorExpression<T> {
     fn implicit_zero(&self) -> Self::DType {
-        self.source.owned().zero
+        self.owned().zero
     }
 
     fn expression_nodes(&self) -> Result<usize> {
-        Ok(self.source.owned().nodes)
+        Ok(self.owned().nodes)
     }
 
     fn detach_sources(&mut self, pending: &mut Vec<Box<dyn Drain>>) {
-        self.source.detach(pending);
+        if let Some(source) = self.source.take() {
+            pending.push(Box::new(source));
+        }
     }
 
     fn preferred_step<'a>(
@@ -245,5 +233,5 @@ impl<T: TensorElement> TensorRead for TensorExpression<T> {
 }
 
 impl<T: TensorElement> TensorTransform for TensorExpression<T> {
-    crate::mapping::transform_methods!();
+    crate::mapping::transform_methods!(clone_mapping);
 }

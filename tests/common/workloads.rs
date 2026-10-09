@@ -31,6 +31,7 @@ pub async fn run() {
         "matrix" => read_cases::run().await,
         "reduction" => slice_cases::run().await,
         "completion" => completion_cases::run().await,
+        "owned" => completion_cases::owned().await,
         "pipeline" => pipeline_cases::run().await,
         "copy" => copy_cases::run().await,
         "sparse" => sparse_cases::run().await,
@@ -45,6 +46,7 @@ pub async fn run() {
             read_cases::run().await;
             slice_cases::run().await;
             completion_cases::run().await;
+            completion_cases::owned().await;
             pipeline_cases::run().await;
             copy_cases::run().await;
             sparse_cases::run().await;

@@ -174,3 +174,7 @@ with the normal thread stack. Generated measurements remain under ignored
 The private profiling implementation lives in `tests/unit/profiling.rs`, included
 as the existing `profiling` unit-test module. Its entrypoint and shared workloads
 are unchanged.
+
+The `owned` workload isolates ordinary, high-rank, and gather transform construction
+from row-major and completion-order consumption on dense and sparse sources.
+Setup is outside timing; mapping costs are reported separately from consumption.
