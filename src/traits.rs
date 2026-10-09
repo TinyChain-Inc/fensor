@@ -1,13 +1,11 @@
-use std::future::Future;
-use std::pin::Pin;
-
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use number_general::NumberType;
 
 use crate::schema::Layout;
 use crate::{Axes, Error, Range, Result, Shape, TensorSchema, validate};
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub use futures::future::BoxFuture;
 
 /// Minimal shape/dtype surface shared by base tensors AND their views.
 pub trait TensorGeometry: Send + Sync {
@@ -15,6 +13,9 @@ pub trait TensorGeometry: Send + Sync {
 
     fn dtype(&self) -> NumberType;
 
+    /// The layout reported by this value. Stored tensors report their native layout;
+    /// computed or transformed values may omit a sparse-axis hint. Copy callers
+    /// choose destination layout explicitly.
     fn layout(&self) -> Layout;
 
     fn shape(&self) -> &[u64];
@@ -37,11 +38,10 @@ pub trait TensorArray: TensorGeometry {
 }
 
 /// A lazily-produced, row-major-ordered stream of populated sparse elements.
-pub type SparseElementStream<'a, ET> =
-    Pin<Box<dyn Stream<Item = Result<(Vec<u64>, ET)>> + Send + 'a>>;
+pub type SparseElementStream<'a, ET> = BoxStream<'a, Result<(Vec<u64>, ET)>>;
 
 /// Bounded batches of values in logical row-major order, independent of storage tiling.
-pub type ValueBlockStream<'a, T> = Pin<Box<dyn Stream<Item = Result<Vec<T>>> + Send + 'a>>;
+pub type ValueBlockStream<'a, T> = BoxStream<'a, Result<Vec<T>>>;
 
 /// Coordinate-bearing bounded blocks, in implementation-selected order.
 /// Successful complete consumption visits every logical coordinate exactly once,
@@ -50,8 +50,7 @@ pub type ValueBlockStream<'a, T> = Pin<Box<dyn Stream<Item = Result<Vec<T>>> + S
 /// Coordinates and values have equal length within the
 /// [execution limit](https://github.com/TinyChain-Inc/fensor/blob/main/DESIGN.md#bound-and-policy-constants).
 /// Each call is independent.
-pub type CoordinateBlockStream<'a, T> =
-    Pin<Box<dyn Stream<Item = Result<(Vec<Vec<u64>>, Vec<T>)>> + Send + 'a>>;
+pub type CoordinateBlockStream<'a, T> = BoxStream<'a, Result<(Vec<Vec<u64>>, Vec<T>)>>;
 
 /// Async value reads aligned with ndarray coordinate semantics.
 pub trait TensorRead: TensorGeometry {
@@ -230,7 +229,7 @@ pub trait TensorUnaryBoolean: TensorGeometry + Sized {
 /// Source and destination adapters need only support their respective dtypes:
 ///
 /// ```
-/// use fensor::{Result, Tensor, TensorExpression, TensorFileEntry, TensorNumeric, TensorUnaryBoolean};
+/// use fensor::{Result, Tensor, TensorExpression, TensorFileEntry, TensorGeometry, TensorNumeric, TensorUnaryBoolean};
 /// use freqfs::DirLock;
 /// async fn mask<S, D>(
 ///     tensor: &Tensor<S, f32>,
@@ -243,7 +242,7 @@ pub trait TensorUnaryBoolean: TensorGeometry + Sized {
 /// {
 ///     let source = TensorExpression::new(tensor.view())?.into_dense();
 ///     let mask = source.is_nan().await?.not().await?.clone();
-///     Tensor::copy_from(dir, &mask, max_capacity).await
+///     Tensor::copy_from(dir, &mask, mask.layout(), max_capacity).await
 /// }
 /// ```
 pub trait TensorNumeric: TensorGeometry + Sized {
@@ -263,7 +262,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// The destination storage adapter need only support the output dtype:
 ///
 /// ```
-/// use fensor::{Result, Tensor, TensorCast, TensorFileEntry};
+/// use fensor::{Result, Tensor, TensorCast, TensorFileEntry, TensorGeometry};
 /// use freqfs::DirLock;
 ///
 /// async fn widen<Source, Destination>(
@@ -277,7 +276,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 /// {
 ///     let view = source.view();
 ///     let cast = TensorCast::<f64>::cast(&view).await?;
-///     Tensor::copy_from(dir, &cast, max_capacity).await
+///     Tensor::copy_from(dir, &cast, cast.layout(), max_capacity).await
 /// }
 /// ```
 ///
@@ -723,16 +722,13 @@ pub(crate) fn sparse_slice<V: TensorGeometry + ?Sized>(
     order: Axes,
 ) -> Result<crate::slice::Slice> {
     let range = sparse_range(tensor, range, order)?;
-    validate::iter_range_coords(tensor.shape(), &range)?;
+    let (lengths, _) = validate::validate_range(tensor.shape(), &range)?;
     let axes = range
         .into_iter()
-        .map(|axis| match axis {
+        .zip(lengths)
+        .map(|(axis, len)| match axis {
             crate::AxisRange::At(at) => crate::request::Axis::range(at, 1),
-            crate::AxisRange::In(start, end, step) => crate::request::Axis::Span {
-                start,
-                step,
-                len: (end - start).div_ceil(step),
-            },
+            crate::AxisRange::In(start, _, step) => crate::request::Axis::Span { start, step, len },
             crate::AxisRange::Of(values) => crate::request::Axis::Selected(values),
         })
         .collect();
@@ -780,13 +776,13 @@ fn sparse_range<V: TensorGeometry + ?Sized>(
 /// adapter must support the real output of a component projection:
 ///
 /// ```
-/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorComplex, TensorCast, TensorRead};
+/// use fensor::{complex::Complex32, Tensor, TensorFileEntry, TensorComplex, TensorCast, TensorGeometry, TensorRead};
 /// async fn project<A: TensorFileEntry<Complex32>, B: TensorFileEntry<f64>>(
 ///     source: &Tensor<A, Complex32>, dir: freqfs::DirLock<B>,
 /// ) -> fensor::Result<Tensor<B, f64>> {
 ///     let real = source.view().conj().await?.re().await?.clone();
 ///     let widened = TensorCast::<f64>::cast(&real).await?;
-///     Tensor::copy_from(dir, &widened, 16).await
+///     Tensor::copy_from(dir, &widened, widened.layout(), 16).await
 /// }
 /// ```
 ///

@@ -2,7 +2,16 @@
 
 Track harnesses and runners, not generated results. All default output paths are
 under ignored `benchmarks/results/`, relative to the runner's location.
-`git add benchmarks` includes code without staging local measurements. Keep existing ignored evidence intact; each campaign writes a new output file.
+`git add benchmarks` includes code without staging local measurements. Retain raw
+CSVs, logs, commands, source/dependency identities, and the patches or snapshots
+needed to reproduce dirty inputs. Each campaign writes a new output file.
+
+Cargo targets, incremental caches, and compiled executables are temporary build
+artifacts. Keep targets outside `benchmarks/results/`, reuse them across campaigns,
+and delete frozen executables when comparisons finish, retaining their hashes and
+build inputs. The runner already removes each run's temporary tensor directory.
+Do not copy build caches into an evidence archive or retain them to preserve timing
+results; offline summaries read only the CSV.
 
 ## Measurement and reproduction
 
@@ -36,11 +45,16 @@ report zero completed elements, not copy throughput. Compare attempt wall time
 as successful-copy latency only for cases admitted in both runs; inspect
 admission outcomes separately. Other copy workloads require success.
 
-Freeze before/after sources and dependency identities. Compile identical workload
-code against both versions with separate target directories and lockfiles. If the
-harness changes, apply only its test-only changes to the frozen baseline; retain
-its production source hash. Never substitute another revision for a missing
-baseline. Finish builds before timing, and run comparisons without concurrent tests.
+Freeze before/after sources, lockfiles, and dependency identities. Compile identical
+workloads, copying each executable aside before another build can replace it. A
+reused target is sufficient for sequential builds; use separate targets only when
+build isolation requires them, and release those caches afterward. If the harness
+changes, apply only its test-only changes to the frozen baseline; retain its
+production source hash. Never substitute another revision for a missing baseline.
+Finish builds before timing, and run comparisons without concurrent tests.
+When switching source roots in a reused target, run
+`cargo clean --release -p ha-ndarray` before rebuilding: its un-hashed rlib/cdylib
+filenames otherwise permit stale artifacts from the other root. This removes generated output, not evidence.
 
 The `sparse` suite isolates sparse-axis allocation and final-value clearing across
 the standard capacities, leading/trailing axes, and two cache budgets. It records

@@ -175,6 +175,36 @@ impl StorageGeometry {
             .collect())
     }
 
+    /// Validate a complete logical block, including zero-valued edge padding.
+    /// Check the block ID before its length; valid positions may contain any value.
+    pub fn validate_block<T: TensorElement>(&self, id: u64, values: &[T]) -> Result<()> {
+        let bounds = self.block_bounds(id)?;
+        if values.len() != self.block_len() {
+            return Err(Error::InvalidLayout("invalid logical block length".into()));
+        }
+        if bounds
+            .iter()
+            .zip(self.block_shape())
+            .all(|(&(lo, hi), &len)| hi - lo == len)
+        {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        crate::read_metrics::record(|m| m.padding_walks += 1);
+        let mut next = 0;
+        for offset in self.block_offsets(id)? {
+            if values[next..offset].iter().any(|v| *v != T::ZERO) {
+                return Err(Error::InvalidLayout("nonzero logical block padding".into()));
+            }
+            next = offset + 1;
+        }
+        if values[next..].iter().any(|v| *v != T::ZERO) {
+            return Err(Error::InvalidLayout("nonzero logical block padding".into()));
+        }
+        Ok(())
+    }
+
     /// Valid physical-buffer offsets in logical order, excluding edge padding.
     pub fn block_offsets(&self, id: u64) -> Result<impl Iterator<Item = usize> + '_> {
         let mut cursor = BlockCursor::new(self, id)?;
@@ -260,14 +290,14 @@ pub(crate) fn slice_requests<S: TensorSource>(
 where
     S::DType: TensorElement,
 {
-    let source = source.clone();
-    let geometry = source.storage_geometry();
     if slice.len() <= crate::expression::MAX_BATCH_ELEMENTS as u64
         || matches!(source.layout(), Layout::Dense)
     {
         return Ok(slice.stream());
     }
 
+    let source = source.clone();
+    let geometry = source.storage_geometry();
     let mapping = mapping.unwrap_or_else(|| crate::mapping::StorageSlice::identity(source.shape()));
     // Bound the selection in block order using only rank-sized mapping metadata.
     // Inner-axis slices can include unrelated occupied blocks in this interval;
@@ -373,12 +403,12 @@ pub(crate) fn ordered_requests<S: TensorSource>(
 where
     S::DType: TensorElement,
 {
-    let geometry = source.storage_geometry();
     if matches!(source.layout(), Layout::Dense)
         || mapping.axes.windows(2).any(|axes| axes[0].0 >= axes[1].0)
     {
         return Ok(slice.stream());
     }
+    let geometry = source.storage_geometry();
     // A region must be a contiguous row-major run. Earlier axes are singleton;
     // after the first multi-element axis all block extents cover the full axis.
     let mut spans = false;
@@ -453,6 +483,24 @@ mod traversal_tests {
                         geometry.block_offsets(id).unwrap().collect::<Vec<_>>(),
                         expected.iter().map(|(i, _)| *i).collect::<Vec<_>>()
                     );
+                    let mut values = vec![-0.0; geometry.block_len()];
+                    for (i, (offset, _)) in expected.iter().enumerate() {
+                        values[*offset] = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY][i % 3];
+                    }
+                    geometry.validate_block(id, &values).unwrap();
+                    for offset in 0..values.len() {
+                        if expected.iter().any(|(valid, _)| *valid == offset) {
+                            continue;
+                        }
+                        for invalid in [1.0, f64::NAN, f64::INFINITY] {
+                            values[offset] = invalid;
+                            assert!(matches!(
+                                geometry.validate_block(id, &values),
+                                Err(Error::InvalidLayout(_))
+                            ));
+                        }
+                        values[offset] = -0.0;
+                    }
                     let mut cursor = BlockCursor::new(&geometry, id).unwrap();
                     let address = cursor.coord.as_ptr();
 
@@ -468,6 +516,18 @@ mod traversal_tests {
                 }
                 assert!(geometry.block_offsets(geometry.block_count()).is_err());
                 assert!(geometry.block_offsets(u64::MAX).is_err());
+                for id in [geometry.block_count(), u64::MAX] {
+                    assert!(matches!(
+                        geometry.validate_block::<f64>(id, &[]),
+                        Err(Error::InvalidCoord(_))
+                    ));
+                }
+                for len in [geometry.block_len() - 1, geometry.block_len() + 1] {
+                    assert!(matches!(
+                        geometry.validate_block(0, &vec![0.0; len]),
+                        Err(Error::InvalidLayout(_))
+                    ));
+                }
             }
         }
     }

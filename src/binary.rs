@@ -322,8 +322,8 @@ where
 
         let left_slice = slice.clone();
         Ok(expression::traversal::Ordered::Sources(vec![
-            (0, Box::new(move || self.left.ordered_step(left_slice))),
-            (1, Box::new(move || self.right.ordered_step(slice))),
+            Box::new(move || self.left.ordered_step(left_slice)),
+            Box::new(move || self.right.ordered_step(slice)),
         ]))
     }
 
@@ -344,7 +344,7 @@ where
     ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
             let left = context.batch(&self.left, coords.clone()).await?;
-            let right = context.batch(&self.right, coords.clone()).await?;
+            let right = context.batch(&self.right, coords).await?;
 
             Batch {
                 _allocation: None,

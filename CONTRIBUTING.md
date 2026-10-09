@@ -19,9 +19,10 @@ cargo test --test matmul
 
 Reuse the same Cargo target directory and normal incremental debug builds. Separate
 clean targets, disabled incremental compilation, and serialized builds are resource
-workarounds or benchmark controls, not the routine validation workflow. Most of the
-cost is compiling generic expressions and filesystem adapters; filtering a test
-still compiles its test target.
+workarounds or benchmark controls, not the routine validation workflow. Keep build
+artifacts outside benchmark results and follow the [retention rules](BENCHMARKS.md).
+Most compilation cost comes from generic expressions and filesystem adapters;
+filtering a test still compiles its test target.
 Unary, trig, and cast tests retain separate integration targets so a local edit
 rebuilds only its affected target. Use `cargo test --test math_unary`,
 `--test math_trig`, or `--test math_cast`; no aggregate target is required.

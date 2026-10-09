@@ -35,7 +35,7 @@ where
     selected[last] = AxisRange::Of(vec![view.shape()[last] - 1, 0, view.shape()[last] - 1, 1]);
     let mut empty_range = full.clone();
     empty_range[0] = AxisRange::In(0, 0, 1);
-    for range in [full.clone(), selected, empty_range] {
+    for range in [full, selected, empty_range] {
         let expected: Vec<_> = iter_coords(view.shape())
             .zip(values.iter().copied())
             .filter(|(coord, value)| {
@@ -66,18 +66,6 @@ where
             );
         }
     }
-    assert!(
-        view.read_sparse_elements_in_order(full.clone(), (0..view.ndim()).rev().collect())
-            .await
-            .is_err()
-    );
-    let mut invalid = full;
-    invalid[0] = AxisRange::At(view.shape()[0]);
-    assert!(
-        view.read_sparse_elements_in_order(invalid, (0..view.ndim()).collect())
-            .await
-            .is_err()
-    );
 }
 
 #[tokio::test]

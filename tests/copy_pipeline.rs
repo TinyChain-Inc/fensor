@@ -135,7 +135,7 @@ async fn destination_backpressure_stops_source_consumption() {
         fail_read: false,
         stall_read: false,
     };
-    let mut copy = Box::pin(Tensor::copy_from(dir.clone(), &reader, 1));
+    let mut copy = Box::pin(Tensor::copy_from(dir.clone(), &reader, reader.layout(), 1));
     let guard = futures::select! {
         guard = receive.fuse() => guard.unwrap(),
         _ = copy.as_mut().fuse() => panic!("copy completed before releasing its block"),
@@ -186,7 +186,7 @@ async fn cancellation_and_errors_release_the_active_operation_and_source() {
             fail_read,
             stall_read,
         };
-        let mut copy = Box::pin(Tensor::copy_from(dir.clone(), &reader, 1));
+        let mut copy = Box::pin(Tensor::copy_from(dir.clone(), &reader, reader.layout(), 1));
         let mut guard = Some(futures::select! {
             guard = receive.fuse() => guard.unwrap(),
             _ = copy.as_mut().fuse() => panic!("copy completed before releasing its block"),

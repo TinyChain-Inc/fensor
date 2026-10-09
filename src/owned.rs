@@ -15,6 +15,10 @@ use crate::{
     TensorViewSemantics,
 };
 
+/// An owned, read-only tensor value for runtime composition.
+///
+/// Concrete operations retain their operands and delegate numerical work; shared
+/// consumption bounds stack use. Clones retain the same sources and their leases.
 #[derive(Clone)]
 pub struct TensorExpression<T: TensorElement> {
     source: Handle<T>,
@@ -204,10 +208,9 @@ impl<T: TensorElement> Expression for TensorExpression<T> {
         }
         let strides = crate::contiguous_strides(self.source().shape())?;
         Ok(if self.is_identity(&strides) {
-            expression::traversal::Ordered::Sources(vec![(
-                0,
-                Box::new(move || self.source().ordered_step(slice)),
-            )])
+            expression::traversal::Ordered::Sources(vec![Box::new(move || {
+                self.source().ordered_step(slice)
+            })])
         } else {
             expression::traversal::Ordered::Ready(slice.stream())
         })

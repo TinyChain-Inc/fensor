@@ -21,20 +21,25 @@ be cloned without requiring the filesystem adapter to implement `Clone`.
 `TensorWriteBulk` implementations provide writes from buffers and fill. Each
 implementation validates supported geometry and input cardinality.
 
-Each consumed batch uses an explicit stack of evaluation frames. Elementwise
+`TensorExpression<T>` owns values composed at runtime, including their source
+handles. Concrete views retain their operands and implement their operations.
+The shared consumer uses an explicit stack of evaluation frames so polling and
+destruction remain safe at user-controlled nesting depths. Elementwise
 operations realize their bounded numerical result through ha-ndarray before
 returning it to the parent; geometric projections forward their source result.
 Reductions, matrix products, and Fourier transforms retain bounded batches, tiles,
 or accumulators in the same process. They never persist computed intermediates.
 Nested expressions can recompute values, and source reads/cache spill can do I/O.
 
-`Tensor::copy_from(dir, &expression, max_capacity).await?` explicitly creates
-independent filesystem storage. Copying is never necessary between operations.
-The destination adapter can differ from the source adapter and must support the
-output dtype. `max_capacity` limits storage-block capacity; it does not select an
-exact block shape. Sparse copying uses the expression's reported layout and omits
-final numerical zeros. Transformed owned expressions report scalar sparsity when
-their original sparse-axis geometry no longer describes the output.
+`Tensor::copy_from(dir, &expression, destination_layout, max_capacity).await?`
+creates independent filesystem storage with caller-selected packing. Copying is
+never necessary between operations. The destination adapter can differ from the
+source adapter and must support the output dtype. `max_capacity` limits block
+capacity; it does not select an exact block shape. Sparse copying accepts a new
+sparse axis and omits final numerical zeros. A reader's reported layout describes
+its values and supplies a hint; it does not choose destination allocation.
+Dense/sparse kind mismatches return a structured error. Use `into_dense()` before
+materializing a sparse expression as dense storage.
 
 The [native storage contract](DESIGN.md#native-storage-and-sources) describes
 logical-block access, source ownership, and replacement guarantees.
@@ -96,15 +101,10 @@ cannot be streamed or copied. Empty-dimension tensor storage is unsupported.
 
 Numerical rules belong to ha-ndarray. Its
 [numerical contract](https://github.com/TinyChain-Inc/ha-ndarray/blob/main/NUMERICS.md)
-provides non-normative integration context for this standalone crate. In particular,
-integer arithmetic wraps at its dtype width and integer division/remainder by zero return zero. Floats
-retain backend NaN, infinity, signed-zero, and underflow behavior without domain
-clamping. Logical operations return exactly u8 0/1: zero is false, and nonzero
-values, including NaN, are true. Comparisons follow IEEE unordered-NaN rules.
-Complex operations retain the backend's principal branches; complex predicates
-inspect either component, and complex zero requires both components to be zero.
-`mt` transposes without conjugation. Backend validation status belongs to
-ha-ndarray, not this crate's test results.
+provides non-normative integration context for this standalone crate. Fensor delegates
+arithmetic, nonfinite values, signed zeros, predicates, and complex branches to that
+backend; it does not clamp results or define substitute numerical rules. `mt`
+transposes without conjugation. Backend validation status belongs to ha-ndarray.
 
 ## Sparse values
 

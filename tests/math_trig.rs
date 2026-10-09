@@ -1,8 +1,8 @@
 //! Absolute-value and trigonometric views use the same filesystem consumers.
 
 use fensor::{
-    AxisRange, Layout, Tensor, TensorAbs, TensorExpression, TensorRead, TensorSchema,
-    TensorTransform, TensorTrig, TensorUnary, TensorWrite,
+    AxisRange, Layout, Tensor, TensorAbs, TensorExpression, TensorGeometry, TensorRead,
+    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -192,7 +192,9 @@ async fn explicit_dense_chain_preserves_transforms_and_reuse() {
     // exercises batch boundaries without allocating thousands of sparse files.
     let expression = expression.slice(range![AxisRange::In(0, 8, 1)]).unwrap();
     let (out_root, out_dir) = new_dir("trig_chain_out").await;
-    let output = Tensor::copy_from(out_dir, &expression, 16).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 16)
+        .await
+        .unwrap();
     for i in 0..8 {
         let expected = 1.0;
         assert_eq!(expression.read_value(&[i]).await.unwrap(), expected);

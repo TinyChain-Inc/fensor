@@ -1395,9 +1395,14 @@ mod section_d_bulk_io {
             }
         }
         let (sparse_root, dir) = new_dir("d_copy_sparse").await;
-        let sparse = Tensor::copy_from(dir, &SparseReader(&dense), 4)
-            .await
-            .unwrap();
+        let sparse = Tensor::copy_from(
+            dir,
+            &SparseReader(&dense),
+            Layout::Sparse { axis: Some(1) },
+            4,
+        )
+        .await
+        .unwrap();
 
         for coord in iter_coords(dense.shape()) {
             let d = dense.read_value(&coord).await.expect("dense");
@@ -1551,11 +1556,26 @@ mod section_g_sparse_iteration {
     #[tokio::test]
     async fn in_order_iteration_matches_base_order() {
         let (root, tensor, _) = create_sparse("g_in_order", shape![2, 3, 4], 4, Some(0)).await;
-
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
-        tensor.write_value(&[1, 0, 1], 4.0).await.expect("w");
 
+        let partial: Vec<(Vec<u64>, f32)> = tensor
+            .read_sparse_elements_in_order(
+                range![
+                    AxisRange::In(1, 2, 1),
+                    AxisRange::In(0, 3, 1),
+                    AxisRange::In(0, 4, 1)
+                ],
+                axes![0, 1, 2],
+            )
+            .await
+            .expect("partial range supported")
+            .try_collect()
+            .await
+            .expect("stream must not error");
+        assert_eq!(partial, [(vec![1, 2, 3], 9.0)]);
+
+        tensor.write_value(&[1, 0, 1], 4.0).await.expect("w");
         let rows: Vec<(Vec<u64>, f32)> = tensor
             .read_sparse_elements_in_order(
                 range![
@@ -1570,39 +1590,8 @@ mod section_g_sparse_iteration {
             .try_collect()
             .await
             .expect("stream must not error");
-
         assert_eq!(rows.len(), 3, "should yield exactly the written coords");
-        // First coordinate in axis-0 order: [0,0,0]
-        assert_eq!(rows[0].0, vec![0u64, 0, 0]);
-        assert_eq!(rows[0].1, 1.0);
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn in_order_iteration_with_partial_range() {
-        let (root, tensor, _) = create_sparse("g_partial", shape![2, 3, 4], 4, Some(0)).await;
-
-        tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
-        tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
-
-        let rows: Vec<(Vec<u64>, f32)> = tensor
-            .read_sparse_elements_in_order(
-                range![
-                    AxisRange::In(1, 2, 1),
-                    AxisRange::In(0, 3, 1),
-                    AxisRange::In(0, 4, 1)
-                ],
-                axes![0, 1, 2],
-            )
-            .await
-            .expect("partial range supported")
-            .try_collect()
-            .await
-            .expect("stream must not error");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, vec![1u64, 2, 3]);
+        assert_eq!(rows[0], (vec![0, 0, 0], 1.0));
 
         cleanup(&root).await;
     }
@@ -1638,6 +1627,31 @@ mod section_g_sparse_iteration {
             }
             other => panic!("unexpected error variant: {other}"),
         }
+
+        for (name, first) in [
+            ("point out of bounds", AxisRange::At(2)),
+            ("zero step", AxisRange::In(0, 2, 0)),
+            ("reversed endpoints", AxisRange::In(2, 1, 1)),
+            ("end out of bounds", AxisRange::In(0, 3, 1)),
+            (
+                "explicit coordinate out of bounds",
+                AxisRange::Of(vec![0, 2]),
+            ),
+        ] {
+            let result = tensor
+                .read_sparse_elements_in_order(
+                    range![first, AxisRange::In(0, 3, 1), AxisRange::In(0, 4, 1)],
+                    axes![0, 1, 2],
+                )
+                .await;
+            assert!(matches!(result, Err(Error::InvalidLayout(_))), "{name}");
+        }
+        assert!(matches!(
+            tensor
+                .read_sparse_elements_in_order(range![], axes![0, 1, 2])
+                .await,
+            Err(Error::InvalidLayout(_))
+        ));
 
         cleanup(&root).await;
     }

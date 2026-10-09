@@ -120,7 +120,7 @@ pub async fn copy<V: TensorRead<DType = f32>>(
     measure(&name, "copy-attempt", "new", async {
         let mut sync_ns = 0;
         let result = async {
-            let output = Tensor::copy_from(dir, view, capacity).await?;
+            let output = Tensor::copy_from(dir, view, view.layout(), capacity).await?;
             let sync = Instant::now();
             let result = output.sync().await;
             sync_ns = sync.elapsed().as_nanos();

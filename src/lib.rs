@@ -104,12 +104,11 @@ mod selection;
 
 mod slice;
 
-mod storage_read;
-
 mod sparse;
+
 mod storage;
-pub use sparse::{SparseCell, SparseNode};
-pub use storage::BlockUpdates;
+
+mod storage_read;
 
 mod tensor;
 
@@ -139,12 +138,15 @@ pub use matmul::MatMulView;
 pub use matrix::DiagView;
 pub use metadata::TensorMetadata;
 pub use number_general::NumberType;
+pub use owned::TensorExpression;
 pub use reduce::{ReduceView, StatisticsElement, TensorStatistics};
 pub use schema::{
     AxisRange, Layout, MAX_BLOCK_CAPACITY, Range, RowMajorCoords, Shape, Strides, TensorSchema,
     contiguous_strides, row_major_coords,
 };
 pub use selection::WhereView;
+pub use sparse::{SparseCell, SparseNode};
+pub use storage::{BlockUpdates, StorageGeometry, StorageRead, TensorSource};
 pub use traits::{
     BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray, TensorBoolean,
     TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar, TensorGeometry,
@@ -164,6 +166,3 @@ pub use validate::{
 pub use view::TensorView;
 
 pub(crate) const PORTABLE_INLINE_RANK: usize = 8;
-
-pub use owned::TensorExpression;
-pub use storage::{StorageGeometry, StorageRead, TensorSource};

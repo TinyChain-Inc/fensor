@@ -104,7 +104,10 @@ impl<'a> Context<'a> {
             let _ = send.send(result);
         });
         {
-            let mut pending = self.pending.lock().expect("evaluation driver poisoned");
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?;
             if pending.is_some() {
                 return Err(Error::InvalidLayout("concurrent child evaluation".into()));
             }
@@ -179,7 +182,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                 .context
                 .pending
                 .lock()
-                .expect("evaluation driver poisoned")
+                .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?
                 .take();
             if let Some(frame) = pending {
                 if this.frames.len() == MAX_FRAMES {
@@ -213,7 +216,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                         .context
                         .pending
                         .lock()
-                        .expect("evaluation driver poisoned")
+                        .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?
                         .is_none()
                     {
                         return Poll::Pending;
@@ -228,11 +231,12 @@ impl<T: TensorElement> Drop for Driver<'_, T> {
     fn drop(&mut self) {
         // A queued child owns a Context clone. Detach before dropping it to break
         // that temporary cycle, including cancellation before the child is polled.
+        // Poison recovery here only permits destruction; never resume evaluation.
         let pending = self
             .context
             .pending
             .lock()
-            .expect("evaluation driver poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         drop(pending);
 
@@ -243,6 +247,54 @@ impl<T: TensorElement> Drop for Driver<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_driver_rejects_polling_and_releases_pending_work() {
+        let context = Context {
+            pending: Arc::new(Mutex::new(None)),
+            live: Arc::new(AtomicUsize::new(0)),
+        };
+        let lease = Arc::new(());
+        let retained = Arc::downgrade(&lease);
+        let child_context = context.clone();
+        let allocation = context.reserve::<f64>(1).unwrap();
+        *context.pending.lock().unwrap() = Some(Box::pin(async move {
+            let _owned = (lease, child_context, allocation);
+            std::future::pending::<()>().await;
+        }));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = context.pending.lock().unwrap();
+                panic!("injected driver failure");
+            }))
+            .is_err()
+        );
+        let (_send, receive) = oneshot::channel();
+        let mut driver = Driver::<f64> {
+            context: context.clone(),
+            frames: vec![],
+            receive,
+            work: WorkBudget::new(),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Err(Error::InvalidLayout(_)))
+        ));
+        assert!(retained.upgrade().is_some());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _driver = driver;
+                panic!("injected outer unwind");
+            }))
+            .is_err()
+        );
+        assert!(retained.upgrade().is_none());
+        assert_eq!(context.live.load(Ordering::Relaxed), 0);
+        assert!(context.pending.is_poisoned());
+        assert_eq!(Arc::strong_count(&context.pending), 1);
+    }
 
     #[test]
     fn batch_admission_follows_retained_values_and_refunds_on_drop() {

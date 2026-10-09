@@ -182,15 +182,12 @@ where
             return Ok(expression::traversal::Ordered::Ready(slice.stream()));
         }
 
+        let condition_slice = slice.clone();
         let then_slice = slice.clone();
-        let or_else_slice = slice.clone();
         Ok(expression::traversal::Ordered::Sources(vec![
-            (1, Box::new(move || self.then.ordered_step(then_slice))),
-            (
-                2,
-                Box::new(move || self.or_else.ordered_step(or_else_slice)),
-            ),
-            (0, Box::new(move || self.condition.ordered_step(slice))),
+            Box::new(move || self.condition.ordered_step(condition_slice)),
+            Box::new(move || self.then.ordered_step(then_slice)),
+            Box::new(move || self.or_else.ordered_step(slice)),
         ]))
     }
 
@@ -213,7 +210,7 @@ where
         Box::pin(async move {
             let condition = context.batch(&self.condition, coords.clone()).await?;
             let then = context.batch(&self.then, coords.clone()).await?;
-            let or_else = context.batch(&self.or_else, coords.clone()).await?;
+            let or_else = context.batch(&self.or_else, coords).await?;
 
             Batch {
                 _allocation: None,

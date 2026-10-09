@@ -2,8 +2,8 @@
 
 use fensor::unary::Cast;
 use fensor::{
-    AxisRange, Layout, Tensor, TensorArray, TensorCast, TensorRead, TensorSchema, TensorTransform,
-    TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
+    AxisRange, Layout, Tensor, TensorArray, TensorCast, TensorGeometry, TensorRead, TensorSchema,
+    TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -68,7 +68,9 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     let blocks: Vec<Vec<f64>> = cast.read_blocks().unwrap().try_collect().await.unwrap();
     let values: Vec<_> = blocks.into_iter().flatten().collect();
     let (out_root, out_dir) = new_dir("cast_dense_out").await;
-    let output: Tensor<FsEntry, f64> = Tensor::copy_from(out_dir.clone(), &cast, 4).await.unwrap();
+    let output: Tensor<FsEntry, f64> = Tensor::copy_from(out_dir.clone(), &cast, cast.layout(), 4)
+        .await
+        .unwrap();
 
     assert_eq!(output.schema().dtype(), NumberType::Float(FloatType::F64));
     output.sync().await.unwrap();
@@ -206,7 +208,9 @@ async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
         .unwrap();
     assert_eq!(rows, vec![(vec![2, 1], nonzero)]);
     let (out_root, out_dir) = new_dir("cast_sparse_out").await;
-    let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
+        .await
+        .unwrap();
     let blocks: Vec<Vec<f64>> = expression
         .read_blocks()
         .unwrap()

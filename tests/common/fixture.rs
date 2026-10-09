@@ -137,7 +137,9 @@ pub async fn copied<V: TensorRead>(
     V::DType: TensorElement,
 {
     let (root, dir) = new_dir("consumer_copy").await;
-    let copy: Tensor<FsEntry, V::DType> = Tensor::copy_from(dir.clone(), view, 17).await.unwrap();
+    let copy: Tensor<FsEntry, V::DType> = Tensor::copy_from(dir.clone(), view, view.layout(), 17)
+        .await
+        .unwrap();
     copy.sync().await.unwrap();
     drop(copy);
     drop(dir);

@@ -159,7 +159,7 @@ async fn sparse_zero_extension_preserves_reductions_through_copy() {
     check(&rounded.min(axes![1], false).await.unwrap(), &[0., 0., 2.]).await;
     check(&rounded.max(axes![1], false).await.unwrap(), &[0., 0., 3.]).await;
     let (_dir_root, dir) = new_dir("reduced_support").await;
-    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &sum, 2).await.unwrap();
+    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &sum, sum.layout(), 2).await.unwrap();
     assert_eq!(copy.min_all().await.unwrap(), 0.);
     assert_eq!(sum.min_all().await.unwrap(), 0.);
     let (_empty_root, empty) = source(vec![0u8; 6], shape![2, 3], true).await;
@@ -482,7 +482,9 @@ async fn reduction_copy_spills_and_reloads() {
         let (root, _) = new_dir("reduce_cache_output").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let dir = cache.load(root.to_path_buf()).unwrap();
-        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, 32).await.unwrap();
+        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, view.layout(), 32)
+            .await
+            .unwrap();
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);

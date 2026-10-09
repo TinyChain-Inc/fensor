@@ -211,36 +211,38 @@ async fn exercise(case: &str) {
             // This leaf never awaits storage. A pending poll must therefore be
             // a cooperative yield, including while numerical ancestors are ready.
             let mut stream = expression.into_blocks().unwrap();
-            let mut next = Box::pin(stream.try_next());
-            let mut polls = 0;
-            futures::future::poll_fn(|cx| {
-                polls += 1;
-                assert!(next.as_mut().poll(cx).is_pending());
-                if weak.upgrade().unwrap().load(Ordering::Relaxed) > 0 {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
-            assert!(polls > 1, "ready descent monopolized one poll");
-            drop(next);
+            {
+                let mut next = std::pin::pin!(stream.try_next());
+                let mut polls = 0;
+                futures::future::poll_fn(|cx| {
+                    polls += 1;
+                    assert!(next.as_mut().poll(cx).is_pending());
+                    if weak.upgrade().unwrap().load(Ordering::Relaxed) > 0 {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                assert!(polls > 1, "ready descent monopolized one poll");
+            }
             drop(stream);
         }
         "cancel" => {
             let mut stream = expression.into_blocks().unwrap();
-            let mut next = Box::pin(stream.try_next());
-            futures::future::poll_fn(|cx| {
-                assert!(next.as_mut().poll(cx).is_pending());
-                if weak.upgrade().unwrap().load(Ordering::Relaxed) > 0 {
-                    Poll::Ready(())
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            })
-            .await;
-            drop(next);
+            {
+                let mut next = std::pin::pin!(stream.try_next());
+                futures::future::poll_fn(|cx| {
+                    assert!(next.as_mut().poll(cx).is_pending());
+                    if weak.upgrade().unwrap().load(Ordering::Relaxed) > 0 {
+                        Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
             drop(stream);
         }
         "limit" => {

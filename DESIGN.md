@@ -25,6 +25,10 @@ returning it to the parent, so backend operation depth cannot grow with runtime
 expression depth. Reductions, matrix products, and Fourier transforms use the
 same process. None may create temporary tensor files or persist computed
 intermediates. Persistence requires an explicit write or `Tensor::copy_from`.
+The copy caller selects destination layout; reader layout never selects allocation
+implicitly. Geometry validates block IDs, lengths, and padding for native storage
+and caller-owned logical-block replacements; storage owners retain payload and
+mutation validation.
 Source-cache spill/reload is permitted. No result cache, shared cursor, or
 expression registry is part of execution.
 
@@ -120,13 +124,17 @@ a matrix source. Output mappings are independent of request traversal. Provider
 steps use explicit work lists with fallible allocation and the expression
 description limit, preserving first-provider and first-error precedence.
 
-Sparse occupied-candidate merging retains one bounded request and reusable coordinate cursor
-per leaf, plus one output batch. Implicit requests retain compact metadata rather
-than expanding every leaf batch into coordinate lists; explicit requests retain
-their caller-provided bounded coordinates. A merge step advances all heads equal
-to the preceding output before selecting the next unique coordinate. Request
-metadata and rank-sized cursor scratch scale with the admitted leaf count,
-separately from the numerical payload admission limit.
+Ordered providers use the same operand order as evaluation: left before right,
+and condition before then and else. One work list flattens their leaf streams;
+there is no separate error-ordering tree.
+
+Sparse occupied-candidate traversal retains one bounded request and reusable
+coordinate cursor per leaf, plus one output batch. Each cursor supplies row-major
+positions to collate's flat ordered union; only distinct output positions become
+coordinates. Implicit requests retain compact metadata, and explicit requests
+retain their caller-provided bounded coordinates. Request metadata and rank-sized
+scratch scale with admitted leaf count, separately from numerical payload admission.
+Both union polling and empty-request traversal yield cooperatively.
 
 One unbuffered stream of evaluation futures retains each request with its evaluated
 batch. Outer consumers apply `buffered(num_cpus::get().max(1))` for row-major value,
@@ -219,18 +227,18 @@ Unary/scalar nodes inherit their source's slice requests and evaluate the comple
 expression; they never consume an intermediate zero-filtered reader. Boolean
 terminals deliberately use logical requests to preserve error/decision order.
 
-Terminal and axis reductions share an accumulator and consume every selected
-logical value, including implicit sparse zeros. Indexed traversal evaluates candidate
-coordinates once and accounts for the remaining cardinality through zero partials,
-without expanding absent coordinates. Each pointwise node caches the typed result
+Reductions consume every selected logical value, including implicit sparse zeros.
+Indexed traversal evaluates candidate coordinates once and accounts for the
+remaining cardinality through zero partials, without expanding absent coordinates.
+Each pointwise node caches the typed result
 of its operation on its operands' implicit zeros. This constant metadata preserves
 backend zero signs when aggregating gaps; it is not an element mask or occupancy
-history. ha-ndarray reduces each bounded batch; its
-scalar arithmetic/extrema rules combine partials. Seed from the first
-partial to preserve signed-zero behavior. Complete small groups share one source
-request and bounded segment boundaries; long groups keep one active accumulator
-and chunked inputs, never a partial list. Requested axis outputs are processed
-sequentially within each output batch. Output transforms map reduced coordinates
+history. ha-ndarray reduces each bounded batch; its scalar arithmetic/extrema rules
+combine partials. Seed from the first partial to preserve signed-zero behavior. Complete small groups share one source
+request and bounded segment boundaries, then delegate each nonempty group directly
+to the operation's partial and finish methods. Terminals and long groups share one
+active accumulator and chunked inputs, never a partial list. Requested axis outputs
+are processed sequentially within each output batch. Output transforms map reduced coordinates
 and do not move through source axes. Selected output ranges still require their
 source groups.
 
@@ -481,7 +489,7 @@ flush before returning from `FileSave`. This does not change encoded bytes or ma
 
 Occupied scans retain cursors and bounded native page lookahead until consumed or
 dropped. Expression consumers retain the scan across output batches. Native pages
-validate complete typed rows before returning keys; consumers trust that provenance
-without a second membership lookup. Dense validation borrows required payloads
-without cloning them. Native fills visit valid offsets while retaining old-value
+validate ordered block IDs before returning keys; consumers need no second
+membership lookup. Payload reads validate the selected dense chunks. Dense
+validation borrows required payloads without cloning them. Native fills visit valid offsets while retaining old-value
 validation and zero padding.

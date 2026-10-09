@@ -121,7 +121,9 @@ async fn sparse_zero_intermediates_and_copy_match_dense_semantics() {
         Err(fensor::Error::WouldDensify { .. })
     ));
     let (_dir_root, dir) = new_dir("matmul_zero_copy").await;
-    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &view, 2).await.unwrap();
+    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &view, view.layout(), 2)
+        .await
+        .unwrap();
     assert!(matches!(
         copy.view().eq_scalar(0.).await,
         Err(fensor::Error::WouldDensify { .. })
@@ -371,7 +373,9 @@ macro_rules! accuracy {
                         .collect();
                     let (_dir_root, dir) = new_dir("adaptive_accuracy_copy").await;
                     let copy: Tensor<FsEntry, $t> =
-                        Tensor::copy_from(dir, &product, 17).await.unwrap();
+                        Tensor::copy_from(dir, &product, product.layout(), 17)
+                            .await
+                            .unwrap();
                     for (coord, value) in [
                         (vec![0, 0], ordinary[0]),
                         (vec![1, 32], ordinary[65]),
@@ -436,7 +440,9 @@ async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
         let (root, _) = new_dir("matmul_cache_output").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let dir = cache.load(root.to_path_buf()).unwrap();
-        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, 32).await.unwrap();
+        let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, view.layout(), 32)
+            .await
+            .unwrap();
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);

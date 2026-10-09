@@ -1,8 +1,8 @@
 //! Downstream public API smoke coverage, not a transaction or storage-provider test.
 
 use fensor::{
-    AxisRange, Layout, Tensor, TensorExpression, TensorMathScalar, TensorRead, TensorReduce,
-    TensorSource, TensorTransform, TensorWrite,
+    AxisRange, Layout, Tensor, TensorExpression, TensorGeometry, TensorMathScalar, TensorRead,
+    TensorReduce, TensorSource, TensorTransform, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
@@ -67,9 +67,10 @@ async fn public_composition_storage_access_and_persistence() {
         coordinates(&expression, &[9.0, 11.0]).await;
 
         let (copy_root, dir) = common::new_dir("handoff_copy").await;
-        let copy: Tensor<common::FsEntry, f32> = Tensor::copy_from(dir.clone(), &expression, 2)
-            .await
-            .unwrap();
+        let copy: Tensor<common::FsEntry, f32> =
+            Tensor::copy_from(dir.clone(), &expression, expression.layout(), 2)
+                .await
+                .unwrap();
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);

@@ -1,8 +1,8 @@
 //! Native u8 storage and lazy boolean expressions over real filesystem tensors.
 
 use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorNumeric, TensorRead,
-    TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
+    AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorGeometry, TensorNumeric,
+    TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -214,7 +214,9 @@ async fn dense_predicate_chain_preserves_cast_zeros_and_copy_parity() {
     assert!(rows.iter().all(|(c, v)| c[0] != 1 && *v == 1));
     let selected = expression.slice(range![AxisRange::In(0, 4, 1)]).unwrap();
     let (out_root, out_dir) = new_dir("boolean_chain_out").await;
-    let output = Tensor::copy_from(out_dir, &selected, 2).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &selected, selected.layout(), 2)
+        .await
+        .unwrap();
     for (i, value) in [1, 0, 1, 1].into_iter().enumerate() {
         assert_eq!(selected.read_value(&[i as u64]).await.unwrap(), value);
         assert_eq!(output.read_value(&[i as u64]).await.unwrap(), value);
@@ -224,9 +226,10 @@ async fn dense_predicate_chain_preserves_cast_zeros_and_copy_parity() {
         .slice(range![AxisRange::At(0), AxisRange::In(0, 4, 1)])
         .unwrap();
     let (mid_root, mid_dir) = new_dir("boolean_intermediate").await;
-    let intermediate = Tensor::copy_from(mid_dir, &source.is_nan().await.unwrap(), 2)
-        .await
-        .unwrap();
+    let intermediate =
+        Tensor::copy_from(mid_dir, &source.is_nan().await.unwrap(), source.layout(), 2)
+            .await
+            .unwrap();
     assert_eq!(
         TensorExpression::new(source.is_nan().await.unwrap())
             .unwrap()

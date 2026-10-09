@@ -188,9 +188,11 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
         }
         // Cancellation while waiting for native table access leaves no held guards.
         let guard = owner.values.write().await;
-        let mut replacement = Box::pin(tensor.replace_logical_block(0, vec![2.; len as usize]));
-        assert!(futures::poll!(replacement.as_mut()).is_pending());
-        drop(replacement);
+        {
+            let mut replacement =
+                std::pin::pin!(tensor.replace_logical_block(0, vec![2.; len as usize]));
+            assert!(futures::poll!(replacement.as_mut()).is_pending());
+        }
         drop(guard);
         assert!(owner.gate.try_write().is_ok());
         assert!(owner.healthy().is_ok());
@@ -599,7 +601,7 @@ async fn copy_batches_coalesce_existing_logical_blocks() {
     let (out_root, dir) = new_dir("copy_interleaved_output").await;
     let output = copy_metrics::CURRENT
         .scope(Default::default(), async {
-            let output = Tensor::<TestFE, f32>::copy_from(dir, &source, 4096)
+            let output = Tensor::<TestFE, f32>::copy_from(dir, &source, source.layout(), 4096)
                 .await
                 .unwrap();
             copy_metrics::CURRENT.with(|m| {
@@ -789,7 +791,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
 
         if metadata {
             let held = owner.blocks.write().await;
-            let mut future = Box::pin(builder.finish());
+            let mut future = builder.finish();
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(10), &mut future)
                     .await
@@ -812,7 +814,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
         } else {
             let held = owner.values.write().await;
             let coords = [vec![1, 0]];
-            let mut future = Box::pin(builder.stage(&coords, vec![2.]));
+            let mut future = builder.stage(&coords, vec![2.]);
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(10), &mut future)
                     .await

@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_providers_preserve_error_precedence_and_ordered_union() {
+    async fn ordered_providers_visit_operands_left_to_right() {
         use crate::{TensorAbs, TensorMath, TensorWhere};
 
         type Provide = fn(&[u64]) -> Result<Option<RequestIterator>>;
@@ -552,9 +552,9 @@ mod tests {
         .await;
 
         for (providers, expected, fails) in [
-            ([none, error, none], [0, 1, 0], true),
-            ([none, none, error], [0, 1, 1], true),
-            ([error, none, none], [1, 1, 1], true),
+            ([none, error, none], [1, 1, 0], true),
+            ([none, none, error], [1, 1, 1], true),
+            ([error, none, none], [1, 0, 0], true),
             ([none, some, some], [1, 1, 1], false),
             ([some, none, some], [1, 1, 1], false),
             ([some, some, none], [1, 1, 1], false),

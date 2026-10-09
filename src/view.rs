@@ -72,7 +72,7 @@ where
         geometry: &crate::StorageGeometry,
         source: crate::TensorExpression<S::DType>,
     ) -> Result<futures::stream::BoxStream<'static, Result<crate::BlockUpdates<S::DType>>>> {
-        use futures::{StreamExt, TryStreamExt};
+        use futures::StreamExt;
         self.validate_geometry(geometry)?;
         if self.shape() != source.shape() {
             return Err(Error::InvalidLayout(
@@ -84,13 +84,9 @@ where
         let mapping = self.mapping.clone();
         Ok(
             crate::expression::completion_batches(std::sync::Arc::new(source))?
-                .and_then(move |(request, batch)| {
-                    futures::future::ready(crate::storage::plan_updates(
-                        &geometry,
-                        Some(&mapping),
-                        &request,
-                        batch.values,
-                    ))
+                .map(move |result| {
+                    let (request, batch) = result?;
+                    crate::storage::plan_updates(&geometry, Some(&mapping), &request, batch.values)
                 })
                 .boxed(),
         )

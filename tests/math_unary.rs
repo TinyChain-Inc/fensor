@@ -3,9 +3,9 @@
 
 use fensor::unary::{Exp, Round};
 use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorAbs, TensorExpression, TensorRead, TensorSchema,
-    TensorTransform, TensorTrig, TensorUnary, TensorView, TensorViewSemantics, TensorWrite,
-    UnaryView,
+    AxisRange, Error, Layout, Tensor, TensorAbs, TensorExpression, TensorGeometry, TensorRead,
+    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorViewSemantics,
+    TensorWrite, UnaryView,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
@@ -33,6 +33,7 @@ async fn dense_single_block_round_matches_expected_values() {
     let rounded = Tensor::copy_from(
         out_dir,
         &tensor.view().round().await.expect("round should succeed"),
+        Layout::Dense,
         1000,
     )
     .await
@@ -65,6 +66,7 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
     let expd = Tensor::copy_from(
         exp_dir,
         &tensor.view().exp().await.expect("exp should succeed"),
+        Layout::Dense,
         1000,
     )
     .await
@@ -72,6 +74,7 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
     let lnd = Tensor::copy_from(
         ln_dir,
         &tensor.view().ln().await.expect("ln should succeed"),
+        Layout::Dense,
         1000,
     )
     .await
@@ -117,7 +120,7 @@ async fn chain_is_lazy_until_copy() {
         "copy must not have run any I/O yet"
     );
 
-    let copied = Tensor::copy_from(out_dir.clone(), &chain, 1000)
+    let copied = Tensor::copy_from(out_dir.clone(), &chain, chain.layout(), 1000)
         .await
         .expect("copy should succeed");
     copied.sync().await.expect("sync");
@@ -152,6 +155,7 @@ async fn ln_domain_edges_produce_ieee754_values_not_errors() {
             .ln()
             .await
             .expect("ln should succeed, not error"),
+        Layout::Dense,
         1000,
     )
     .await
@@ -185,7 +189,15 @@ async fn sparse_round_and_explicit_dense_exp_ln_preserve_values() {
         let (_out_root, out_dir) = new_dir(&format!("sparse_unary_supported_{op_name}_out")).await;
         let view = tensor.view();
         let result = match op_name {
-            "round" => Tensor::copy_from(out_dir, &view.round().await.expect("round"), 1000).await,
+            "round" => {
+                Tensor::copy_from(
+                    out_dir,
+                    &view.round().await.expect("round"),
+                    view.layout(),
+                    1000,
+                )
+                .await
+            }
             "exp" => {
                 Tensor::copy_from(
                     out_dir,
@@ -195,6 +207,7 @@ async fn sparse_round_and_explicit_dense_exp_ln_preserve_values() {
                         .exp()
                         .await
                         .expect("exp"),
+                    Layout::Dense,
                     1000,
                 )
                 .await
@@ -208,6 +221,7 @@ async fn sparse_round_and_explicit_dense_exp_ln_preserve_values() {
                         .ln()
                         .await
                         .expect("ln"),
+                    Layout::Dense,
                     1000,
                 )
                 .await
@@ -278,7 +292,7 @@ async fn transformed_sparse_unary_view_copies() {
         .exp()
         .await
         .expect("exp should succeed lazily");
-    let result = Tensor::copy_from(out_dir, &chain, 2)
+    let result = Tensor::copy_from(out_dir, &chain, chain.layout(), 2)
         .await
         .expect("copy transformed sparse");
     assert_eq!(
@@ -320,6 +334,7 @@ async fn chained_exp_then_round_matches_per_coordinate_computation_multi_block()
             .round()
             .await
             .expect("round should succeed"),
+        Layout::Dense,
         1000,
     )
     .await
@@ -366,7 +381,9 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
     assert_eq!(first.iter().map(Vec::len).collect::<Vec<_>>(), vec![10]);
     let values: Vec<_> = first.into_iter().flatten().collect();
     let (out_root, out_dir) = new_dir("unary_consumers_out").await;
-    let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
+        .await
+        .unwrap();
     for (i, coord) in iter_coords(&[5, 2]).enumerate() {
         let expected = (((coord[1] * 5 + coord[0]) as f64 / 4.0).round()).exp();
         assert_eq!(values[i], expected);
@@ -412,7 +429,9 @@ async fn sparse_chain_keeps_intermediate_zeros_through_transforms() {
         .unwrap();
     assert!(rows.is_empty());
     let (out_root, out_dir) = new_dir("sparse_chain_support_out").await;
-    let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
+        .await
+        .unwrap();
     for coord in iter_coords(&[3, 2]) {
         assert_eq!(
             output.read_value(&coord).await.unwrap(),
@@ -480,7 +499,7 @@ async fn copying_spills_beyond_cache_budget_and_reloads() {
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
         let expression = tensor.view().exp().await.unwrap();
-        let output = Tensor::copy_from(out_dir.clone(), &expression, 16)
+        let output = Tensor::copy_from(out_dir.clone(), &expression, expression.layout(), 16)
             .await
             .unwrap();
 
@@ -621,7 +640,9 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
         let values: Vec<_> = blocks.into_iter().flatten().collect();
         assert_eq!(values.len(), 6);
         let (out_root, out_dir) = new_dir(&format!("{name}_out")).await;
-        let output = Tensor::copy_from(out_dir, &expression, 2).await.unwrap();
+        let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
+            .await
+            .unwrap();
         if matches!(layout, Layout::Sparse { .. }) {
             let rows: Vec<_> = expression
                 .read_coordinate_blocks()

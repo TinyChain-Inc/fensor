@@ -1,7 +1,7 @@
 //! Reproducible storage-shape workloads; measurements are evidence, not thresholds.
 use std::time::Instant;
 
-use fensor::{Layout, Tensor, TensorRead, TensorSchema, TensorSource, TensorWrite};
+use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
 use number_general::DType;
 
 use super::{benchmark, common};
@@ -64,7 +64,7 @@ pub async fn storage() {
         let point = start.elapsed();
         let (copy_root, copy_dir) = common::new_dir("adaptive_copy").await;
         let start = Instant::now();
-        let copy = Tensor::<common::FsEntry, f64>::copy_from(copy_dir, &t, 4096)
+        let copy = Tensor::<common::FsEntry, f64>::copy_from(copy_dir, &t, t.layout(), 4096)
             .await
             .unwrap();
         let construct_time = start.elapsed();
@@ -329,6 +329,7 @@ pub async fn traversal() {
     }
     Box::pin(sparse_output()).await;
     Box::pin(sparse_selections()).await;
+    Box::pin(sparse_union()).await;
 }
 
 async fn sparse_output() {
@@ -372,6 +373,93 @@ async fn sparse_output() {
             },
         )
         .await;
+    }
+}
+
+async fn sparse_union() {
+    use fensor::{TensorExpression, TensorMath};
+    use futures::TryStreamExt;
+
+    let repeats = workload_repetitions(4);
+    for rank in [2, 9] {
+        for leaves in [2, 8] {
+            let mut shape = vec![1; rank];
+            shape[rank - 2] = 32;
+            shape[rank - 1] = 257;
+            let present = |leaf: usize, row: usize| row.is_multiple_of(4) || row % 4 == leaf % 4;
+            let expected: Vec<f64> = (0..32)
+                .map(|row| {
+                    (0..leaves)
+                        .filter(|&leaf| present(leaf, row))
+                        .map(|leaf| (leaf + 1) as f64)
+                        .sum()
+                })
+                .collect();
+            let mut roots = Vec::new();
+            let mut expression: Option<TensorExpression<f64>> = None;
+
+            for leaf in 0..leaves {
+                let (root, tensor) = common::fixture::source(
+                    "sparse_union",
+                    shape.clone().into(),
+                    Layout::Sparse {
+                        axis: Some(rank - 2),
+                    },
+                    256,
+                    1_000_000,
+                    (0..32 * 257).map(|offset| {
+                        if present(leaf, offset / 257) && (offset % 257) % 8 == 0 {
+                            (leaf + 1) as f64
+                        } else {
+                            0.
+                        }
+                    }),
+                )
+                .await;
+                roots.push(root);
+                let operand = TensorExpression::new(tensor).unwrap();
+                expression = Some(match expression {
+                    Some(expression) => {
+                        TensorExpression::new(expression.add(&operand).await.unwrap()).unwrap()
+                    }
+                    None => operand,
+                });
+            }
+
+            let expression = expression.unwrap();
+            benchmark::measure(
+                &format!("sparse_union_rank{rank}_leaves{leaves}"),
+                "owned_sparse",
+                "warm",
+                async {
+                    let mut count = 0;
+                    for _ in 0..repeats {
+                        let mut expected = expected
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, value)| **value != 0.)
+                            .flat_map(|(row, value)| {
+                                (0..257).step_by(8).map(move |column| (row, column, *value))
+                            });
+                        let mut stream = expression.clone().into_sparse_elements().unwrap();
+                        while let Some((coord, value)) = stream.try_next().await.unwrap() {
+                            let (row, column, expected_value) = expected.next().unwrap();
+                            assert_eq!(coord.len(), rank);
+                            assert!(coord[..rank - 2].iter().all(|&axis| axis == 0));
+                            assert_eq!(coord[rank - 2], row as u64);
+                            assert_eq!(coord[rank - 1], column);
+                            assert_eq!(value, expected_value);
+                            count += 1;
+                        }
+                        assert!(expected.next().is_none());
+                    }
+                    count
+                },
+            )
+            .await;
+            drop(expression);
+            drop(roots);
+        }
     }
 }
 

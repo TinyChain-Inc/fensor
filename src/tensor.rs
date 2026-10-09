@@ -5,7 +5,6 @@ mod sparse_storage;
 mod physical_tests;
 
 #[cfg(test)]
-#[path = "tensor/dtype_storage.rs"]
 mod dtype_storage;
 
 use std::sync::Arc;
@@ -314,9 +313,11 @@ where
     /// Create an independent tensor by consuming a reader in bounded batches.
     ///
     /// Evaluation is driven by reads; no intermediate tensor is created. The
-    /// destination uses the reader's dtype and shape. Sparse output resets the
-    /// axis hint to `None` and omits zeros. Errors propagate, leaving cleanup of
-    /// partial destination storage to the caller. Coordinate-bearing blocks may be
+    /// destination uses the reader's dtype and shape with the caller's layout.
+    /// The reported source layout does not prescribe destination allocation; sparse
+    /// axes may differ. Dense/sparse kind changes require explicit conversion first.
+    /// Sparse output omits zeros. Errors propagate; the caller cleans up partial
+    /// destination storage. Coordinate-bearing blocks may be
     /// unordered; bounds, lengths, and total count are checked. Exactly-once coverage
     /// is the source contract, without a whole-output duplicate detector.
     /// Updates are grouped by destination block within each bounded incoming batch;
@@ -325,16 +326,26 @@ where
     /// Each destination update completes before the next source batch is requested.
     /// Dropping the copy cancels its active operation and releases the source stream.
     /// The source retains its own bounded buffering in addition to the current batch.
-    pub async fn copy_from<R>(dir: DirLock<FE>, source: &R, max_capacity: usize) -> Result<Self>
+    pub async fn copy_from<R>(
+        dir: DirLock<FE>,
+        source: &R,
+        destination_layout: Layout,
+        max_capacity: usize,
+    ) -> Result<Self>
     where
         R: TensorRead<DType = T> + ?Sized,
     {
         let schema =
             TensorSchema::new(<T as number_general::DType>::dtype(), source.shape().into())?;
-        let layout = source.layout();
+        if matches!(source.layout(), Layout::Dense) != matches!(destination_layout, Layout::Dense) {
+            return Err(Error::Unsupported(
+                "copy requires matching dense/sparse kinds; convert the source explicitly first"
+                    .into(),
+            ));
+        }
 
-        let output = Self::unpublished(dir, schema, layout, max_capacity).await?;
-        if matches!(source.layout(), Layout::Sparse { .. }) {
+        let output = Self::unpublished(dir, schema, destination_layout, max_capacity).await?;
+        if matches!(destination_layout, Layout::Sparse { .. }) {
             let entries = source
                 .read_sparse_elements_in_order(
                     crate::validate::full_range(source.shape()),
@@ -921,7 +932,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
     }
 
     fn read_storage<'a>(&'a self, read: crate::StorageRead<'a>) -> BoxFuture<'a, Result<Vec<T>>> {
-        Box::pin(async move { self.read_batch(read.request, read.mapping).await })
+        Box::pin(self.read_batch(read.request, read.mapping))
     }
 
     fn occupied_blocks(

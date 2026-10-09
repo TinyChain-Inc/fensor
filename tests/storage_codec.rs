@@ -186,7 +186,7 @@ async fn json_storage_supports_dense_sparse_copy_and_reload() {
         assert_eq!(tensor.layout(), layout);
         let (copy_root, copy_dir) = common::new_dir("json_to_tbon").await;
         let cast = tensor.view().cast().await.unwrap();
-        let copy = Tensor::<FsEntry, f64>::copy_from(copy_dir.clone(), &cast, 2)
+        let copy = Tensor::<FsEntry, f64>::copy_from(copy_dir.clone(), &cast, cast.layout(), 2)
             .await
             .unwrap();
 
@@ -363,7 +363,10 @@ async fn binary_sources_use_independent_codecs() {
     a.sync().await.unwrap();
     let expression = a.view().add(&b.view()).await.unwrap().clone();
     let (_output_dir_root, output_dir) = common::new_dir("binary_codecs_copy").await;
-    let output: Tensor<FsEntry, f32> = Tensor::copy_from(output_dir, &expression, 4).await.unwrap();
+    let output: Tensor<FsEntry, f32> =
+        Tensor::copy_from(output_dir, &expression, expression.layout(), 4)
+            .await
+            .unwrap();
 
     assert_eq!(output.read_value(&[4]).await.unwrap(), 6.);
     assert_eq!(output.read_value(&[0]).await.unwrap(), 0.);
@@ -411,9 +414,10 @@ async fn conditional_sources_and_output_use_independent_codecs() {
     let out_root = common::Directory::new("conditional_json_output").await;
     let out_cache = Cache::<JsonEntry>::new(1024, None, 0, std::time::Duration::from_secs(1));
     let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
-    let output: Tensor<JsonEntry, f32> = Tensor::copy_from(out_dir.clone(), &expression, 4)
-        .await
-        .unwrap();
+    let output: Tensor<JsonEntry, f32> =
+        Tensor::copy_from(out_dir.clone(), &expression, expression.layout(), 4)
+            .await
+            .unwrap();
     output.sync().await.unwrap();
     drop(output);
     drop(out_dir);
@@ -427,7 +431,9 @@ async fn conditional_sources_and_output_use_independent_codecs() {
     let reduced = expression.sum(ha_ndarray::axes![0], false).await.unwrap();
     assert_eq!(reduced.sum_all().await.unwrap(), 6.);
     let (_dir_root, dir) = common::new_dir("reduced_independent_codec").await;
-    let reduced_copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &reduced, 1).await.unwrap();
+    let reduced_copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &reduced, reduced.layout(), 1)
+        .await
+        .unwrap();
     assert_eq!(reduced_copy.read_value(&[0]).await.unwrap(), 6.);
     let matrix = a
         .view()
@@ -437,6 +443,8 @@ async fn conditional_sources_and_output_use_independent_codecs() {
         .await
         .unwrap();
     let (_dir_root, dir) = common::new_dir("matmul_independent_codec").await;
-    let product: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &matrix, 1).await.unwrap();
+    let product: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &matrix, matrix.layout(), 1)
+        .await
+        .unwrap();
     assert_eq!(product.read_value(&[0, 0]).await.unwrap(), 0.);
 }

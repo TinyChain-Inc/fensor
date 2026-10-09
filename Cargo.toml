@@ -19,6 +19,7 @@ required-features = ["benchmarks"]
 get-size = "0.1"
 tokio = { version = "1", features = ["sync"] }
 b-table = { path = "../b-table", features = ["stream"] }
+collate = { path = "../collate", features = ["stream"] }
 destream = { path = "../destream", version = "0.10" }
 freqfs = { path = "../freqfs", version = "0.13" }
 ha-ndarray = { path = "../ha-ndarray", version = "0.5" }

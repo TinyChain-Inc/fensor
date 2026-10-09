@@ -3,9 +3,9 @@
 use fensor::{
     Layout, Tensor, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
     TensorCompareScalar, TensorComplex, TensorElement, TensorExpression, TensorFileEntry,
-    TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric, TensorRead,
-    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig, TensorUnary,
-    TensorUnaryBoolean, TensorWhere, TensorWrite,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric,
+    TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig,
+    TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -371,9 +371,10 @@ async fn projection_batching_and_live_sources() {
         1
     );
     let (copy_root, dir) = common::new_dir("projection_boundary").await;
-    let copy: Tensor<FsEntry, f64> = Tensor::copy_from(dir, &tensor.view().re().await.unwrap(), 2)
-        .await
-        .unwrap();
+    let copy: Tensor<FsEntry, f64> =
+        Tensor::copy_from(dir, &tensor.view().re().await.unwrap(), tensor.layout(), 2)
+            .await
+            .unwrap();
     assert_eq!(
         TensorExpression::new(copy.view())
             .unwrap()

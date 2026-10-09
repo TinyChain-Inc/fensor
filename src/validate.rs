@@ -143,8 +143,8 @@ pub fn matmul_output_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
     Ok(out)
 }
 
-/// Validate ranges without expanding interval axes into coordinate buffers.
-pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoords> {
+/// Validate range bounds and cardinality without cloning explicit selections.
+pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64)> {
     if range.len() != shape.len() {
         return Err(Error::InvalidLayout(
             "range rank must match tensor rank".into(),
@@ -174,6 +174,12 @@ pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoo
             .map_err(|_| Error::InvalidLayout("range size overflow".into()))?
     };
 
+    Ok((lengths, remaining))
+}
+
+/// Validate ranges without expanding interval axes into coordinate buffers.
+pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoords> {
+    let (lengths, remaining) = validate_range(shape, range)?;
     Ok(RangeCoords {
         range: range.clone(),
         coord: Coord::from_elem(0, range.len()),
@@ -301,6 +307,37 @@ mod tests {
 
     #[test]
     fn range_cardinality_handles_empty_selections_and_overflow() {
+        assert!(matches!(
+            validate_range(&[3], &Range::new()),
+            Err(Error::InvalidLayout(error)) if error == "range rank must match tensor rank"
+        ));
+        for (name, bound) in [
+            ("point", AxisRange::At(3)),
+            ("step", AxisRange::In(0, 3, 0)),
+            ("reversed", AxisRange::In(2, 1, 1)),
+            ("endpoint", AxisRange::In(0, 4, 1)),
+            ("explicit", AxisRange::Of(vec![0, 3])),
+        ] {
+            assert!(
+                matches!(validate_range(&[3], &smallvec::smallvec![bound]),
+                    Err(Error::InvalidLayout(error)) if error == "range bound at axis 0 is out of bounds"),
+                "{name}"
+            );
+        }
+        for (range, expected) in [
+            (smallvec::smallvec![AxisRange::In(1, 3, 2)], 1),
+            (smallvec::smallvec![AxisRange::In(3, 3, 1)], 0),
+            (smallvec::smallvec![AxisRange::Of(vec![2, 0, 2])], 3),
+        ] {
+            let (lengths, count) = validate_range(&[3], &range).unwrap();
+            assert_eq!(lengths.as_slice(), &[expected]);
+            assert_eq!(count, expected);
+            assert_eq!(
+                iter_range_coords(&[3], &range).unwrap().count() as u64,
+                expected
+            );
+        }
+
         let long = u64::MAX / 2;
         let selection: Range =
             smallvec::smallvec![AxisRange::In(0, long, 1), AxisRange::Of(vec![0, 1, 0])];

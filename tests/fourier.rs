@@ -392,7 +392,7 @@ async fn sparse_group_support_and_live_sources() {
         .unwrap();
     consumers(&retained, &[one; 8], 0.).await;
     let (copy_root, dir) = new_dir("fourier_support_copy").await;
-    let copy = Tensor::<FsEntry, Complex64>::copy_from(dir, &zero, 2)
+    let copy = Tensor::<FsEntry, Complex64>::copy_from(dir, &zero, zero.layout(), 2)
         .await
         .unwrap();
     let copied = TensorExpression::new(copy.view().fft().await.unwrap())

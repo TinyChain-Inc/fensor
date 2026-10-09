@@ -614,11 +614,7 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
             .enumerate()
             .map(|(axis, dim)| {
                 if self.axes.contains(&axis) {
-                    request::Axis::Span {
-                        start: 0,
-                        step: 1,
-                        len: *dim,
-                    }
+                    request::Axis::range(0, *dim)
                 } else {
                     let i = if self.keepdims {
                         axis
@@ -627,11 +623,7 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
                         next += 1;
                         i
                     };
-                    request::Axis::Span {
-                        start: coord[i],
-                        step: 1,
-                        len: 1,
-                    }
+                    request::Axis::range(coord[i], 1)
                 }
             })
             .collect();
@@ -775,22 +767,12 @@ where
                     .await?;
                 let mut input = batch.values.into_iter();
 
+                // The validated batch contains every nonempty group in full.
                 for len in lengths {
-                    let mut state = None;
-                    let mut remaining = len;
-                    accumulate::<_, O>(
-                        &self.op,
-                        &mut state,
-                        &mut remaining,
-                        input.by_ref().take(len as usize).collect(),
-                    )?;
-                    accumulate_zeros::<_, O>(
-                        &self.op,
-                        &mut state,
-                        remaining,
-                        self.source.implicit_zero(),
-                    )?;
-                    values.push(O::finish_axis(state)?);
+                    #[cfg(test)]
+                    crate::read_metrics::record(|m| m.reduction_calls += 1);
+                    let group = input.by_ref().take(len as usize).collect();
+                    values.push(O::finish(self.op.partial(group)?)?);
                 }
             }
 

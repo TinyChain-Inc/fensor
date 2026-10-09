@@ -1,11 +1,13 @@
 //! Shallow expression traversal. Deferred steps retain borrows, never nested consumers.
 
 use std::sync::Arc;
+use std::task::{Poll, ready};
 
+use collate::Collator;
 use futures::{StreamExt, TryStreamExt};
 
 use super::{Expression, MAX_BATCH_ELEMENTS, RequestIterator};
-use crate::request::{BatchRequest, Cursor};
+use crate::request::{BatchRequest, Cursor, decode_flat};
 use crate::schema::Coord;
 use crate::slice::{Requests, Slice};
 use crate::{Error, Result, TensorElement};
@@ -19,7 +21,7 @@ pub enum Preferred<'a> {
 
 pub enum Ordered<'a> {
     Ready(Requests<'static>),
-    Sources(Vec<(usize, Deferred<'a, Ordered<'a>>)>),
+    Sources(Vec<Deferred<'a, Ordered<'a>>>),
 }
 
 pub enum Selection<'a> {
@@ -100,139 +102,88 @@ pub fn ordered<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Reque
 where
     E::DType: TensorElement,
 {
-    // Slots preserve stream polling order separately from eager provider-error order.
-    enum Node {
-        Leaf(usize),
-        Union(Vec<usize>),
-    }
-
-    let mut pending: Vec<(usize, usize, Deferred<'_, Ordered<'_>>)> = Vec::new();
-    let mut nodes = vec![Node::Union(vec![0])];
+    let mut pending: Vec<Deferred<'_, Ordered<'_>>> = Vec::new();
     let mut streams = Vec::new();
     reserve(&mut pending, 1)?;
-    pending.push((0, 0, Box::new(move || source.ordered_step(slice))));
+    pending.push(Box::new(move || source.ordered_step(slice)));
     let mut visited = 0;
 
-    while let Some((parent, slot, next)) = pending.pop() {
+    while let Some(next) = pending.pop() {
         visit(&mut visited)?;
-        let index = nodes.len();
-        if let Node::Union(children) = &mut nodes[parent] {
-            children[slot] = index;
-        }
-        reserve(&mut nodes, 1)?;
         match next()? {
             Ordered::Ready(stream) => {
-                nodes.push(Node::Leaf(streams.len()));
                 reserve(&mut streams, 1)?;
-                streams.push(Some(stream));
+                streams.push(stream);
             }
             Ordered::Sources(children) => {
-                nodes.push(Node::Union(vec![0; children.len()]));
                 reserve(&mut pending, children.len())?;
-                pending.extend(
-                    children
-                        .into_iter()
-                        .rev()
-                        .map(|(slot, child)| (index, slot, child)),
-                );
+                pending.extend(children.into_iter().rev());
             }
         }
     }
 
-    let mut ordered = Vec::new();
-    reserve(&mut ordered, streams.len())?;
-    let mut traversal = vec![0];
-
-    while let Some(index) = traversal.pop() {
-        match &nodes[index] {
-            Node::Leaf(stream) => {
-                ordered.push(streams[*stream].take().expect("unique candidate leaf"))
-            }
-            Node::Union(children) => {
-                reserve(&mut traversal, children.len())?;
-                traversal.extend(children.iter().rev().copied());
-            }
-        }
+    if streams.len() == 1 {
+        return Ok(streams.pop().expect("one candidate stream"));
     }
 
-    if ordered.len() == 1 {
-        return Ok(ordered.pop().expect("one candidate stream"));
-    }
-
-    Ok(merge(ordered, source.shape().into()))
+    Ok(merge(streams, source.shape().into()))
 }
 
-/// One compact request and reusable lookahead coordinate per leaf, with one output batch.
-/// Flattening the union prevents stream polling and drop from following expression depth.
+/// Adapt each compact request with reusable scratch; the union retains scalar heads.
+/// Coordinates are allocated only for distinct outputs in the bounded result batch.
 fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'static> {
-    struct Input {
-        stream: Requests<'static>,
-        coordinates: Option<Cursor<BatchRequest, Arc<[u64]>>>,
-        next: Coord,
-        ready: bool,
-        done: bool,
-    }
-
+    let shape: Arc<[u64]> = Arc::from(shape.as_slice());
     let inputs: Vec<_> = streams
         .into_iter()
-        .map(|stream| Input {
-            stream,
-            coordinates: None,
-            next: Coord::new(),
-            ready: false,
-            done: false,
+        .map(|mut stream| {
+            let shape = Arc::clone(&shape);
+            let mut coordinates: Option<Cursor<BatchRequest, Arc<[u64]>>> = None;
+            let mut scratch = Coord::new();
+            let mut budget = super::driver::WorkBudget::new();
+            futures::stream::poll_fn(move |cx| {
+                loop {
+                    ready!(budget.poll(cx));
+                    if coordinates
+                        .as_mut()
+                        .is_some_and(|cursor| cursor.next_into(&mut scratch))
+                    {
+                        let flat = scratch.iter().zip(shape.iter()).try_fold(
+                            0u64,
+                            |flat, (coordinate, dimension)| {
+                                flat.checked_mul(*dimension)
+                                    .and_then(|flat| flat.checked_add(*coordinate))
+                                    .ok_or_else(|| {
+                                        Error::InvalidCoord("candidate position overflow".into())
+                                    })
+                            },
+                        );
+                        return Poll::Ready(Some(flat));
+                    }
+
+                    match ready!(stream.poll_next_unpin(cx)) {
+                        Some(Ok(request)) => match request.into_cursor(Arc::clone(&shape)) {
+                            Ok(cursor) => coordinates = Some(cursor),
+                            Err(error) => return Poll::Ready(Some(Err(error))),
+                        },
+                        Some(Err(error)) => return Poll::Ready(Some(Err(error))),
+                        None => return Poll::Ready(None),
+                    }
+                }
+            })
         })
         .collect();
-    let shape: Arc<[u64]> = Arc::from(shape.as_slice());
+    let union = collate::try_union(Collator::default(), inputs).boxed();
     futures::stream::try_unfold(
-        (
-            inputs,
-            shape,
-            None::<Coord>,
-            super::driver::WorkBudget::new(),
-        ),
-        |(mut inputs, shape, mut previous, mut budget)| async move {
+        (union, shape, Coord::new()),
+        |(mut union, shape, mut scratch)| async move {
             let mut output = Vec::with_capacity(MAX_BATCH_ELEMENTS);
 
             while output.len() < MAX_BATCH_ELEMENTS {
-                let mut first: Option<usize> = None;
-
-                for i in 0..inputs.len() {
-                    futures::future::poll_fn(|cx| budget.poll(cx)).await;
-                    let input = &mut inputs[i];
-                    // Retire every matching head in one pass. Repeated operands do
-                    // not require another full leaf scan for each duplicate.
-                    while !input.done && (!input.ready || previous.as_ref() == Some(&input.next)) {
-                        futures::future::poll_fn(|cx| budget.poll(cx)).await;
-                        input.ready = input
-                            .coordinates
-                            .as_mut()
-                            .is_some_and(|cursor| cursor.next_into(&mut input.next));
-                        if input.ready {
-                            continue;
-                        }
-
-                        if let Some(request) = input.stream.try_next().await? {
-                            input.coordinates = Some(request.into_cursor(Arc::clone(&shape))?);
-                        } else {
-                            input.coordinates = None;
-                            input.done = true;
-                        }
-                    }
-
-                    if input.ready && first.is_none_or(|first| inputs[i].next < inputs[first].next)
-                    {
-                        first = Some(i);
-                    }
-                }
-
-                let Some(first) = first else {
+                let Some(flat) = union.try_next().await? else {
                     break;
                 };
-
-                let coord = &inputs[first].next;
-                output.push(coord.to_vec());
-                previous.get_or_insert_with(Coord::new).clone_from(coord);
+                decode_flat(flat, &shape, &mut scratch)?;
+                output.push(scratch.to_vec());
             }
 
             if output.is_empty() {
@@ -240,7 +191,7 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
             } else {
                 Ok(Some((
                     BatchRequest::explicit(output)?,
-                    (inputs, shape, previous, budget),
+                    (union, shape, scratch),
                 )))
             }
         },
@@ -252,13 +203,12 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
 mod tests {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::Poll;
 
     use super::*;
     use crate::read_metrics::{CURRENT, Metrics};
 
     #[tokio::test]
-    async fn wide_sparse_support_retains_compact_requests_and_releases_sources() {
+    async fn wide_sparse_candidates_retain_compact_requests_and_release_sources() {
         for (leaves, rank) in [(1, 1), (129, 9)] {
             let mut shape = crate::Shape::from_elem(1, rank);
             shape[rank - 1] = MAX_BATCH_ELEMENTS as u64 + 1;
@@ -310,7 +260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_sparse_support_can_be_cancelled_and_errors_release_sources() {
+    async fn ready_sparse_candidates_can_be_cancelled_and_errors_release_sources() {
         for fail in [false, true] {
             let lease = Arc::new(());
             let weak = Arc::downgrade(&lease);
@@ -340,13 +290,48 @@ mod tests {
                 );
                 assert!(weak.upgrade().is_none());
             } else {
-                let mut next = Box::pin(stream.try_next());
-                assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
-                assert!(weak.upgrade().is_some());
-                drop(next);
+                {
+                    let mut next = std::pin::pin!(stream.try_next());
+                    assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
+                    assert!(weak.upgrade().is_some());
+                }
                 drop(stream);
                 assert!(weak.upgrade().is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn candidate_errors_discard_partial_batches_and_empty_inputs_yield() {
+        for next in [
+            Err(Error::InvalidLayout("candidate failure".into())),
+            Ok(BatchRequest::explicit(vec![vec![2]]).unwrap()),
+        ] {
+            let lease = Arc::new(());
+            let weak = Arc::downgrade(&lease);
+            let source = futures::stream::iter([Ok(BatchRequest::linear(0, 1).unwrap()), next])
+                .map(move |item| {
+                    let _ = &lease;
+                    item
+                })
+                .boxed();
+            let mut stream = merge(vec![source], crate::Shape::from_slice(&[2]));
+            assert!(stream.try_next().await.is_err());
+            assert!(weak.upgrade().is_none());
+            assert!(stream.try_next().await.unwrap().is_none());
+        }
+
+        let lease = Arc::new(());
+        let weak = Arc::downgrade(&lease);
+        let source = futures::stream::repeat_with(move || {
+            let _ = &lease;
+            Ok(BatchRequest::linear(0, 0).unwrap())
+        })
+        .boxed();
+        let mut stream = merge(vec![source], crate::Shape::from_slice(&[2]));
+        assert!(matches!(futures::poll!(stream.try_next()), Poll::Pending));
+        assert!(weak.upgrade().is_some());
+        drop(stream);
+        assert!(weak.upgrade().is_none());
     }
 }

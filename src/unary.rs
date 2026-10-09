@@ -395,9 +395,8 @@ where
         &self,
         slice: crate::slice::Slice,
     ) -> Result<expression::traversal::Ordered<'_>> {
-        Ok(expression::traversal::Ordered::Sources(vec![(
-            0,
-            Box::new(move || self.source.ordered_step(slice)),
+        Ok(expression::traversal::Ordered::Sources(vec![Box::new(
+            move || self.source.ordered_step(slice),
         )]))
     }
 
@@ -416,7 +415,7 @@ where
         coords: std::sync::Arc<BatchRequest>,
     ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
-            let source = context.batch(&self.source, coords.clone()).await?;
+            let source = context.batch(&self.source, coords).await?;
             Batch {
                 _allocation: None,
                 array: self.op.apply(source.array)?,

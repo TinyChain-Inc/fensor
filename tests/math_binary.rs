@@ -219,7 +219,9 @@ async fn sparse_zero_intermediates_match_materialized_values() {
     )
     .await;
     let (_dir_root, dir) = new_dir("binary_zero_copy").await;
-    let copied: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &zero, 2).await.unwrap();
+    let copied: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &zero, zero.layout(), 2)
+        .await
+        .unwrap();
     check(copied.view(), vec![0.; 4]).await;
     assert!(matches!(
         copied.view().exp().await,
@@ -400,9 +402,10 @@ async fn binary_copy_under_cache_pressure_reloads() {
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
         let expression = a.view().add(&b.view()).await.unwrap();
-        let output: Tensor<FsEntry, u8> = Tensor::copy_from(out_dir.clone(), &expression, 32)
-            .await
-            .unwrap();
+        let output: Tensor<FsEntry, u8> =
+            Tensor::copy_from(out_dir.clone(), &expression, expression.layout(), 32)
+                .await
+                .unwrap();
 
         assert_eq!(output.read_value(&[1023]).await.unwrap(), 0);
         output.sync().await.unwrap();
@@ -504,7 +507,7 @@ async fn binary_tree_transforms_preserve_operand_order_and_scalar_limits() {
     let (_dir_root, dir) = new_dir("binary_scalar_copy").await;
 
     assert!(
-        Tensor::<FsEntry, f64>::copy_from(dir, &scalar, 2)
+        Tensor::<FsEntry, f64>::copy_from(dir, &scalar, scalar.layout(), 2)
             .await
             .is_err()
     );
@@ -872,7 +875,9 @@ async fn sparse_scalar_comparison_and_selection_use_ordinary_zeros() {
         Err(fensor::Error::WouldDensify { .. })
     ));
     let (_dir_root, dir) = new_dir("selected_zero_copy").await;
-    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &selected, 2).await.unwrap();
+    let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &selected, selected.layout(), 2)
+        .await
+        .unwrap();
     let selected = TensorExpression::new(selected).unwrap().into_dense();
     let copy = TensorExpression::new(copy).unwrap().into_dense();
     check(selected.eq_scalar(0.).await.unwrap(), vec![1, 1, 0, 1]).await;
@@ -1068,7 +1073,7 @@ async fn conditional_live_sources_transforms_and_scalar_limit() {
     assert!(scalar.read_blocks().is_err());
     let (_dir_root, dir) = new_dir("conditional_scalar_copy").await;
     assert!(
-        Tensor::<FsEntry, f32>::copy_from(dir, &scalar, 2)
+        Tensor::<FsEntry, f32>::copy_from(dir, &scalar, scalar.layout(), 2)
             .await
             .is_err()
     );
@@ -1098,9 +1103,10 @@ async fn conditional_copy_under_cache_pressure_reloads() {
         let out_cache =
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
         let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
-        let output: Tensor<FsEntry, u8> = Tensor::copy_from(out_dir.clone(), &expression, 32)
-            .await
-            .unwrap();
+        let output: Tensor<FsEntry, u8> =
+            Tensor::copy_from(out_dir.clone(), &expression, expression.layout(), 32)
+                .await
+                .unwrap();
         assert_eq!(output.read_value(&[1023]).await.unwrap(), 255);
         output.sync().await.unwrap();
         drop(output);

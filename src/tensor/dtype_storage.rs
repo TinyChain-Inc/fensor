@@ -103,10 +103,14 @@ where
         );
         fixture::blocks(&tensor, &expected, same).await;
         let (copy_root, copy_dir) = common::new_dir("dtype_copy").await;
-        let copied =
-            Tensor::<FsEntry, T>::copy_from(copy_dir.clone(), &tensor.view().flip(0).unwrap(), 31)
-                .await
-                .unwrap();
+        let copied = Tensor::<FsEntry, T>::copy_from(
+            copy_dir.clone(),
+            &tensor.view().flip(0).unwrap(),
+            layout,
+            31,
+        )
+        .await
+        .unwrap();
         let reversed: Vec<_> = expected.iter().copied().rev().collect();
         fixture::blocks(&copied, &reversed, same).await;
         copied.sync().await.unwrap();

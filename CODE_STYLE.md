@@ -81,3 +81,25 @@ refer to the owner; public documentation links to DESIGN.md's bound table, which
 records current values. Boundary tests use the owning constant and adjacent
 values where accessible; explicit numerical and benchmark fixtures retain their
 inputs. Do not expose private limits solely for documentation or tests.
+
+## Panics and errors
+
+Return structured errors for invalid input, storage failures, resource limits,
+and poisoned execution state. Assertions and `expect` require an internal
+invariant established by validation or local control flow; external operations
+are fallible. Destructors must avoid introducing panics during cleanup. Tests
+may assert and unwrap expected results.
+
+## Futures and streams
+
+- Concrete operations own mathematics; shared consumers own stack-safe polling,
+  batching, and delivery order. Transaction leases belong to the caller.
+- Prefer `async fn`, stream combinators, and `try_unfold`. Handwritten polling
+  belongs to scheduling, cooperative progress, or resource release. Ready-item
+  loops must yield cooperatively; an `await` need not return `Pending`.
+- Use `pin!` for local consumption. Keep `BoxFuture` and `BoxStream` at owned,
+  erased, or documented stack-size boundaries. Local pinning cannot replace an
+  escaping boxed future, and boxing recursion does not make polling stack-safe.
+- Only the outer consumer buffers evaluation. Preserve ordered versus
+  completion-order delivery explicitly. Streams retain their sources; cancellation
+  drops active work without background ingestion tasks.
