@@ -170,3 +170,7 @@ come from production-linked consumers; unit-test counters establish structural
 work independently. Smoke runs check both native production and profiling wiring
 with the normal thread stack. Generated measurements remain under ignored
 `benchmarks/results/`.
+
+The private profiling implementation lives in `tests/unit/profiling.rs`, included
+as the existing `profiling` unit-test module. Its entrypoint and shared workloads
+are unchanged.

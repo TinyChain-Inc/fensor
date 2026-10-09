@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[path = "../tests/unit/view/tests.rs"]
 mod tests;
 
 use crate::mapping::{AxisContrib, CoordinateMap};

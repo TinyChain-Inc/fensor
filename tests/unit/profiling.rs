@@ -2,10 +2,10 @@
 
 use crate::test_support as common;
 
-#[path = "../tests/common/benchmark.rs"]
+#[path = "../common/benchmark.rs"]
 mod benchmark;
 
-#[path = "../tests/common/workloads.rs"]
+#[path = "../common/workloads.rs"]
 mod workloads;
 
 async fn observe(

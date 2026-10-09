@@ -26,7 +26,7 @@ mod matrix_unary {
             .unwrap();
             tensor.write_value(&[n - 1, n - 1], 255).await.unwrap();
             tensor.write_value(&[0, 1], 127).await.unwrap();
-            tensor.corrupt_sparse_payload(1).await;
+            crate::tensor::corruption::corrupt_sparse_payload(&tensor, 1).await;
             let diag = tensor.view().diag().await.unwrap();
             assert_eq!(diag.read_value(&[0]).await.unwrap(), 0);
             let entries: Vec<_> = diag
@@ -48,7 +48,7 @@ mod matrix_unary {
                     .await
                     .is_err()
             );
-            tensor.corrupt_sparse_payload(n * n - 1).await;
+            crate::tensor::corruption::corrupt_sparse_payload(&tensor, n * n - 1).await;
             assert!(matches!(
                 diag.read_value(&[n - 1]).await,
                 Err(Error::InvalidLayout(_))
@@ -88,8 +88,8 @@ mod math_unary {
         tensor.write_value(&[3], 0.2).await.unwrap();
         tensor.write_value(&[4], 1.2).await.unwrap();
         tensor.write_value(&[7], 0.2).await.unwrap();
-        tensor.corrupt_sparse_payload(3).await;
-        tensor.corrupt_sparse_payload(7).await;
+        crate::tensor::corruption::corrupt_sparse_payload(&tensor, 3).await;
+        crate::tensor::corruption::corrupt_sparse_payload(&tensor, 7).await;
         let view = tensor.view();
         // Consecutive groups share reads without visiting the corrupt gap;
         // missing rows stay zero and repeated selections retain their order.
@@ -287,7 +287,7 @@ mod matmul {
             .unwrap();
             a.write_value(&[999_999_999, 1], 2.).await.unwrap();
             a.write_value(&[0, 0], 1.).await.unwrap();
-            a.corrupt_sparse_payload(0).await;
+            crate::tensor::corruption::corrupt_sparse_payload(&a, 0).await;
             let (_b_root, b) = common::fixture::source(
                 "right_operand",
                 shape![2, 2],
@@ -357,7 +357,7 @@ mod math_binary {
         .unwrap();
         tensor.write_value(&[0], 0.2).await.unwrap();
         tensor.write_value(&[7], 0.2).await.unwrap();
-        tensor.corrupt_sparse_payload(7).await;
+        crate::tensor::corruption::corrupt_sparse_payload(&tensor, 7).await;
         let (_empty_root, empty) = common::fixture::source(
             "empty_operand",
             shape![8],
@@ -420,7 +420,7 @@ mod math_binary {
         .unwrap();
         corrupt.write_value(&[0], 1).await.unwrap();
         corrupt.write_value(&[7], 1).await.unwrap();
-        corrupt.corrupt_sparse_payload(7).await;
+        crate::tensor::corruption::corrupt_sparse_payload(&corrupt, 7).await;
         let (_empty_root, empty) = common::fixture::source(
             "empty_operand",
             shape![8],
@@ -496,7 +496,7 @@ mod reduce {
             .unwrap();
             tensor.write_value(&[499_999_999, 0], 2.).await.unwrap();
             tensor.write_value(&[0, 0], 1.).await.unwrap();
-            tensor.corrupt_sparse_payload(0).await;
+            crate::tensor::corruption::corrupt_sparse_payload(&tensor, 0).await;
             let view = tensor.view().sum(axes![1], false).await.unwrap();
             let entries: Vec<_> = view
                 .read_sparse_elements_in_order(
@@ -538,7 +538,7 @@ mod reduce {
         .unwrap();
         tensor.write_value(&[0], 0.2).await.unwrap();
         tensor.write_value(&[8192], 1.).await.unwrap();
-        tensor.corrupt_sparse_payload(8192).await;
+        crate::tensor::corruption::corrupt_sparse_payload(&tensor, 8192).await;
         assert!(tensor.any().await.unwrap());
         assert!(!tensor.view().round().await.unwrap().all().await.unwrap());
         assert!(!tensor.all().await.unwrap());

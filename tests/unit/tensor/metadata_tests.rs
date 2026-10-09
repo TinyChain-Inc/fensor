@@ -1,3 +1,5 @@
+use number_general::FloatType;
+
 use super::*;
 
 #[test]

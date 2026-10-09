@@ -84,12 +84,14 @@ mod metadata;
 mod owned;
 
 #[cfg(test)]
+#[path = "../tests/unit/read_metrics.rs"]
 mod read_metrics;
 
 #[cfg(test)]
 extern crate self as fensor;
 
 #[cfg(all(test, feature = "benchmarks"))]
+#[path = "../tests/unit/profiling.rs"]
 mod profiling;
 
 pub mod reduce;

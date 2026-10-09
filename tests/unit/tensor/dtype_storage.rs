@@ -138,7 +138,7 @@ where
         // Corrupt a required block through its owning filesystem adapter. Reads
         // and scalar writes must reject the length before indexing or mutation.
         if matches!(layout, Layout::Sparse { .. }) {
-            tensor.corrupt_sparse_payload(2).await;
+            crate::tensor::corruption::corrupt_sparse_payload(&tensor, 2).await;
             assert!(matches!(
                 tensor.read_value(&[2]).await,
                 Err(Error::InvalidLayout(_))

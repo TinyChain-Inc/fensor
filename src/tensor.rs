@@ -2,9 +2,11 @@ mod construction;
 mod sparse_storage;
 
 #[cfg(test)]
+#[path = "../tests/unit/tensor/physical_tests.rs"]
 mod physical_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/tensor/dtype_storage.rs"]
 mod dtype_storage;
 
 use std::sync::Arc;
@@ -12,8 +14,6 @@ use std::sync::Arc;
 use freqfs::{Dir, DirLock, FileLoad, FileLock, FileReadGuardOwned};
 use futures::{StreamExt, TryStreamExt};
 use get_size::GetSize;
-#[cfg(test)]
-use number_general::FloatType;
 use number_general::NumberType;
 use safecast::AsType;
 
@@ -901,17 +901,21 @@ fn validate_tensor_dtype<T: TensorElement>(dtype: NumberType) -> Result<()> {
 // Unit tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
+#[path = "../tests/unit/tensor/metadata_tests.rs"]
 mod metadata_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/tensor/sparse_axis_tests.rs"]
 mod sparse_axis_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/tensor/sparse_lifecycle_tests.rs"]
 mod sparse_lifecycle_tests;
 
 // Task-local counters cannot mix observations from concurrent test fixtures.
 // No instrumentation or configuration is present in production builds.
 #[cfg(test)]
+#[path = "../tests/unit/tensor/copy_metrics.rs"]
 pub(crate) mod copy_metrics;
 
 impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE, T> {
@@ -983,3 +987,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/tensor/corruption.rs"]
+pub(crate) mod corruption;

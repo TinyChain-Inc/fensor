@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use ha_ndarray::shape;
+use number_general::FloatType;
 
 use super::*;
 use crate::Shape;
@@ -379,7 +380,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 .clone();
             file.write::<Vec<f32>>(0).await.unwrap().pop();
         } else {
-            tensor.corrupt_sparse_payload(id).await;
+            crate::tensor::corruption::corrupt_sparse_payload(&tensor, id).await;
         }
         assert!(matches!(
             tensor
@@ -976,7 +977,7 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
         let owner = tensor.storage.sparse().unwrap();
 
         match fault {
-            0 => tensor.corrupt_sparse_payload(1).await,
+            0 => crate::tensor::corruption::corrupt_sparse_payload(&tensor, 1).await,
             1 | 2 => {
                 let values = if fault == 1 {
                     vec![0.; 2]

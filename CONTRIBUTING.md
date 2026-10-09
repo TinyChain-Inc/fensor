@@ -85,3 +85,17 @@ project.
 
 This project follows the [Contributor Covenant](https://www.contributor-covenant.org/)
 code of conduct.
+
+## Test ownership
+
+Keep production implementations in `src/`, integration targets in `tests/`,
+private unit tests in `tests/unit/`, and shared fixtures in `tests/common/`.
+Private tests retain their owning Rust module through `#[cfg(test)]` path
+inclusion; moving a file must not widen production visibility or rename tests.
+
+Fixtures must not add fields or public APIs to production types. Put corruption
+helpers in private test-support modules and observe execution through narrowly
+scoped, test-only calls backed by task-local state. Observations must retain any
+watched ownership handle and explicitly scope spawned work. Keep definitions,
+fixture adapters, and profiling code outside `src/`; normal builds contain none
+of that support code.

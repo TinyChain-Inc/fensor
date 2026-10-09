@@ -175,3 +175,35 @@ batch error boundaries, high-rank scratch, and expression integration coverage.
 - Cancellation phases and expression-depth cases remain separate. Local pinned
   futures leave their owning scope before release assertions; already boxed
   construction futures are cancelled directly without an additional box.
+
+Private unit-test implementations live under `tests/unit/` and shared fixtures
+under `tests/common/`. Their existing Rust module names and targeted test commands
+are unchanged; see [test ownership](../CONTRIBUTING.md#test-ownership).
+
+## Schema case consolidation
+
+The following former `schema::tests` functions are now named cases in four
+table-driven tests in `unit/schema/tests.rs`. All 18 inputs, expected shapes or
+strides, and `InvalidSchema` assertions remain; only 14 test functions were removed.
+This consolidation is separate from the unit-test file relocation.
+
+| Former function | Replacement test / named case |
+|---|---|
+| `contiguous_strides_rank_three` | `contiguous_strides_valid_shapes` / `rank_three` |
+| `contiguous_strides_rank_two` | `contiguous_strides_valid_shapes` / `rank_two` |
+| `contiguous_strides_single_dim` | `contiguous_strides_valid_shapes` / `single_dim` |
+| `contiguous_strides_all_ones` | `contiguous_strides_valid_shapes` / `all_ones` |
+| `contiguous_strides_leading_one` | `contiguous_strides_valid_shapes` / `leading_one` |
+| `contiguous_strides_trailing_one` | `contiguous_strides_valid_shapes` / `trailing_one` |
+| `contiguous_strides_empty_shape` | `contiguous_strides_reject_invalid_shapes` / `empty_shape` |
+| `contiguous_strides_zero_dim` | `contiguous_strides_reject_invalid_shapes` / `zero_dim` |
+| `contiguous_strides_overflow` | `contiguous_strides_reject_invalid_shapes` / `overflow` |
+| `greedy_block_shape_capacity_covers_whole_tensor` | `greedy_block_shape_valid_capacities` / `capacity_covers_whole_tensor` |
+| `greedy_block_shape_capacity_equals_total` | `greedy_block_shape_valid_capacities` / `capacity_equals_total` |
+| `greedy_block_shape_partial_fit_limits_outer_axis` | `greedy_block_shape_valid_capacities` / `partial_fit_limits_outer_axis` |
+| `greedy_block_shape_rank_two_partial` | `greedy_block_shape_valid_capacities` / `rank_two_partial` |
+| `greedy_block_shape_single_dim` | `greedy_block_shape_valid_capacities` / `single_dim` |
+| `greedy_block_shape_capacity_one` | `greedy_block_shape_valid_capacities` / `capacity_one` |
+| `greedy_block_shape_zero_capacity` | `greedy_block_shape_reject_invalid_inputs` / `zero_capacity` |
+| `greedy_block_shape_empty_shape` | `greedy_block_shape_reject_invalid_inputs` / `empty_shape` |
+| `greedy_block_shape_zero_dim` | `greedy_block_shape_reject_invalid_inputs` / `zero_dim` |

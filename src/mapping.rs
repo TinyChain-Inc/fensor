@@ -1,9 +1,11 @@
 //! Coordinate mapping shared by geometric storage and reduction views.
 
 #[cfg(test)]
+#[path = "../tests/unit/mapping/delegation_tests.rs"]
 mod delegation_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/mapping/traversal_tests.rs"]
 mod traversal_tests;
 
 use std::{iter, sync::Arc};
@@ -879,102 +881,9 @@ macro_rules! transform_methods {
 pub(crate) use transform_methods;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signed_mapping_overflow_is_a_structured_error() {
-        let map = CoordinateMap {
-            base_offset: i128::MAX,
-            axes: vec![AxisContrib::Stride(i128::MAX)],
-            shape: smallvec::smallvec![3],
-        };
-        assert!(matches!(map.flat_offset(&[2]), Err(Error::InvalidCoord(_))));
-        assert!(matches!(map.clone().flip(0), Err(Error::InvalidLayout(_))));
-        assert!(matches!(
-            map.clone()
-                .slice(smallvec::smallvec![AxisRange::In(0, 3, 2)]),
-            Err(Error::InvalidLayout(_))
-        ));
-        assert!(matches!(
-            map.slice(smallvec::smallvec![AxisRange::Of(vec![2])]),
-            Err(Error::InvalidLayout(_))
-        ));
-    }
-
-    #[test]
-    fn gather_transforms_share_the_original_table() {
-        let original = GatherOffsets::from(vec![9, 2, 9, 4, 7, 3]);
-        let sliced = original.slice(1, 2, 3).unwrap();
-        let flipped = sliced.flipped();
-        let nested = flipped.slice(1, 1, 2).unwrap();
-
-        for view in [&sliced, &flipped, &nested] {
-            assert!(Arc::ptr_eq(&original.offsets, &view.offsets));
-        }
-        assert_eq!(
-            (0..3).map(|i| *flipped.get(i).unwrap()).collect::<Vec<_>>(),
-            [3, 4, 2]
-        );
-        assert_eq!(
-            (0..2).map(|i| *nested.get(i).unwrap()).collect::<Vec<_>>(),
-            [4, 2]
-        );
-        assert_eq!(*original.get(0).unwrap(), *original.get(2).unwrap());
-        assert_eq!(
-            *nested
-                .slice(1, usize::MAX, 1)
-                .unwrap()
-                .flipped()
-                .get(0)
-                .unwrap(),
-            2
-        );
-    }
-}
+#[path = "../tests/unit/mapping/tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod compact_tests {
-    use super::*;
-
-    #[test]
-    fn identity_is_structural_and_mapping_reuses_scratch() {
-        let shape = ha_ndarray::shape![3, 4];
-        let strides = schema::contiguous_strides(&shape).unwrap();
-        let map = CoordinateMap::identity(shape.clone(), &strides);
-        assert!(map.is_identity(&shape, &strides));
-        let flipped = map.clone().flip(1).unwrap();
-        assert!(!flipped.is_identity(&shape, &strides));
-        assert!(
-            flipped
-                .clone()
-                .flip(1)
-                .unwrap()
-                .is_identity(&shape, &strides)
-        );
-        let mut out = Coord::with_capacity(2);
-        let ptr = out.as_ptr();
-
-        for row in 0..3 {
-            for col in 0..4 {
-                flipped
-                    .resolve_into(&[row, col], &shape, &strides, &mut out)
-                    .unwrap();
-                assert_eq!(out.as_slice(), &[row, 3 - col]);
-                assert_eq!(out.as_ptr(), ptr);
-            }
-        }
-
-        let mut bad = map;
-        bad.base_offset = 12;
-        assert!(
-            bad.resolve_into(&[0, 0], &shape, &strides, &mut out)
-                .is_err()
-        );
-        bad.base_offset = i128::MAX;
-        assert!(
-            bad.resolve_into(&[2, 3], &shape, &strides, &mut out)
-                .is_err()
-        );
-    }
-}
+#[path = "../tests/unit/mapping/compact_tests.rs"]
+mod compact_tests;
