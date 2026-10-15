@@ -22,8 +22,8 @@ mod slice_cases;
 #[path = "sparse_cases.rs"]
 mod sparse_cases;
 
-#[path = "adaptive_cases.rs"]
-mod adaptive_cases;
+#[path = "storage_cases.rs"]
+mod storage_cases;
 
 pub async fn run() {
     let selected = std::env::var("FENSOR_BENCH_SUITE").unwrap_or_else(|_| "all".into());
@@ -35,13 +35,13 @@ pub async fn run() {
         "pipeline" => pipeline_cases::run().await,
         "copy" => copy_cases::run().await,
         "sparse" => sparse_cases::run().await,
-        "adaptive" => adaptive_cases::storage().await,
+        "storage" => storage_cases::storage().await,
         "mutation" => {
-            adaptive_cases::mutation().await;
-            adaptive_cases::replacement().await;
+            storage_cases::mutation().await;
+            storage_cases::replacement().await;
         }
-        "traversal" => adaptive_cases::traversal().await,
-        "reopen" => adaptive_cases::reopen().await,
+        "traversal" => storage_cases::traversal().await,
+        "reopen" => storage_cases::reopen().await,
         "all" => {
             read_cases::run().await;
             slice_cases::run().await;
@@ -50,11 +50,11 @@ pub async fn run() {
             pipeline_cases::run().await;
             copy_cases::run().await;
             sparse_cases::run().await;
-            adaptive_cases::storage().await;
-            adaptive_cases::mutation().await;
-            adaptive_cases::replacement().await;
-            adaptive_cases::traversal().await;
-            adaptive_cases::reopen().await;
+            storage_cases::storage().await;
+            storage_cases::mutation().await;
+            storage_cases::replacement().await;
+            storage_cases::traversal().await;
+            storage_cases::reopen().await;
         }
         _ => panic!("unknown benchmark suite {selected}"),
     }

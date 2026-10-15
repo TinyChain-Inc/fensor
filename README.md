@@ -194,22 +194,24 @@ work proportional to nonzeros or optimal transform throughput.
 ## Streams, bounds, and concurrency
 
 For `Layout::Sparse { axis: Some(a) }`, coordinates through axis `a` select a
-dense trailing region. Physical chunks have extent one on that prefix and split
+dense trailing region. Storage blocks have extent one on that prefix and split
 the full trailing shape into at most 4,096 elements each. `axis: None` selects
-scalar sparsity. Chunk capacity does not change the logical dense region.
+scalar sparsity. Storage block capacity does not change the logical dense region.
 Loading validates the recorded geometry without retessellating it.
 
-Sparse chunks are dense typed vectors in a native `b-table`, keyed by logical
-block ID. Rows share native pages. Missing chunks are zero; all-zero chunks have
+Sparse storage blocks are dense typed vectors in a native `b-table`, keyed by logical
+block ID. Rows share native pages. Missing blocks are zero; all-zero blocks have
 no row. Omission changes physical storage only: every logical coordinate still
 has its ordinary numerical value.
 
-One native ownership guard coordinates reads, replacement, reclamation, and
-synchronization. After a failed or cancelled mutation, callers must discard all
-handles to the affected storage and coordinate recovery before reuse. Native
+Native table guards coordinate sparse reads and replacement. Synchronization
+releases operation guards before entering the directory hierarchy; callers quiesce
+mutations when they need a precise durable boundary. Validation is not a
+transaction snapshot across concurrent writes. After a failed or cancelled
+mutation, callers must discard all handles to the affected storage and coordinate recovery before reuse. Native
 writes may have partially changed storage; cancellation returns no error.
 
-Physical block lengths are validated against bounded metadata. Adapters remain
+Stored payload lengths are validated against bounded metadata. Adapters remain
 responsible for limiting decoding allocations before fensor receives a payload.
 
 | Consumer | Delivery order |
@@ -264,7 +266,7 @@ validates geometry and native structure without recovery or repair paths.
 
 Call `tensor.sync().await?` before dropping and reopening storage. It writes blocks
 and publishes the current sparse index root; syncing only the containing directory
-does not publish that in-memory root. Exclude concurrent writes during sync.
+does not publish that in-memory root. Quiesce writes for a precise durable boundary.
 Use `tensor.sync_all().await?` for delegated durable synchronization. Callers own
 transaction and recovery policy.
 fensor provides no commit, rollback, or isolation semantics.

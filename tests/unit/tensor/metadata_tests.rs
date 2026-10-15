@@ -22,9 +22,7 @@ async fn metadata_publication_does_not_replace_existing_contents() {
     )
     .await
     .unwrap();
-    let file = tensor
-        .storage
-        .blocks()
+    let file = crate::tensor::corruption::files(&tensor.storage)
         .read()
         .await
         .get_file(METADATA)
@@ -33,7 +31,7 @@ async fn metadata_publication_does_not_replace_existing_contents() {
     let original = file.read::<TensorMetadata<f32>>().await.unwrap().clone();
     tensor.schema = TensorSchema::new(NumberType::Float(FloatType::F32), vec![4].into()).unwrap();
     assert!(matches!(
-        tensor.persist_metadata().await,
+        tensor.publish_metadata().await,
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
     ));
     assert_eq!(*file.read::<TensorMetadata<f32>>().await.unwrap(), original);

@@ -21,7 +21,7 @@ The opt-in `benchmarks` feature compiles two ignored tests which use the same wo
 - Unit `profiling::profile` additionally observes task-local read/copy counters.
 
 `FENSOR_BENCH_SUITE` selects `matrix`, `reduction`, `completion`, `pipeline`,
-`copy`, `sparse`, `adaptive`, `mutation`, `traversal`, `reopen`, or `all` (default). Matrix cases include storage reads, affine/gather transforms,
+`copy`, `sparse`, `storage`, `mutation`, `traversal`, `reopen`, or `all` (default). Matrix cases include storage reads, affine/gather transforms,
 regular/irregular selections, batches, nested products and extreme shapes.
 Reduction cases include short/long groups, axes, strided and nested sources.
 Completion cases compare streams and numeric terminals. Pipeline/copy cases vary
@@ -143,13 +143,13 @@ out of project documentation. Timing thresholds do not belong in ordinary CI.
 
 ## Storage and transaction processes
 
-The same harness selects `adaptive` for sparse vectors, narrow and trailing-axis
+The same harness selects `storage` for sparse vectors, narrow and trailing-axis
 regions, low occupancy, and nearly full blocks; `mutation` for scalar/fill and
 dense replacement; `traversal` for point/stream/reduction/transformed reads; and
-`reopen` for strict loading. Storage accounting includes native dense-chunk row pages and dense payload files. It reads one synchronized page at a time outside timing.
+`reopen` for strict loading. Storage accounting includes native dense-block row pages and dense payload files. It reads one synchronized page at a time outside timing.
 
 ```sh
-FENSOR_BENCH_SUITE=adaptive cargo test --release --features benchmarks --test benchmark -- --ignored --nocapture --test-threads=1
+FENSOR_BENCH_SUITE=storage cargo test --release --features benchmarks --test benchmark -- --ignored --nocapture --test-threads=1
 ```
 
 Set `FENSOR_WORKLOAD_REPEATS` to lengthen steady-state measurements: defaults are

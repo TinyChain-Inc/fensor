@@ -653,7 +653,11 @@ mod bulk_mutation {
         )
         .await
         .unwrap();
-        tensor.storage.blocks().write().await.delete("0").await;
+        crate::tensor::corruption::files(&tensor.storage)
+            .write()
+            .await
+            .delete("0")
+            .await;
         assert!(tensor.write_value(&[0], 1.).await.is_err());
         assert!(
             tensor
@@ -662,7 +666,13 @@ mod bulk_mutation {
                 .is_err()
         );
         assert!(tensor.fill(1.).await.is_err());
-        assert!(tensor.storage.blocks().read().await.get_file("0").is_none());
+        assert!(
+            crate::tensor::corruption::files(&tensor.storage)
+                .read()
+                .await
+                .get_file("0")
+                .is_none()
+        );
         tensor
             .write_values(vec![AxisRange::In(4, 6, 1)].into(), vec![7., 8.])
             .await

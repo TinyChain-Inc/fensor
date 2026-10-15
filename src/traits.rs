@@ -695,7 +695,7 @@ where
 }
 
 /// Batch coordinates without expanding the remaining logical range.
-pub(crate) fn coordinate_batches(
+fn coordinate_batches(
     mut coords: impl Iterator<Item = Vec<u64>>,
 ) -> impl Iterator<Item = Vec<Vec<u64>>> {
     std::iter::from_fn(move || {
@@ -707,7 +707,7 @@ pub(crate) fn coordinate_batches(
     })
 }
 
-pub(crate) fn sparse_coords<V: TensorGeometry + ?Sized>(
+fn sparse_coords<V: TensorGeometry + ?Sized>(
     tensor: &V,
     range: Range,
     requested_order: Axes,
@@ -855,3 +855,7 @@ where
 
     fn angle(&self) -> BoxFuture<'_, Result<Self::AngleOutput>>;
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/traits/tests.rs"]
+mod tests;

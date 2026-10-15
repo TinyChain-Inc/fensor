@@ -1,4 +1,5 @@
 mod construction;
+mod dense_storage;
 mod sparse_storage;
 
 #[cfg(test)]
@@ -11,12 +12,13 @@ mod dtype_storage;
 
 use std::sync::Arc;
 
-use freqfs::{Dir, DirLock, FileLoad, FileLock, FileReadGuardOwned};
+use freqfs::{DirLock, FileLoad};
 use futures::{StreamExt, TryStreamExt};
 use get_size::GetSize;
 use number_general::NumberType;
 use safecast::AsType;
 
+use self::dense_storage::DenseStorage;
 use crate::error::{Error, Result};
 use crate::mapping::CoordinateMap;
 use crate::request::BatchRequest;
@@ -84,11 +86,6 @@ where
 // Private storage structs
 // ---------------------------------------------------------------------------
 
-struct DenseStorage<FE> {
-    blocks: DirLock<FE>,
-    storage_schema: StorageSchema,
-}
-
 // Tensor already shares this owner through Arc; boxing a variant adds another allocation.
 #[allow(clippy::large_enum_variant)]
 enum Storage<FE, T> {
@@ -104,17 +101,10 @@ impl<FE, T> Storage<FE, T> {
         }
     }
 
-    pub(crate) fn blocks(&self) -> &DirLock<FE> {
-        match self {
-            Self::Dense(s) => &s.blocks,
-            Self::Sparse(s) => &s.blocks,
-        }
-    }
-
     pub(crate) fn storage_schema(&self) -> &StorageSchema {
         match self {
-            Self::Dense(s) => &s.storage_schema,
-            Self::Sparse(s) => &s.geometry.storage,
+            Self::Dense(s) => s.storage_schema(),
+            Self::Sparse(s) => &s.geometry().storage,
         }
     }
 }
@@ -152,14 +142,15 @@ where
     ///
     /// Call this before dropping and reopening a tensor. Syncing the containing
     /// directory alone does not publish the index's in-memory root. The caller
-    /// must exclude concurrent writes and remains responsible for durable directory
-    /// synchronization and any transaction policy.
+    /// quiesces mutations for a precise persistence boundary; synchronization does
+    /// not exclude writes for its entire call. The caller owns durable directory
+    /// synchronization and transaction policy.
     pub async fn sync(&self) -> Result<()>
     where
         FE: freqfs::FileSave + Clone,
     {
         match self.storage.as_ref() {
-            Storage::Dense(dense) => dense.blocks.sync().await.map_err(Error::from),
+            Storage::Dense(dense) => dense.sync().await,
             Storage::Sparse(sparse) => sparse.sync().await,
         }
     }
@@ -172,7 +163,7 @@ where
     ) -> Result<Self> {
         let tensor = Self::unpublished(dir, schema, layout, max_capacity).await?;
         tensor.initialize_dense_blocks().await?;
-        tensor.persist_metadata().await?;
+        tensor.publish_metadata().await?;
         Ok(tensor)
     }
 
@@ -199,7 +190,7 @@ where
     ) -> Result<Self> {
         let tensor = Self::unpublished_with_geometry(dir, geometry).await?;
         tensor.initialize_dense_blocks().await?;
-        tensor.persist_metadata().await?;
+        tensor.publish_metadata().await?;
         Ok(tensor)
     }
 
@@ -220,10 +211,7 @@ where
 
         let schema = geometry.schema.clone();
         let storage = match geometry.layout() {
-            Layout::Dense => Storage::Dense(DenseStorage {
-                blocks,
-                storage_schema: geometry.storage,
-            }),
+            Layout::Dense => Storage::Dense(DenseStorage::new(blocks, geometry.storage)),
             Layout::Sparse { .. } => Storage::Sparse(
                 sparse_storage::SparseStorage::create(&dir, blocks, geometry).await?,
             ),
@@ -251,7 +239,7 @@ where
     {
         let output = Self::unpublished(dir, schema, Layout::Dense, max_capacity).await?;
         let expected = crate::schema::checked_product(output.shape())?;
-        let output = construction::Dense(output);
+        let output = dense_storage::Construction(output);
         let values = values.fuse();
         futures::pin_mut!(values);
         let mut received = 0u64;
@@ -355,7 +343,7 @@ where
             return construction::sparse(output, entries).await;
         }
 
-        let output = construction::Dense(output);
+        let output = dense_storage::Construction(output);
         let mut blocks = source.read_coordinate_blocks()?;
         let expected = crate::schema::checked_product(source.shape())?;
         let mut received = 0u64;
@@ -409,10 +397,7 @@ where
                         "dense tensor contains a sparse index".into(),
                     ));
                 }
-                Storage::Dense(DenseStorage {
-                    blocks,
-                    storage_schema: geometry.storage,
-                })
+                Storage::Dense(DenseStorage::new(blocks, geometry.storage))
             }
             Layout::Sparse { .. } => {
                 Storage::Sparse(sparse_storage::SparseStorage::load(&dir, blocks, geometry)?)
@@ -429,15 +414,14 @@ where
     }
 
     /// Validate required blocks and sparse index references with bounded scratch.
+    /// Validation is not a transaction snapshot across concurrent mutations.
     pub async fn validate(&self) -> Result<()> {
         match self.storage.as_ref() {
             Storage::Sparse(sparse) => {
                 sparse.validate().await?;
             }
             Storage::Dense(dense) => {
-                for id in 0..self.num_blocks() {
-                    drop(dense.read::<T>(id).await?);
-                }
+                dense.validate::<T>().await?;
             }
         }
 
@@ -450,11 +434,7 @@ where
         FE: freqfs::FileSave + Clone,
     {
         match self.storage.as_ref() {
-            Storage::Dense(dense) => {
-                dense.blocks.sync().await?;
-                self.directory.sync_all().await?;
-                Ok(())
-            }
+            Storage::Dense(dense) => dense.sync_all(&self.directory).await,
             Storage::Sparse(sparse) => sparse.sync_all(&self.directory).await,
         }
     }
@@ -484,10 +464,6 @@ where
         &self.storage.storage_schema().strides
     }
 
-    pub(crate) fn num_blocks(&self) -> u64 {
-        self.storage.storage_schema().shape.iter().product::<u64>()
-    }
-
     pub(crate) fn block_len(&self) -> usize {
         self.block_shape().iter().product::<u64>() as usize
     }
@@ -498,22 +474,11 @@ where
     }
 
     async fn initialize_dense_blocks(&self) -> Result<()> {
-        if let Layout::Sparse { .. } = self.layout() {
+        let Storage::Dense(dense) = self.storage.as_ref() else {
             return Ok(());
-        }
+        };
 
-        for block_id in 0..self.num_blocks() {
-            let values = self.default_block();
-            let bound = block_allocation::<FE, T>(&values);
-            self.storage
-                .blocks()
-                .write()
-                .await
-                .create_file(block_id.to_string(), values, bound)
-                .await?;
-        }
-
-        Ok(())
+        dense.initialize::<T>().await
     }
 
     async fn write_block_updates(&self, id: u64, updates: &[(usize, T)]) -> Result<()> {
@@ -527,24 +492,21 @@ where
         Ok(())
     }
 
-    async fn persist_metadata(&self) -> Result<()> {
+    // Publish metadata only after construction succeeds; synchronization is caller-owned.
+    async fn publish_metadata(&self) -> Result<()> {
         let metadata = TensorMetadata::<T>::new(
             self.schema.shape().clone(),
             self.layout(),
             self.storage.storage_schema().block_schema.shape.clone(),
         )?;
-        let size = std::mem::size_of::<FE>() + metadata.get_size();
-        self.storage
-            .blocks()
-            .write()
-            .await
-            .create_file(METADATA.to_string(), metadata, size)
-            .await?;
-        Ok(())
+        match self.storage.as_ref() {
+            Storage::Dense(dense) => dense.publish_metadata(metadata).await,
+            Storage::Sparse(sparse) => sparse.publish_metadata(metadata).await,
+        }
     }
 
     /// Plan one bounded request by logical block and scatter position.
-    fn read_groups(
+    fn plan_read_groups(
         &self,
         request: &BatchRequest,
         mapping: Option<&CoordinateMap>,
@@ -567,26 +529,16 @@ where
     ) -> Result<Vec<T>> {
         let dense = match self.storage.as_ref() {
             Storage::Sparse(sparse) => {
-                let _guard = sparse.gate.read().await;
-
-                let groups = self.read_groups(request, mapping)?;
+                let groups = self.plan_read_groups(request, mapping)?;
                 let mut values = vec![T::ZERO; request.len()];
 
-                if groups.len() == 1 {
-                    let (&id, runs) = groups.first_key_value().expect("one logical block");
-                    let block = sparse.read(id).await?;
-                    for run in runs {
-                        run.scatter(&block, &mut values)?;
-                    }
-                } else {
-                    sparse.read_groups(&groups, &mut values).await?;
-                }
+                sparse.read_groups(&groups, &mut values).await?;
                 return Ok(values);
             }
             Storage::Dense(dense) => dense,
         };
 
-        let groups = self.read_groups(request, mapping)?;
+        let groups = self.plan_read_groups(request, mapping)?;
 
         let mut values = vec![T::ZERO; request.len()];
 
@@ -693,69 +645,6 @@ where
 }
 
 // Required dense reads borrow validated payloads; consumers clone only when needed.
-// Boxed storage futures bound stack usage in deeply composed consumers.
-impl<FE> DenseStorage<FE> {
-    fn block_len(&self) -> usize {
-        self.storage_schema
-            .block_schema
-            .shape
-            .iter()
-            .product::<u64>() as usize
-    }
-
-    fn validate_id(&self, id: u64) -> Result<()> {
-        if id >= self.storage_schema.shape.iter().product::<u64>() {
-            return Err(Error::InvalidCoord("logical block out of bounds".into()));
-        }
-
-        Ok(())
-    }
-
-    async fn replace<T>(&self, id: u64, block: Vec<T>) -> Result<()>
-    where
-        FE: TensorFileEntry<T>,
-        T: TensorElement,
-    {
-        self.validate_id(id)?;
-        if block.len() != self.block_len() {
-            return Err(Error::InvalidLayout(
-                "invalid replacement block length".into(),
-            ));
-        }
-
-        let file = required_file(&*self.blocks.read().await, id)?;
-        let mut stored = file
-            .write::<Vec<T>>(block_allocation::<FE, T>(&block))
-            .await?;
-        validate_stored_length(&stored, self.block_len())?;
-        *stored = block;
-        Ok(())
-    }
-
-    async fn update<T>(&self, id: u64, updates: &[(usize, T)]) -> Result<()>
-    where
-        FE: TensorFileEntry<T>,
-        T: TensorElement,
-    {
-        let file = required_file(&*self.blocks.read().await, id)?;
-        let mut block = file.write::<Vec<T>>(0).await?;
-        apply_block_updates(&mut block, self.block_len(), updates)
-    }
-
-    fn read<T>(&self, id: u64) -> BoxFuture<'_, Result<FileReadGuardOwned<FE, Vec<T>>>>
-    where
-        FE: TensorFileEntry<T>,
-        T: TensorElement,
-    {
-        Box::pin(async move {
-            let file = required_file(&*self.blocks.read().await, id)?;
-            let block = file.into_read::<Vec<T>>().await?;
-            validate_stored_length(&block, self.block_len())?;
-            Ok(block)
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // TensorWriteBulk implementation
 // ---------------------------------------------------------------------------
@@ -833,13 +722,6 @@ where
 }
 
 // Dense reads and replacement require an existing, correctly typed payload.
-fn required_file<FE: FileLoad>(blocks: &Dir<FE>, id: u64) -> Result<FileLock<FE>> {
-    blocks
-        .get_file(&id.to_string())
-        .cloned()
-        .ok_or_else(|| Error::InvalidLayout("missing required tensor payload".into()))
-}
-
 fn validate_stored_length<T>(block: &[T], expected: usize) -> Result<()> {
     if block.len() != expected {
         return Err(Error::InvalidLayout("invalid stored block length".into()));
@@ -870,6 +752,19 @@ fn apply_block_updates<T: Copy>(
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
+async fn create_metadata_file<FE: TensorFileEntry<T>, T: TensorElement>(
+    blocks: &DirLock<FE>,
+    metadata: TensorMetadata<T>,
+) -> Result<()> {
+    let size = std::mem::size_of::<FE>() + metadata.get_size();
+    blocks
+        .write()
+        .await
+        .create_file(METADATA.to_string(), metadata, size)
+        .await?;
+    Ok(())
+}
+
 async fn load_metadata_file<FE, T>(blocks: &DirLock<FE>) -> Result<crate::StorageGeometry>
 where
     FE: AsType<TensorMetadata<T>> + FileLoad,
@@ -957,11 +852,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
     fn read_logical_block(&self, id: u64) -> BoxFuture<'_, Result<Vec<T>>> {
         Box::pin(async move {
             match self.storage.as_ref() {
-                Storage::Sparse(sparse) => {
-                    let _guard = sparse.gate.read().await;
-
-                    sparse.read(id).await
-                }
+                Storage::Sparse(sparse) => sparse.read(id).await,
                 Storage::Dense(dense) => {
                     self.storage_geometry().block_bounds(id)?;
                     Ok(dense.read::<T>(id).await?.to_vec())
@@ -973,7 +864,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
 
 impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
     /// Replace one complete logical block. Callers exclude related native writes.
-    /// Sparse replacement serializes payload and index changes under the native ownership guard.
+    /// Sparse replacement serializes payload and index changes under one native table write guard.
     /// After failed or cancelled mutation, callers must discard all handles to the
     /// affected storage and coordinate recovery before reuse.
     /// Failure may leave partial changes; this method supplies no transaction policy.
@@ -990,5 +881,4 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/tensor/corruption.rs"]
-pub(crate) mod corruption;
+pub(crate) use sparse_storage::corruption;

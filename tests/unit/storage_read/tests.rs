@@ -2,7 +2,7 @@ use ha_ndarray::{axes, range, shape};
 
 use super::*;
 use crate::AxisRange;
-use crate::mapping::AxisContrib;
+use crate::mapping::test_support::affine;
 use crate::request::{Axis, Cartesian};
 use crate::schema::contiguous_strides;
 
@@ -22,7 +22,7 @@ fn compare(storage: &StorageShape<'_>, map: &CoordinateMap, request: BatchReques
     }
 
     let expected: Vec<_> = request
-        .coordinates(&map.shape)
+        .coordinates(map.shape())
         .unwrap()
         .iter()
         .map(|coord| {
@@ -99,7 +99,7 @@ fn affine_plans_match_scalar_mapping_across_blocks() {
         };
 
         for map in &maps {
-            let size = map.shape.iter().product::<u64>();
+            let size = map.shape().iter().product::<u64>();
 
             for start in 0..size {
                 compare(
@@ -110,7 +110,7 @@ fn affine_plans_match_scalar_mapping_across_blocks() {
             }
 
             let axes = map
-                .shape
+                .shape()
                 .iter()
                 .map(|d| Axis::Selected(vec![(*d - 1), 0, 0]))
                 .collect();
@@ -143,11 +143,7 @@ fn progressions_handle_arbitrary_signed_steps_and_carries() {
                 len += 1;
             }
 
-            let map = CoordinateMap {
-                base_offset: start,
-                axes: vec![AxisContrib::Stride(step)],
-                shape: shape![len as usize as u64],
-            };
+            let map = affine(start, step, shape![len as usize as u64]);
             compare(
                 &storage,
                 &map,
@@ -187,7 +183,7 @@ async fn compact_runs_reduce_mapping_work_and_preserve_broadcasts() {
             .scope(Default::default(), async {
                 let plan = storage
                     .plan(
-                        &BatchRequest::linear(0, map.shape.iter().product::<u64>() as usize)
+                        &BatchRequest::linear(0, map.shape().iter().product::<u64>() as usize)
                             .unwrap(),
                         Some(&map),
                     )
@@ -263,11 +259,7 @@ fn malformed_progressions_and_runs_fail_closed() {
     };
 
     for (offset, stride) in [(64, 1), (-1, 1), (1, -1), (i128::MAX, i128::MAX)] {
-        let map = CoordinateMap {
-            base_offset: offset,
-            axes: vec![AxisContrib::Stride(stride)],
-            shape: shape![3],
-        };
+        let map = affine(offset, stride, shape![3]);
         assert!(
             storage
                 .plan(&BatchRequest::linear(0, 3).unwrap(), Some(&map))

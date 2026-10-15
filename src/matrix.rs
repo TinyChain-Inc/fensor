@@ -123,7 +123,7 @@ impl<S: TensorGeometry> TensorGeometry for DiagView<S> {
     }
 
     fn shape(&self) -> &[u64] {
-        &self.mapping.shape
+        self.mapping.shape()
     }
 
     fn layout(&self) -> Layout {

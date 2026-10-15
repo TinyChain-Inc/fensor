@@ -17,14 +17,14 @@ use crate::{Axes, AxisRange, Error, PORTABLE_INLINE_RANK, Range, Result, Shape, 
 
 #[derive(Clone)]
 pub(crate) struct CoordinateMap {
-    pub base_offset: i128,
+    base_offset: i128,
     // Large descriptors stay heap-backed; their gather metadata is shared.
-    pub axes: Vec<AxisContrib>,
-    pub shape: Shape,
+    axes: Vec<AxisContrib>,
+    shape: Shape,
 }
 
 #[derive(Clone)]
-pub(crate) enum AxisContrib {
+enum AxisContrib {
     Stride(i128),
     Gather(GatherOffsets),
     Broadcast(i128),
@@ -70,7 +70,7 @@ impl StorageSlice {
 
 /// Caller-selection-sized metadata. Slices and reversals share the table.
 #[derive(Clone)]
-pub(crate) struct GatherOffsets {
+struct GatherOffsets {
     offsets: Arc<[i128]>,
     start: usize,
     step: usize,
@@ -201,6 +201,21 @@ impl CoordinateMap {
         }
 
         Ok(Some(StorageSlice { origins, axes }))
+    }
+
+    pub fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+
+    pub fn is_base_mapping(&self, shape: &[u64]) -> bool {
+        self.base_offset == 0 && self.shape.as_slice() == shape && self.is_c_contiguous()
+    }
+
+    pub fn supports_write_through(&self) -> bool {
+        !self
+            .axes
+            .iter()
+            .any(|axis| matches!(axis, AxisContrib::Gather(_) | AxisContrib::Broadcast(_)))
     }
 
     pub fn identity(shape: Shape, strides: &[u64]) -> Self {
@@ -361,7 +376,7 @@ impl CoordinateMap {
         Ok(k)
     }
 
-    pub fn is_c_contiguous(&self) -> bool {
+    fn is_c_contiguous(&self) -> bool {
         if self.axes.len() != self.shape.len() {
             return false;
         }
@@ -683,7 +698,7 @@ impl CoordinateMap {
     }
 }
 
-pub fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Axes> {
+fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Axes> {
     let axes: Axes = permutation.unwrap_or_else(|| (0..ndim).rev().collect());
 
     if axes.len() != ndim {
@@ -888,3 +903,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/unit/mapping/compact_tests.rs"]
 mod compact_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/mapping/test_support.rs"]
+pub(crate) mod test_support;

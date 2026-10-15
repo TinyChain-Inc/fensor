@@ -354,7 +354,7 @@ where
             let left = context.batch(&self.left, coords.clone()).await?;
             let right = context.batch(&self.right, coords).await?;
 
-            Batch::from_array(self.op.apply(left.array, right.array)?)
+            Batch::from_array(self.op.apply(left.into_array(), right.into_array())?)
         })
     }
 }

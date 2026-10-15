@@ -221,7 +221,9 @@ where
             let or_else = context.batch(&self.or_else, coords).await?;
 
             Batch::from_array(ArrayAccess::from(
-                condition.array.cond(then.array, or_else.array)?,
+                condition
+                    .into_array()
+                    .cond(then.into_array(), or_else.into_array())?,
             ))
         })
     }

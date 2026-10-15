@@ -126,9 +126,7 @@ impl<T: TensorElement> TensorGeometry for TensorExpression<T> {
 
         match self.owned().layout {
             Layout::Sparse { axis: Some(_) }
-                if self.mapping.base_offset != 0
-                    || self.mapping.shape.as_slice() != self.source().shape()
-                    || !self.mapping.is_c_contiguous() =>
+                if !self.mapping.is_base_mapping(self.source().shape()) =>
             {
                 Layout::Sparse { axis: None }
             }
@@ -137,7 +135,7 @@ impl<T: TensorElement> TensorGeometry for TensorExpression<T> {
     }
 
     fn shape(&self) -> &[u64] {
-        &self.mapping.shape
+        self.mapping.shape()
     }
 }
 

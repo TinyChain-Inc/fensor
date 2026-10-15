@@ -394,19 +394,3 @@ fn malformed_batches_fail_closed() {
     };
     assert!(evaluated.validate(MAX_BATCH_ELEMENTS + 1).is_err());
 }
-
-#[test]
-fn batching_only_consumes_its_bounded_prefix() {
-    use std::cell::Cell;
-    let consumed = Cell::new(0);
-    let coords = (0..1_000_000_000u64).map(|i| {
-        consumed.set(consumed.get() + 1);
-        vec![i]
-    });
-    let mut batches = crate::traits::coordinate_batches(coords);
-    assert_eq!(consumed.get(), 0);
-    assert_eq!(batches.next().unwrap().len(), MAX_BATCH_ELEMENTS);
-    assert_eq!(consumed.get(), MAX_BATCH_ELEMENTS);
-    drop(batches);
-    assert_eq!(consumed.get(), MAX_BATCH_ELEMENTS);
-}

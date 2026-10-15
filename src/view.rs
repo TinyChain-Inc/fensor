@@ -2,7 +2,7 @@
 #[path = "../tests/unit/view/tests.rs"]
 mod tests;
 
-use crate::mapping::{AxisContrib, CoordinateMap};
+use crate::mapping::CoordinateMap;
 use crate::schema::Layout;
 use crate::{
     BoxFuture, Error, Result, TensorArray, TensorElement, TensorGeometry, TensorRead, TensorSource,
@@ -151,7 +151,7 @@ where
     }
 
     fn shape(&self) -> &[u64] {
-        &self.mapping.shape
+        self.mapping.shape()
     }
 }
 
@@ -160,17 +160,11 @@ where
     S::DType: TensorElement,
 {
     fn is_base_tensor(&self) -> bool {
-        self.mapping.base_offset == 0
-            && self.mapping.shape.as_slice() == self.tensor.shape()
-            && self.mapping.is_c_contiguous()
+        self.mapping.is_base_mapping(self.tensor.shape())
     }
 
     fn supports_write_through(&self) -> bool {
-        !self
-            .mapping
-            .axes
-            .iter()
-            .any(|a| matches!(a, AxisContrib::Gather(_) | AxisContrib::Broadcast(_)))
+        self.mapping.supports_write_through()
     }
 }
 

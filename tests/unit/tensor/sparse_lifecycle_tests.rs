@@ -75,7 +75,7 @@ async fn clearing_one_value_preserves_the_rest_of_its_sparse_key() {
     assert_eq!(tensor.read_logical_block(id).await.unwrap(), vec![0.; 2]);
     assert!(
         tensor
-            .occupied_blocks(0..tensor.num_blocks())
+            .occupied_blocks(0..tensor.storage_geometry().block_count())
             .try_next()
             .await
             .unwrap()
@@ -169,10 +169,10 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
         let owner = tensor.storage.sparse().unwrap();
         {
             use futures::FutureExt;
-            let held = owner.gate.write().await;
+            let held = crate::tensor::corruption::block_table(owner).write().await;
             assert!(matches!(
                 tensor
-                    .replace_logical_block(owner.geometry.block_count(), vec![])
+                    .replace_logical_block(owner.geometry().block_count(), vec![])
                     .now_or_never(),
                 Some(Err(Error::InvalidCoord(_)))
             ));
@@ -187,19 +187,22 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
             );
         }
         // Cancellation while waiting for native table access leaves no held guards.
-        let guard = owner.values.write().await;
+        let guard = crate::tensor::corruption::block_table(owner).write().await;
         {
             let mut replacement =
                 std::pin::pin!(tensor.replace_logical_block(0, vec![2.; len as usize]));
             assert!(futures::poll!(replacement.as_mut()).is_pending());
         }
         drop(guard);
-        assert!(owner.gate.try_write().is_ok());
+        assert!(
+            crate::tensor::corruption::block_table(owner)
+                .try_write()
+                .is_ok()
+        );
         // This fixture stopped before any table mutation. Inspect native data
         // directly, then follow the caller contract by discarding both handles.
         assert_eq!(
-            owner
-                .values
+            crate::tensor::corruption::block_table(owner)
                 .read()
                 .await
                 .get_row(&[crate::SparseCell::Key(0)])
@@ -332,7 +335,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
 
         let coords = vec![vec![1, 1], vec![0, 3], vec![0, 0], vec![0, 3]];
         let groups: BTreeMap<_, _> = tensor
-            .read_groups(&BatchRequest::explicit(coords.clone()).unwrap(), None)
+            .plan_read_groups(&BatchRequest::explicit(coords.clone()).unwrap(), None)
             .unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(
@@ -374,9 +377,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
         // Validate the entire borrowed block, even for one selected value.
         let id = *groups.keys().next().unwrap();
         if matches!(layout, Layout::Dense) {
-            let file = tensor
-                .storage
-                .blocks()
+            let file = crate::tensor::corruption::files(&tensor.storage)
                 .read()
                 .await
                 .get_file(&id.to_string())
@@ -400,7 +401,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
 async fn invalid_affine_requests_fail_before_storage_io() {
     let (root, tensor) = create_sparse("invalid_affine", shape![2, 4], 4, None).await;
     let mut map = CoordinateMap::identity(shape![2, 4], tensor.strides());
-    map.base_offset = -1;
+    crate::mapping::test_support::set_offset(&mut map, -1);
     crate::read_metrics::CURRENT
         .scope(Default::default(), async {
             assert!(matches!(
@@ -537,7 +538,7 @@ async fn compact_requests_survive_elementwise_composition() {
 
     // An invalid mapped position is rejected before any data/index read.
     let mut mapping = crate::mapping::CoordinateMap::identity(shape![2, 2], tensor.strides());
-    mapping.base_offset = 4;
+    crate::mapping::test_support::set_offset(&mut mapping, 4);
     assert!(matches!(
         tensor.read_batch(&request, Some(&mapping)).await,
         Err(Error::InvalidCoord(_))
@@ -557,7 +558,7 @@ async fn copy_batches_group_logical_blocks() {
     )
     .await
     .unwrap();
-    let output = construction::Dense(tensor);
+    let output = dense_storage::Construction(tensor);
     let coords = vec![vec![1, 3], vec![0, 2], vec![1, 1], vec![0, 0]];
     let expected = 1;
     copy_metrics::CURRENT
@@ -598,7 +599,7 @@ async fn copy_batches_coalesce_existing_logical_blocks() {
     // Row-major input repeatedly interleaves many destination blocks.
     let (root, source) = create_sparse("copy_interleaved", shape![65, 33], 4096, Some(1)).await;
 
-    for id in 0..source.num_blocks() {
+    for id in 0..source.storage_geometry().block_count() {
         source
             .replace_logical_block(id, vec![1.; source.block_len()])
             .await
@@ -614,14 +615,17 @@ async fn copy_batches_coalesce_existing_logical_blocks() {
             copy_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
                 assert_eq!(m.block_updates, 0);
-                assert_eq!(m.constructed_blocks, output.num_blocks() as usize);
+                assert_eq!(
+                    m.constructed_blocks,
+                    output.storage_geometry().block_count() as usize
+                );
                 assert_eq!(m.staged_elements, 65 * 33);
                 assert!(m.max_staging_batch <= crate::expression::MAX_BATCH_ELEMENTS);
             });
             output
         })
         .await;
-    for id in 0..output.num_blocks() {
+    for id in 0..output.storage_geometry().block_count() {
         assert_eq!(
             output.read_logical_block(id).await.unwrap(),
             vec![1.; output.block_len()]
@@ -703,13 +707,20 @@ async fn sparse_copy_zeros_do_not_create_storage() {
         .await;
     assert!(
         tensor
-            .occupied_blocks(0..tensor.num_blocks())
+            .occupied_blocks(0..tensor.storage_geometry().block_count())
             .try_next()
             .await
             .unwrap()
             .is_none()
     );
-    assert_eq!(tensor.storage.blocks().read().await.files().count(), 1); // metadata only
+    assert_eq!(
+        crate::tensor::corruption::files(&tensor.storage)
+            .read()
+            .await
+            .files()
+            .count(),
+        1
+    ); // metadata only
     cleanup(&root).await;
 }
 
@@ -797,7 +808,9 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
         builder.stage(&[vec![0, 0]], vec![1.]).await.unwrap();
 
         if metadata {
-            let held = owner.blocks.write().await;
+            let held = crate::tensor::corruption::files(&probe.storage)
+                .write()
+                .await;
             let mut future = builder.finish();
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(10), &mut future)
@@ -807,8 +820,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
             // Completion has persisted its row before waiting for metadata. This
             // exercises cancellation after mutation, independently of table locks.
             assert!(
-                owner
-                    .values
+                crate::tensor::corruption::block_table(owner)
                     .read()
                     .await
                     .get_row(&[crate::SparseCell::Key(0)])
@@ -819,7 +831,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
             drop(future);
             drop(held);
         } else {
-            let held = owner.values.write().await;
+            let held = crate::tensor::corruption::block_table(owner).write().await;
             let coords = [vec![1, 0]];
             let mut future = builder.stage(&coords, vec![2.]);
             assert!(
@@ -832,7 +844,11 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
             drop(builder);
         }
 
-        assert!(owner.gate.try_write().is_ok());
+        assert!(
+            crate::tensor::corruption::block_table(owner)
+                .try_write()
+                .is_ok()
+        );
         // The caller discards every handle after cancellation. Metadata was
         // withheld, so incomplete construction cannot be reopened.
         drop(probe);
@@ -927,7 +943,13 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
             .await
             .unwrap();
     }
-    assert_eq!(tensor.storage.blocks().read().await.len(), 1);
+    assert_eq!(
+        crate::tensor::corruption::files(&tensor.storage)
+            .read()
+            .await
+            .len(),
+        1
+    );
     let values_dir = tensor
         .directory
         .read()
@@ -988,8 +1010,7 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
                 } else {
                     vec![1., 2.]
                 };
-                owner
-                    .values
+                crate::tensor::corruption::block_table(owner)
                     .write()
                     .await
                     .upsert(
@@ -1003,8 +1024,7 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
                 dir.write().await.delete("values").await;
             }
             4 => {
-                owner
-                    .blocks
+                crate::tensor::corruption::files(&tensor.storage)
                     .write()
                     .await
                     .create_file(

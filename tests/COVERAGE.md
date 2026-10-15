@@ -125,7 +125,7 @@ bounded requests and execution with the structural suites listed above.
 |---|---|
 | Absent-zero, insertion, replacement, deletion, reinsertion, block presence and stable logical addressing | `sparse_point_mutation_lifecycle`; shared-page, edge and interrupted-publication fixtures remain separate |
 | Every dtype/layout, borrowed non-Unpin input, schema/type checks, write-through, original mutation/reopen, transformed copy/reopen and malformed payloads | `tensor::dtype_storage`; full block comparisons, exhaustive sparse point/entry checks, dense point probes at special values, every block boundary and the modified final element |
-| Dense trailing regions, scalar sparsity, omitted zero chunks, edge padding, exact nonfinite bits, capacity-independent values and reopening | `dense_sparse_rows` parameterized cases |
+| Dense trailing regions, scalar sparsity, omitted zero blocks, edge padding, exact nonfinite bits, capacity-independent values and reopening | `dense_sparse_rows` parameterized cases |
 | Lazy dense conversion, unchanged operand clones, transformed layout and implicit zeros across batch boundaries | `dense_sparse_rows::lazy_dense_conversion_includes_implicit_zeros_across_batches` and companion geometry case |
 | Copy batch boundaries, explicit destination layout, pre-consumption rejection, independent geometry and exceptional values | `tensor_copy`; collection copy policy fixture retains axis hints; specialized errors and cancellation remain separate |
 | Typed source errors, cardinality, coordinate bounds/order/duplicates, cancellation, incomplete metadata and strict rejection | `tensor::construction::tests`; interrupted staging, publication and completion release guards |
@@ -150,7 +150,7 @@ only emitted coordinates. Invalid cardinality/request tests remain separate.
 
 Benchmark runner tests own paired summaries, zero baselines, thread grouping and
 admission filtering. The existing production/profiling entrypoints share
-`common/adaptive_cases.rs`; `common::benchmark::storage` distinguishes encoded
+`common/storage_cases.rs`; `common::benchmark::storage` distinguishes encoded
 bytes from retained node memory. Construction and final synchronization remain
 separate measurements. Results stay outside tracked documentation.
 
@@ -207,3 +207,25 @@ This consolidation is separate from the unit-test file relocation.
 | `greedy_block_shape_zero_capacity` | `greedy_block_shape_reject_invalid_inputs` / `zero_capacity` |
 | `greedy_block_shape_empty_shape` | `greedy_block_shape_reject_invalid_inputs` / `empty_shape` |
 | `greedy_block_shape_zero_dim` | `greedy_block_shape_reject_invalid_inputs` / `zero_dim` |
+
+Sparse owner locking is covered by
+`tensor::sparse_storage::validation_tests::table_guards_preserve_batch_reads_and_partial_updates`:
+a blocked payload read retains its table guard across consecutive and separated
+ID groups, concurrent partial updates preserve both values, and quiesced sync
+reopens successfully after overlapping native operations. Raw corruption helpers
+live in `tests/unit/tensor/sparse_storage/corruption.rs`; production exposes no
+sparse table or directory handles. Existing cancellation and validation-order
+fixtures acquire native table guards directly.
+
+Storage naming cleanup preserves all test names and integration targets.
+Dense construction moved from `construction::Dense` to
+`dense_storage::Construction`; construction tests retain their original module.
+Benchmark workloads moved from `common/adaptive_cases.rs` to
+`common/storage_cases.rs`; the suite selector is now `storage`. Existing workload
+record names and archived measurements are unchanged.
+
+Encapsulation cleanup retains the bounded batching assertions, relocated from
+`expression::tests::batching_only_consumes_its_bounded_prefix` to
+`traits::tests::batching_only_consumes_its_bounded_prefix`. Raw malformed mapping
+fixtures live in mapping-owned test support; dense file access lives in
+dense-storage-owned test support. Neither adds production visibility.

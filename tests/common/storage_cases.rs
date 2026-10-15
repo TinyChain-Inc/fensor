@@ -62,7 +62,7 @@ pub async fn storage() {
         }
         t.sync().await.unwrap();
         let point = start.elapsed();
-        let (copy_root, copy_dir) = common::new_dir("adaptive_copy").await;
+        let (copy_root, copy_dir) = common::new_dir("storage_copy").await;
         let start = Instant::now();
         let copy = Tensor::<common::FsEntry, f64>::copy_from(copy_dir, &t, t.layout(), 4096)
             .await

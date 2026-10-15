@@ -4,7 +4,7 @@ use number_general::DType;
 use super::*;
 use crate::tensor::copy_metrics;
 use crate::test_support::{FsEntry, cleanup, new_dir};
-use crate::{Layout, TensorSchema};
+use crate::{BoxFuture, Layout, Result, TensorSchema, TensorSource};
 
 #[derive(Debug)]
 enum InputError {
@@ -183,7 +183,7 @@ async fn dense_replacement_validates_required_payload_without_repair() {
         )
         .await
         .unwrap();
-        let blocks = tensor.storage.blocks();
+        let blocks = crate::tensor::corruption::files(&tensor.storage);
         {
             let held = blocks.write().await;
             assert!(matches!(

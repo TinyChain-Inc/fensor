@@ -6,8 +6,6 @@ async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
     id: u64,
     mutate: impl FnOnce(&mut Vec<SparseCell<T>>),
 ) {
-    let owner = tensor.storage.sparse().unwrap();
-    let _guard = owner.gate.write().await;
     let values = tensor
         .directory
         .read()
@@ -56,4 +54,21 @@ pub(crate) async fn corrupt_sparse_payload<F: TensorFileEntry<T>, T: TensorEleme
         values.clear();
     })
     .await;
+}
+
+pub(in crate::tensor) fn block_table<F, T>(
+    owner: &super::SparseStorage<F, T>,
+) -> &super::Blocks<F, T> {
+    &owner.blocks
+}
+
+pub(in crate::tensor) fn files<F, T>(
+    storage: &crate::tensor::Storage<F, T>,
+) -> &freqfs::DirLock<F> {
+    match storage {
+        crate::tensor::Storage::Dense(dense) => {
+            crate::tensor::dense_storage::test_support::files(dense)
+        }
+        crate::tensor::Storage::Sparse(sparse) => &sparse.metadata_dir,
+    }
 }

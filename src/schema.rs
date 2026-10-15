@@ -98,7 +98,7 @@ impl BlockSchema {
     }
 }
 
-/// Held by `DenseStorage`/`SparseStorage` INSTEAD OF `TensorSchema`.
+/// Storage block grid and payload geometry.
 /// `shape`/`strides` are the block-grid dimensions/strides (ceil(tensor_dim /
 /// block_dim) per axis), precomputed once at construction -- never recomputed
 /// per call.
@@ -191,7 +191,7 @@ impl StorageSchema {
     }
 }
 
-/// Physical location of a coordinate: which block, and the offset within it.
+/// Logical storage address: block ID and offset within its payload.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub(crate) struct BlockPosition {
     pub(crate) block_id: u64,
@@ -241,7 +241,7 @@ pub fn contiguous_strides(shape: &[u64]) -> FResult<Strides> {
     Ok(strides)
 }
 
-pub fn greedy_block_shape(shape: &[u64], max_capacity: usize) -> FResult<Shape> {
+fn greedy_block_shape(shape: &[u64], max_capacity: usize) -> FResult<Shape> {
     validate_shape_dims(shape)?;
 
     if max_capacity == 0 {

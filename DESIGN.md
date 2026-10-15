@@ -42,10 +42,10 @@ expression registry is part of execution.
 ## Requests and evaluation
 
 Sparse geometry gives each prefix coordinate a full dense trailing region,
-independent of the physical chunk capacity. Zero writes validate their chunk and
+independent of the storage block capacity. Zero writes validate their storage block and
 remove its row when all values are zero. The native sparse
-owner coordinates payload rows, reclamation, and synchronization under one guard;
-inner table guards are released before entering another ownership domain.
+owner coordinates payload reads and mutations through native table guards;
+table guards are released before entering another ownership domain.
 
 Fourier views are bounded evaluation boundaries like reductions and matrix
 products. Each transformed axis is capped at `MAX_BATCH_ELEMENTS`; complete
@@ -179,7 +179,8 @@ contract; boolean terminals preserve logical short-circuit/error boundaries.
 ## Mapping and shared storage reads
 
 `CoordinateMap` shares geometric mapping between storage views and aggregate
-outputs. Identity and affine eligibility are derived structurally, without cached
+outputs. Its private mapping fields own identity and write-through decisions;
+callers borrow shape metadata. Identity and affine eligibility are derived structurally, without cached
 flags. `AxisRange::Of` may allocate metadata proportional to explicitly supplied
 indices. Slicing/flipping an existing gather shares its table through offset,
 direction/stride, and length; interval slices do not expand to index lists.
@@ -207,7 +208,7 @@ I/O. Dense reads retain native borrowed-block validation and scatter. Sparse rea
 read a bounded dense vector from its typed native table row before scattering.
 Each table or file guard is released before entering another domain. Unit-stride
 runs copy slices; negative, zero, and other strides use the shared scatter loop.
-Missing sparse chunks yield zero; malformed stored chunks fail closed.
+Missing sparse storage blocks yield zero; malformed stored blocks fail closed.
 Payload validation checks padding gaps between valid offsets without a validity
 mask. Full blocks need no padding traversal.
 
@@ -307,7 +308,7 @@ When geometry proves row-major block contiguity, sparse construction retains one
 dense block until complete and streams completed rows into native ordered ingestion.
 Only the current block and the bounded input batch remain live. Interleaved input
 groups each bounded batch by block
-and updates the destination's existing typed rows. All-zero chunks are omitted;
+and updates the destination's existing typed rows. All-zero storage blocks are omitted;
 successful completion publishes metadata. There is no
 incomplete-block map, extra staging table, sorting, or source reevaluation.
 Cancellation or error never exposes a completed Tensor, and missing metadata makes
@@ -400,6 +401,17 @@ operation. See [collection rules](CODE_STYLE.md#collections-and-geometry).
 
 ## Native storage and sources
 
+Terminology: a **dense trailing region** is selected by a sparse-axis prefix;
+a **storage block** is a bounded piece addressed by a logical block ID; its
+**payload** is the dense numerical buffer. Dense storage uses payload files and
+sparse storage uses table rows. A region may span multiple storage blocks.
+
+`tensor/dense_storage.rs` and `tensor/sparse_storage.rs` own their concrete reads,
+updates, replacements, validation, metadata publication, synchronization, and
+unpublished `Construction` processes. Storage handles remain private. Shared Tensor
+request planning uses `plan_read_groups`; owner `read_groups` performs I/O.
+Construction stream validation remains in `tensor/construction.rs`.
+
 Native creation and loading select dense or sparse storage directly. The sparse
 owner creates or strictly loads one typed native table from validated geometry;
 loading never enters creation code. Creation requires empty delegated storage and
@@ -422,10 +434,10 @@ leases. Native clones share live storage and are not snapshots. Borrowed and own
 consumption use one evaluator and one outer buffering boundary.
 
 For `Layout::Sparse { axis: Some(a) }`, axes through `a` select a full dense
-trailing region. Physical chunks have prefix extent one and bounded trailing
+trailing region. Storage blocks have prefix extent one and bounded trailing
 extents. `axis: None` denotes scalar sparsity. `create_with_geometry` accepts
 validated geometry; normal creation chooses geometry and delegates. Metadata
-records shape, layout, sparse axis, and physical block shape. Physical chunking
+records shape, layout, sparse axis, and physical block shape. Storage block partitioning
 does not change logical values or the dense trailing region.
 
 Each sparse table row stores a logical block ID and dense typed vector.
@@ -435,29 +447,33 @@ bits and complex components. Adapters own `SparseNode<T>` serialization, explici
 payload tags, and bounded decoding allocations. Rows share native table pages;
 there is no separate descriptor, occupancy table, or payload-file representation.
 
-An absent physical chunk is all-zero. Removing a chunk's last nonzero value
-removes its row. Invalid padding, malformed lengths, empty stored chunks, and
+An absent storage block is all-zero. Removing a block's last nonzero value
+removes its row. Invalid padding, malformed lengths, empty stored blocks, and
 incorrect block IDs are errors. Batch reads share a native table range for
 consecutive requested block IDs. Gaps retain separate reads so unrelated payload
 corruption remains outside the selection. Replacement and read-modify-write
-hold one native ownership guard; helpers never reacquire it. Table guards are
-released before entering another domain. Failed or cancelled mutation may leave partial changes. Callers must discard
-all handles to the affected storage and coordinate recovery before reuse. Native
-storage retains no history or recovery protocol.
+hold one native table write guard, including old-payload validation; helpers
+receive that guard instead of reacquiring it. A bounded batch holds one read guard
+across all requested groups. Point reads and occupied pages acquire their own
+read guards inside the sparse owner. Operation guards are released before
+synchronization enters the directory hierarchy.
 
-The sparse ownership lock coordinates native access without tracking recovery
-state. Payload validation still reports corruption. Transaction abort-only state
-belongs to callers such as tc-collection; fensor neither marks clones invalid nor
-repairs partial writes.
+Failed or cancelled mutation may leave partial changes. Callers must discard all
+handles to the affected storage and coordinate recovery before reuse. Transaction
+abort-only state belongs to callers such as tc-collection; fensor retains no
+recovery state and neither marks clones invalid nor repairs partial writes.
 
 Strict loading requires typed metadata, directories, every dense file, and a valid
 sparse table. It validates structure, ordering, geometry, payloads, and block IDs
 without creating or repairing storage. `sync` writes native payloads and the sparse table root; `sync_all` additionally performs delegated
 durable synchronization. Neither method creates transaction visibility or records
-a commit decision. Callers own recovery from failed materialization.
+a commit decision. Synchronization does not exclude mutation for its entire call;
+callers quiesce writes when they require a precise durable boundary. Structural
+validation and payload validation also do not form a transaction snapshot during
+concurrent writes. Callers own recovery from failed materialization.
 
 `tests/storage_source.rs` owns external-source composition and consumer parity.
-`tests/dense_sparse_rows.rs` exercises sparse-axis geometry, omitted zero chunks,
+`tests/dense_sparse_rows.rs` exercises sparse-axis geometry, omitted zero blocks,
 nonfinite values, reopening, and explicit dense conversion. Independent corruption,
 cancellation, pagination, and lifecycle fixtures retain their owning assertions;
 see [test ownership](tests/COVERAGE.md).
@@ -515,6 +531,6 @@ flush before returning from `FileSave`. This does not change encoded bytes or ma
 Occupied scans retain cursors and bounded native page lookahead until consumed or
 dropped. Expression consumers retain the scan across output batches. Native pages
 validate ordered block IDs before returning keys; consumers need no second
-membership lookup. Payload reads validate the selected dense chunks. Dense
+membership lookup. Payload reads validate the selected dense blocks. Dense
 validation borrows required payloads without cloning them. Native fills visit valid offsets while retaining old-value
 validation and zero padding.

@@ -51,7 +51,7 @@ No whole-result collectors or whole-index compaction APIs.
   converted to dense. Candidate traversal is an index optimization, never a
   numerical mask. Cache only the typed implicit-zero result needed to preserve
   backend zero signs through expressions and indexed reductions. Preserve ordered
-  sparse reads and chunk-zero deletion.
+  sparse reads and all-zero storage-block deletion.
 - Logical shapes, strides, coordinates, and cardinalities use `u64`; runtime
   axes and bounded buffer indices use `usize`. Follow the collection rules in
   `CODE_STYLE.md`. Preserve adapter-owned payload typing.

@@ -332,7 +332,7 @@ impl BatchRequest {
         base_shape: &[u64],
         base_strides: &[u64],
     ) -> Result<Self> {
-        self.validate(&mapping.shape)?;
+        self.validate(mapping.shape())?;
         let mut runs = Vec::new();
         let affine = match self.kind {
             RequestKind::Explicit(_) | RequestKind::FlatRuns(_) => None,
@@ -340,7 +340,7 @@ impl BatchRequest {
         };
 
         if let Some((offset, strides)) = affine {
-            progressions(self, &mapping.shape, offset, &strides, |run| {
+            progressions(self, mapping.shape(), offset, &strides, |run| {
                 push_progression(&mut runs, run);
                 Ok(())
             })?;

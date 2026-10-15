@@ -208,7 +208,7 @@ impl<S: TensorGeometry, O: Send + Sync> TensorGeometry for FourierView<S, O> {
     }
 
     fn shape(&self) -> &[u64] {
-        &self.mapping.shape
+        self.mapping.shape()
     }
 
     fn layout(&self) -> Layout {

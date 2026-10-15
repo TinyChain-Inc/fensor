@@ -124,7 +124,7 @@ impl StorageShape<'_> {
         request: &BatchRequest,
         mapping: Option<&CoordinateMap>,
     ) -> Result<LogicalGroups> {
-        let shape = mapping.map(|m| m.shape.as_slice()).unwrap_or(self.shape);
+        let shape = mapping.map(|m| m.shape()).unwrap_or(self.shape);
         request.validate(shape)?;
 
         let affine = if matches!(

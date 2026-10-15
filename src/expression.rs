@@ -165,7 +165,7 @@ where
 }
 
 pub struct Batch<T: TensorElement> {
-    pub array: ArrayAccess<'static, T>,
+    array: ArrayAccess<'static, T>,
 }
 
 pub fn batch_array<T: TensorElement>(values: Vec<T>) -> Result<ArrayAccess<'static, T>> {
@@ -189,6 +189,10 @@ impl<T: TensorElement> Batch<T> {
         Ok(Self {
             array: batch_array(values)?,
         })
+    }
+
+    pub(crate) fn into_array(self) -> ArrayAccess<'static, T> {
+        self.array
     }
 
     fn validate(&self, expected: usize) -> Result<()> {

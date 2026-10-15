@@ -383,7 +383,7 @@ fn plan_request(
     strides: &[u64],
     request: &BatchRequest,
 ) -> Result<Vec<MatrixPlan>> {
-    request.validate(&mapping.shape)?;
+    request.validate(mapping.shape())?;
     if mapping.is_identity(shape, strides) {
         match request.kind() {
             RequestKind::Rectangles(rectangles) => return cartesian_plans(rectangles, shape),
@@ -572,7 +572,7 @@ where
     }
 
     fn shape(&self) -> &[u64] {
-        &self.mapping.shape
+        self.mapping.shape()
     }
 
     fn layout(&self) -> Layout {
