@@ -17,15 +17,22 @@ non-transactional, and explicit about supported and unsupported behavior.
 - Review new layout coercions, error-ordering state, caches, and fast paths against
   a concrete contract or measurement. Prefer explicit destination choices and
   structured unsupported errors over silently choosing allocation policy.
-- Delegate behavior through expression APIs, not strategy enums, equivalent flags,
-  or type probes. Request providers return actual iterators; precedence and error
-  propagation must be explicit. Enums may represent genuine data alternatives.
+- Use concrete types and trait methods for operations known at construction.
+  Enums may represent runtime data alternatives or explicit traversal states;
+  do not add operation/strategy tags that duplicate concrete behavior. Keep
+  representation matching near its owner and expose validated traversal, except
+  where a specialized consumer needs compact geometry. Request providers return
+  actual iterators; precedence and error propagation remain explicit.
 - Expression construction is lazy even when asynchronous. Consumers may evaluate
   bounded intermediates in memory but never persist them implicitly. Reads and
   terminal reductions create no result storage. Source-cache spill is separate.
-- Only outer consumers buffer batches. Preserve the public stream orders,
-  completion-order numeric terminals, boolean short-circuit/error boundaries,
-  and sequential destination updates. Add no tasks or nested worker pools.
+- Consume expression requests one at a time. Dense storage buffers ordinary file
+  reads with futures; freqfs owns admission, eviction, and bounded capacity errors.
+  Do not add an expression batch queue, speculative warming stage, tasks, or
+  nested worker pools. Preserve request order, boolean short-circuit boundaries,
+  and sequential destination updates. Optimize against adequately provisioned
+  production workloads; constrained-cache fixtures check bounded failure and
+  cleanup, not a separate performance policy.
 - Do not add transaction lifecycle, recovery, or codec policy. Malformed metadata
   and blocks fail closed; callers own cleanup, durability, and transactions.
 
@@ -34,7 +41,12 @@ non-transactional, and explicit about supported and unsupported behavior.
 Tensor execution must not allocate values, coordinates, or
 partial-result collections proportional to total tensor size, output size, or
 reduction-group size. Coordinates must be generated lazily and consumed in
-bounded batches. Each collection must have an identifiable bound.
+bounded batches. Each collection must have an identifiable bound; name it locally
+for non-obvious allocations. Do not size implicit working buffers from total
+logical cardinality. Streamed filesystem materialization and caller-supplied
+literal buffers are permitted, not permission to collect tensor streams in RAM.
+Keep execution batches, storage blocks, metadata ranks, and index pages independent,
+even when their limits have equal values.
 
 Rank-sized metadata, caller-owned values/explicit selections, filesystem/cache
 metadata, and independent consumers are separate costs, not permission to collect

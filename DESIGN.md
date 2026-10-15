@@ -10,8 +10,8 @@ individual field and function invariants.
 Tensor execution must not allocate values, coordinates, or
 partial-result collections proportional to total tensor size, output size, or
 reduction-group size. Coordinates must be generated lazily and consumed in
-bounded batches. Each collection must have an identifiable bound. Only the outer
-consumer may introduce concurrent batches.
+bounded batches. Each collection must have an identifiable bound. Each consumer
+evaluates one expression request at a time; native dense storage buffers file reads.
 
 Rank-sized metadata and caller-supplied values or explicit index selections are
 separate, documented memory costs. They must not justify expanding implicit
@@ -154,18 +154,22 @@ Both union polling and empty-request traversal yield cooperatively.
 Borrowed and owned block streams share request selection and ordered consumption;
 the owned stream retains its expression through an `Arc`.
 
-One unbuffered stream of evaluation futures retains each request with its evaluated
-batch. Outer consumers apply `buffered(num_cpus::get().max(1))` for row-major value,
-ordered sparse, and boolean reads, or `buffer_unordered` with the same limit for
-coordinate streams and numeric terminals. No task is spawned. Request generation
-order therefore does not guarantee coordinate-batch delivery order.
+One sequential stream evaluates each request before pulling the next. Row-major,
+sparse, coordinate, update, and terminal consumers share this implementation.
+Coordinate and update streams retain preferred request partitioning, which need
+not be row-major; delivery follows that partitioning without a completion queue.
 
-ha-ndarray owns numerical parallelism; fensor owns asynchronous batch concurrency.
+ha-ndarray owns numerical parallelism. Dense storage uses ordinary read futures
+with `buffered(num_cpus::get().max(1))`, retaining validated borrowed payloads
+until their ordered scatter completes. There is no second expression-batch buffer,
+prefetch phase, or payload-copy queue. Independent consumers remain concurrent.
+freqfs owns resource admission; a cache too small for pinned reads can return a
+bounded capacity error. Successful execution with a one-block cache is not required.
 The evaluation driver and occupied-candidate adapters cooperate with Tokio's
 per-task scheduler budget. Completed frames, queued children, and candidate
 advances record progress; pending operations refund their cooperation attempt.
 Tokio owns accounting and wakeups, with no fensor scheduling counter. This keeps
-ready traversal cancellable on Tokio without spawning tasks or changing request
+ready traversal cancellable on Tokio without spawning tasks or adding expression
 buffering. Outside Tokio (or in an unconstrained task), these hooks do not enforce
 fairness. They do not preempt a synchronous numerical kernel or impose a
 wall-clock latency bound.
@@ -323,7 +327,7 @@ validation. The geometry visitor reuses rank-sized coordinate scratch without
 per-element allocations.
 Geometric views expose bounded `BlockUpdates` through `plan_updates` and
 `updates_from`. Both use the storage-run planner; affine updates do not expand
-coordinate lists. Owned expression updates share completion-order evaluation with
+coordinate lists. Owned expression updates share sequential request evaluation with
 coordinate consumption, retaining source handles until consumed or dropped.
 Planning describes addresses only; callers enforce write permissions.
 Creation alone initializes dense blocks; mutation fails on missing storage.
@@ -338,8 +342,10 @@ callers own cleanup, and no write prefix or rollback is promised.
 
 ## Bound and policy constants
 
-These are private implementation owners, not public tuning options. Equal values
-do not couple independent bounds.
+These constants have distinct owners and are not tuning options. The public
+`MAX_BATCH_ELEMENTS` lets custom readers and update planners respect the execution
+limit; `MAX_BLOCK_CAPACITY` bounds stored payloads. Equal values do not couple
+execution batches, storage blocks, metadata ranks, or index pages.
 
 | Meaning | Owner / constant | Current value |
 |---|---|---:|
@@ -431,7 +437,7 @@ conversion includes implicit zeros without copying storage or changing shared
 clones. Nonidentity output mappings conservatively report scalar sparse layout
 instead of retaining a stale dense-suffix axis. External handles may retain read
 leases. Native clones share live storage and are not snapshots. Borrowed and owned
-consumption use one evaluator and one outer buffering boundary.
+consumption use one evaluator and one sequential request stream.
 
 For `Layout::Sparse { axis: Some(a) }`, axes through `a` select a full dense
 trailing region. Storage blocks have prefix extent one and bounded trailing
@@ -505,7 +511,7 @@ batching and axis-group traversal. Counts include all logical values, including
 implicit sparse zeros. Partial statistics retain constant-sized state; standard
 deviation combines centered moments and uses squared complex magnitude. Real
 results are f64; complex mean is c64 and complex standard deviation and norm are
-f64. Nonfinite arithmetic and completion-order reproducibility limits remain
+f64. Nonfinite arithmetic and backend reproducibility limits remain
 part of numerical evaluation, not transaction visibility.
 
 `TensorView::logical_block_range` derives a conservative half-open grid interval
@@ -534,3 +540,10 @@ validate ordered block IDs before returning keys; consumers need no second
 membership lookup. Payload reads validate the selected dense blocks. Dense
 validation borrows required payloads without cloning them. Native fills visit valid offsets while retaining old-value
 validation and zero padding.
+
+Geometry owns address validation; storage owns payload validation and file access.
+Reuse computed block bounds for padding traversal. Buffered dense reads retain at
+most the CPU-derived window of payload guards.
+Each consumed guard is released after scatter. Insufficient pinned capacity returns
+freqfs's bounded admission error; error or cancellation drops the stream and its
+guards. Sparse storage retains its coherent table guard and no read-ahead queue.

@@ -16,18 +16,17 @@
 //! [`TensorGeometry::size`] checks cardinality overflow and returns `Result<u64>`.
 //! Only bounded buffer dimensions are narrowed for backend evaluation.
 //!
-//! ha-ndarray owns numerical parallelism; fensor owns bounded async concurrency.
-//! The outer consumer uses CPU-limited `buffered` for row-major/sparse/boolean
-//! delivery and `buffer_unordered` for coordinate streams and numeric terminals.
-//! Synchronous backend work runs on the polling thread and may use backend workers;
-//! `async move` does not create CPU parallelism. Inner evaluation adds no buffering.
+//! ha-ndarray owns numerical parallelism. Shared consumers evaluate one request
+//! at a time; dense storage buffers ordinary borrowed reads. freqfs owns admission
+//! and returns bounded errors if pinned reads exhaust cache capacity. Independent
+//! consumers remain concurrent. No prefetch stage or expression batch queue exists.
 //! Copying completes each destination update before requesting the next source batch.
 //!
 //! Sparse absence is numerical zero; reductions count all logical values. Sparse
 //! pointwise operations reject nonzero implicit backgrounds unless converted with
 //! [`TensorExpression::into_dense`]. Numeric terminals accumulate in
-//! completion order under the backend aggregate contract, with no input-order
-//! error precedence. Boolean terminals retain logical short-circuit boundaries.
+//! request order under the backend aggregate contract. Boolean terminals retain
+//! logical short-circuit boundaries.
 //! Dropping consumption cancels pending evaluation. Copy failures leave unpublished
 //! storage for caller cleanup. Call [`Tensor::sync`] on completed storage before reopening.
 //!
@@ -131,6 +130,7 @@ mod view;
 
 pub use binary::BinaryView;
 pub use error::{Error, Result};
+pub use expression::MAX_BATCH_ELEMENTS;
 #[cfg(feature = "complex")]
 pub use fft::FourierView;
 pub use ha_ndarray::Axes;

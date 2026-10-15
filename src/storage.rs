@@ -72,13 +72,25 @@ impl<'a> BlockCursor<'a> {
     #[inline]
     fn new(geometry: &'a StorageGeometry, id: u64) -> Result<Self> {
         let bounds = geometry.block_bounds(id)?;
+        Ok(Self::from_bounds(geometry, bounds))
+    }
+
+    fn from_bounds(geometry: &'a StorageGeometry, bounds: Vec<(u64, u64)>) -> Self {
         let coord = bounds.iter().map(|(lo, _)| *lo).collect();
-        Ok(Self {
+        Self {
             geometry,
             bounds,
             coord,
             offset: 0,
             done: false,
+        }
+    }
+
+    fn offsets(mut self) -> impl Iterator<Item = usize> + 'a {
+        std::iter::from_fn(move || {
+            let offset = self.current()?.0;
+            self.advance();
+            Some(offset)
         })
     }
 
@@ -158,10 +170,18 @@ impl StorageGeometry {
         Ok((position.block_id, position.offset_in_block))
     }
 
-    pub fn block_bounds(&self, id: u64) -> Result<Vec<(u64, u64)>> {
+    pub(crate) fn validate_id(&self, id: u64) -> Result<()> {
         if id >= self.block_count() {
             return Err(Error::InvalidCoord("logical block out of bounds".into()));
         }
+
+        Ok(())
+    }
+
+    pub fn block_bounds(&self, id: u64) -> Result<Vec<(u64, u64)>> {
+        self.validate_id(id)?;
+        #[cfg(test)]
+        crate::read_metrics::record(|m| m.block_bounds += 1);
 
         Ok((0..self.schema.shape().len())
             .map(|axis| {
@@ -178,10 +198,13 @@ impl StorageGeometry {
     /// Validate a complete logical block, including zero-valued edge padding.
     /// Check the block ID before its length; valid positions may contain any value.
     pub fn validate_block<T: TensorElement>(&self, id: u64, values: &[T]) -> Result<()> {
-        let bounds = self.block_bounds(id)?;
+        self.validate_id(id)?;
         if values.len() != self.block_len() {
             return Err(Error::InvalidLayout("invalid logical block length".into()));
         }
+
+        let bounds = self.block_bounds(id)?;
+
         if bounds
             .iter()
             .zip(self.block_shape())
@@ -193,26 +216,23 @@ impl StorageGeometry {
         #[cfg(test)]
         crate::read_metrics::record(|m| m.padding_walks += 1);
         let mut next = 0;
-        for offset in self.block_offsets(id)? {
+        for offset in BlockCursor::from_bounds(self, bounds).offsets() {
             if values[next..offset].iter().any(|v| *v != T::ZERO) {
                 return Err(Error::InvalidLayout("nonzero logical block padding".into()));
             }
             next = offset + 1;
         }
+
         if values[next..].iter().any(|v| *v != T::ZERO) {
             return Err(Error::InvalidLayout("nonzero logical block padding".into()));
         }
+
         Ok(())
     }
 
     /// Valid physical-buffer offsets in logical order, excluding edge padding.
     pub fn block_offsets(&self, id: u64) -> Result<impl Iterator<Item = usize> + '_> {
-        let mut cursor = BlockCursor::new(self, id)?;
-        Ok(std::iter::from_fn(move || {
-            let offset = cursor.current()?.0;
-            cursor.advance();
-            Some(offset)
-        }))
+        Ok(BlockCursor::new(self, id)?.offsets())
     }
 
     pub fn sparse_axis(&self) -> Option<usize> {

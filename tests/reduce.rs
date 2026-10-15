@@ -478,6 +478,13 @@ async fn reduction_copy_spills_and_reloads() {
         .await
         .unwrap();
         tensor.write_value(&[1023, 3], 255).await.unwrap();
+        tensor.sync().await.unwrap();
+        drop(tensor);
+
+        let tensor = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
+            .await
+            .unwrap();
+
         let view = tensor.view().sum(axes![1], false).await.unwrap();
         let (root, _) = new_dir("reduce_cache_output").await;
         let cache = freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));

@@ -21,7 +21,7 @@ The opt-in `benchmarks` feature compiles two ignored tests which use the same wo
 - Unit `profiling::profile` additionally observes task-local read/copy counters.
 
 `FENSOR_BENCH_SUITE` selects `matrix`, `reduction`, `completion`, `pipeline`,
-`copy`, `sparse`, `storage`, `mutation`, `traversal`, `reopen`, or `all` (default). Matrix cases include storage reads, affine/gather transforms,
+`copy`, `sparse`, `storage`, `mutation`, `traversal`, `read-ahead`, `reopen`, or `all` (default). Matrix cases include storage reads, affine/gather transforms,
 regular/irregular selections, batches, nested products and extreme shapes.
 Reduction cases include short/long groups, axes, strided and nested sources.
 Completion cases compare streams and numeric terminals. Pipeline/copy cases vary
@@ -176,5 +176,12 @@ as the existing `profiling` unit-test module. Its entrypoint and shared workload
 are unchanged.
 
 The `owned` workload isolates ordinary, high-rank, and gather transform construction
-from row-major and completion-order consumption on dense and sparse sources.
+from row-major and coordinate-request consumption on dense and sparse sources.
 Setup is outside timing; mapping costs are reported separately from consumption.
+
+The `read-ahead` suite measures sequential, transformed, selected, and point reads,
+reductions, and copying with resident and cache-pressure workloads. Adapter load
+counts identify native-cache misses; these runs do not establish physical-device
+cold reads. Use identical cache budgets and instrumentation when comparing builds.
+For prefetch comparisons, use the same freqfs implementation in both builds and
+include cache-pressure cases: inspection before declined admission also costs I/O.

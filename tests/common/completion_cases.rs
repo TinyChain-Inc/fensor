@@ -1,4 +1,4 @@
-//! Completion-order evaluation and numeric terminals, with ordered controls.
+//! Request consumption and numeric terminals, with row-stream controls.
 
 use fensor::{
     TensorMatMul, TensorRead, TensorReduce, TensorReduceAll, TensorTransform, TensorTrig,

@@ -14,8 +14,8 @@ where
     FsEntry: TensorFileEntry<T>,
 {
     for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
-        // Dense payloads exceed the cache even for u8. Sparse fixtures also
-        // budget for their many distinct axis keys; index memory is a separate cost.
+        // Dtype parity uses enough cache for concurrent borrowed reads.
+        // Dedicated dense-owner tests cover insufficient-capacity errors.
         let len = if matches!(layout, Layout::Dense) {
             4097
         } else {
@@ -29,11 +29,7 @@ where
             expected[2..4].copy_from_slice(&samples);
         }
 
-        let cache = if matches!(layout, Layout::Dense) {
-            2048
-        } else {
-            1_000_000
-        };
+        let cache = 1_000_000;
 
         let root = common::Directory::new("dtype_storage").await;
         let dir = freqfs::Cache::<FsEntry>::new(cache, None, 0, std::time::Duration::from_secs(1))

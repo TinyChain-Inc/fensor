@@ -542,21 +542,7 @@ where
 
         let mut values = vec![T::ZERO; request.len()];
 
-        for (id, positions) in groups {
-            let block = dense.read::<T>(id).await?;
-
-            #[cfg(test)]
-            crate::read_metrics::record(|m| {
-                m.borrows += 1;
-                m.borrowed += block.len();
-            });
-
-            for run in positions {
-                run.scatter(&block, &mut values)?;
-            }
-
-            // This block guard is released before the next block is awaited.
-        }
+        dense.read_groups(groups, &mut values).await?;
 
         Ok(values)
     }
@@ -853,10 +839,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
         Box::pin(async move {
             match self.storage.as_ref() {
                 Storage::Sparse(sparse) => sparse.read(id).await,
-                Storage::Dense(dense) => {
-                    self.storage_geometry().block_bounds(id)?;
-                    Ok(dense.read::<T>(id).await?.to_vec())
-                }
+                Storage::Dense(dense) => Ok(dense.read::<T>(id).await?.to_vec()),
             }
         })
     }

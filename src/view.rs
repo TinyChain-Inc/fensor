@@ -53,7 +53,7 @@ where
         Ok(())
     }
 
-    /// Map one bounded row-major value batch to logical-block updates.
+    /// Map at most [`crate::MAX_BATCH_ELEMENTS`] row-major values to logical-block updates.
     /// This plans addresses only; callers enforce write-through and reserve storage.
     pub fn plan_updates(
         &self,
@@ -66,7 +66,7 @@ where
         crate::storage::plan_updates(geometry, Some(&self.mapping), &request, values)
     }
 
-    /// Consume an owned expression into bounded destination updates in completion order.
+    /// Consume an owned expression into bounded destination updates in source request order.
     /// Dropping the stream releases its source handles. This acquires no write permission.
     pub fn updates_from(
         &self,
@@ -84,7 +84,7 @@ where
         let geometry = geometry.clone();
         let mapping = self.mapping.clone();
         Ok(
-            crate::expression::completion_batches(std::sync::Arc::new(source))?
+            crate::expression::preferred_batches(std::sync::Arc::new(source))?
                 .map(move |result| {
                     let (request, batch) = result?;
                     crate::storage::plan_updates(&geometry, Some(&mapping), &request, batch.values)

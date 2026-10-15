@@ -36,7 +36,7 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
   already use affine runs. Preserve the bounded irregular/gather paths.
 - Operand reuse across matrix tiles and nested-expression scheduling, guided by
   measurements and without implicitly persisting computed intermediates.
-- Dense-initialization improvements and completion-order cache locality, guided
+- Dense-initialization improvements and request-order cache locality, guided
   by measurements. Native fills and value-buffer writes already update bounded
   blocks; `copy_from` consumes and writes each destination batch sequentially.
 - Profile async allocation and backend scheduling before changing future types,

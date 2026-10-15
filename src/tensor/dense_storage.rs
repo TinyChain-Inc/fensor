@@ -1,6 +1,7 @@
 //! Dense storage keeps each logical block in a required typed payload file.
 
 use freqfs::{Dir, DirLock, FileLoad, FileLock, FileReadGuardOwned};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{
     Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates, block_allocation,
@@ -135,11 +136,45 @@ impl<FE> DenseStorage<FE> {
         T: TensorElement,
     {
         Box::pin(async move {
+            self.validate_id(id)?;
             let file = required_file(&*self.blocks.read().await, id)?;
             let block = file.into_read::<Vec<T>>().await?;
             validate_stored_length(&block, self.block_len())?;
             Ok(block)
         })
+    }
+
+    pub(super) async fn read_groups<T>(
+        &self,
+        groups: crate::storage_read::LogicalGroups,
+        values: &mut [T],
+    ) -> Result<()>
+    where
+        FE: TensorFileEntry<T>,
+        T: TensorElement,
+    {
+        // Ordinary reads retain their guards until consumed. Cache admission may
+        // fail when these reads or independent consumers pin too much capacity.
+        let reads = stream::iter(groups)
+            .map(|(id, positions)| async move {
+                self.read::<T>(id).await.map(|block| (positions, block))
+            })
+            .buffered(num_cpus::get().max(1));
+        let mut reads = std::pin::pin!(reads);
+
+        while let Some((positions, block)) = reads.try_next().await? {
+            #[cfg(test)]
+            crate::read_metrics::record(|m| {
+                m.borrows += 1;
+                m.borrowed += block.len();
+            });
+
+            for run in positions {
+                run.scatter(&block, values)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -202,3 +237,7 @@ fn required_file<FE: FileLoad>(blocks: &Dir<FE>, id: u64) -> Result<FileLock<FE>
 #[cfg(test)]
 #[path = "../../tests/unit/tensor/dense_storage/test_support.rs"]
 pub(super) mod test_support;
+
+#[cfg(test)]
+#[path = "../../tests/unit/tensor/dense_storage/tests.rs"]
+mod tests;

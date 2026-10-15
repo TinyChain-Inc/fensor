@@ -1,8 +1,14 @@
-//! A trampoline using an explicit continuation stack. Child requests suspend
-//! their caller; only this driver polls them. No nested executor or spawned task.
-//! Concrete operations still delegate to operands, as in v1; the trampoline prevents
-//! user-controlled expression depth from becoming call-stack depth. Boxing alone
-//! does not flatten nested future polling.
+//! Evaluate expressions without recursive polling.
+//!
+//! A trampoline is a loop that runs pending continuations (work remaining after
+//! a child completes) instead of nesting calls on the native stack. Here, parent
+//! futures suspend while the driver polls their children from an explicit stack,
+//! then resume with the child results. Concrete operations still delegate to
+//! operands, but user-controlled expression depth does not become call-stack
+//! depth. Boxing futures alone does not flatten their recursive polling.
+//!
+//! This is not another executor or a spawned task. Tokio provides cooperative
+//! scheduling; the driver owns evaluation order and cancellation cleanup.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,7 +22,12 @@ use super::{Batch, EvaluatedBatch, Expression};
 use crate::request::BatchRequest;
 use crate::{BoxFuture, Error, Result, TensorElement};
 
-// Bounds continuation storage independently of the numerical batch bound.
+// Cap simultaneously retained continuations so stack-safe evaluation cannot grow
+// its frame stack without limit. This bounds frame count, not aggregate bytes:
+// frames can retain differently sized futures and completed sibling batches.
+// 16,384 is the existing resource-policy ceiling; no measured or calculated
+// derivation is recorded. It is not a Rust/Tokio limit or a safe native-stack
+// depth. The trampoline provides stack safety independently of this value.
 const MAX_FRAMES: usize = 16_384;
 
 type Frame<'a> = BoxFuture<'a, ()>;

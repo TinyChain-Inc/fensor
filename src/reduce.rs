@@ -1,6 +1,6 @@
 //! Bounded reductions over logical values, including implicit sparse zeros.
 
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use ha_ndarray::{NDArrayReduceAll, Number, Real};
 
 use crate::expression::{self, Batch, Expression};
@@ -442,10 +442,7 @@ where
     let slice = crate::slice::Slice::full(source.shape())?;
     let mut remaining = slice.len();
     let requests = expression::traversal::selection(source, slice)?;
-    // Numeric aggregates allow evaluation-order differences. Consume completed
-    // batches immediately; boolean terminals retain logical ordered delivery.
-    let batches =
-        expression::evaluation_futures(source, requests).buffer_unordered(num_cpus::get().max(1));
+    let batches = expression::evaluate_requests(source, requests);
     futures::pin_mut!(batches);
     let mut state = None;
 

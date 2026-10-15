@@ -11,7 +11,7 @@ async fn complete_groups_pack_without_materialization() {
         smallvec::smallvec![count as u64, width as u64],
         Layout::Dense,
         31,
-        2048,
+        1_000_000,
         std::iter::repeat_n(Complex64::ONE, count * width),
     )
     .await;

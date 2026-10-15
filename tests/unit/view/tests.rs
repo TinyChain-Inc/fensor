@@ -1238,6 +1238,29 @@ async fn unsqueeze_then_squeeze_round_trip() {
 async fn update_planning_matches_coordinates_without_affine_expansion() {
     use crate::TensorSource;
 
+    // The destination exceeds the batch limit, so rejection cannot be a shape error.
+    let limit = crate::MAX_BATCH_ELEMENTS;
+    let (root, tensor) = create_dense("update_plan_limit", shape![(limit + 1) as u64], 256).await;
+    let geometry = tensor.storage_geometry();
+    let view = tensor.view();
+    let updates = view.plan_updates(&geometry, 0, vec![1.; limit]).unwrap();
+    assert_eq!(updates.values().map(Vec::len).sum::<usize>(), limit);
+    assert!(matches!(
+        view.plan_updates(&geometry, 0, vec![1.; limit + 1]),
+        Err(Error::InvalidLayout(_))
+    ));
+    for id in 0..geometry.block_count() {
+        assert!(
+            tensor
+                .read_logical_block(id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|v| *v == 0.)
+        );
+    }
+    cleanup(&root).await;
+
     for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
         for block_shape in [shape![2, 3], shape![4, 64]] {
             let (root, dir) = new_dir("update_plans").await;
@@ -1304,14 +1327,6 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
                 assert!(
                     view.plan_updates(&geometry, view.size().unwrap(), vec![1.])
                         .is_err()
-                );
-                assert!(
-                    view.plan_updates(
-                        &geometry,
-                        0,
-                        vec![0.; crate::expression::MAX_BATCH_ELEMENTS + 1]
-                    )
-                    .is_err()
                 );
             }
 

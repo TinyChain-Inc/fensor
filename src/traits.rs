@@ -1,5 +1,4 @@
-use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use number_general::NumberType;
 
 use crate::schema::Layout;
@@ -45,10 +44,10 @@ pub type ValueBlockStream<'a, T> = BoxStream<'a, Result<Vec<T>>>;
 
 /// Coordinate-bearing bounded blocks, in implementation-selected order.
 /// Successful complete consumption visits every logical coordinate exactly once,
-/// including zero-valued coordinates. Built-in readers deliver completed batches
-/// without input-order error precedence; dropping a stream cancels pending work.
+/// including zero-valued coordinates. Built-in readers deliver batches in their
+/// selected request order; dropping a stream cancels pending work.
 /// Coordinates and values have equal length within the
-/// [execution limit](https://github.com/TinyChain-Inc/fensor/blob/main/DESIGN.md#bound-and-policy-constants).
+/// [`crate::MAX_BATCH_ELEMENTS`] execution limit.
 /// Each call is independent.
 pub type CoordinateBlockStream<'a, T> = BoxStream<'a, Result<(Vec<Vec<u64>>, Vec<T>)>>;
 
@@ -57,10 +56,11 @@ pub trait TensorRead: TensorGeometry {
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>>;
 
     /// Each call constructs an independent, demand-driven stream; no tensor-sized buffer.
+    /// Custom readers must return at most [`crate::MAX_BATCH_ELEMENTS`] values per batch.
     fn read_blocks(&self) -> Result<ValueBlockStream<'_, Self::DType>> {
         let batches = coordinate_batches(crate::schema::row_major_coords(self.shape())?);
         Ok(futures::stream::iter(batches)
-            .map(move |coords| async move {
+            .then(move |coords| async move {
                 let mut values = Vec::with_capacity(coords.len());
 
                 for coord in coords {
@@ -69,7 +69,6 @@ pub trait TensorRead: TensorGeometry {
 
                 Ok(values)
             })
-            .buffered(num_cpus::get().max(1))
             .boxed())
     }
 
@@ -121,7 +120,7 @@ pub trait TensorRead: TensorGeometry {
         Box::pin(async move {
             let coords = sparse_coords(self, range, requested_order)?;
             let elements = futures::stream::iter(coordinate_batches(coords))
-                .map(move |coords| async move {
+                .then(move |coords| async move {
                     let mut elements = Vec::new();
 
                     for coord in coords {
@@ -132,7 +131,6 @@ pub trait TensorRead: TensorGeometry {
                     }
                     Ok::<_, Error>(futures::stream::iter(elements.into_iter().map(Ok)))
                 })
-                .buffered(num_cpus::get().max(1))
                 .try_flatten();
             Ok(elements.boxed())
         })
@@ -609,10 +607,10 @@ pub trait TensorReduce: TensorGeometry {
 
 /// Terminal reductions include every logical value, including implicit sparse zeros.
 /// A nonempty all-zero tensor has zero sum, product, minimum, and maximum.
-/// Built-in expressions accumulate batches in completion order. Floating results
-/// may depend on scheduling within ha-ndarray's aggregate contract, including
-/// permitted extreme-range differences. The first observed error cancels pending
-/// evaluation; errors have no input-order precedence. Extrema do not short-circuit.
+/// Built-in expressions accumulate batches in request order. Floating results
+/// retain ha-ndarray's aggregate reproducibility limits, including permitted
+/// extreme-range differences. Errors stop consumption before evaluating the next
+/// request. Extrema do not short-circuit.
 pub trait TensorReduceAll: TensorRead {
     fn sum_all(&self) -> BoxFuture<'_, Result<Self::DType>>;
 

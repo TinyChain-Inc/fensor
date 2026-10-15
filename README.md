@@ -218,8 +218,8 @@ responsible for limiting decoding allocations before fensor receives a payload.
 |---|---|
 | `read_blocks()` | Logical row-major values |
 | `read_sparse_elements_in_order()` | Requested row-major sparse order |
-| `read_coordinate_blocks()` | Completion-dependent batches of paired coordinates/values |
-| Whole-tensor numeric terminals | Accumulate batches in completion order |
+| `read_coordinate_blocks()` | Preferred-request-order batches of paired coordinates/values |
+| Whole-tensor numeric terminals | Accumulate batches in request order |
 | Boolean terminals | Logical order with short-circuiting |
 
 A successful complete coordinate stream visits every logical coordinate exactly
@@ -228,19 +228,22 @@ built-in expressions can generate tiled requests. Request traversal is distinct
 from batch delivery order. Each stream is independent and live, not a snapshot.
 Concurrent source writes are not isolated. Dropping a stream cancels pending work.
 
-**ha-ndarray owns numerical parallelism; fensor owns bounded async concurrency.**
-The outer consumer keeps at most `num_cpus::get().max(1)` batch futures in flight,
-using `buffered` for ordered consumers and `buffer_unordered` otherwise. Inner
-evaluation adds no buffered streams or tasks. The driver suspends a parent until
-its requested child completes, preserving operand order without recursive future
+**ha-ndarray owns numerical parallelism; dense storage owns concurrent reads.**
+Expression consumers evaluate one bounded request at a time. Dense storage uses
+ordinary file reads with `buffered(num_cpus::get().max(1))` and scatters directly
+from borrowed payloads. freqfs owns admission and eviction; insufficient cache
+capacity can return a bounded error. There is no separate prefetch stage or
+expression-batch queue. Independent consumers may run concurrently.
+The driver suspends a parent until its requested child completes, preserving
+operand order without recursive future
 polling. Ready evaluation and occupied-candidate traversal yield cooperatively at
 bounded work intervals, so cancellation can interrupt cached work. Synchronous
 backend calls run on the polling thread and may use ha-ndarray's workers; `async move` does not create CPU parallelism.
 
-Numeric terminal accumulation can depend on read scheduling, including extreme
-overflow/underflow differences permitted by ha-ndarray's aggregate contract.
-Wrapping integers, NaN extrema, and signed-zero rules are preserved. Unordered consumers promise no input-order error precedence.
-Numeric terminals return the first observed error and drop pending evaluation.
+Numeric terminal accumulation retains request-partitioning and backend scheduling
+limits, including extreme overflow/underflow differences permitted by ha-ndarray.
+Wrapping integers, NaN extrema, and signed-zero rules are preserved. Errors stop
+request consumption and drop active evaluation; later requests are not evaluated.
 
 Execution batches obey the [execution limit](DESIGN.md#bound-and-policy-constants).
 Values, coordinates, and partial-result collections must not scale with total tensor, output, or reduction
@@ -319,7 +322,7 @@ See [remaining work](ROADMAP.md), [execution design](DESIGN.md),
 
 Geometric `TensorView` values can plan bounded `BlockUpdates` from row-major value
 batches with `plan_updates`, or consume an owned expression with `updates_from`.
-The latter uses completion-order delivery and retains the source until consumption
+The latter uses preferred-request-order delivery and retains the source until consumption
 or drop. These methods describe logical-block offsets; callers own write permission
 and publication. Independent native materialization uses `Tensor::copy_from`.
 

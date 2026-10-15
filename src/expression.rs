@@ -4,8 +4,7 @@
 
 use std::ops::Deref;
 
-use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use ha_ndarray::{Array, ArrayAccess, Buffer, NDArray, NDArrayRead, Number};
 
 use crate::request::{self, BatchRequest};
@@ -19,8 +18,12 @@ pub(crate) use driver::evaluate_batch;
 
 pub(crate) mod traversal;
 
-/// Execution limit independent of filesystem storage block capacity.
-pub(crate) const MAX_BATCH_ELEMENTS: usize = 4096;
+/// Maximum element count per execution batch, custom-reader batch, or
+/// [`crate::TensorView::plan_updates`] call.
+///
+/// Independent of [`crate::MAX_BLOCK_CAPACITY`]. This is not an aggregate memory
+/// limit: independent consumers and suspended expression frames retain buffers.
+pub const MAX_BATCH_ELEMENTS: usize = 4096;
 
 fn validate_len(context: &str, actual: usize, expected: usize) -> Result<()> {
     if actual != expected {
@@ -93,7 +96,7 @@ where
 {
     let requests = request::linear_requests(source.shape())?;
     Ok(
-        ordered_requests(source, futures::stream::iter(requests.map(Ok)))
+        evaluate_requests(source, futures::stream::iter(requests.map(Ok)))
             .map_ok(|(_, batch)| batch.values)
             .boxed(),
     )
@@ -132,7 +135,7 @@ pub fn coordinate_blocks<E: Expression + ?Sized>(
 where
     E::DType: TensorElement,
 {
-    Ok(completion_batches(expression)?
+    Ok(preferred_batches(expression)?
         .map(move |batch| {
             let (request, batch) = batch?;
             Ok((request.into_coordinates(expression.shape())?, batch.values))
@@ -140,14 +143,10 @@ where
         .boxed())
 }
 
-/// Shared completion-order consumption before a caller chooses its output representation.
-pub(crate) fn completion_batches<'a, H>(
+/// Consume preferred requests sequentially before choosing an output representation.
+pub(crate) fn preferred_batches<'a, H>(
     expression: H,
-) -> Result<
-    impl futures::Stream<Item = Result<CoordinateBatch<<H::Target as TensorGeometry>::DType>>>
-    + Send
-    + 'a,
->
+) -> Result<BatchStream<'a, <H::Target as TensorGeometry>::DType>>
 where
     H: Deref + Clone + Send + Sync + 'a,
     H::Target: Expression,
@@ -158,10 +157,10 @@ where
         None => Box::new(request::linear_requests(expression.shape())?),
     };
 
-    Ok(
-        evaluation_futures(expression, futures::stream::iter(requests.map(Ok)))
-            .buffer_unordered(num_cpus::get().max(1)),
-    )
+    Ok(evaluate_requests(
+        expression,
+        futures::stream::iter(requests.map(Ok)),
+    ))
 }
 
 pub struct Batch<T: TensorElement> {
@@ -271,65 +270,43 @@ pub(crate) fn sparse_elements<T: TensorElement>(
 
 type CoordinateBatch<T> = (BatchRequest, EvaluatedBatch<T>);
 
-/// Evaluate bounded coordinate batches with at most `num_cpus::get().max(1)`
-/// batches in flight. Expression temporaries scale with batch size, expression
-/// size, and concurrency, not total tensor size. Collecting the returned stream
-/// can still allocate whole-tensor output in the caller.
-pub fn ordered_batches<'a, E, I>(
-    expression: &'a E,
-    coords: I,
-) -> BoxStream<'a, Result<CoordinateBatch<E::DType>>>
+type BatchStream<'a, T> = BoxStream<'a, Result<CoordinateBatch<T>>>;
+
+/// Evaluate one bounded coordinate batch at a time. Expression temporaries scale
+/// with batch size and expression structure, not total tensor size. Collecting
+/// the returned stream can still allocate whole-tensor output in the caller.
+pub fn ordered_batches<'a, E, I>(expression: &'a E, coords: I) -> BatchStream<'a, E::DType>
 where
     E: Expression + ?Sized,
     E::DType: TensorElement,
     I: Iterator<Item = BatchRequest> + Send + 'a,
 {
-    ordered_requests(expression, futures::stream::iter(coords.map(Ok)))
+    evaluate_requests(expression, futures::stream::iter(coords.map(Ok)))
 }
 
-/// Ordered delivery for consumers whose value or error boundaries require it.
-/// Also accepts demand-driven sparse-index requests without another buffer.
-pub(crate) fn ordered_requests<'a, H, R>(
+/// Consume one request at a time; native storage owns concurrent file reads.
+/// Borrowed and owned sources use the same stream and cancellation boundary.
+pub(crate) fn evaluate_requests<'a, H, R>(
     expression: H,
     requests: R,
-) -> BoxStream<'a, Result<CoordinateBatch<<H::Target as TensorGeometry>::DType>>>
+) -> BatchStream<'a, <H::Target as TensorGeometry>::DType>
 where
     H: Deref + Clone + Send + Sync + 'a,
     H::Target: Expression,
     <H::Target as TensorGeometry>::DType: TensorElement,
     R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,
 {
-    evaluation_futures(expression, requests)
-        .buffered(num_cpus::get().max(1))
+    requests
+        .then(move |request| {
+            let expression = expression.clone();
+
+            async move {
+                let request = request?;
+                let values = evaluate_batch(&*expression, &request).await?;
+                Ok((request, values))
+            }
+        })
         .boxed()
-}
-
-/// Build lazy evaluation futures from borrowed or owned source handles. Only
-/// the outer consumer chooses buffering and delivery order.
-pub(crate) fn evaluation_futures<'a, H, R>(
-    expression: H,
-    requests: R,
-) -> impl futures::Stream<
-    Item = impl std::future::Future<
-        Output = Result<CoordinateBatch<<H::Target as TensorGeometry>::DType>>,
-    > + Send
-           + 'a,
-> + Send
-+ 'a
-where
-    H: Deref + Clone + Send + Sync + 'a,
-    H::Target: Expression,
-    <H::Target as TensorGeometry>::DType: TensorElement,
-    R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,
-{
-    requests.map(move |coords| {
-        let expression = expression.clone();
-        async move {
-            let coords = coords?;
-            let values = evaluate_batch(&*expression, &coords).await?;
-            Ok((coords, values))
-        }
-    })
 }
 
 impl<S: crate::TensorSource> crate::expression::traversal::Plan for TensorView<S>
@@ -435,7 +412,7 @@ where
     R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,
 {
     let shape = source.shape().to_vec();
-    ordered_requests(source, requests)
+    evaluate_requests(source, requests)
         .map(move |result| {
             let (request, batch) = result?;
             Ok::<_, Error>(futures::stream::iter(sparse_elements(

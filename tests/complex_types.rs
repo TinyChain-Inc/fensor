@@ -275,7 +275,7 @@ macro_rules! exceptional {
                 shape![input.len() as u64],
                 Layout::Dense,
                 2,
-                1024,
+                1_000_000,
                 input.clone(),
             )
             .await;

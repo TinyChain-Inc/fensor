@@ -251,6 +251,9 @@ fn push_progression(runs: &mut Vec<Progression>, next: Progression) {
     runs.push(next);
 }
 
+// Runtime address representations, not numerical operation tags. Mapping chooses
+// compact forms from runtime geometry; storage and matrix planners can exploit
+// them without expanding coordinates. Shared cursors handle general traversal.
 #[derive(Clone, Debug)]
 pub(crate) enum RequestKind {
     Linear { start: u64 },

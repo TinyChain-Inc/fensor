@@ -115,8 +115,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     {
         #[cfg(test)]
         crate::read_metrics::record(|m| m.logical_payload_reads += 1);
-        self.geometry.block_bounds(id)?;
 
+        // Entry points validate IDs; grouped reads and construction use validated plans.
         let row = table.get_row(&[SparseCell::Key(id)]).await?;
         row.map(|row| self.row_payload(id, row)).transpose()
     }
@@ -143,13 +143,15 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                 }
 
                 if first == last {
-                    let block = self
-                        .read_row(&table, first)
-                        .await?
-                        .unwrap_or_else(|| vec![T::ZERO; self.geometry.block_len()]);
+                    let Some(block) = self.read_row(&table, first).await? else {
+                        // Missing rows already have their numerical zero in output.
+                        continue;
+                    };
+
                     for run in &groups[&first] {
                         run.scatter(&block, output)?;
                     }
+
                     continue;
                 }
 
@@ -191,7 +193,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     pub fn read(&self, id: u64) -> BoxFuture<'_, Result<Vec<T>>> {
         Box::pin(async move {
-            self.geometry.block_bounds(id)?;
+            self.geometry.validate_id(id)?;
             let table = self.blocks.read().await;
             Ok(self
                 .read_row(&table, id)
@@ -252,7 +254,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     pub fn replace(&self, id: u64, values: Vec<T>) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            self.geometry.block_bounds(id)?;
+            self.geometry.validate_id(id)?;
             if values.len() != self.geometry.block_len() {
                 return Err(Error::InvalidLayout(
                     "invalid replacement block length".into(),
@@ -269,7 +271,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     pub fn update<'a>(&'a self, id: u64, updates: &'a [(usize, T)]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.geometry.block_bounds(id)?;
+            self.geometry.validate_id(id)?;
             let mut table = self.blocks.write().await;
 
             let previous = self.read_row(&table, id).await?;

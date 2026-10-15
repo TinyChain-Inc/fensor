@@ -100,6 +100,7 @@ may assert and unwrap expected results.
 - Use `pin!` for local consumption. Keep `BoxFuture` and `BoxStream` at owned,
   erased, or documented stack-size boundaries. Local pinning cannot replace an
   escaping boxed future, and boxing recursion does not make polling stack-safe.
-- Only the outer consumer buffers evaluation. Preserve ordered versus
-  completion-order delivery explicitly. Streams retain their sources; cancellation
-  drops active work without background ingestion tasks.
+- Evaluate expression requests sequentially through the shared consumer. Dense
+  storage buffers ordinary borrowed reads; freqfs owns capacity admission. Do not
+  add another evaluation queue or background ingestion task. Streams retain their
+  sources; cancellation drops active work and buffered read guards.

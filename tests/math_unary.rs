@@ -494,6 +494,14 @@ async fn copying_spills_beyond_cache_budget_and_reloads() {
         }
         assert!(count > 1, "blocks must spill before explicit sync");
         tensor.write_value(&[1023], 2.0).await.unwrap();
+        tensor.sync().await.unwrap();
+        drop(tensor);
+        drop(dir);
+
+        let tensor = Tensor::<FsEntry, f32>::load(common::open_dir(&root).unwrap())
+            .await
+            .unwrap();
+
         let (out_root, _) = new_dir("unary_small_cache_out").await;
         let out_cache =
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));

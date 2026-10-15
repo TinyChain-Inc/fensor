@@ -81,12 +81,7 @@ where
                 shape![3, n as u64],
                 layout,
                 7,
-                if matches!(layout, Layout::Dense) {
-                    // Admit typed complex blocks and file envelopes, not encoded bytes.
-                    1024
-                } else {
-                    1_000_000
-                },
+                1_000_000,
                 input.clone(),
             )
             .await;
@@ -225,11 +220,7 @@ where
             shape![2, 2, 3],
             layout,
             3,
-            if matches!(layout, Layout::Dense) {
-                512
-            } else {
-                1_000_000
-            },
+            1_000_000,
             input.clone(),
         )
         .await;

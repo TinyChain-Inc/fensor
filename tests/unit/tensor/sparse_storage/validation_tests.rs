@@ -30,12 +30,28 @@ async fn replacement_validation_preserves_lock_precedence() {
         Some(Err(Error::InvalidLayout(message)))
             if message == "invalid replacement block length"
     ));
+    assert!(matches!(
+        storage.read(geometry.block_count()).now_or_never(),
+        Some(Err(Error::InvalidCoord(_)))
+    ));
+    assert!(matches!(
+        storage.update(geometry.block_count(), &[]).now_or_never(),
+        Some(Err(Error::InvalidCoord(_)))
+    ));
     assert!(storage.replace(1, vec![1.; 4]).now_or_never().is_none());
     drop(guard);
     assert!(matches!(
         storage.replace(1, vec![1.; 4]).await,
         Err(Error::InvalidLayout(message)) if message == "nonzero logical block padding"
     ));
+
+    crate::read_metrics::CURRENT
+        .scope(Default::default(), async {
+            let request = crate::request::BatchRequest::linear(0, 1).unwrap();
+            assert_eq!(tensor.read_batch(&request, None).await.unwrap(), vec![0.]);
+            crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().block_bounds, 0));
+        })
+        .await;
 
     assert!(storage.blocks.try_write().is_ok());
     assert_eq!(tensor.read_logical_block(1).await.unwrap(), vec![0.; 4]);

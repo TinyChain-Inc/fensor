@@ -422,6 +422,13 @@ async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
             a.write_value(&[i, 1], 2).await.unwrap();
         }
 
+        a.sync().await.unwrap();
+        drop(a);
+
+        let a = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
+            .await
+            .unwrap();
+
         let (_b_root, b) = source(&[1u8; 130], shape![2, 65], false, 17).await;
         let view = a.view().matmul(&b.view()).await.unwrap();
         let mut stream = view.read_blocks().unwrap();

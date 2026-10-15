@@ -396,6 +396,14 @@ async fn binary_copy_under_cache_pressure_reloads() {
         .await
         .unwrap();
         a.write_value(&[1023], 255).await.unwrap();
+        a.sync().await.unwrap();
+        drop(a);
+
+        // Read concurrency has a separate capacity requirement from construction.
+        let a = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
+            .await
+            .unwrap();
+
         let (_b_root, b) = source(&vec![1u8; 1024], Layout::Dense, 31).await;
         let (out_root, _) = new_dir("binary_cache_copy").await;
         let out_cache =
@@ -1094,6 +1102,14 @@ async fn conditional_copy_under_cache_pressure_reloads() {
         .await
         .unwrap();
         a.write_value(&[1023], 255).await.unwrap();
+        a.sync().await.unwrap();
+        drop(a);
+
+        // Read concurrency has a separate capacity requirement from construction.
+        let a = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
+            .await
+            .unwrap();
+
         let condition = a.view().eq_scalar(0).await.unwrap();
         let expression = condition
             .cond(&a.view().add_scalar(1).await.unwrap(), &a.view())

@@ -61,7 +61,10 @@ fn block_consumers_share_order_padding_and_rank_scratch() {
                 for (i, (offset, _)) in expected.iter().enumerate() {
                     values[*offset] = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY][i % 3];
                 }
-                geometry.validate_block(id, &values).unwrap();
+                crate::read_metrics::CURRENT.sync_scope(Default::default(), || {
+                    geometry.validate_block(id, &values).unwrap();
+                    crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().block_bounds, 1));
+                });
                 for offset in 0..values.len() {
                     if expected.iter().any(|(valid, _)| *valid == offset) {
                         continue;

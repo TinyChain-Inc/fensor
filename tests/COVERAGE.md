@@ -34,16 +34,16 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Request-to-update parity, affine allocation bounds, owned source consumption and release | View unit `update_planning_matches_coordinates_without_affine_expansion`, `update_stream_evaluates_once_and_owns_its_source` |
 | Bulk block publication counts, edge padding, duplicate writes, NaN, and missing-block mutation rejection | `tensor::physical_tests::bulk_mutation` |
 | Sequential copy backpressure, drop/error cancellation | `copy_pipeline` with a held filesystem block guard |
-| Ordered batch completion and concurrency bound | Expression unit `buffered_batches_are_bounded_ordered_and_cancelled_by_drop` for borrowed and owned handles |
-| Completion-order progress, slot replenishment, one-slot window, pairing and cancellation | Expression unit `completion_order_replenishes_slots_and_preserves_pairs` |
+| Sequential batch backpressure and ordered delivery | Expression unit `sequential_batches_are_ordered_and_cancelled_by_drop` for borrowed and owned handles |
+| Request pairing, backpressure, independent consumers and cancellation | Expression unit `sequential_consumption_preserves_pairs_and_backpressure` |
 | Dynamic expression depth on normal worker stacks, wide-expression numerical completion, shared operands, sparse values, failed transforms, cancellation/error and unpolled-drop source release | `expression_depth` isolated subprocesses in default and complex suites; also run the target in release |
 | Wide sparse candidate merging, high-rank compact request retention, duplicates, empty requests, EOF/error/cancellation cleanup | Expression traversal `wide_sparse_candidates_retain_compact_requests_and_release_sources`, `ready_sparse_candidates_can_be_cancelled_and_errors_release_sources` |
 | Pending-frame poison and cleanup during unwinding | Expression driver unit `poisoned_driver_rejects_polling_and_releases_pending_work`; permit-specific tests removed with aggregate admission |
 | Ready expression cancellation and peer-task progress | `expression_depth` ready-cancel subprocess case; expression traversal cancellation test |
 | Shared owned/borrowed block consumption, transformed values and nonfinite values | `storage_source::owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_values` |
 | Owned source release after errors | Expression unit `owned_stream_error_releases_pending_evaluation_on_drop` |
-| First observed errors and pending evaluation cancellation | Expression unit `unordered_errors_cancel_pending_evaluation` |
-| Numeric terminal completion schedules, wrapping and aggregate accuracy | Expression unit `numeric_terminals_accept_completion_schedules` |
+| Request-order errors and evaluation cleanup | Expression unit `sequential_errors_stop_before_later_evaluation` |
+| Numeric terminal input delays, wrapping and aggregate accuracy | Expression unit `numeric_terminals_preserve_values_across_input_delays` |
 | Fixture directory uniqueness and scoped cleanup | `foundations::temporary_directory_names_are_unique_across_threads`, `fixture_directories_are_removed_on_completion_and_unwind` |
 | Public type restrictions and no adapter Clone requirement | Doctests |
 | Composition and coordinate-stream consumption example | Crate-level compile-checked doctest in `src/lib.rs` |
@@ -229,3 +229,35 @@ Encapsulation cleanup retains the bounded batching assertions, relocated from
 `traits::tests::batching_only_consumes_its_bounded_prefix`. Raw malformed mapping
 fixtures live in mapping-owned test support; dense file access lives in
 dense-storage-owned test support. Neither adds production visibility.
+
+Read validation: `unit/storage/traversal_tests.rs` checks reuse of computed bounds
+during padding validation. `unit/tensor/dense_storage/tests.rs` checks progress
+when the cache can admit only one dense payload, with both the default handle
+budget and a single file-handle permit. Existing storage and sparse
+consumer fixtures retain invalid-ID, corruption, ordering, and zero-row coverage.
+
+
+The sequential-consumer change replaces outer-window assertions with one-active-
+request assertions; borrowed/owned cancellation and source-release checks remain.
+`unordered_errors_cancel_pending_evaluation` is now
+`sequential_errors_stop_before_later_evaluation`, retaining injected failures and
+cleanup while asserting request-order errors.
+`numeric_terminals_accept_completion_schedules` is now
+`numeric_terminals_preserve_values_across_input_delays`; all numerical cases remain.
+The former one-payload-cache success fixture is now
+`dense_reads_delegate_capacity_and_release_failed_work`: sufficient-capacity
+success (including one handle), deterministic capacity failure, release, and retry.
+`buffered_reads_preserve_order_and_release_guards` owns ordinary dense-read
+buffering, duplicate positions, ordered corruption errors, and guard cancellation.
+
+Small-cache binary, conditional, unary, reduction, and matrix copy fixtures keep
+their construction and destination budgets. They synchronize and reopen sources
+with sufficient read capacity before evaluating expressions; their numerical,
+spill, destination synchronization, and reopen assertions remain unchanged.
+
+The Fourier complete-pack fixture likewise uses sufficient read capacity while
+retaining request-count, duplicate-read sharing, numerical, and no-materialization
+assertions. Constrained-cache behavior is owned by the dense-reader capacity fixture.
+
+Complex exceptional-value and Fourier parity fixtures use adequate source-read
+capacity for both layouts; all existing numerical and copy assertions remain.
