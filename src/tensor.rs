@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use freqfs::{DirLock, FileLoad};
 use futures::{StreamExt, TryStreamExt};
-use get_size::GetSize;
 use number_general::NumberType;
 use safecast::AsType;
 
@@ -107,14 +106,6 @@ impl<FE, T> Storage<FE, T> {
             Self::Sparse(s) => &s.geometry().storage,
         }
     }
-}
-
-// A typed buffer plus its adapter envelope. Cache reconciliation charges the
-// actual entry after creation/replacement; reserve all retained Vec capacity.
-fn block_allocation<FE, T>(values: &Vec<T>) -> usize {
-    std::mem::size_of::<FE>()
-        + std::mem::size_of::<Vec<T>>()
-        + values.capacity() * std::mem::size_of::<T>()
 }
 
 pub struct Tensor<FE, T> {
@@ -742,11 +733,10 @@ async fn create_metadata_file<FE: TensorFileEntry<T>, T: TensorElement>(
     blocks: &DirLock<FE>,
     metadata: TensorMetadata<T>,
 ) -> Result<()> {
-    let size = std::mem::size_of::<FE>() + metadata.get_size();
     blocks
         .write()
         .await
-        .create_file(METADATA.to_string(), metadata, size)
+        .create_file(METADATA.to_string(), metadata)
         .await?;
     Ok(())
 }

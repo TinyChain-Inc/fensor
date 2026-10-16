@@ -203,11 +203,7 @@ async fn dense_replacement_validates_required_payload_without_repair() {
                 blocks
                     .write()
                     .await
-                    .create_file(
-                        "0".into(),
-                        vec![1u8, 2],
-                        std::mem::size_of::<FsEntry>() + std::mem::size_of::<Vec<u64>>() + 2,
-                    )
+                    .create_file("0".into(), vec![1u8, 2])
                     .await
                     .unwrap();
             }
@@ -215,11 +211,7 @@ async fn dense_replacement_validates_required_payload_without_repair() {
                 blocks
                     .write()
                     .await
-                    .create_file(
-                        "0".into(),
-                        vec![1f64],
-                        std::mem::size_of::<FsEntry>() + std::mem::size_of::<Vec<u64>>() + 8,
-                    )
+                    .create_file("0".into(), vec![1f64])
                     .await
                     .unwrap();
             }

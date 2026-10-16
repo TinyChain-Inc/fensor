@@ -309,7 +309,7 @@ async fn u8_malformed_blocks_fail_closed() {
     .unwrap();
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     let file = blocks.read().await.get_file("0").unwrap().clone();
-    file.write::<Vec<u8>>(0).await.unwrap().truncate(1);
+    file.write::<Vec<u8>>().await.unwrap().truncate(1);
     assert!(matches!(
         tensor.read_value(&[0]).await,
         Err(Error::InvalidLayout(_))

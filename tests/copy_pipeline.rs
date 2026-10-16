@@ -76,15 +76,11 @@ impl TensorRead for Reader<'_> {
                     blocks
                         .write()
                         .await
-                        .create_file(
-                            "0".into(),
-                            vec![0u8],
-                            std::mem::size_of::<FsEntry>() + std::mem::size_of::<Vec<u64>>() + 1,
-                        )
+                        .create_file("0".into(), vec![0u8])
                         .await
                         .unwrap();
                     let file = blocks.read().await.get_file("0").unwrap().clone();
-                    let guard = file.write_owned::<Vec<u8>>(0).await.unwrap();
+                    let guard = file.write_owned::<Vec<u8>>().await.unwrap();
                     self.guard
                         .lock()
                         .unwrap()
@@ -229,7 +225,7 @@ async fn cancellation_and_errors_release_the_active_operation_and_source() {
         let blocks = dir.read().await.get_dir("blocks").cloned().unwrap();
         assert!(blocks.read().await.get_file("1").is_none());
         let file = blocks.read().await.get_file("0").cloned().unwrap();
-        assert!(file.try_write::<Vec<u8>>(0).is_ok());
+        assert!(file.try_write::<Vec<u8>>().is_ok());
         assert_eq!(reader.reads.read(), reads);
         common::cleanup(&out_root).await;
     }

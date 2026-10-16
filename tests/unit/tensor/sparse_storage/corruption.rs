@@ -19,7 +19,7 @@ async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
         let mut node = entry
             .as_file()
             .unwrap()
-            .write::<crate::SparseNode<T>>(0)
+            .write::<crate::SparseNode<T>>()
             .await
             .unwrap();
         if let b_table::Node::Leaf(rows) = &mut *node {

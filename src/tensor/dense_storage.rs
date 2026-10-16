@@ -4,8 +4,7 @@ use freqfs::{Dir, DirLock, FileLoad, FileLock, FileReadGuardOwned};
 use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{
-    Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates, block_allocation,
-    validate_stored_length,
+    Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates, validate_stored_length,
 };
 use crate::request::BatchRequest;
 use crate::schema::StorageSchema;
@@ -36,11 +35,10 @@ impl<FE> DenseStorage<FE> {
     {
         for id in 0..self.storage_schema.shape.iter().product::<u64>() {
             let values = vec![T::default(); self.block_len()];
-            let bound = block_allocation::<FE, T>(&values);
             self.blocks
                 .write()
                 .await
-                .create_file(id.to_string(), values, bound)
+                .create_file(id.to_string(), values)
                 .await?;
         }
 
@@ -112,9 +110,7 @@ impl<FE> DenseStorage<FE> {
         }
 
         let file = required_file(&*self.blocks.read().await, id)?;
-        let mut stored = file
-            .write::<Vec<T>>(block_allocation::<FE, T>(&block))
-            .await?;
+        let mut stored = file.write::<Vec<T>>().await?;
         validate_stored_length(&stored, self.block_len())?;
         *stored = block;
         Ok(())
@@ -126,7 +122,7 @@ impl<FE> DenseStorage<FE> {
         T: TensorElement,
     {
         let file = required_file(&*self.blocks.read().await, id)?;
-        let mut block = file.write::<Vec<T>>(0).await?;
+        let mut block = file.write::<Vec<T>>().await?;
         apply_block_updates(&mut block, self.block_len(), updates)
     }
 
@@ -198,17 +194,16 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                 let file = dense.blocks.read().await.get_file(&id.to_string()).cloned();
 
                 if let Some(file) = file {
-                    let mut block = file.write::<Vec<T>>(0).await?;
+                    let mut block = file.write::<Vec<T>>().await?;
                     super::apply_block_updates(&mut block, tensor.block_len(), &updates)?;
                 } else {
                     let mut block = tensor.default_block();
                     super::apply_block_updates(&mut block, tensor.block_len(), &updates)?;
-                    let bound = super::block_allocation::<F, T>(&block);
                     dense
                         .blocks
                         .write()
                         .await
-                        .create_file(id.to_string(), block, bound)
+                        .create_file(id.to_string(), block)
                         .await?;
                 }
 

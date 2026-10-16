@@ -148,7 +148,6 @@ mod math_unary {
 
 mod storage_source {
     use futures::TryStreamExt;
-    use get_size::GetSize;
     use number_general::FloatType;
 
     use crate::test_support::cleanup;
@@ -240,7 +239,7 @@ mod storage_source {
                 .unwrap()
                 .clone();
             {
-                let mut node = file.write::<SparseNode<f64>>(0).await.unwrap();
+                let mut node = file.write::<SparseNode<f64>>().await.unwrap();
                 let b_table::Node::Leaf(rows) = &*node else {
                     panic!("single sparse page")
                 };
@@ -250,9 +249,6 @@ mod storage_source {
                     SparseCell::Payload(vec![12.]),
                 ]);
                 let replacement = b_table::Node::Leaf(rows);
-                node.reserve(std::mem::size_of::<FsEntry>() + replacement.get_size())
-                    .await
-                    .unwrap();
                 *node = replacement;
             }
             tensor.sync().await.unwrap();

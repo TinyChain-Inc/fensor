@@ -81,7 +81,7 @@ async fn table_guards_preserve_batch_reads_and_partial_updates() {
     let values = dir.read().await.get_dir("values").cloned().unwrap();
     let primary = values.read().await.get_dir("primary").cloned().unwrap();
     let file = primary.read().await.files().next().unwrap().clone();
-    let held = file.write::<crate::SparseNode<f32>>(0).await.unwrap();
+    let held = file.write::<crate::SparseNode<f32>>().await.unwrap();
     let request = BatchRequest::explicit(vec![vec![0, 0], vec![1, 0], vec![3, 0]]).unwrap();
     {
         let mut read = std::pin::pin!(tensor.read_batch(&request, None));
@@ -101,7 +101,7 @@ async fn table_guards_preserve_batch_reads_and_partial_updates() {
         write.await.unwrap();
     }
 
-    let held = file.write::<crate::SparseNode<f32>>(0).await.unwrap();
+    let held = file.write::<crate::SparseNode<f32>>().await.unwrap();
     {
         let mut left = std::pin::pin!(storage.update(0, &[(0, 3.)]));
         let mut right = std::pin::pin!(storage.update(0, &[(1, 4.)]));

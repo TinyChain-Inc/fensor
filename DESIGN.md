@@ -458,8 +458,10 @@ removes its row. Invalid padding, malformed lengths, empty stored blocks, and
 incorrect block IDs are errors. Batch reads share a native table range for
 consecutive requested block IDs. Gaps retain separate reads so unrelated payload
 corruption remains outside the selection. Replacement and read-modify-write
-hold one native table write guard, including old-payload validation; helpers
-receive that guard instead of reacquiring it. A bounded batch holds one read guard
+hold one native table write guard. Table resolves the old row once and lends it
+to a synchronous update callback for payload validation and block mathematics,
+then maintains its indexes using that same row. Helpers receive the acquired
+guard instead of reacquiring it. A bounded batch holds one read guard
 across all requested groups. Point reads and occupied pages acquire their own
 read guards inside the sparse owner. Operation guards are released before
 synchronization enters the directory hierarchy.

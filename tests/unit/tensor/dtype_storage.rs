@@ -145,7 +145,7 @@ where
             ));
         } else {
             let file = blocks.read().await.get_file("0").unwrap().clone();
-            file.write::<Vec<T>>(0).await.unwrap().clear();
+            file.write::<Vec<T>>().await.unwrap().clear();
             assert!(matches!(
                 tensor.read_value(&[2]).await,
                 Err(Error::InvalidLayout(_))

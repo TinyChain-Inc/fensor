@@ -383,7 +383,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 .get_file(&id.to_string())
                 .unwrap()
                 .clone();
-            file.write::<Vec<f32>>(0).await.unwrap().pop();
+            file.write::<Vec<f32>>().await.unwrap().pop();
         } else {
             crate::tensor::corruption::corrupt_sparse_payload(&tensor, id).await;
         }
@@ -674,7 +674,7 @@ async fn update_planning_rejects_invalid_input_and_corrupt_blocks() {
     assert_eq!(block, vec![0.; 4]);
     let blocks = dir.read().await.get_dir(BLOCKS).unwrap().clone();
     let file = blocks.read().await.get_file("0").unwrap().clone();
-    file.write::<Vec<f32>>(0).await.unwrap().pop();
+    file.write::<Vec<f32>>().await.unwrap().pop();
     assert!(tensor.write_value(&[0], 1.).await.is_err());
     assert_eq!(*file.read::<Vec<f32>>().await.unwrap(), vec![0.; 3]);
     cleanup(&root).await;
@@ -1027,11 +1027,7 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
                 crate::tensor::corruption::files(&tensor.storage)
                     .write()
                     .await
-                    .create_file(
-                        "unexpected_payload".into(),
-                        vec![1f32],
-                        std::mem::size_of::<TestFE>() + std::mem::size_of::<Vec<f32>>() + 4,
-                    )
+                    .create_file("unexpected_payload".into(), vec![1f32])
                     .await
                     .unwrap();
             }

@@ -91,20 +91,20 @@ async fn buffered_reads_preserve_order_and_release_guards() {
         BatchRequest::explicit(vec![vec![0], vec![2], vec![2], vec![1], vec![7]]).unwrap();
 
     for cancel in [false, true] {
-        let held = first.write::<Vec<f32>>(0).await.unwrap();
+        let held = first.write::<Vec<f32>>().await.unwrap();
         let mut read = Box::pin(tensor.read_batch(&request, None));
         assert!(read.as_mut().now_or_never().is_none());
 
         if num_cpus::get() > 1 {
             // The second completed read is buffered behind the blocked first.
-            assert!(second.try_write::<Vec<f32>>(0).is_err());
+            assert!(second.try_write::<Vec<f32>>().is_err());
         }
 
         if cancel {
             drop(read);
             drop(held);
-            drop(second.try_write::<Vec<f32>>(0).unwrap());
-            drop(first.try_write::<Vec<f32>>(0).unwrap());
+            drop(second.try_write::<Vec<f32>>().unwrap());
+            drop(first.try_write::<Vec<f32>>().unwrap());
         } else {
             drop(held);
             assert_eq!(read.await.unwrap(), vec![0., 2., 2., 1., 7.]);
@@ -112,12 +112,12 @@ async fn buffered_reads_preserve_order_and_release_guards() {
     }
 
     // Later lookup failures stay behind the earlier payload validation.
-    let mut held = first.write::<Vec<f32>>(0).await.unwrap();
+    let mut held = first.write::<Vec<f32>>().await.unwrap();
     held.clear();
     owner.blocks.write().await.delete("1").await;
     let mut read = Box::pin(tensor.read_batch(&request, None));
     assert!(read.as_mut().now_or_never().is_none());
     drop(held);
     assert!(read.await.unwrap_err().to_string().contains("length"));
-    drop(first.try_write::<Vec<f32>>(0).unwrap());
+    drop(first.try_write::<Vec<f32>>().unwrap());
 }

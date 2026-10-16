@@ -842,7 +842,7 @@ async fn dense_scalar_write_rejects_malformed_existing_block() {
     .unwrap();
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     let file = blocks.read().await.get_file("0").unwrap().clone();
-    file.write::<Vec<f32>>(0).await.unwrap().truncate(1);
+    file.write::<Vec<f32>>().await.unwrap().truncate(1);
     assert!(matches!(
         tensor.write_value(&[0], 2.0).await,
         Err(Error::InvalidLayout(_))

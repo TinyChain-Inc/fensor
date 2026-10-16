@@ -88,20 +88,28 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         Ok(values.iter().any(|v| *v != T::ZERO))
     }
 
-    fn row_payload(&self, id: u64, mut row: b_table::Row<SparseCell<T>>) -> Result<Vec<T>> {
+    fn row_values<'a>(&self, id: u64, row: &'a [SparseCell<T>]) -> Result<&'a [T]> {
         if row.len() != 2 || row[0] != SparseCell::Key(id) {
             return Err(Error::InvalidLayout("invalid sparse block key".into()));
         }
 
-        let Some(SparseCell::Payload(values)) = row.pop() else {
+        let SparseCell::Payload(values) = &row[1] else {
             return Err(Error::InvalidLayout("invalid sparse payload".into()));
         };
 
-        if !self.validate_payload(id, &values)? {
+        if !self.validate_payload(id, values)? {
             return Err(Error::InvalidLayout("empty sparse payload".into()));
         }
 
         Ok(values)
+    }
+
+    fn row_payload(&self, id: u64, mut row: b_table::Row<SparseCell<T>>) -> Result<Vec<T>> {
+        self.row_values(id, &row)?;
+        match row.pop() {
+            Some(SparseCell::Payload(values)) => Ok(values),
+            _ => Err(Error::InvalidLayout("invalid sparse payload".into())),
+        }
     }
 
     // Reuse the acquired table guard, including across a read-modify-write.
@@ -202,15 +210,6 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         })
     }
 
-    async fn put(&self, table: &mut WriteBlocks<F, T>, id: u64, values: Vec<T>) -> Result<bool> {
-        let inserted = table
-            .upsert(vec![SparseCell::Key(id)], vec![SparseCell::Payload(values)])
-            .await?;
-        #[cfg(test)]
-        super::copy_metrics::record(|m| m.payload_writes += 1);
-        Ok(inserted)
-    }
-
     // Only unpublished construction appends rows whose block IDs increase.
     async fn append<S>(&self, table: &mut WriteBlocks<F, T>, rows: S) -> Result<()>
     where
@@ -225,31 +224,38 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         Ok(())
     }
 
-    async fn remove(&self, table: &mut WriteBlocks<F, T>, id: u64) -> Result<()> {
-        table.delete_row(&[SparseCell::Key(id)]).await?;
-        Ok(())
-    }
-
-    async fn replace_block(
+    async fn update_block(
         &self,
         table: &mut WriteBlocks<F, T>,
         id: u64,
-        values: Vec<T>,
-        nonzero: bool,
-        present: bool,
-    ) -> Result<()> {
+        updates: &[(usize, T)],
+    ) -> Result<bool> {
+        let mut inserted = false;
         #[cfg(test)]
-        super::copy_metrics::record(|m| m.replaced_blocks += 1);
-        if !nonzero && !present {
-            return Ok(());
-        }
+        let mut written = false;
+        #[cfg(test)]
+        crate::read_metrics::record(|m| m.logical_payload_reads += 1);
 
-        if nonzero {
-            self.put(table, id, values).await?;
-        } else {
-            self.remove(table, id).await?;
-        }
-        Ok(())
+        table
+            .try_update(vec![SparseCell::Key(id)], |previous| {
+                let mut values = match previous {
+                    Some(row) => self.row_values(id, row)?.to_vec(),
+                    None => vec![T::ZERO; self.geometry.block_len()],
+                };
+                super::apply_block_updates(&mut values, self.geometry.block_len(), updates)?;
+                let nonzero = self.validate_payload(id, &values)?;
+                #[cfg(test)]
+                {
+                    written = nonzero;
+                }
+                inserted = previous.is_none() && nonzero;
+                Ok::<_, Error>(nonzero.then(|| vec![SparseCell::Payload(values)]))
+            })
+            .await?;
+
+        #[cfg(test)]
+        super::copy_metrics::record(|m| m.payload_writes += usize::from(written));
+        Ok(inserted)
     }
 
     pub fn replace(&self, id: u64, values: Vec<T>) -> BoxFuture<'_, Result<()>> {
@@ -263,9 +269,21 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             let mut table = self.blocks.write().await;
 
             let nonzero = self.validate_payload(id, &values)?;
-            let present = self.read_row(&table, id).await?.is_some();
-            self.replace_block(&mut table, id, values, nonzero, present)
-                .await
+            #[cfg(test)]
+            crate::read_metrics::record(|m| m.logical_payload_reads += 1);
+            table
+                .try_update(vec![SparseCell::Key(id)], |previous| {
+                    if let Some(row) = previous {
+                        self.row_values(id, row)?;
+                    }
+                    #[cfg(test)]
+                    super::copy_metrics::record(|m| m.replaced_blocks += 1);
+                    Ok::<_, Error>(nonzero.then(|| vec![SparseCell::Payload(values)]))
+                })
+                .await?;
+            #[cfg(test)]
+            super::copy_metrics::record(|m| m.payload_writes += usize::from(nonzero));
+            Ok(())
         })
     }
 
@@ -274,13 +292,10 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             self.geometry.validate_id(id)?;
             let mut table = self.blocks.write().await;
 
-            let previous = self.read_row(&table, id).await?;
-            let present = previous.is_some();
-            let mut values = previous.unwrap_or_else(|| vec![T::ZERO; self.geometry.block_len()]);
-            super::apply_block_updates(&mut values, self.geometry.block_len(), updates)?;
-            let nonzero = self.validate_payload(id, &values)?;
-            self.replace_block(&mut table, id, values, nonzero, present)
-                .await
+            self.update_block(&mut table, id, updates).await?;
+            #[cfg(test)]
+            super::copy_metrics::record(|m| m.replaced_blocks += 1);
+            Ok(())
         })
     }
 
@@ -448,59 +463,42 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                 }
             }
             if let Some((current, block)) = &mut self.current {
-                let rows = futures::stream::try_unfold(
-                    (coords.iter().zip(values), current, block),
-                    |(mut input, current, block)| async move {
-                        for (coord, value) in input.by_ref() {
-                            let (id, offset) = owner
-                                .geometry
-                                .block_position(coord)
-                                .expect("validated construction coordinate");
-                            if let Some(previous) = current.filter(|previous| id != *previous) {
-                                let complete = std::mem::replace(
-                                    block,
-                                    vec![T::ZERO; owner.geometry.block_len()],
-                                );
-                                *current = Some(id);
-                                block[offset] = value;
-                                if complete.iter().any(|value| *value != T::ZERO) {
-                                    let row = (
-                                        vec![SparseCell::Key(previous)],
-                                        vec![SparseCell::Payload(complete)],
-                                    );
-                                    return Ok::<_, std::io::Error>(Some((
-                                        row,
-                                        (input, current, block),
-                                    )));
-                                }
-                                continue;
-                            }
+                let mut input = coords.iter().zip(values);
+                let rows = std::iter::from_fn(|| {
+                    for (coord, value) in input.by_ref() {
+                        let (id, offset) = owner
+                            .geometry
+                            .block_position(coord)
+                            .expect("validated construction coordinate");
+                        if let Some(previous) = current.filter(|previous| id != *previous) {
+                            let complete =
+                                std::mem::replace(block, vec![T::ZERO; owner.geometry.block_len()]);
                             *current = Some(id);
                             block[offset] = value;
+                            if complete.iter().any(|value| *value != T::ZERO) {
+                                let row = (
+                                    vec![SparseCell::Key(previous)],
+                                    vec![SparseCell::Payload(complete)],
+                                );
+                                return Some(Ok::<_, std::io::Error>(row));
+                            }
+                            continue;
                         }
-                        Ok(None)
-                    },
-                );
-                owner.append(&mut table, rows).await?;
+                        *current = Some(id);
+                        block[offset] = value;
+                    }
+                    None
+                });
+                owner
+                    .append(&mut table, futures::stream::iter(rows))
+                    .await?;
             } else {
                 let request = crate::request::BatchRequest::explicit(coords.to_vec())?;
                 let groups = crate::storage::plan_updates(&owner.geometry, None, &request, values)?;
                 for (id, updates) in groups {
-                    let mut values = owner
-                        .read_row(&table, id)
-                        .await?
-                        .unwrap_or_else(|| vec![T::ZERO; owner.geometry.block_len()]);
-                    super::apply_block_updates(&mut values, owner.geometry.block_len(), &updates)?;
-                    let present = owner.validate_payload(id, &values)?;
-                    if present {
-                        let _inserted = owner.put(&mut table, id, values).await?;
-                        #[cfg(test)]
-                        super::copy_metrics::record(|m| {
-                            m.constructed_blocks += usize::from(_inserted)
-                        });
-                    } else {
-                        owner.remove(&mut table, id).await?;
-                    }
+                    let _inserted = owner.update_block(&mut table, id, &updates).await?;
+                    #[cfg(test)]
+                    super::copy_metrics::record(|m| m.constructed_blocks += usize::from(_inserted));
                 }
             }
 
