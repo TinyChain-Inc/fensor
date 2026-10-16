@@ -1,7 +1,7 @@
 //! Scalar parameters attached to lazy unary expressions.
 //!
-//! Scalar operands preserve the source's support; they never populate implicit
-//! sparse zeros. The operation parameter has the source dtype.
+//! Scalar operations on sparse sources must preserve implicit zeros.
+//! The operation parameter has the source dtype.
 //!
 //! Computed scalar views remain read-only after transforms.
 //!
@@ -45,6 +45,8 @@ macro_rules! scalar_op {
         impl<$ty: $($bounds)+> UnaryOp<$ty> for $name<$ty> {
             type Output = $output;
 
+            const NAME: &'static str = stringify!($method);
+
             fn apply(
                 &self,
                 array: ArrayAccess<'static, $ty>,
@@ -53,6 +55,7 @@ macro_rules! scalar_op {
             }
         }
     };
+
 }
 
 scalar_op!(
@@ -92,11 +95,13 @@ scalar_op!(
 
 // Expand only members of the explicit public-trait implementation below.
 macro_rules! scalar_constructor {
-    ($output:ident, $method:ident, $op:ident) => {
-        type $output = UnaryView<Self, $op<Self::DType>>;
+    ($output:ident, $method:ident, $op:ident $(; where [$($bounds:tt)+])?) => {
+        type $output = UnaryView<Self, $op<Self::DType>> $(where $($bounds)+)?;
 
-        fn $method(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::$output>> {
-            Box::pin(async move { Ok(UnaryView::new(self.clone(), $op(rhs))) })
+        fn $method(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::$output>>
+        $(where $($bounds)+)?
+        {
+            Box::pin(async move { UnaryView::new(self.clone(), $op(rhs)) })
         }
     };
 }
@@ -116,29 +121,9 @@ where
 
     scalar_constructor!(PowOutput, pow_scalar, PowScalar);
 
-    type LogOutput
-        = UnaryView<Self, LogScalar<E::DType>>
-    where
-        E::DType: Float;
+    scalar_constructor!(LogOutput, log_scalar, LogScalar; where [Self::DType: Float]);
 
-    type RemOutput
-        = UnaryView<Self, RemScalar<E::DType>>
-    where
-        E::DType: Real;
-
-    fn rem_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::RemOutput>>
-    where
-        E::DType: Real,
-    {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), RemScalar(rhs))) })
-    }
-
-    fn log_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LogOutput>>
-    where
-        Self::DType: Float,
-    {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), LogScalar(rhs))) })
-    }
+    scalar_constructor!(RemOutput, rem_scalar, RemScalar; where [E::DType: Real]);
 }
 
 scalar_op!(
@@ -180,53 +165,13 @@ where
 
     scalar_constructor!(NeOutput, ne_scalar, NeScalar);
 
-    type GtOutput
-        = UnaryView<Self, GtScalar<E::DType>>
-    where
-        E::DType: Real;
+    scalar_constructor!(GtOutput, gt_scalar, GtScalar; where [E::DType: Real]);
 
-    fn gt_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::GtOutput>>
-    where
-        E::DType: Real,
-    {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), GtScalar(rhs))) })
-    }
+    scalar_constructor!(GeOutput, ge_scalar, GeScalar; where [E::DType: Real]);
 
-    type GeOutput
-        = UnaryView<Self, GeScalar<E::DType>>
-    where
-        E::DType: Real;
+    scalar_constructor!(LtOutput, lt_scalar, LtScalar; where [E::DType: Real]);
 
-    fn ge_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::GeOutput>>
-    where
-        E::DType: Real,
-    {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), GeScalar(rhs))) })
-    }
-
-    type LtOutput
-        = UnaryView<Self, LtScalar<E::DType>>
-    where
-        E::DType: Real;
-
-    fn lt_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LtOutput>>
-    where
-        E::DType: Real,
-    {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), LtScalar(rhs))) })
-    }
-
-    type LeOutput
-        = UnaryView<Self, LeScalar<E::DType>>
-    where
-        E::DType: Real;
-
-    fn le_scalar(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::LeOutput>>
-    where
-        E::DType: Real,
-    {
-        Box::pin(async move { Ok(UnaryView::new(self.clone(), LeScalar(rhs))) })
-    }
+    scalar_constructor!(LeOutput, le_scalar, LeScalar; where [E::DType: Real]);
 }
 
 scalar_op!(

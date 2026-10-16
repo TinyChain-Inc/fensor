@@ -1,8 +1,8 @@
 //! Downstream public API smoke coverage, not a transaction or storage-provider test.
 
 use fensor::{
-    AxisRange, Layout, Tensor, TensorBlockStore, TensorMathScalar, TensorRead, TensorReduce,
-    TensorSparseIndex, TensorTransform, TensorWrite,
+    AxisRange, Layout, Tensor, TensorExpression, TensorGeometry, TensorMathScalar, TensorRead,
+    TensorReduce, TensorSource, TensorTransform, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
@@ -41,21 +41,19 @@ async fn public_composition_storage_access_and_persistence() {
         )
         .await;
 
-        // With this fixture's sparse block shape [2, 1], both rows of
-        // column zero share key [0, 0]. This known key tests low-level access;
-        // it is not an external coordinate-to-block mapping implementation.
-        if matches!(layout, Layout::Sparse { .. }) {
-            let id = source.lookup_block_id(&[0, 0]).await.unwrap().unwrap();
-            assert_eq!(source.read_block(id).await.unwrap().unwrap(), [1.0, 4.0]);
-        }
+        // Logical block access does not expose native table pages.
+        let geometry = source.storage_geometry();
+        let (id, offset) = geometry.block_position(&[0, 0]).unwrap();
+        assert_eq!(source.read_logical_block(id).await.unwrap()[offset], 1.0);
 
         let geometric = source.view().transpose(Some(axes![1, 0])).unwrap();
         geometric.write_value(&[0, 0], 0.0).await.unwrap();
         assert_eq!(geometric.read_value(&[0, 0]).await.unwrap(), 0.0);
         assert_eq!(geometric.read_value(&[0, 1]).await.unwrap(), 4.0);
 
-        let expression = source
-            .view()
+        let expression = TensorExpression::new(source.view())
+            .unwrap()
+            .into_dense()
             .slice(range![AxisRange::In(0, 2, 1), AxisRange::In(1, 3, 1)])
             .unwrap()
             .transpose(Some(axes![1, 0]))
@@ -69,9 +67,10 @@ async fn public_composition_storage_access_and_persistence() {
         coordinates(&expression, &[9.0, 11.0]).await;
 
         let (copy_root, dir) = common::new_dir("handoff_copy").await;
-        let copy: Tensor<common::FsEntry, f32> = Tensor::copy_from(dir.clone(), &expression, 2)
-            .await
-            .unwrap();
+        let copy: Tensor<common::FsEntry, f32> =
+            Tensor::copy_from(dir.clone(), &expression, expression.layout(), 2)
+                .await
+                .unwrap();
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);

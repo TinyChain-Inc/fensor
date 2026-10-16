@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use fensor::{
     AxisRange, Error, Layout, Range, Tensor, TensorGeometry, TensorRead, TensorSchema,
@@ -12,7 +11,7 @@ mod common;
 
 use common::{FsEntry, cleanup, iter_coords, new_dir};
 
-async fn create_tensor(name: &str, layout: Layout) -> (PathBuf, Tensor<FsEntry, f32>) {
+async fn create_tensor(name: &str, layout: Layout) -> (common::Directory, Tensor<FsEntry, f32>) {
     let (root, dir) = new_dir(name).await;
     let schema =
         TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3, 4]).expect("schema");
@@ -51,7 +50,13 @@ async fn accessor_coordinate_offset_and_read_write_dense() {
     )
     .await;
 
-    assert_eq!(tensor.view().flat_offset(&[1, 2, 3]).expect("offset"), 23);
+    assert_eq!(
+        tensor
+            .view()
+            .resolve_base_coord(&[1, 2, 3])
+            .expect("coordinate"),
+        [1, 2, 3]
+    );
 
     tensor.write_value(&[1, 2, 3], 7.5).await.expect("write");
     tensor.write_value(&[0, 0, 0], 1.25).await.expect("write");
@@ -287,4 +292,42 @@ fn temporary_directory_names_are_unique_across_threads() {
     }
 
     assert_eq!(names.len(), 256);
+}
+
+#[tokio::test]
+async fn fixture_directories_are_removed_on_completion_and_unwind() {
+    use futures::FutureExt;
+    for unwind in [false, true] {
+        let (root, dir) = new_dir("scoped_directory").await;
+        let path = root.to_path_buf();
+        let result = std::panic::AssertUnwindSafe(async move {
+            let _root = root;
+            drop(dir);
+            assert!(!unwind, "exercise fixture cleanup on unwind");
+        })
+        .catch_unwind()
+        .await;
+        assert_eq!(result.is_err(), unwind);
+        assert!(!path.exists());
+
+        let (root, tensor) = common::fixture::source(
+            "scoped_source",
+            shape![2],
+            Layout::Dense,
+            2,
+            1_000_000,
+            [1f32, 2.],
+        )
+        .await;
+        let path = root.to_path_buf();
+        let result = std::panic::AssertUnwindSafe(async move {
+            let _root = root;
+            drop(tensor);
+            assert!(!unwind, "exercise source cleanup on unwind");
+        })
+        .catch_unwind()
+        .await;
+        assert_eq!(result.is_err(), unwind);
+        assert!(!path.exists());
+    }
 }
