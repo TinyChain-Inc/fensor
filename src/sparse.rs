@@ -3,7 +3,8 @@
 use std::{cmp::Ordering, io, marker::PhantomData};
 
 use b_table::{BTreeSchema, IndexSchema, Schema};
-use number_general::{Complex, Float, Number};
+use collate::Collate;
+use number_general::{Float, Number, NumberInstance};
 
 use crate::TensorElement;
 
@@ -29,51 +30,103 @@ impl<T> Default for SparseCell<T> {
     }
 }
 
-fn bits<T: TensorElement>(v: T) -> [u64; 2] {
-    match v.into() {
-        Number::Float(Float::F32(v)) => [v.to_bits() as u64, 0],
-        Number::Float(Float::F64(v)) => [v.to_bits(), 0],
-        Number::Complex(Complex::C32(v)) => [v.re.to_bits() as u64, v.im.to_bits() as u64],
-        Number::Complex(Complex::C64(v)) => [v.re.to_bits(), v.im.to_bits()],
-        Number::Int(v) => [i64::from(v) as u64, 0],
-        Number::UInt(v) => [u64::from(v), 0],
-        Number::Bool(v) => [u64::from(bool::from(v)), 0],
+// NaNs form one semantic equality class after all non-NaN values. Signed zeros
+// compare equally. Replacement still writes the caller's supplied representation.
+fn float_cmp(a: f64, b: f64) -> Ordering {
+    a.partial_cmp(&b)
+        .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
+}
+
+fn number_cmp(a: Number, b: Number) -> Ordering {
+    match (a, b) {
+        (Number::Float(a), Number::Float(b)) => float_cmp(a.into(), b.into()),
+        (Number::Complex(a), Number::Complex(b)) => {
+            let (ar, ai): (Float, Float) = a.into();
+            let (br, bi): (Float, Float) = b.into();
+
+            float_cmp(
+                f64::from(ar).hypot(ai.into()),
+                f64::from(br).hypot(bi.into()),
+            )
+        }
+        (Number::Int(a), Number::Int(b)) => a.cmp(&b),
+        (Number::UInt(a), Number::UInt(b)) => a.cmp(&b),
+        (Number::Bool(a), Number::Bool(b)) => bool::from(a).cmp(&bool::from(b)),
+        (a, b) => a.class().cmp(&b.class()),
+    }
+}
+
+fn same_number(a: Number, b: Number) -> bool {
+    match (a, b) {
+        (Number::Complex(a), Number::Complex(b)) => {
+            let (ar, ai): (Float, Float) = a.into();
+            let (br, bi): (Float, Float) = b.into();
+
+            float_cmp(ar.into(), br.into()).is_eq() && float_cmp(ai.into(), bi.into()).is_eq()
+        }
+        (a, b) => number_cmp(a, b).is_eq(),
     }
 }
 
 impl<T: TensorElement> PartialEq for SparseCell<T> {
-    fn eq(&self, b: &Self) -> bool {
-        self.cmp(b) == Ordering::Equal
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Key(a), Self::Key(b)) => a == b,
+            (Self::Payload(a), Self::Payload(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(&a, &b)| same_number(a.into(), b.into()))
+            }
+            _ => false,
+        }
     }
 }
 
 impl<T: TensorElement> Eq for SparseCell<T> {}
 
-impl<T: TensorElement> PartialOrd for SparseCell<T> {
-    fn partial_cmp(&self, b: &Self) -> Option<Ordering> {
-        Some(self.cmp(b))
+// Collation deliberately groups unequal complex values with the same norm.
+// It therefore belongs to Collate, not SparseCell's Eq/Ord implementation.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SparseCollator<T>(PhantomData<T>);
+
+impl<T> PartialEq for SparseCollator<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
     }
 }
 
-impl<T: TensorElement> Ord for SparseCell<T> {
-    fn cmp(&self, b: &Self) -> Ordering {
-        match (self, b) {
-            (Self::Key(a), Self::Key(b)) => a.cmp(b),
-            (Self::Payload(a), Self::Payload(b)) => {
-                a.iter().copied().map(bits).cmp(b.iter().copied().map(bits))
+impl<T> Eq for SparseCollator<T> {}
+
+impl<T: TensorElement> Collate for SparseCollator<T> {
+    type Value = SparseCell<T>;
+
+    fn cmp(&self, a: &Self::Value, b: &Self::Value) -> Ordering {
+        match (a, b) {
+            (SparseCell::Key(a), SparseCell::Key(b)) => a.cmp(b),
+            (SparseCell::Payload(a), SparseCell::Payload(b)) => {
+                for (&a, &b) in a.iter().zip(b) {
+                    let order = number_cmp(a.into(), b.into());
+                    if !order.is_eq() {
+                        return order;
+                    }
+                }
+
+                a.len().cmp(&b.len())
             }
-            (Self::Key(_), _) => Ordering::Less,
+            (SparseCell::Key(_), _) => Ordering::Less,
             _ => Ordering::Greater,
         }
     }
 }
 
-/// Caller-owned native payload node; each row has one logical block key and one dense payload.
+/// Caller-owned native payload node. Leaves contain a block key and dense payload;
+/// internal separators may retain only the block key.
 pub type SparseNode<T> = b_table::Node<SparseCell<T>>;
 
+// One schema serves both the table and its primary index; there are no auxiliary indexes.
 #[derive(Clone, Debug)]
 pub(crate) struct PayloadSchema<T> {
-    columns: Vec<String>,
     block_len: usize,
     dtype: PhantomData<T>,
 }
@@ -81,10 +134,6 @@ pub(crate) struct PayloadSchema<T> {
 impl<T> PayloadSchema<T> {
     pub(crate) fn new(block_len: usize) -> Self {
         Self {
-            columns: ["block", "payload"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
             block_len,
             dtype: PhantomData,
         }
@@ -93,7 +142,7 @@ impl<T> PayloadSchema<T> {
 
 impl<T> PartialEq for PayloadSchema<T> {
     fn eq(&self, b: &Self) -> bool {
-        self.columns == b.columns && self.block_len == b.block_len
+        self.block_len == b.block_len
     }
 }
 
@@ -122,42 +171,50 @@ impl<T: TensorElement> BTreeSchema for PayloadSchema<T> {
             + self.block_len * std::mem::size_of::<T>()
             + 16;
 
-        // Native splitting and merging require an even order of at least four.
+        // Packing policy: choose an even order of at least four for sparse pages.
         ((crate::schema::SPARSE_NODE_MEMORY - header) / row / 2 * 2).max(4)
     }
 
+    fn validate_prefix(&self, prefix: &[Self::Value]) -> io::Result<()> {
+        match prefix {
+            [SparseCell::Key(_)] => Ok(()),
+            [SparseCell::Key(_), SparseCell::Payload(values)] if values.len() == self.block_len => {
+                Ok(())
+            }
+            _ => Err(invalid()),
+        }
+    }
+
     fn validate_key(&self, row: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if row.len() != 2
-            || !matches!(row[0], SparseCell::Key(_))
-            || !matches!(&row[1], SparseCell::Payload(values) if values.len() == self.block_len)
-        {
+        if row.len() != 2 {
             return Err(invalid());
         }
+        self.validate_prefix(&row)?;
 
         Ok(row)
     }
 }
 
 impl<T: TensorElement> IndexSchema for PayloadSchema<T> {
-    type Id = String;
+    type Id = &'static str;
 
-    fn columns(&self) -> &[String] {
-        &self.columns
+    fn columns(&self) -> &[Self::Id] {
+        &["block", "payload"]
     }
 }
 
 impl<T: TensorElement> Schema for PayloadSchema<T> {
-    type Id = String;
+    type Id = &'static str;
     type Error = io::Error;
     type Value = SparseCell<T>;
     type Index = Self;
 
-    fn key(&self) -> &[String] {
-        &self.columns[..1]
+    fn key(&self) -> &[Self::Id] {
+        &["block"]
     }
 
-    fn values(&self) -> &[String] {
-        &self.columns[1..]
+    fn values(&self) -> &[Self::Id] {
+        &["payload"]
     }
 
     fn primary(&self) -> &Self {
@@ -169,7 +226,7 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
     }
 
     fn validate_key(&self, key: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if key.len() != 1 || !key.iter().all(|v| matches!(v, SparseCell::Key(_))) {
+        if !matches!(key.as_slice(), [SparseCell::Key(_)]) {
             return Err(invalid());
         }
 
@@ -177,8 +234,7 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
     }
 
     fn validate_values(&self, v: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if v.len() != 1
-            || !matches!(&v[0], SparseCell::Payload(values) if values.len() == self.block_len)
+        if !matches!(v.as_slice(), [SparseCell::Payload(values)] if values.len() == self.block_len)
         {
             return Err(invalid());
         }

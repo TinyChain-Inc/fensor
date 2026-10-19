@@ -160,12 +160,12 @@ where
     type FftOutput = FourierView<Self, Fft>;
     type IfftOutput = FourierView<Self, Ifft>;
 
-    fn fft(&self) -> BoxFuture<'_, Result<Self::FftOutput>> {
-        Box::pin(async move { FourierView::new(self, Fft) })
+    async fn fft(&self) -> Result<Self::FftOutput> {
+        FourierView::new(self, Fft)
     }
 
-    fn ifft(&self) -> BoxFuture<'_, Result<Self::IfftOutput>> {
-        Box::pin(async move { FourierView::new(self, Ifft) })
+    async fn ifft(&self) -> Result<Self::IfftOutput> {
+        FourierView::new(self, Ifft)
     }
 }
 

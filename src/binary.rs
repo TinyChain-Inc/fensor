@@ -216,10 +216,10 @@ macro_rules! binary_constructor {
     ($output:ident, $method:ident, $op:ident, $rhs:ty $(; where [$($bounds:tt)+])?) => {
         type $output = BinaryView<Self, $rhs, $op> $(where $($bounds)+)?;
 
-        fn $method<'a>(&'a self, rhs: &'a $rhs) -> BoxFuture<'a, Result<Self::$output>>
+        async fn $method<'a>(&'a self, rhs: &'a $rhs) -> Result<Self::$output>
         $(where $($bounds)+)?
         {
-            Box::pin(async move { BinaryView::new(self.clone(), rhs.clone(), $op) })
+            BinaryView::new(self.clone(), rhs.clone(), $op)
         }
     };
 }

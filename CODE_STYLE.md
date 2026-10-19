@@ -97,6 +97,9 @@ may assert and unwrap expected results.
 - Prefer `async fn`, stream combinators, and `try_unfold`. Handwritten polling
   belongs to scheduling, cooperative progress, or resource release. Ready-item
   loops must yield cooperatively; an `await` need not return `Pending`.
+- Statically dispatched lazy constructors return unboxed `Send` futures. Use
+  `impl Future + Send` in public traits and `async fn` in implementations; keep
+  validation and operand cloning inside the future so unpolled construction is inert.
 - Use `pin!` for local consumption. Keep `BoxFuture` and `BoxStream` at owned,
   erased, or documented stack-size boundaries. Local pinning cannot replace an
   escaping boxed future, and boxing recursion does not make polling stack-safe.

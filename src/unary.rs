@@ -225,10 +225,10 @@ macro_rules! unary_constructor {
     ($output:ident, $method:ident, $op:ident $(; where [$($bounds:tt)+])?) => {
         type $output = UnaryView<Self, $op> $(where $($bounds)+)?;
 
-        fn $method(&self) -> BoxFuture<'_, Result<Self::$output>>
+        async fn $method(&self) -> Result<Self::$output>
         $(where $($bounds)+)?
         {
-            Box::pin(async move { UnaryView::new(self.clone(), $op) })
+            UnaryView::new(self.clone(), $op)
         }
     };
 }
@@ -271,8 +271,8 @@ where
 {
     type Output = UnaryView<Self, Cast<To>>;
 
-    fn cast(&self) -> BoxFuture<'_, Result<Self::Output>> {
-        Box::pin(async move { UnaryView::new(self.clone(), Cast(PhantomData)) })
+    async fn cast(&self) -> Result<Self::Output> {
+        UnaryView::new(self.clone(), Cast(PhantomData))
     }
 }
 

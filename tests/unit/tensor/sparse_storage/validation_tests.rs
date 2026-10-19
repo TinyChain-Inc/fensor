@@ -6,6 +6,31 @@ use crate::{Error, Layout, StorageGeometry, Tensor, TensorSchema, TensorSource};
 
 #[tokio::test]
 async fn replacement_validation_preserves_lock_precedence() {
+    use crate::sparse::{PayloadSchema, SparseCell};
+    use b_table::BTreeSchema;
+
+    let schema = PayloadSchema::<f32>::new(2);
+    for prefix in [
+        vec![SparseCell::Key(0)],
+        vec![SparseCell::Key(0), SparseCell::Payload(vec![1., 2.])],
+    ] {
+        schema.validate_prefix(&prefix).unwrap();
+    }
+    for prefix in [
+        vec![],
+        vec![SparseCell::Payload(vec![1., 2.])],
+        vec![SparseCell::Key(0), SparseCell::Key(1)],
+        vec![SparseCell::Key(0), SparseCell::Payload(vec![1.])],
+        vec![
+            SparseCell::Key(0),
+            SparseCell::Payload(vec![1., 2.]),
+            SparseCell::Key(1),
+        ],
+    ] {
+        assert!(schema.validate_prefix(&prefix).is_err());
+    }
+    assert!(schema.validate_key(vec![SparseCell::Key(0)]).is_err());
+
     let (root, dir) = new_dir("sparse_validation_order").await;
     let geometry = StorageGeometry::new(
         TensorSchema::new(f32::dtype(), vec![2, 5].into()).unwrap(),

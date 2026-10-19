@@ -29,8 +29,7 @@ use ha_ndarray::{
 use crate::expression::Expression;
 use crate::unary::{UnaryOp, sealed};
 use crate::{
-    BoxFuture, Result, TensorBooleanScalar, TensorCompareScalar, TensorElement, TensorMathScalar,
-    UnaryView,
+    Result, TensorBooleanScalar, TensorCompareScalar, TensorElement, TensorMathScalar, UnaryView,
 };
 
 // Each declaration preserves its explicit dtype bounds and backend operation.
@@ -98,10 +97,10 @@ macro_rules! scalar_constructor {
     ($output:ident, $method:ident, $op:ident $(; where [$($bounds:tt)+])?) => {
         type $output = UnaryView<Self, $op<Self::DType>> $(where $($bounds)+)?;
 
-        fn $method(&self, rhs: Self::DType) -> BoxFuture<'_, Result<Self::$output>>
+        async fn $method(&self, rhs: Self::DType) -> Result<Self::$output>
         $(where $($bounds)+)?
         {
-            Box::pin(async move { UnaryView::new(self.clone(), $op(rhs)) })
+            UnaryView::new(self.clone(), $op(rhs))
         }
     };
 }

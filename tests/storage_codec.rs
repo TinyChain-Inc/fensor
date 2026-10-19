@@ -104,6 +104,17 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
             ];
             17
         ])),
+        FsEntry::SparseF64(b_table::Node::Index(
+            vec![vec![fensor::SparseCell::Key(2)]],
+            vec![Default::default(); 2],
+        )),
+        FsEntry::SparseF64(b_table::Node::Index(
+            vec![vec![
+                fensor::SparseCell::Key(2),
+                fensor::SparseCell::Payload(vec![3., -0.]),
+            ]],
+            vec![Default::default(); 2],
+        )),
     ];
     for entry in entries {
         let json: FsEntry =
@@ -142,6 +153,64 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
         .unwrap();
     assert!(bound.0 >= decoded.get_size());
     assert!(bound.0 <= 16 * 1024);
+
+    async fn reject_node(leaf: bool, rows: Vec<Vec<u64>>, child_count: usize) {
+        use futures::{TryStreamExt, stream};
+        let b_table::Node::Index(_, children) =
+            b_table::Node::<u64>::Index(Vec::new(), vec![Default::default(); child_count])
+        else {
+            unreachable!()
+        };
+        let value = (39u8, (leaf, rows, children));
+        let json = destream_json::en::encode(&value)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            destream_json::de::try_decode::<_, _, FsEntry>(
+                (),
+                stream::iter(json.clone().into_iter().map(Ok::<_, std::io::Error>)),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            destream_json::de::try_decode::<_, _, common::file_size::Size>(
+                (),
+                stream::iter(json.into_iter().map(Ok::<_, std::io::Error>)),
+            )
+            .await
+            .is_err()
+        );
+        let tbon = tbon::en::encode(&value)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            tbon::de::try_decode::<_, _, FsEntry>(
+                (),
+                stream::iter(tbon.clone().into_iter().map(Ok::<_, std::io::Error>)),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tbon::de::try_decode::<_, _, common::file_size::Size>(
+                (),
+                stream::iter(tbon.into_iter().map(Ok::<_, std::io::Error>)),
+            )
+            .await
+            .is_err()
+        );
+    }
+    for children in [0, 1, 3] {
+        reject_node(false, vec![vec![1]], children).await;
+    }
+    reject_node(true, vec![vec![1]], 0).await;
+    reject_node(false, vec![vec![]], 2).await;
+    reject_node(false, vec![vec![1, 2, 3]], 2).await;
 
     let oversized = (1u8, vec![0f32; fensor::MAX_BLOCK_CAPACITY + 1]);
     assert!(

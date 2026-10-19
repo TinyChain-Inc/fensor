@@ -1,6 +1,9 @@
 //! Bounded reductions over logical values, including implicit sparse zeros.
 
+use std::future::Future;
+
 use futures::TryStreamExt;
+
 use ha_ndarray::{NDArrayReduceAll, Number, Real};
 
 use crate::expression::{self, Batch, Expression};
@@ -339,20 +342,33 @@ where
 
     fn norm_all(&self) -> BoxFuture<'_, Result<f64>>;
 
-    fn mean(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MeanOutput>>;
+    fn mean(
+        &self,
+        axes: Axes,
+        keepdims: bool,
+    ) -> impl Future<Output = Result<Self::MeanOutput>> + Send + '_;
 
-    fn std(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::StdOutput>>;
+    fn std(
+        &self,
+        axes: Axes,
+        keepdims: bool,
+    ) -> impl Future<Output = Result<Self::StdOutput>> + Send + '_;
 
-    fn norm(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::NormOutput>>;
+    fn norm(
+        &self,
+        axes: Axes,
+        keepdims: bool,
+    ) -> impl Future<Output = Result<Self::NormOutput>> + Send + '_;
 }
 
 macro_rules! axis_constructor {
     ($output:ident, $method:ident, $op:ident $(; where [$($bounds:tt)+])?) => {
         type $output = ReduceView<Self, $op> $(where $($bounds)+)?;
-        fn $method(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::$output>>
+
+        async fn $method(&self, axes: Axes, keepdims: bool) -> Result<Self::$output>
         $(where $($bounds)+)?
         {
-            Box::pin(async move { ReduceView::new(self.clone(), axes, keepdims, $op) })
+            ReduceView::new(self.clone(), axes, keepdims, $op)
         }
     };
 }

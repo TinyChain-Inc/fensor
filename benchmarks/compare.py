@@ -149,7 +149,7 @@ def main():
                     with tempfile.TemporaryDirectory(prefix="fensor-benchmark-", dir=args.root) as root:
                         result = subprocess.run(
                             [str(binary.resolve()), args.entry, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-                            env=os.environ | {"TMPDIR": root, "RAYON_NUM_THREADS": str(threads), args.suite_env: args.suite},
+                            env=os.environ | {"TMPDIR": root, "RAYON_NUM_THREADS": str(threads), "TOKIO_WORKER_THREADS": str(threads), args.suite_env: args.suite},
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         )
                     log.write_text(result.stdout)

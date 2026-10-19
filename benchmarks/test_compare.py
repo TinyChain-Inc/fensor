@@ -116,18 +116,21 @@ class Summaries(unittest.TestCase):
         after = self.path.parent / "after"
         before.write_bytes(b"before executable")
         after.write_bytes(b"after executable")
-        args = ["compare.py", str(before), str(after), "--pairs", "1", "--threads", "1",
+        args = ["compare.py", str(before), str(after), "--pairs", "1", "--threads", "1", "4",
                 "--before-revision", "before", "--after-revision", "after", "--output", str(self.path)]
         result = subprocess.CompletedProcess([], 0, stdout="FENSOR,case,row,warm,wall,ns,10\n")
         with patch("sys.argv", args), patch("compare.subprocess.run", return_value=result) as run, \
                 patch("builtins.print") as output:
             main()
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 4)
+            for call, workers in zip(run.call_args_list, ("1", "1", "4", "4")):
+                self.assertEqual(call.kwargs["env"]["RAYON_NUM_THREADS"], workers)
+                self.assertEqual(call.kwargs["env"]["TOKIO_WORKER_THREADS"], workers)
             self.assertIn("before=10 after=10 delta=+0", output.call_args.args[0])
         with self.path.open() as source:
             reader = csv.DictReader(source)
             self.assertEqual(reader.fieldnames, CSV_FIELDS)
-            self.assertEqual([row["phase"] for row in reader], ["before", "after"])
+            self.assertEqual([row["phase"] for row in reader], ["before", "after", "before", "after"])
 
     def test_offline_cli_does_not_run_benchmarks(self):
         self.write([self.row(10), self.row(20, "after")])

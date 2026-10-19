@@ -78,23 +78,21 @@ where
 {
     type Output = WhereView<Self, L, R>;
 
-    fn cond<'a>(&'a self, then: &'a L, or_else: &'a R) -> BoxFuture<'a, Result<Self::Output>> {
-        Box::pin(async move {
-            if self.shape() != then.shape() || self.shape() != or_else.shape() {
-                return Err(Error::InvalidSchema(format!(
-                    "conditional operand shapes differ: {:?}, {:?}, {:?}",
-                    self.shape(),
-                    then.shape(),
-                    or_else.shape()
-                )));
-            }
+    async fn cond<'a>(&'a self, then: &'a L, or_else: &'a R) -> Result<Self::Output> {
+        if self.shape() != then.shape() || self.shape() != or_else.shape() {
+            return Err(Error::InvalidSchema(format!(
+                "conditional operand shapes differ: {:?}, {:?}, {:?}",
+                self.shape(),
+                then.shape(),
+                or_else.shape()
+            )));
+        }
 
-            Ok(WhereView {
-                zero: or_else.implicit_zero(),
-                condition: self.clone(),
-                then: then.clone(),
-                or_else: or_else.clone(),
-            })
+        Ok(WhereView {
+            zero: or_else.implicit_zero(),
+            condition: self.clone(),
+            then: then.clone(),
+            or_else: or_else.clone(),
         })
     }
 }

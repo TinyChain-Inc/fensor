@@ -5,15 +5,15 @@ use std::ops::{
     Range,
 };
 
-use b_table::{ColumnRange, Table, TableLock, TableWriteGuard, collate::Collator};
-use freqfs::DirLock;
 use futures::TryStreamExt;
 
 use super::{METADATA, SPARSE_INDEX_PAGE_ENTRIES};
-use crate::sparse::{PayloadSchema, SparseCell};
+use crate::sparse::{PayloadSchema, SparseCell, SparseCollator};
 use crate::{BoxFuture, Error, Result, StorageGeometry, Tensor, TensorElement, TensorFileEntry};
+use b_table::{ColumnRange, Table, TableLock, TableWriteGuard};
+use freqfs::DirLock;
 
-type Blocks<F, T> = TableLock<PayloadSchema<T>, PayloadSchema<T>, Collator<SparseCell<T>>, F>;
+type Blocks<F, T> = TableLock<PayloadSchema<T>, PayloadSchema<T>, SparseCollator<T>, F>;
 
 pub(super) struct SparseStorage<F, T> {
     metadata_dir: DirLock<F>,
@@ -27,8 +27,7 @@ impl<F, T> SparseStorage<F, T> {
     }
 }
 
-type WriteBlocks<F, T> =
-    TableWriteGuard<PayloadSchema<T>, PayloadSchema<T>, Collator<SparseCell<T>>, F>;
+type WriteBlocks<F, T> = TableWriteGuard<PayloadSchema<T>, PayloadSchema<T>, SparseCollator<T>, F>;
 
 impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     pub(super) async fn create(
@@ -41,7 +40,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         Ok(Self {
             blocks: TableLock::create(
                 PayloadSchema::new(geometry.block_len()),
-                Collator::default(),
+                SparseCollator::default(),
                 values,
             )
             .await?,
@@ -74,7 +73,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         Ok(Self {
             blocks: TableLock::load(
                 PayloadSchema::new(geometry.block_len()),
-                Collator::default(),
+                SparseCollator::default(),
                 values,
             )?,
             metadata_dir,
@@ -115,7 +114,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     // Reuse the acquired table guard, including across a read-modify-write.
     async fn read_row<G>(
         &self,
-        table: &Table<PayloadSchema<T>, PayloadSchema<T>, Collator<SparseCell<T>>, G>,
+        table: &Table<PayloadSchema<T>, PayloadSchema<T>, SparseCollator<T>, G>,
         id: u64,
     ) -> Result<Option<Vec<T>>>
     where
@@ -168,7 +167,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                     m.logical_payload_reads += (last - first + 1) as usize
                 });
                 let selection = [(
-                    "block".into(),
+                    "block",
                     ColumnRange::In((
                         Included(SparseCell::Key(first)),
                         Included(SparseCell::Key(last)),
@@ -367,7 +366,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         }
 
         let selection = [(
-            "block".into(),
+            "block",
             ColumnRange::In((
                 Included(SparseCell::Key(range.start)),
                 Excluded(SparseCell::Key(range.end)),
@@ -376,9 +375,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         .into_iter()
         .collect();
         let table = self.blocks.read().await;
-        let mut rows = table
-            .rows(selection, &[], false, Some(&["block".into()]))
-            .await?;
+        let mut rows = table.rows(selection, &[], false, Some(&["block"])).await?;
         let mut keys = Vec::new();
 
         while let Some(row) = rows.try_next().await? {

@@ -60,41 +60,38 @@ where
 
     type DiagOutput = DiagView<Self>;
 
-    fn mt(&self) -> BoxFuture<'_, Result<Self::TransposeOutput>> {
-        Box::pin(async move {
-            let rank = self.ndim();
-            if rank < 2 {
-                return Err(Error::InvalidLayout(format!(
-                    "matrix transpose requires rank >= 2: {:?}",
-                    self.shape()
-                )));
-            }
+    async fn mt(&self) -> Result<Self::TransposeOutput> {
+        let rank = self.ndim();
+        if rank < 2 {
+            return Err(Error::InvalidLayout(format!(
+                "matrix transpose requires rank >= 2: {:?}",
+                self.shape()
+            )));
+        }
 
-            let mut axes: Axes = (0..rank).collect();
-            axes.swap(rank - 2, rank - 1);
-            self.clone().transpose(Some(axes))
-        })
+        let mut axes: Axes = (0..rank).collect();
+        axes.swap(rank - 2, rank - 1);
+        self.clone().transpose(Some(axes))
     }
 
-    fn diag(&self) -> BoxFuture<'_, Result<Self::DiagOutput>> {
-        Box::pin(async move {
-            let rank = self.ndim();
-            if rank < 2 || self.shape()[rank - 2] != self.shape()[rank - 1] {
-                return Err(Error::InvalidLayout(format!(
-                    "diagonal requires rank >= 2 and square final dimensions: {:?}",
-                    self.shape()
-                )));
-            }
+    async fn diag(&self) -> Result<Self::DiagOutput> {
+        let rank = self.ndim();
+        if rank < 2 || self.shape()[rank - 2] != self.shape()[rank - 1] {
+            return Err(Error::InvalidLayout(format!(
+                "diagonal requires rank >= 2 and square final dimensions: {:?}",
+                self.shape()
+            )));
+        }
 
-            let shape = Shape::from_slice(&self.shape()[..rank - 1]);
-            let strides = crate::schema::contiguous_strides(&shape)?;
-            let mapping = CoordinateMap::identity(shape.clone(), &strides);
-            Ok(DiagView {
-                source: self.clone(),
-                shape,
-                strides,
-                mapping,
-            })
+        let shape = Shape::from_slice(&self.shape()[..rank - 1]);
+        let strides = crate::schema::contiguous_strides(&shape)?;
+        let mapping = CoordinateMap::identity(shape.clone(), &strides);
+
+        Ok(DiagView {
+            source: self.clone(),
+            shape,
+            strides,
+            mapping,
         })
     }
 }
@@ -108,10 +105,10 @@ where
 {
     type HermitianOutput = crate::UnaryView<Self, crate::unary::Conj>;
 
-    fn mh(&self) -> BoxFuture<'_, Result<Self::HermitianOutput>> {
+    async fn mh(&self) -> Result<Self::HermitianOutput> {
         use crate::TensorComplex;
 
-        Box::pin(async move { self.mt().await?.conj().await })
+        self.mt().await?.conj().await
     }
 }
 

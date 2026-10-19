@@ -72,19 +72,17 @@ where
 {
     type Output = MatMulView<Self, R>;
 
-    fn matmul<'a>(&'a self, rhs: &'a R) -> BoxFuture<'a, Result<Self::Output>> {
-        Box::pin(async move {
-            let output_shape = self.matmul_output_shape(rhs)?;
-            let output_strides = crate::schema::contiguous_strides(&output_shape)?;
-            let mapping = CoordinateMap::identity(output_shape.clone(), &output_strides);
+    async fn matmul<'a>(&'a self, rhs: &'a R) -> Result<Self::Output> {
+        let output_shape = self.matmul_output_shape(rhs)?;
+        let output_strides = crate::schema::contiguous_strides(&output_shape)?;
+        let mapping = CoordinateMap::identity(output_shape.clone(), &output_strides);
 
-            Ok(MatMulView {
-                left: self.clone(),
-                right: rhs.clone(),
-                output_shape,
-                output_strides,
-                mapping,
-            })
+        Ok(MatMulView {
+            left: self.clone(),
+            right: rhs.clone(),
+            output_shape,
+            output_strides,
+            mapping,
         })
     }
 }

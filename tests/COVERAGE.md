@@ -36,6 +36,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Sequential copy backpressure, drop/error cancellation | `copy_pipeline` with a held filesystem block guard |
 | Sequential batch backpressure and ordered delivery | Expression unit `sequential_batches_are_ordered_and_cancelled_by_drop` for borrowed and owned handles |
 | Request pairing, backpressure, independent consumers and cancellation | Expression unit `sequential_consumption_preserves_pairs_and_backpressure` |
+| Unboxed constructor futures retain generic Send guarantees, defer cloning/inspection until polling, and perform no source evaluation | `traits::tests::constructor_futures_are_send_and_defer_work_until_polled` |
 | Dynamic expression depth on normal worker stacks, wide-expression numerical completion, shared operands, sparse values, failed transforms, cancellation/error and unpolled-drop source release | `expression_depth` isolated subprocesses in default and complex suites; also run the target in release |
 | Wide sparse candidate merging, high-rank compact request retention, duplicates, empty requests, EOF/error/cancellation cleanup | Expression traversal `wide_sparse_candidates_retain_compact_requests_and_release_sources`, `ready_sparse_candidates_can_be_cancelled_and_errors_release_sources` |
 | Pending-frame poison and cleanup during unwinding | Expression driver unit `poisoned_driver_rejects_polling_and_releases_pending_work`; permit-specific tests removed with aggregate admission |
@@ -64,6 +65,9 @@ checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
   allocation. `tensor::dtype_storage` checks geometric and bulk zero writes for every
   supported dtype. Existing storage/planner tests retain logical block grouping coverage
   with explicitly persisted layouts.
+  Its `tiny_blocks_share_pages_and_preserve_scalar_bits` fixture also checks
+  unchanged/distinct NaN payloads, signed-zero replacement within a nonzero block,
+  complex component identity, and reopening after replacement.
 
 - `fourier` owns complex conjugate transpose, independent forward/inverse Fourier
   expectations, propagated round-trip bounds, consumer parity, sparse values,

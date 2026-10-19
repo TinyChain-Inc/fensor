@@ -322,6 +322,9 @@ Dense copying and native value-buffer writes share request-to-block planning.
 Published writes retain their read-modify-write corruption checks. Value-buffer writes validate cardinality before mutation and group at
 most one execution batch by logical block, preserving repeated-offset input order.
 Native fills validate and replace one block at a time, retaining zero edge padding.
+Sparse adapters encode complete block/payload leaf rows and typed routing prefixes,
+including block-only separators. Recreate storage containing old copied-minimum
+internal nodes; loading does not migrate it.
 Sparse replacement, construction, and strict reopening share bounded payload
 validation. The geometry visitor reuses rank-sized coordinate scratch without
 per-element allocations.
@@ -431,6 +434,12 @@ bounds, and valid offsets. `occupied_blocks(range)` delivers sorted unique logic
 block IDs within a half-open range, with bounded lookahead, and releases index guards
 before delivery. Resume after an ID with `id + 1..range.end`. Page sizes remain private.
 
+Lazy operation constructors return statically dispatched `Send` futures; `.await`
+performs validation and builds the view without evaluating its values. Unpolled
+constructors do not clone operands or perform validation. Callers needing erased
+futures box at their own boundary; local consumers pin when necessary. Storage
+and evaluation retain their boxed boundaries and stack-safe driver.
+
 Views own source handles. `TensorExpression<T>` erases only the owned read-only
 value description; storage remains statically typed. Its lazy `into_dense()`
 conversion includes implicit zeros without copying storage or changing shared
@@ -447,9 +456,14 @@ records shape, layout, sparse axis, and physical block shape. Storage block part
 does not change logical values or the dense trailing region.
 
 Each sparse table row stores a logical block ID and dense typed vector.
+One private schema describes the table and its primary index using static column
+identifiers; geometry validation and adapter-owned serialization remain separate.
 `SparseCell<T>` separates integer keys from typed payloads;
-its equality and collation preserve exact scalar representations, including NaN
-bits and complex components. Adapters own `SparseNode<T>` serialization, explicit
+its equality compares numerical values, treating signed zeros as equal and NaNs
+as one equality class. Complex equality compares components; the explicit collator
+orders complex values by norm and places NaN norms after non-NaN norms. No bit
+representation participates in comparison. Native replacement always writes the
+supplied payload, preserving signed zeros and NaN payloads through persistence. Adapters own `SparseNode<T>` serialization, explicit
 payload tags, and bounded decoding allocations. Rows share native table pages;
 there is no separate descriptor, occupancy table, or payload-file representation.
 
@@ -526,11 +540,13 @@ be included. Callers own reservations and publication; fensor owns neither.
 File adapters report retained allocation through `GetSize` and inspect encoded
 containers with bounded scratch in `FileLoad::load_size` before decoding payloads.
 Admission counts retained typed capacities, independently of serialized bytes;
-adapters bound temporary decoder allocations separately. Native writes reserve
-replacement capacity before mutation and retain their existing admission for
-updates which do not grow the payload. The caller's cache must also fit
-simultaneously pinned native split/merge pages; the node memory target is not the
-minimum usable whole-cache capacity.
+adapters bound temporary decoder allocations separately. Loading and publication
+of complete values retain cache admission. In-place mutations reconcile actual
+retained size when mutable guards are released; they can exceed the cache target
+before eviction. This is not a strict mutation-memory ceiling or a host OOM
+guarantee. The caller's cache must also fit simultaneously pinned native
+split/merge pages; the node memory target is not the minimum usable whole-cache
+capacity.
 
 File adapters should coalesce small codec chunks with bounded buffered writes and
 flush before returning from `FileSave`. This does not change encoded bytes or make

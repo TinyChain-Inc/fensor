@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use fensor::{Tensor, TensorRead, TensorReduceAll};
 use futures::TryStreamExt;
+use get_size::GetSize;
 
 use super::common::{self, FsEntry, counters};
 
@@ -174,6 +175,9 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
     let (mut bytes, mut payload_bytes, mut table_bytes) = (0u128, 0u128, 0u128);
     let (mut leaves, mut leaf_rows, mut index_rows, mut retained, mut max_node) =
         (0u128, 0u128, 0u128, 0u128, 0u128);
+    let (mut leaf_bytes, mut index_bytes, mut leaf_retained, mut index_retained) =
+        (0u128, 0u128, 0u128, 0u128);
+
     while let Some(dir) = dirs.pop() {
         let mut entries = tokio::fs::read_dir(dir).await.unwrap();
         while let Some(entry) = entries.next_entry().await.unwrap() {
@@ -205,8 +209,12 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
             leaves += u128::from(leaf);
             if leaf {
                 leaf_rows += rows as u128;
+                leaf_bytes += u128::from(metadata.len());
+                leaf_retained += memory as u128;
             } else {
                 index_rows += rows as u128;
+                index_bytes += u128::from(metadata.len());
+                index_retained += memory as u128;
             }
             retained += memory as u128;
             max_node = max_node.max(memory as u128);
@@ -220,6 +228,11 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
         ("payload_file_bytes", payload_bytes),
         ("table_bytes", table_bytes),
         ("node_leaves", leaves),
+        ("node_indexes", nodes - leaves),
+        ("leaf_encoded_bytes", leaf_bytes),
+        ("index_encoded_bytes", index_bytes),
+        ("leaf_retained_bytes", leaf_retained),
+        ("index_retained_bytes", index_retained),
         ("node_leaf_rows", leaf_rows),
         ("node_index_rows", index_rows),
         ("decoded_node_bytes_sum", retained),
@@ -229,17 +242,10 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
     }
 }
 
-fn node_metrics<V>(node: &b_table::Node<V>) -> (bool, usize, usize) {
-    let (leaf, rows, children) = match node {
-        b_table::Node::Leaf(rows) => (true, rows, 0),
-        b_table::Node::Index(rows, children) => (false, rows, children.capacity() * 16),
+fn node_metrics<V: GetSize>(node: &b_table::Node<V>) -> (bool, usize, usize) {
+    let (leaf, rows) = match node {
+        b_table::Node::Leaf(rows) => (true, rows),
+        b_table::Node::Index(rows, _) => (false, rows),
     };
-    let bytes = std::mem::size_of_val(node)
-        + rows.capacity() * std::mem::size_of::<Vec<V>>()
-        + rows
-            .iter()
-            .map(|row| row.capacity() * std::mem::size_of::<V>())
-            .sum::<usize>()
-        + children;
-    (leaf, rows.len(), bytes)
+    (leaf, rows.len(), node.get_size())
 }

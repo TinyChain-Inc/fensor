@@ -1,4 +1,5 @@
 //! Adapter-owned, bounded typed sparse payload serialization.
+
 use destream::{de, en};
 use fensor::{SparseCell, SparseNode, TensorElement};
 
@@ -12,6 +13,7 @@ pub trait Bits: TensorElement {
 
     fn from_bits(a: u64, b: u64) -> Option<Self>;
 }
+
 macro_rules! integer {
     ($($t:ty => $u:ty),+) => {
         $(
@@ -102,6 +104,20 @@ impl<'en, T: Bits> en::IntoStream<'en> for EncodedPayload<'en, T> {
     }
 }
 
+struct EncodedRow<'a, T>(&'a [SparseCell<T>]);
+
+impl<'en, T: Bits> en::IntoStream<'en> for EncodedRow<'en, T> {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self.0 {
+            [SparseCell::Key(block)] => (*block,).into_stream(encoder),
+            [SparseCell::Key(block), SparseCell::Payload(values)] => {
+                (*block, EncodedPayload(values)).into_stream(encoder)
+            }
+            _ => Err(en::Error::custom("invalid sparse payload row")),
+        }
+    }
+}
+
 pub struct Encoded<'a, T>(pub &'a SparseNode<T>);
 
 impl<'en, T: Bits> en::IntoStream<'en> for Encoded<'en, T> {
@@ -110,12 +126,16 @@ impl<'en, T: Bits> en::IntoStream<'en> for Encoded<'en, T> {
             b_table::Node::Leaf(rows) => (true, rows, &[][..]),
             b_table::Node::Index(rows, children) => (false, rows, children.as_slice()),
         };
+        if !leaf && (rows.is_empty() || children.len() != rows.len() + 1) {
+            return Err(en::Error::custom("invalid sparse separator count"));
+        }
+
         let mut encoded = Vec::with_capacity(rows.len());
         for row in rows {
-            let [SparseCell::Key(block), SparseCell::Payload(values)] = row.as_slice() else {
-                return Err(en::Error::custom("invalid sparse payload row"));
-            };
-            encoded.push((*block, EncodedPayload(values)));
+            if leaf && row.len() != 2 {
+                return Err(en::Error::custom("incomplete sparse payload row"));
+            }
+            encoded.push(EncodedRow(row));
         }
         (leaf, encoded, children).into_stream(encoder)
     }
@@ -218,15 +238,55 @@ impl<T: Bits> de::FromStream for Payload<T> {
     }
 }
 
-type EncodedRow<T> = (u64, Payload<T>);
+struct Row<T>(Vec<SparseCell<T>>);
+
+impl<T: Bits> de::FromStream for Row<T> {
+    type Context = bool;
+
+    async fn from_stream<D: de::Decoder>(leaf: bool, decoder: &mut D) -> Result<Self, D::Error> {
+        struct Visitor<T>(bool, std::marker::PhantomData<T>);
+
+        impl<T: Bits> de::Visitor for Visitor<T> {
+            type Value = Row<T>;
+
+            fn expecting() -> &'static str {
+                "a sparse payload row or separator"
+            }
+
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let block = seq.expect_next::<u64>(()).await?;
+                let payload = seq.next_element::<Payload<T>>(()).await?;
+                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+                    return Err(de::Error::custom("unexpected sparse row field"));
+                }
+
+                match payload {
+                    Some(Payload(values)) => Ok(Row(vec![
+                        SparseCell::Key(block),
+                        SparseCell::Payload(values),
+                    ])),
+                    None if !self.0 => Ok(Row(vec![SparseCell::Key(block)])),
+                    None => Err(de::Error::custom("incomplete sparse payload row")),
+                }
+            }
+        }
+
+        decoder
+            .decode_seq(Visitor(leaf, std::marker::PhantomData))
+            .await
+    }
+}
 
 struct Rows<T>(Vec<Vec<SparseCell<T>>>);
 
 impl<T: Bits> de::FromStream for Rows<T> {
-    type Context = ();
+    type Context = bool;
 
-    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        struct Visitor<T>(std::marker::PhantomData<T>);
+    async fn from_stream<D: de::Decoder>(leaf: bool, decoder: &mut D) -> Result<Self, D::Error> {
+        struct Visitor<T>(bool, std::marker::PhantomData<T>);
 
         impl<T: Bits> de::Visitor for Visitor<T> {
             type Value = Rows<T>;
@@ -241,24 +301,26 @@ impl<T: Bits> de::FromStream for Rows<T> {
             ) -> Result<Self::Value, A::Error> {
                 let mut rows = Vec::new();
                 let mut count = 0;
-                while let Some((block, Payload(values))) =
-                    seq.next_element::<EncodedRow<T>>(()).await?
-                {
+                while let Some(Row(row)) = seq.next_element::<Row<T>>(self.0).await? {
                     if rows.len() == MAX_NODE_ENTRIES {
                         return Err(de::Error::custom("oversized sparse node"));
                     }
-                    count += values.len();
-                    if count > MAX_NODE_VALUES {
-                        return Err(de::Error::custom("oversized sparse node payloads"));
+                    if let Some(SparseCell::Payload(values)) = row.get(1) {
+                        count += values.len();
+                        if count > MAX_NODE_VALUES {
+                            return Err(de::Error::custom("oversized sparse node payloads"));
+                        }
                     }
 
                     rows.try_reserve(1).map_err(de::Error::custom)?;
-                    rows.push(vec![SparseCell::Key(block), SparseCell::Payload(values)]);
+                    rows.push(row);
                 }
                 Ok(Rows(rows))
             }
         }
-        decoder.decode_seq(Visitor(std::marker::PhantomData)).await
+        decoder
+            .decode_seq(Visitor(leaf, std::marker::PhantomData))
+            .await
     }
 }
 
@@ -268,15 +330,40 @@ impl<T: Bits> de::FromStream for Decoded<T> {
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        let (leaf, rows, children) =
-            <(bool, Rows<T>, Limited<_>) as de::FromStream>::from_stream((), decoder).await?;
-        if leaf {
-            if !children.0.is_empty() {
-                return Err(de::Error::custom("leaf has children"));
+        struct Visitor<T>(std::marker::PhantomData<T>);
+
+        impl<T: Bits> de::Visitor for Visitor<T> {
+            type Value = Decoded<T>;
+
+            fn expecting() -> &'static str {
+                "a bounded sparse payload node"
             }
-            Ok(Self(b_table::Node::Leaf(rows.0)))
-        } else {
-            Ok(Self(b_table::Node::Index(rows.0, children.0)))
+
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let leaf = seq.expect_next::<bool>(()).await?;
+                let Rows(rows) = seq.expect_next::<Rows<T>>(leaf).await?;
+                let Limited(children) = seq.expect_next::<Limited<_>>(()).await?;
+                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+                    return Err(de::Error::custom("unexpected sparse node field"));
+                }
+
+                if leaf {
+                    if !children.is_empty() {
+                        return Err(de::Error::custom("leaf has children"));
+                    }
+                    Ok(Decoded(b_table::Node::Leaf(rows)))
+                } else {
+                    if rows.is_empty() || children.len() != rows.len() + 1 {
+                        return Err(de::Error::custom("invalid sparse separator count"));
+                    }
+                    Ok(Decoded(b_table::Node::Index(rows, children)))
+                }
+            }
         }
+
+        decoder.decode_seq(Visitor(std::marker::PhantomData)).await
     }
 }

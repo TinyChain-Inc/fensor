@@ -4,9 +4,8 @@ use ha_ndarray::shape;
 use number_general::FloatType;
 
 use super::*;
-use crate::Shape;
-use crate::TensorSource;
 use crate::test_support::{Directory, FsEntry as TestFE, cleanup, new_dir, open_dir};
+use crate::{Shape, TensorSource};
 
 async fn create_sparse(
     name: &str,
@@ -912,8 +911,65 @@ async fn construction_preserves_interleaved_blocks_across_batches() {
     cleanup(&root).await;
 }
 
+// Reuse one dense-suffix block to distinguish representation changes from numerical changes.
+async fn replace_payload_bits<T: crate::TensorElement>(
+    cases: impl IntoIterator<Item = Vec<T>>,
+    bits: impl Fn(T) -> [u64; 2],
+) where
+    TestFE: crate::TensorFileEntry<T>,
+{
+    let (root, dir) = new_dir("sparse_replacement_bits").await;
+    let tensor = Tensor::<TestFE, T>::create(
+        dir,
+        TensorSchema::new(T::dtype(), shape![1, 2]).unwrap(),
+        Layout::Sparse { axis: Some(0) },
+        2,
+    )
+    .await
+    .unwrap();
+    let mut expected = Vec::new();
+    for values in cases {
+        expected = values.iter().copied().map(&bits).collect::<Vec<_>>();
+        tensor.replace_logical_block(0, values).await.unwrap();
+        tensor.validate().await.unwrap();
+        let actual = tensor.read_logical_block(0).await.unwrap();
+        assert_eq!(actual.into_iter().map(&bits).collect::<Vec<_>>(), expected);
+    }
+
+    tensor.sync_all().await.unwrap();
+    drop(tensor);
+    let tensor = Tensor::<TestFE, T>::load(open_dir(&root).unwrap())
+        .await
+        .unwrap();
+    let actual = tensor.read_logical_block(0).await.unwrap();
+    assert_eq!(actual.into_iter().map(bits).collect::<Vec<_>>(), expected);
+    drop(tensor);
+    cleanup(&root).await;
+}
+
 #[tokio::test]
 async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
+    use collate::Collate;
+
+    use crate::sparse::{SparseCell, SparseCollator};
+
+    let collator = SparseCollator::<f64>::default();
+    assert!(
+        collator
+            .cmp(
+                &SparseCell::Payload(vec![-3.]),
+                &SparseCell::Payload(vec![2.])
+            )
+            .is_lt()
+    );
+    assert_eq!(
+        SparseCell::Payload(vec![0.]),
+        SparseCell::Payload(vec![-0.])
+    );
+    assert_eq!(
+        SparseCell::Payload(vec![f64::NAN]),
+        SparseCell::Payload(vec![-f64::NAN])
+    );
     let (root, _) = new_dir("sparse_bits").await;
     let dir = freqfs::Cache::new(
         4 * crate::schema::SPARSE_NODE_MEMORY,
@@ -982,7 +1038,46 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
             expected.to_bits()
         );
     }
+    drop(tensor);
     cleanup(&root).await;
+
+    let nan = f64::from_bits(0x7ff8000000000123);
+    let other_nan = f64::from_bits(0x7ff8000000000456);
+    replace_payload_bits(
+        [
+            vec![nan, 0.],
+            vec![nan, 0.],
+            vec![other_nan, 0.],
+            vec![1., 0.],
+            vec![1., -0.],
+        ],
+        |v: f64| [v.to_bits(), 0],
+    )
+    .await;
+
+    #[cfg(feature = "complex")]
+    {
+        use crate::complex::Complex64;
+
+        let a = SparseCell::Payload(vec![Complex64::new(3., 4.)]);
+        let b = SparseCell::Payload(vec![Complex64::new(5., 0.)]);
+        assert_ne!(a, b);
+        assert!(SparseCollator::<Complex64>::default().cmp(&a, &b).is_eq());
+
+        let cases = [
+            (nan, 0.),
+            (nan, 0.),
+            (other_nan, 0.),
+            (0., nan),
+            (0., other_nan),
+            (-0., other_nan),
+            (1., 0.),
+            (1., -0.),
+        ]
+        .into_iter()
+        .map(|(re, im)| vec![Complex64::new(re, im), Complex64::new(1., 0.)]);
+        replace_payload_bits(cases, |v: Complex64| [v.re.to_bits(), v.im.to_bits()]).await;
+    }
 }
 
 #[tokio::test]

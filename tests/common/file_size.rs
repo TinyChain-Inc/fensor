@@ -1,4 +1,5 @@
 //! Preflight the adapter's tagged containers without allocating their payloads.
+
 use std::mem::size_of;
 
 use destream::de;
@@ -118,24 +119,25 @@ impl de::FromStream for PayloadCount {
 }
 
 struct SparseRowSize {
+    cells: usize,
     values: usize,
     heap: usize,
 }
 
 impl de::FromStream for SparseRowSize {
-    type Context = usize;
+    type Context = (bool, usize);
 
     async fn from_stream<D: de::Decoder>(
-        width: Self::Context,
+        (leaf, width): Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct Visitor(usize);
+        struct Visitor(bool, usize);
 
         impl de::Visitor for Visitor {
             type Value = SparseRowSize;
 
             fn expecting() -> &'static str {
-                "dense sparse-row allocation bound"
+                "sparse row or separator allocation bound"
             }
 
             async fn visit_seq<A: de::SeqAccess>(
@@ -143,32 +145,44 @@ impl de::FromStream for SparseRowSize {
                 mut seq: A,
             ) -> Result<SparseRowSize, A::Error> {
                 seq.expect_next::<u64>(()).await?;
-                let PayloadCount(values) = seq.expect_next::<PayloadCount>(self.0).await?;
+                let payload = seq.next_element::<PayloadCount>(self.1).await?;
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
                     return Err(de::Error::custom("unexpected sparse row field"));
                 }
 
-                Ok(SparseRowSize {
-                    values,
-                    heap: bytes(capacity(values, None, self.0), self.0)?,
-                })
+                match payload {
+                    Some(PayloadCount(values)) => Ok(SparseRowSize {
+                        cells: 2,
+                        values,
+                        heap: bytes(capacity(values, None, self.1), self.1)?,
+                    }),
+                    None if !self.0 => Ok(SparseRowSize {
+                        cells: 1,
+                        values: 0,
+                        heap: 0,
+                    }),
+                    None => Err(de::Error::custom("incomplete sparse payload row")),
+                }
             }
         }
 
-        decoder.decode_seq(Visitor(width)).await
+        decoder.decode_seq(Visitor(leaf, width)).await
     }
 }
 
-struct SparseRowsSize(usize);
+struct SparseRowsSize {
+    len: usize,
+    heap: usize,
+}
 
 impl de::FromStream for SparseRowsSize {
-    type Context = (usize, usize);
+    type Context = (bool, usize, usize);
 
     async fn from_stream<D: de::Decoder>(
-        (cell_width, value_width): Self::Context,
+        (leaf, cell_width, value_width): Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct Visitor(usize, usize);
+        struct Visitor(bool, usize, usize);
 
         impl de::Visitor for Visitor {
             type Value = SparseRowsSize;
@@ -184,7 +198,7 @@ impl de::FromStream for SparseRowsSize {
                 let mut len = 0;
                 let mut values = 0;
                 let mut heap = 0;
-                while let Some(row) = seq.next_element::<SparseRowSize>(self.1).await? {
+                while let Some(row) = seq.next_element::<SparseRowSize>((self.0, self.2)).await? {
                     if len == MAX_NODE_ENTRIES {
                         return Err(de::Error::custom("oversized sparse node"));
                     }
@@ -193,20 +207,25 @@ impl de::FromStream for SparseRowsSize {
                     if values > MAX_NODE_VALUES {
                         return Err(de::Error::custom("oversized sparse node payloads"));
                     }
-                    heap = add(heap, add(bytes(2, self.0)?, row.heap)?)?;
+                    heap = add(heap, add(bytes(row.cells, self.1)?, row.heap)?)?;
                 }
 
-                Ok(SparseRowsSize(add(
-                    heap,
-                    bytes(
-                        capacity(len, None, size_of::<Vec<u64>>()),
-                        size_of::<Vec<u64>>(),
+                Ok(SparseRowsSize {
+                    len,
+                    heap: add(
+                        heap,
+                        bytes(
+                            capacity(len, None, size_of::<Vec<u64>>()),
+                            size_of::<Vec<u64>>(),
+                        )?,
                     )?,
-                )?))
+                })
             }
         }
 
-        decoder.decode_seq(Visitor(cell_width, value_width)).await
+        decoder
+            .decode_seq(Visitor(leaf, cell_width, value_width))
+            .await
     }
 }
 
@@ -229,14 +248,22 @@ impl de::FromStream for NodeSize {
             }
 
             async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<NodeSize, A::Error> {
-                seq.expect_next::<bool>(()).await?;
-                let mut bound = size_of::<fensor::SparseNode<u64>>();
-                bound = add(bound, seq.expect_next::<SparseRowsSize>(self.0).await?.0)?;
+                let leaf = seq.expect_next::<bool>(()).await?;
+                let rows = seq
+                    .expect_next::<SparseRowsSize>((leaf, self.0.0, self.0.1))
+                    .await?;
                 let children = seq.expect_next::<Count>((16, MAX_NODE_ENTRIES)).await?;
-                bound = add(bound, bytes(capacity(children.len, None, 16), 16)?)?;
+                if (leaf && children.len != 0)
+                    || (!leaf && (rows.len == 0 || children.len != rows.len + 1))
+                {
+                    return Err(de::Error::custom("invalid sparse separator count"));
+                }
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
                     return Err(de::Error::custom("unexpected native node field"));
                 }
+
+                let mut bound = add(size_of::<fensor::SparseNode<u64>>(), rows.heap)?;
+                bound = add(bound, bytes(capacity(children.len, None, 16), 16)?)?;
                 Ok(NodeSize(bound))
             }
         }

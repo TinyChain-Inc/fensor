@@ -1,4 +1,7 @@
+use std::future::Future;
+
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+
 use number_general::NumberType;
 
 use crate::schema::Layout;
@@ -196,11 +199,11 @@ pub trait TensorUnary: TensorGeometry + Sized {
     where
         Self::DType: ha_ndarray::Real;
 
-    fn exp(&self) -> BoxFuture<'_, Result<Self::ExpOutput>>;
+    fn exp(&self) -> impl Future<Output = Result<Self::ExpOutput>> + Send + '_;
 
-    fn ln(&self) -> BoxFuture<'_, Result<Self::LnOutput>>;
+    fn ln(&self) -> impl Future<Output = Result<Self::LnOutput>> + Send + '_;
 
-    fn round(&self) -> BoxFuture<'_, Result<Self::RoundOutput>>
+    fn round(&self) -> impl Future<Output = Result<Self::RoundOutput>> + Send + '_
     where
         Self::DType: ha_ndarray::Real;
 }
@@ -210,7 +213,7 @@ pub trait TensorUnary: TensorGeometry + Sized {
 pub trait TensorUnaryBoolean: TensorGeometry + Sized {
     type Output: TensorRead<DType = u8>;
 
-    fn not(&self) -> BoxFuture<'_, Result<Self::Output>>;
+    fn not(&self) -> impl Future<Output = Result<Self::Output>> + Send + '_;
 }
 
 /// Floating-point predicates returning u8 masks.
@@ -248,9 +251,9 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 
     type IsInfOutput: TensorRead<DType = u8>;
 
-    fn is_nan(&self) -> BoxFuture<'_, Result<Self::IsNanOutput>>;
+    fn is_nan(&self) -> impl Future<Output = Result<Self::IsNanOutput>> + Send + '_;
 
-    fn is_inf(&self) -> BoxFuture<'_, Result<Self::IsInfOutput>>;
+    fn is_inf(&self) -> impl Future<Output = Result<Self::IsInfOutput>> + Send + '_;
 }
 
 /// Lazy conversion between supported concrete element types, including narrowing.
@@ -289,7 +292,7 @@ pub trait TensorNumeric: TensorGeometry + Sized {
 pub trait TensorCast<To: crate::TensorElement>: TensorGeometry + Sized {
     type Output: TensorRead<DType = To>;
 
-    fn cast(&self) -> BoxFuture<'_, Result<Self::Output>>;
+    fn cast(&self) -> impl Future<Output = Result<Self::Output>> + Send + '_;
 }
 
 /// Elementwise absolute value; complex magnitudes have the component's real dtype.
@@ -299,7 +302,7 @@ where
 {
     type Output: TensorRead<DType = <Self::DType as ha_ndarray::Number>::Abs>;
 
-    fn abs(&self) -> BoxFuture<'_, Result<Self::Output>>;
+    fn abs(&self) -> impl Future<Output = Result<Self::Output>> + Send + '_;
 }
 
 /// Lazy elementwise trigonometry. Sparse inputs require a zero-preserving operation.
@@ -322,23 +325,23 @@ pub trait TensorTrig: TensorGeometry + Sized {
 
     type TanhOutput: TensorRead<DType = Self::DType>;
 
-    fn sin(&self) -> BoxFuture<'_, Result<Self::SinOutput>>;
+    fn sin(&self) -> impl Future<Output = Result<Self::SinOutput>> + Send + '_;
 
-    fn asin(&self) -> BoxFuture<'_, Result<Self::AsinOutput>>;
+    fn asin(&self) -> impl Future<Output = Result<Self::AsinOutput>> + Send + '_;
 
-    fn sinh(&self) -> BoxFuture<'_, Result<Self::SinhOutput>>;
+    fn sinh(&self) -> impl Future<Output = Result<Self::SinhOutput>> + Send + '_;
 
-    fn cos(&self) -> BoxFuture<'_, Result<Self::CosOutput>>;
+    fn cos(&self) -> impl Future<Output = Result<Self::CosOutput>> + Send + '_;
 
-    fn acos(&self) -> BoxFuture<'_, Result<Self::AcosOutput>>;
+    fn acos(&self) -> impl Future<Output = Result<Self::AcosOutput>> + Send + '_;
 
-    fn cosh(&self) -> BoxFuture<'_, Result<Self::CoshOutput>>;
+    fn cosh(&self) -> impl Future<Output = Result<Self::CoshOutput>> + Send + '_;
 
-    fn tan(&self) -> BoxFuture<'_, Result<Self::TanOutput>>;
+    fn tan(&self) -> impl Future<Output = Result<Self::TanOutput>> + Send + '_;
 
-    fn atan(&self) -> BoxFuture<'_, Result<Self::AtanOutput>>;
+    fn atan(&self) -> impl Future<Output = Result<Self::AtanOutput>> + Send + '_;
 
-    fn tanh(&self) -> BoxFuture<'_, Result<Self::TanhOutput>>;
+    fn tanh(&self) -> impl Future<Output = Result<Self::TanhOutput>> + Send + '_;
 }
 
 /// Elementwise tensor math operations.
@@ -363,21 +366,26 @@ where
     where
         Self::DType: ha_ndarray::Real;
 
-    fn add<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::AddOutput>>;
+    fn add<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::AddOutput>> + Send + 'a;
 
-    fn sub<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::SubOutput>>;
+    fn sub<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::SubOutput>> + Send + 'a;
 
-    fn mul<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::MulOutput>>;
+    fn mul<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::MulOutput>> + Send + 'a;
 
-    fn div<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::DivOutput>>;
+    fn div<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::DivOutput>> + Send + 'a;
 
-    fn pow<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::PowOutput>>;
+    fn pow<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::PowOutput>> + Send + 'a;
 
-    fn log<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LogOutput>>
+    fn log<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::LogOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Float;
 
-    fn rem<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::RemOutput>>
+    fn rem<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::RemOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 }
@@ -406,21 +414,42 @@ pub trait TensorMathScalar: TensorGeometry {
     where
         Self::DType: ha_ndarray::Real;
 
-    fn add_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::AddOutput>>;
+    fn add_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::AddOutput>> + Send + 'a;
 
-    fn sub_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::SubOutput>>;
+    fn sub_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::SubOutput>> + Send + 'a;
 
-    fn mul_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::MulOutput>>;
+    fn mul_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::MulOutput>> + Send + 'a;
 
-    fn div_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::DivOutput>>;
+    fn div_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::DivOutput>> + Send + 'a;
 
-    fn pow_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::PowOutput>>;
+    fn pow_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::PowOutput>> + Send + 'a;
 
-    fn log_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LogOutput>>
+    fn log_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::LogOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Float;
 
-    fn rem_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::RemOutput>>
+    fn rem_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::RemOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 }
@@ -454,23 +483,23 @@ where
     where
         Self::DType: ha_ndarray::Real;
 
-    fn eq<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::EqOutput>>;
+    fn eq<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::EqOutput>> + Send + 'a;
 
-    fn ne<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::NeOutput>>;
+    fn ne<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::NeOutput>> + Send + 'a;
 
-    fn gt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GtOutput>>
+    fn gt<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::GtOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 
-    fn ge<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::GeOutput>>
+    fn ge<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::GeOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 
-    fn lt<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LtOutput>>
+    fn lt<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::LtOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 
-    fn le<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::LeOutput>>
+    fn le<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::LeOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 }
@@ -500,23 +529,41 @@ pub trait TensorCompareScalar: TensorGeometry {
     where
         Self::DType: ha_ndarray::Real;
 
-    fn eq_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::EqOutput>>;
+    fn eq_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::EqOutput>> + Send + 'a;
 
-    fn ne_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::NeOutput>>;
+    fn ne_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::NeOutput>> + Send + 'a;
 
-    fn gt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GtOutput>>
+    fn gt_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::GtOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 
-    fn ge_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::GeOutput>>
+    fn ge_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::GeOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 
-    fn lt_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LtOutput>>
+    fn lt_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::LtOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 
-    fn le_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::LeOutput>>
+    fn le_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::LeOutput>> + Send + 'a
     where
         Self::DType: ha_ndarray::Real;
 }
@@ -535,11 +582,13 @@ where
 
     type XorOutput: TensorRead<DType = u8>;
 
-    fn and<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::AndOutput>>;
+    fn and<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::AndOutput>> + Send + 'a;
 
-    fn or<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::OrOutput>>;
+    fn or<'a>(&'a self, rhs: &'a Rhs) -> impl Future<Output = Result<Self::OrOutput>> + Send + 'a;
 
-    fn xor<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::XorOutput>>;
+    fn xor<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::XorOutput>> + Send + 'a;
 }
 
 /// Lazy elementwise logical operations with scalar arguments.
@@ -553,11 +602,20 @@ pub trait TensorBooleanScalar: TensorGeometry {
 
     type XorOutput: TensorRead<DType = u8>;
 
-    fn and_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::AndOutput>>;
+    fn and_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::AndOutput>> + Send + 'a;
 
-    fn or_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::OrOutput>>;
+    fn or_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::OrOutput>> + Send + 'a;
 
-    fn xor_scalar<'a>(&'a self, rhs: Self::DType) -> BoxFuture<'a, Result<Self::XorOutput>>;
+    fn xor_scalar<'a>(
+        &'a self,
+        rhs: Self::DType,
+    ) -> impl Future<Output = Result<Self::XorOutput>> + Send + 'a;
 }
 
 /// Lazy selection over ordinary numerical values, including implicit sparse zeros.
@@ -573,8 +631,11 @@ where
 {
     type Output: TensorRead<DType = Then::DType>;
 
-    fn cond<'a>(&'a self, then: &'a Then, or_else: &'a Else)
-    -> BoxFuture<'a, Result<Self::Output>>;
+    fn cond<'a>(
+        &'a self,
+        then: &'a Then,
+        or_else: &'a Else,
+    ) -> impl Future<Output = Result<Self::Output>> + Send + 'a;
 }
 
 /// Lazy axis reductions include every selected logical value, including implicit
@@ -592,15 +653,31 @@ pub trait TensorReduce: TensorGeometry {
     where
         Self::DType: ha_ndarray::Real;
 
-    fn sum(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::SumOutput>>;
+    fn sum(
+        &self,
+        axes: Axes,
+        keepdims: bool,
+    ) -> impl Future<Output = Result<Self::SumOutput>> + Send + '_;
 
-    fn product(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::ProductOutput>>;
+    fn product(
+        &self,
+        axes: Axes,
+        keepdims: bool,
+    ) -> impl Future<Output = Result<Self::ProductOutput>> + Send + '_;
 
-    fn min(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MinOutput>>
+    fn min(
+        &self,
+        axes: Axes,
+        keepdims: bool,
+    ) -> impl Future<Output = Result<Self::MinOutput>> + Send + '_
     where
         Self::DType: ha_ndarray::Real;
 
-    fn max(&self, axes: Axes, keepdims: bool) -> BoxFuture<'_, Result<Self::MaxOutput>>
+    fn max(
+        &self,
+        axes: Axes,
+        keepdims: bool,
+    ) -> impl Future<Output = Result<Self::MaxOutput>> + Send + '_
     where
         Self::DType: ha_ndarray::Real;
 }
@@ -642,11 +719,11 @@ pub trait TensorMatrixUnary: TensorGeometry {
     type DiagOutput: TensorRead<DType = Self::DType>;
 
     /// Swap the final two axes, preserving batch axes and existing write constraints.
-    fn mt(&self) -> BoxFuture<'_, Result<Self::TransposeOutput>>;
+    fn mt(&self) -> impl Future<Output = Result<Self::TransposeOutput>> + Send + '_;
 
     /// Extract square matrix diagonals: `[..., N, N]` becomes `[..., N]`.
     /// Only selected source coordinates contribute values.
-    fn diag(&self) -> BoxFuture<'_, Result<Self::DiagOutput>>;
+    fn diag(&self) -> impl Future<Output = Result<Self::DiagOutput>> + Send + '_;
 }
 
 /// Lazy conjugate transpose of the final two axes, preserving batch axes.
@@ -654,7 +731,7 @@ pub trait TensorMatrixUnary: TensorGeometry {
 pub trait TensorMatrixUnaryComplex: TensorGeometry {
     type HermitianOutput: TensorRead<DType = Self::DType>;
 
-    fn mh(&self) -> BoxFuture<'_, Result<Self::HermitianOutput>>;
+    fn mh(&self) -> impl Future<Output = Result<Self::HermitianOutput>> + Send + '_;
 }
 
 /// Bounded, unnormalized last-axis Fourier transforms of complex expressions.
@@ -667,9 +744,9 @@ pub trait TensorFourier: TensorGeometry {
     type FftOutput: TensorRead<DType = Self::DType>;
     type IfftOutput: TensorRead<DType = Self::DType>;
 
-    fn fft(&self) -> BoxFuture<'_, Result<Self::FftOutput>>;
+    fn fft(&self) -> impl Future<Output = Result<Self::FftOutput>> + Send + '_;
 
-    fn ifft(&self) -> BoxFuture<'_, Result<Self::IfftOutput>>;
+    fn ifft(&self) -> impl Future<Output = Result<Self::IfftOutput>> + Send + '_;
 }
 
 /// Lazy matrix multiplication with matching dtypes and explicit batch broadcasting.
@@ -689,7 +766,8 @@ where
         validate::matmul_output_shape(self.shape(), rhs.shape())
     }
 
-    fn matmul<'a>(&'a self, rhs: &'a Rhs) -> BoxFuture<'a, Result<Self::Output>>;
+    fn matmul<'a>(&'a self, rhs: &'a Rhs)
+    -> impl Future<Output = Result<Self::Output>> + Send + 'a;
 }
 
 /// Batch coordinates without expanding the remaining logical range.
@@ -845,13 +923,13 @@ where
 
     type AngleOutput: TensorRead<DType = <Self::DType as ha_ndarray::Complex>::Real>;
 
-    fn conj(&self) -> BoxFuture<'_, Result<Self::ConjOutput>>;
+    fn conj(&self) -> impl Future<Output = Result<Self::ConjOutput>> + Send + '_;
 
-    fn re(&self) -> BoxFuture<'_, Result<Self::ReOutput>>;
+    fn re(&self) -> impl Future<Output = Result<Self::ReOutput>> + Send + '_;
 
-    fn im(&self) -> BoxFuture<'_, Result<Self::ImOutput>>;
+    fn im(&self) -> impl Future<Output = Result<Self::ImOutput>> + Send + '_;
 
-    fn angle(&self) -> BoxFuture<'_, Result<Self::AngleOutput>>;
+    fn angle(&self) -> impl Future<Output = Result<Self::AngleOutput>> + Send + '_;
 }
 
 #[cfg(test)]
