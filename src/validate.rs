@@ -1,5 +1,6 @@
 use crate::schema::Coord;
-use crate::{AxisRange, Error, Range, Result, Shape};
+use crate::{Axes, AxisRange, Error, Range, Result, Shape};
+
 pub(crate) fn validate_coord(shape: &[u64], coord: &[u64]) -> Result<()> {
     if coord.len() != shape.len() {
         return Err(Error::InvalidCoord(
@@ -26,6 +27,81 @@ pub(crate) fn ensure_offset_in_bounds(offset: usize, block_len: usize) -> Result
             "block offset out of bounds".to_string(),
         ))
     }
+}
+
+/// Common broadcast shape, aligning trailing axes without narrowing logical dimensions.
+/// This describes geometry only; operands still need explicit broadcast transforms.
+pub fn broadcast_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
+    let mut shape = Shape::from_elem(1, left.len().max(right.len()));
+    let rank = shape.len();
+
+    for i in 0..rank {
+        let l = left.len().checked_sub(i + 1).map(|a| left[a]).unwrap_or(1);
+        let r = right
+            .len()
+            .checked_sub(i + 1)
+            .map(|a| right[a])
+            .unwrap_or(1);
+        if l != r && l != 1 && r != 1 {
+            return Err(Error::InvalidSchema(
+                "incompatible tensor broadcast shapes".into(),
+            ));
+        }
+        shape[rank - i - 1] = l.max(r);
+    }
+
+    Ok(shape)
+}
+
+/// Operand shapes with common matrix batch axes, preserving their final two axes.
+/// Contraction dimensions are validated by matrix multiplication itself.
+pub fn matmul_broadcast_shapes(left: &[u64], right: &[u64]) -> Result<(Shape, Shape)> {
+    if left.len() < 2 || right.len() < 2 {
+        return Err(Error::InvalidSchema(
+            "matmul requires rank at least two".into(),
+        ));
+    }
+
+    let mut left_shape = broadcast_shape(&left[..left.len() - 2], &right[..right.len() - 2])?;
+    let mut right_shape = left_shape.clone();
+    left_shape.extend_from_slice(&left[left.len() - 2..]);
+    right_shape.extend_from_slice(&right[right.len() - 2..]);
+    Ok((left_shape, right_shape))
+}
+
+/// Sorted, unique reduction axes, validated against the input rank.
+pub fn reduction_axes(rank: usize, mut axes: Axes) -> Result<Axes> {
+    axes.sort_unstable();
+    axes.dedup();
+    if axes.iter().any(|&axis| axis >= rank) {
+        return Err(Error::InvalidLayout("reduction axis out of bounds".into()));
+    }
+
+    Ok(axes)
+}
+
+/// Axes to sum with retained dimensions before reshaping to a broadcast source shape.
+pub fn broadcast_reduce_axes(source: &[u64], target: &[u64]) -> Result<Axes> {
+    if target.len() > source.len() {
+        return Err(Error::InvalidSchema(
+            "broadcast reduction increases rank".into(),
+        ));
+    }
+
+    let prefix = source.len() - target.len();
+    let mut axes: Axes = (0..prefix).collect();
+
+    for (axis, (&source, &target)) in source[prefix..].iter().zip(target).enumerate() {
+        if target == 1 && source != 1 {
+            axes.push(prefix + axis);
+        } else if source != target {
+            return Err(Error::InvalidSchema(
+                "invalid broadcast reduction target".into(),
+            ));
+        }
+    }
+
+    Ok(axes)
 }
 
 pub fn matmul_output_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
@@ -67,8 +143,8 @@ pub fn matmul_output_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
     Ok(out)
 }
 
-/// Validate ranges without expanding interval axes into coordinate buffers.
-pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoords> {
+/// Validate range bounds and cardinality without cloning explicit selections.
+pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64)> {
     if range.len() != shape.len() {
         return Err(Error::InvalidLayout(
             "range rank must match tensor rank".into(),
@@ -97,6 +173,13 @@ pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoo
         crate::schema::checked_product(&lengths)
             .map_err(|_| Error::InvalidLayout("range size overflow".into()))?
     };
+
+    Ok((lengths, remaining))
+}
+
+/// Validate ranges without expanding interval axes into coordinate buffers.
+pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoords> {
+    let (lengths, remaining) = validate_range(shape, range)?;
     Ok(RangeCoords {
         range: range.clone(),
         coord: Coord::from_elem(0, range.len()),
@@ -167,24 +250,5 @@ impl Iterator for RangeCoords {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn range_cardinality_handles_empty_selections_and_overflow() {
-        let long = u64::MAX / 2;
-        let selection: Range =
-            smallvec::smallvec![AxisRange::In(0, long, 1), AxisRange::Of(vec![0, 1, 0])];
-        assert!(matches!(
-            iter_range_coords(&[long, 2], &selection),
-            Err(Error::InvalidLayout(_))
-        ));
-
-        let mut empty = selection;
-        empty.push(AxisRange::Of(Vec::new()));
-        let mut coords = iter_range_coords(&[long, 2, 1], &empty).unwrap();
-        assert_eq!(coords.remaining(), 0);
-        assert_eq!(coords.next(), None);
-        assert_eq!(coords.next(), None);
-    }
-}
+#[path = "../tests/unit/validate/tests.rs"]
+mod tests;

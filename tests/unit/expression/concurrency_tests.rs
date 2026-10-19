@@ -1,14 +1,13 @@
-//! Exercise the real outer buffer with controlled readiness over stored values.
+//! Exercise sequential request consumption and cancellation over stored values.
 
 use std::sync::Mutex;
 
 use futures::{TryStreamExt, channel::oneshot};
 use number_general::DType;
 
-use crate::test_support::{self, FsEntry, counters::Counter};
-use crate::{TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
-
 use super::*;
+use crate::test_support::{self, FsEntry, counters::Counter};
+use crate::{Layout, TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
 
 struct Source<'a, T: TensorElement>
 where
@@ -49,17 +48,18 @@ where
     }
 }
 
-impl<T: TensorElement> Expression for Source<'_, T>
+impl<T: TensorElement> crate::expression::traversal::Plan for Source<'_, T>
 where
     FsEntry: TensorFileEntry<T>,
 {
-    fn preferred_requests(&self, shape: &[u64]) -> Result<Option<RequestIterator>> {
-        Ok(Some(Box::new(crate::schema::row_major_coords(shape)?.map(
-            |coord| BatchRequest::explicit(vec![coord]).unwrap(),
+    fn preferred_step<'a>(&'a self, shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
+        Ok(traversal::Preferred::Ready(Some(Box::new(
+            crate::schema::row_major_coords(shape)?
+                .map(|coord| BatchRequest::explicit(vec![coord]).unwrap()),
         ))))
     }
 
-    fn slice_requests(&self, slice: crate::slice::Slice) -> Result<crate::slice::Requests<'_>> {
+    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
         // Test-only singleton batches preserve the validated slice selection.
         let requests = slice.requests().flat_map(|request| {
             request
@@ -68,10 +68,21 @@ where
                 .into_iter()
                 .map(|coord| BatchRequest::explicit(vec![coord]))
         });
-        Ok(futures::stream::iter(requests).boxed())
+        Ok(traversal::Selection::Ready(
+            futures::stream::iter(requests).boxed(),
+        ))
     }
+}
 
-    fn build<'a>(&'a self, request: &'a BatchRequest) -> BoxFuture<'a, Result<Batch<T>>> {
+impl<T: TensorElement> Expression for Source<'_, T>
+where
+    FsEntry: TensorFileEntry<T>,
+{
+    fn build<'a>(
+        &'a self,
+        context: super::Context<'a>,
+        request: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<T>>> {
         Box::pin(async move {
             let index = self.started.increment();
             let _finished = Finish(&self.finished);
@@ -81,7 +92,8 @@ where
             } else if self.fail_at == Some(index) {
                 return Err(Error::Unsupported("injected later batch failure".into()));
             }
-            let batch = self.tensor.build(request).await?;
+
+            let batch = self.tensor.build(context, request).await?;
             self.completed.increment();
             Ok(batch)
         })
@@ -122,8 +134,8 @@ where
 }
 
 #[tokio::test]
-async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
-    let limit = num_cpus::get().max(1);
+async fn sequential_batches_are_ordered_and_cancelled_by_drop() {
+    let limit = 1;
     let count = limit + 2;
     let (root, dir) = test_support::new_dir("ordered_batches").await;
     let tensor = Tensor::create(
@@ -142,11 +154,17 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             .unwrap();
     }
 
-    for cancel in [false, true] {
+    for (owned, cancel) in [(false, false), (false, true), (true, false), (true, true)] {
         let (source, release) = delayed(&tensor);
+        let source = std::sync::Arc::new(source);
+        let weak = std::sync::Arc::downgrade(&source);
         let requests = (0..count).map(|i| BatchRequest::explicit(vec![vec![i as u64]]).unwrap());
-        let mut stream = ordered_batches(&source, requests);
-        // Tokio's cooperative I/O budget may yield before the window finishes.
+        let mut stream = if owned {
+            evaluate_requests(source.clone(), futures::stream::iter(requests.map(Ok)))
+        } else {
+            ordered_batches(&*source, requests)
+        };
+        // A blocked request prevents evaluation of the next request.
         futures::future::poll_fn(|cx| {
             assert!(stream.as_mut().poll_next(cx).is_pending());
             assert!(source.started.read() <= limit as u64);
@@ -169,6 +187,7 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             );
         } else {
             release.send(Ok(())).unwrap();
+
             for i in 0..count {
                 let (_, batch) = stream.try_next().await.unwrap().unwrap();
                 assert_eq!(batch.values, vec![(i % 255) as u8]);
@@ -176,7 +195,13 @@ async fn buffered_batches_are_bounded_ordered_and_cancelled_by_drop() {
             assert!(stream.try_next().await.unwrap().is_none());
             assert_eq!(source.started.read(), count as u64);
             assert_eq!(source.finished.read(), count as u64);
+            drop(stream);
         }
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "stream retained its source after drop"
+        );
     }
 
     test_support::cleanup(&root).await;
@@ -186,7 +211,7 @@ async fn stored<T: TensorElement>(
     name: &str,
     values: &[T],
     sparse: bool,
-) -> (std::path::PathBuf, Tensor<FsEntry, T>)
+) -> (crate::test_support::Directory, Tensor<FsEntry, T>)
 where
     FsEntry: TensorFileEntry<T>,
 {
@@ -212,65 +237,35 @@ where
 }
 
 #[tokio::test]
-async fn completion_order_replenishes_slots_and_preserves_pairs() {
+async fn sequential_consumption_preserves_pairs_and_backpressure() {
     use futures::FutureExt;
 
-    let count = num_cpus::get().max(2) + 3;
-    let values: Vec<_> = (0..count).map(|i| (i % 255) as u8).collect();
-    let (root, tensor) = stored("unordered_slots", &values, false).await;
-    for window in [1, 2, num_cpus::get().max(1)] {
-        let (source, release) = delayed(&tensor);
-        let requests = (0..count).map(|i| BatchRequest::explicit(vec![vec![i as u64]]));
-        let mut stream = evaluation_futures(&source, futures::stream::iter(requests))
-            .buffer_unordered(window)
-            .boxed();
-        let mut seen = Vec::new();
-        if window == 1 {
-            assert!(stream.next().now_or_never().is_none());
-            assert_eq!(source.started.read(), 1);
-        } else {
-            for _ in 1..count {
-                let (request, batch) = stream.try_next().await.unwrap().unwrap();
-                let coords = request.into_coordinates(source.shape()).unwrap();
-                let index = coords[0][0] as usize;
-                assert_ne!(index, 0);
-                assert_eq!(batch.values, vec![values[index]]);
-                assert!(source.started.read() - source.finished.read() <= window as u64);
-                seen.push(index);
-            }
-            assert_eq!(
-                source.started.read(),
-                count as u64,
-                "completed slots admit later reads"
-            );
-            assert!(stream.next().now_or_never().is_none());
-        }
-        release.send(Ok(())).unwrap();
-        while let Some((request, batch)) = stream.try_next().await.unwrap() {
-            let index = request.into_coordinates(source.shape()).unwrap()[0][0] as usize;
-            assert_eq!(batch.values, vec![values[index]]);
-            seen.push(index);
-        }
-        assert!(stream.try_next().await.unwrap().is_none());
-        assert_eq!(source.started.read(), count as u64);
-        assert_eq!(source.finished.read(), count as u64);
-        seen.sort();
-        assert_eq!(seen, (0..count).collect::<Vec<_>>());
-    }
-
-    // Exercise the public coordinate consumer and its cancellation, independently
-    // of the fixed-window helper checks above.
+    let count = 8;
+    let values: Vec<_> = (0..count).map(|i| i as u8).collect();
+    let (root, tensor) = stored("sequential_pairs", &values, false).await;
     let (source, release) = delayed(&tensor);
     let mut stream = source.read_coordinate_blocks().unwrap();
-    if num_cpus::get() > 1 {
+    assert!(stream.next().now_or_never().is_none());
+    assert_eq!(source.started.read(), 1);
+    assert_eq!(source.completed.read(), 0);
+    release.send(Ok(())).unwrap();
+
+    for (i, value) in values.iter().enumerate() {
         let (coords, batch) = stream.try_next().await.unwrap().unwrap();
-        assert_ne!(coords[0], vec![0]);
-        assert_eq!(batch[0], values[coords[0][0] as usize]);
-    } else {
-        assert!(stream.next().now_or_never().is_none());
+        assert_eq!(coords, vec![vec![i as u64]]);
+        assert_eq!(batch, vec![*value]);
+        assert_eq!(source.started.read(), (i + 1) as u64);
     }
+
+    assert!(stream.try_next().await.unwrap().is_none());
+    assert_eq!(source.finished.read(), count as u64);
     drop(stream);
-    assert_eq!(source.finished.read(), source.started.read());
+
+    let (source, release) = delayed(&tensor);
+    let mut stream = source.read_coordinate_blocks().unwrap();
+    assert!(stream.next().now_or_never().is_none());
+    drop(stream);
+    assert_eq!(source.finished.read(), 1);
     assert!(release.send(Ok(())).is_err());
 
     // Separate descriptions can consume the same stored source concurrently.
@@ -296,6 +291,7 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(pairs.len(), count);
+
         for (i, (coord, value)) in pairs.into_iter().enumerate() {
             assert_eq!(coord, vec![i as u64]);
             assert_eq!(value, values[i]);
@@ -306,34 +302,32 @@ async fn completion_order_replenishes_slots_and_preserves_pairs() {
 }
 
 #[tokio::test]
-async fn unordered_errors_cancel_pending_evaluation() {
-    let (root, tensor) = stored("unordered_errors", &[1u8, 2, 3], false).await;
-    // Use an explicit two-slot window to prove a later error can overtake an
-    // unresolved first read, even on a one-CPU test runner.
+async fn sequential_errors_stop_before_later_evaluation() {
+    use futures::FutureExt;
+
+    let (root, tensor) = stored("sequential_errors", &[1u8, 2, 3], false).await;
     let (mut source, release) = delayed(&tensor);
     source.fail_at = Some(1);
     let requests = (0..3).map(|i| BatchRequest::explicit(vec![vec![i]]));
-    let result = evaluation_futures(&source, futures::stream::iter(requests))
-        .buffer_unordered(2)
-        .try_collect::<Vec<_>>()
-        .await;
-    assert!(matches!(result, Err(Error::Unsupported(_))));
-    assert_eq!(source.finished.read(), source.started.read());
-    assert!(release.send(Ok(())).is_err());
+    let mut stream = evaluate_requests(&source, futures::stream::iter(requests));
+    assert!(stream.next().now_or_never().is_none());
+    assert_eq!(source.started.read(), 1);
+    release.send(Ok(())).unwrap();
+    assert_eq!(stream.try_next().await.unwrap().unwrap().1.values, vec![1]);
+    assert!(matches!(
+        stream.try_next().await,
+        Err(Error::Unsupported(_))
+    ));
+    drop(stream);
+    assert_eq!(source.started.read(), 2);
+    assert_eq!(source.finished.read(), 2);
 
     let (mut source, release) = delayed(&tensor);
     source.fail_at = Some(1);
-    if num_cpus::get() == 1 {
-        release.send(Ok(())).unwrap();
-    } else {
-        let result = source.min_all().await;
-        assert!(matches!(result, Err(Error::Unsupported(_))));
-        assert!(release.send(Ok(())).is_err());
-        assert_eq!(source.finished.read(), source.started.read());
-        test_support::cleanup(&root).await;
-        return;
-    }
+    release.send(Ok(())).unwrap();
     assert!(matches!(source.min_all().await, Err(Error::Unsupported(_))));
+    assert_eq!(source.started.read(), 2);
+    assert_eq!(source.finished.read(), 2);
     test_support::cleanup(&root).await;
 }
 
@@ -353,28 +347,24 @@ where
         _ => source.max_all(),
     };
 
-    if !release_first && num_cpus::get() > 1 {
-        futures::future::poll_fn(|cx| {
-            assert!(terminal.as_mut().poll(cx).is_pending());
-            if source.completed.read() == (source.shape()[0] - 1) {
-                std::task::Poll::Ready(())
-            } else {
-                std::task::Poll::Pending
-            }
-        })
-        .await;
+    if !release_first {
+        assert!(futures::poll!(terminal.as_mut()).is_pending());
+        assert_eq!(source.started.read(), 1);
+        assert_eq!(source.completed.read(), 0);
     }
+
     release.send(Ok(())).unwrap();
     terminal.await
 }
 
 #[tokio::test]
-async fn numeric_terminals_accept_completion_schedules() {
+async fn numeric_terminals_preserve_values_across_input_delays() {
     use num_rational::BigRational;
     use num_traits::ToPrimitive;
 
     for sparse in [false, true] {
         let (root, tensor) = stored("unordered_integer", &[255u8, 2, 3], sparse).await;
+
         for release_first in [false, true] {
             for (operation, expected) in [4, 250, 2, 255].into_iter().enumerate() {
                 let (source, release) = delayed(&tensor);
@@ -389,8 +379,7 @@ async fn numeric_terminals_accept_completion_schedules() {
         test_support::cleanup(&root).await;
     }
 
-    // Exact binary-rational inputs. Cancellation can change the sum's last bits;
-    // compare both schedules with the established real aggregate gamma bound.
+    // Compare delayed and ready consumption with the real aggregate gamma bound.
     let values = [1e16f64, -1e16, 1.];
     let exact: BigRational = values
         .into_iter()
@@ -399,10 +388,12 @@ async fn numeric_terminals_accept_completion_schedules() {
     let scale = values.iter().map(|v| v.abs()).sum::<f64>();
     let ku = 8. * values.len() as f64 * (f64::EPSILON / 2.);
     let (root, tensor) = stored("unordered_float", &values, false).await;
+
     for release_first in [false, true] {
         let (source, release) = delayed(&tensor);
         let actual = scheduled(&source, release, 0, release_first).await.unwrap();
         assert!((actual - exact.to_f64().unwrap()).abs() <= ku / (1. - ku) * scale);
+
         for (operation, expected) in [(2, -1e16), (3, 1e16)] {
             let (source, release) = delayed(&tensor);
             assert_eq!(
@@ -422,6 +413,7 @@ async fn numeric_terminals_accept_completion_schedules() {
         [1., f32::NAN, f32::INFINITY],
     ] {
         let (root, tensor) = stored("unordered_float_edges", &values, false).await;
+
         for release_first in [false, true] {
             for operation in 0..4 {
                 let (source, release) = delayed(&tensor);
@@ -440,4 +432,24 @@ async fn numeric_terminals_accept_completion_schedules() {
         }
         test_support::cleanup(&root).await;
     }
+}
+
+#[tokio::test]
+async fn owned_stream_error_releases_pending_evaluation_on_drop() {
+    let (root, tensor) = stored("owned_error", &[1u8, 2], false).await;
+    let (source, release) = delayed(&tensor);
+    let source = std::sync::Arc::new(source);
+    let weak = std::sync::Arc::downgrade(&source);
+    let requests = futures::stream::iter([Ok(BatchRequest::point(&[0]))]);
+    let mut stream = evaluate_requests(source, requests);
+    release
+        .send(Err(Error::InvalidLayout("test read failure".into())))
+        .unwrap();
+    assert!(matches!(
+        stream.try_next().await,
+        Err(Error::InvalidLayout(_))
+    ));
+    drop(stream);
+    assert!(weak.upgrade().is_none());
+    test_support::cleanup(&root).await;
 }

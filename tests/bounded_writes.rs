@@ -10,7 +10,7 @@ use common::{FsEntry, new_dir};
 #[tokio::test]
 async fn writes_validate_cardinality_before_mutation() {
     for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
-        let (_, dir) = new_dir("bounded_writes").await;
+        let (_dir_root, dir) = new_dir("bounded_writes").await;
         let tensor = Tensor::<FsEntry, u8>::create(
             dir,
             TensorSchema::new(u8::dtype(), shape![6]).unwrap(),
@@ -51,7 +51,7 @@ async fn writes_validate_cardinality_before_mutation() {
 #[tokio::test]
 async fn huge_mismatched_write_does_not_expand_coordinates() {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let (_, dir) = new_dir("huge_bounded_write").await;
+        let (_dir_root, dir) = new_dir("huge_bounded_write").await;
         let tensor = Tensor::<FsEntry, u8>::create(
             dir,
             TensorSchema::new(u8::dtype(), shape![1_000_000_000]).unwrap(),

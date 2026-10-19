@@ -2,9 +2,9 @@
 
 use fensor::{
     Layout, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCompare, TensorCompareScalar,
-    TensorElement, TensorFileEntry, TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary,
-    TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform,
-    TensorUnaryBoolean, TensorWhere, TensorWrite,
+    TensorElement, TensorExpression, TensorFileEntry, TensorMatMul, TensorMath, TensorMathScalar,
+    TensorMatrixUnary, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
+    TensorTransform, TensorUnaryBoolean, TensorWhere, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
@@ -23,11 +23,12 @@ where
         let (root, tensor) =
             fixture::source("real_width", shape![2, 2], layout, 3, 1024, input.clone()).await;
         let view = tensor.view();
+        let dense = TensorExpression::new(view.clone()).unwrap().into_dense();
         let backend = Array::new(Buffer::from(input.clone()), shape![2, 2]).unwrap();
-        // Concrete expression types stay in each invocation; no type erasure.
+        // Densifying cases convert explicitly; zero-preserving cases retain sparse evaluation.
         macro_rules! arithmetic {
-            ($method:ident, $scalar:ident) => {
-                let mut expected = backend
+            ($method:ident, $scalar:ident, $binary_source:ident, $scalar_source:ident) => {
+                let expected = backend
                     .clone()
                     .$method(backend.clone())
                     .unwrap()
@@ -36,18 +37,13 @@ where
                     .to_slice()
                     .unwrap()
                     .to_vec();
-                if matches!(layout, Layout::Sparse { .. }) {
-                    for (source, value) in input.iter().zip(&mut expected) {
-                        if *source == T::ZERO {
-                            *value = T::ZERO;
-                        }
-                    }
-                }
-                fixture::blocks(&view.$method(&view).await.unwrap(), &expected, |a, b| {
-                    a == b
-                })
+                fixture::blocks(
+                    &$binary_source.$method(&$binary_source).await.unwrap(),
+                    &expected,
+                    |a, b| a == b,
+                )
                 .await;
-                let mut expected = backend
+                let expected = backend
                     .clone()
                     .$scalar(T::ONE)
                     .unwrap()
@@ -56,79 +52,80 @@ where
                     .to_slice()
                     .unwrap()
                     .to_vec();
-                if matches!(layout, Layout::Sparse { .. }) {
-                    for (source, value) in input.iter().zip(&mut expected) {
-                        if *source == T::ZERO {
-                            *value = T::ZERO;
-                        }
-                    }
-                }
-                fixture::blocks(&view.$scalar(T::ONE).await.unwrap(), &expected, |a, b| {
-                    a == b
-                })
+                fixture::blocks(
+                    &$scalar_source.$scalar(T::ONE).await.unwrap(),
+                    &expected,
+                    |a, b| a == b,
+                )
                 .await;
             };
         }
-        arithmetic!(add, add_scalar);
-        arithmetic!(sub, sub_scalar);
-        arithmetic!(mul, mul_scalar);
-        arithmetic!(div, div_scalar);
-        arithmetic!(pow, pow_scalar);
-        arithmetic!(rem, rem_scalar);
-        let supported: Vec<u8> = input
-            .iter()
-            .map(|v| u8::from(matches!(layout, Layout::Dense) || *v != T::ZERO))
-            .collect();
+        arithmetic!(add, add_scalar, view, dense);
+        arithmetic!(sub, sub_scalar, view, dense);
+        arithmetic!(mul, mul_scalar, view, view);
+        arithmetic!(div, div_scalar, view, view);
+        arithmetic!(pow, pow_scalar, dense, view);
+        arithmetic!(rem, rem_scalar, view, view);
         macro_rules! comparison {
-            ($method:ident, $scalar:ident, $predicate:expr) => {
+            ($method:ident, $scalar:ident, $predicate:expr, $binary_source:ident, $scalar_source:ident) => {
                 let expected: Vec<u8> = input
                     .iter()
-                    .zip(&supported)
-                    .map(|(&v, &s)| s * u8::from(($predicate)(v, v)))
+                    .map(|&v| u8::from(($predicate)(v, v)))
                     .collect();
-                fixture::blocks(&view.$method(&view).await.unwrap(), &expected, |a, b| {
-                    a == b
-                })
+                fixture::blocks(
+                    &$binary_source.$method(&$binary_source).await.unwrap(),
+                    &expected,
+                    |a, b| a == b,
+                )
                 .await;
                 let expected: Vec<u8> = input
                     .iter()
-                    .zip(&supported)
-                    .map(|(&v, &s)| s * u8::from(($predicate)(v, T::ONE)))
+                    .map(|&v| u8::from(($predicate)(v, T::ONE)))
                     .collect();
-                fixture::blocks(&view.$scalar(T::ONE).await.unwrap(), &expected, |a, b| {
-                    a == b
-                })
+                fixture::blocks(
+                    &$scalar_source.$scalar(T::ONE).await.unwrap(),
+                    &expected,
+                    |a, b| a == b,
+                )
                 .await;
             };
         }
-        comparison!(eq, eq_scalar, |a: T, b: T| a == b);
-        comparison!(ne, ne_scalar, |a: T, b: T| a != b);
-        comparison!(gt, gt_scalar, |a: T, b: T| a > b);
-        comparison!(ge, ge_scalar, |a: T, b: T| a >= b);
-        comparison!(lt, lt_scalar, |a: T, b: T| a < b);
-        comparison!(le, le_scalar, |a: T, b: T| a <= b);
-        comparison!(and, and_scalar, |a: T, b: T| a != T::ZERO && b != T::ZERO);
-        comparison!(or, or_scalar, |a: T, b: T| a != T::ZERO || b != T::ZERO);
-        comparison!(xor, xor_scalar, |a: T, b: T| (a != T::ZERO)
-            != (b != T::ZERO));
-        let expected: Vec<u8> = input
-            .iter()
-            .zip(&supported)
-            .map(|(v, s)| s * u8::from(*v == T::ZERO))
-            .collect();
-        fixture::blocks(&view.not().await.unwrap(), &expected, |a, b| a == b).await;
+        comparison!(eq, eq_scalar, |a: T, b: T| a == b, dense, view);
+        comparison!(ne, ne_scalar, |a: T, b: T| a != b, view, dense);
+        comparison!(gt, gt_scalar, |a: T, b: T| a > b, view, view);
+        comparison!(ge, ge_scalar, |a: T, b: T| a >= b, dense, view);
+        comparison!(lt, lt_scalar, |a: T, b: T| a < b, view, dense);
+        comparison!(le, le_scalar, |a: T, b: T| a <= b, dense, dense);
+        comparison!(
+            and,
+            and_scalar,
+            |a: T, b: T| a != T::ZERO && b != T::ZERO,
+            view,
+            view
+        );
+        comparison!(
+            or,
+            or_scalar,
+            |a: T, b: T| a != T::ZERO || b != T::ZERO,
+            view,
+            dense
+        );
+        comparison!(
+            xor,
+            xor_scalar,
+            |a: T, b: T| (a != T::ZERO) != (b != T::ZERO),
+            view,
+            dense
+        );
+        let expected: Vec<u8> = input.iter().map(|v| u8::from(*v == T::ZERO)).collect();
+        fixture::blocks(&dense.not().await.unwrap(), &expected, |a, b| a == b).await;
         fixture::blocks(
             &view.abs().await.unwrap(),
             &input.iter().map(|v| Number::abs(*v)).collect::<Vec<_>>(),
             |a, b| a == b,
         )
         .await;
-        let values: Vec<T> = input
-            .iter()
-            .zip(&supported)
-            .filter(|(_, s)| **s != 0)
-            .map(|(v, _)| *v)
-            .collect();
+        let values = &input;
         assert_eq!(
             tensor.sum_all().await.unwrap(),
             values.iter().copied().reduce(Number::add).unwrap()
@@ -155,7 +152,7 @@ where
         );
         for keep in [false, true] {
             for axes in [axes![], axes![0], axes![1], axes![1, 0]] {
-                // Independent per-group expected values and empty-support policy.
+                // Every logical value, including sparse zeros, participates in each group.
                 let groups: Vec<Vec<usize>> = match axes.as_slice() {
                     [] => vec![vec![0], vec![1], vec![2], vec![3]],
                     [0] => vec![vec![0, 2], vec![1, 3]],
@@ -168,7 +165,6 @@ where
                             .iter()
                             .map(|g| {
                                 g.iter()
-                                    .filter(|i| supported[**i] != 0)
                                     .map(|i| input[*i])
                                     .reduce($combine)
                                     .unwrap_or(T::ZERO)
@@ -216,8 +212,8 @@ where
             .collect();
         fixture::consumers(&product, &expected, |a, b| a == b, |a, b| a == b).await;
         fixture::blocks(
-            &view
-                .eq(&view)
+            &dense
+                .eq(&dense)
                 .await
                 .unwrap()
                 .cond(&view, &view)

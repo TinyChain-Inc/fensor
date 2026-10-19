@@ -16,18 +16,19 @@
 //! [`TensorGeometry::size`] checks cardinality overflow and returns `Result<u64>`.
 //! Only bounded buffer dimensions are narrowed for backend evaluation.
 //!
-//! ha-ndarray owns numerical parallelism; fensor owns bounded async concurrency.
-//! The outer consumer uses CPU-limited `buffered` for row-major/sparse/boolean
-//! delivery and `buffer_unordered` for coordinate streams and numeric terminals.
-//! Synchronous backend work runs on the polling thread and may use backend workers;
-//! `async move` does not create CPU parallelism. Inner evaluation adds no buffering.
-//! Copying overlaps one sequential update and one lookahead with `try_join!`.
+//! ha-ndarray owns numerical parallelism. Shared consumers evaluate one request
+//! at a time; dense storage buffers ordinary borrowed reads. freqfs owns admission
+//! and returns bounded errors if pinned reads exhaust cache capacity. Independent
+//! consumers remain concurrent. No prefetch stage or expression batch queue exists.
+//! Copying completes each destination update before requesting the next source batch.
 //!
-//! Sparse support survives intermediate zeros. Numeric terminals accumulate in
-//! completion order under the backend aggregate contract, with no input-order
-//! error precedence. Boolean terminals retain logical short-circuit boundaries.
-//! Dropping consumption cancels pending evaluation. Copy failures can leave partial
-//! storage; call [`Tensor::sync`] explicitly before reopening it.
+//! Sparse absence is numerical zero; reductions count all logical values. Sparse
+//! pointwise operations reject nonzero implicit backgrounds unless converted with
+//! [`TensorExpression::into_dense`]. Numeric terminals accumulate in
+//! request order under the backend aggregate contract. Boolean terminals retain
+//! logical short-circuit boundaries.
+//! Dropping consumption cancels pending evaluation. Copy failures leave unpublished
+//! storage for caller cleanup. Call [`Tensor::sync`] on completed storage before reopening.
 //!
 //! ## Compose and consume without result storage
 //!
@@ -37,7 +38,7 @@
 //!
 //! ```no_run
 //! use fensor::{
-//!     Result, Tensor, TensorFileEntry, TensorMatMul, TensorMathScalar, TensorRead,
+//!     Result, Tensor, TensorExpression, TensorFileEntry, TensorMatMul, TensorMathScalar, TensorRead,
 //!     TensorUnary,
 //! };
 //! use futures::TryStreamExt;
@@ -47,8 +48,8 @@
 //!     right: &Tensor<FE, f32>,
 //!     mut visit: impl FnMut(&[u64], f32),
 //! ) -> Result<()> {
-//!     let result = left.view()
-//!         .matmul(&right.view()).await?
+//!     let product = left.view().matmul(&right.view()).await?;
+//!     let result = TensorExpression::new(product)?.into_dense()
 //!         .add_scalar(1.0).await?
 //!         .exp().await?;
 //!
@@ -79,13 +80,17 @@ mod matrix;
 
 mod metadata;
 
+mod owned;
+
 #[cfg(test)]
+#[path = "../tests/unit/read_metrics.rs"]
 mod read_metrics;
 
 #[cfg(test)]
 extern crate self as fensor;
 
 #[cfg(all(test, feature = "benchmarks"))]
+#[path = "../tests/unit/profiling.rs"]
 mod profiling;
 
 pub mod reduce;
@@ -99,6 +104,10 @@ mod schema;
 mod selection;
 
 mod slice;
+
+mod sparse;
+
+mod storage;
 
 mod storage_read;
 
@@ -121,6 +130,7 @@ mod view;
 
 pub use binary::BinaryView;
 pub use error::{Error, Result};
+pub use expression::MAX_BATCH_ELEMENTS;
 #[cfg(feature = "complex")]
 pub use fft::FourierView;
 pub use ha_ndarray::Axes;
@@ -130,18 +140,20 @@ pub use matmul::MatMulView;
 pub use matrix::DiagView;
 pub use metadata::TensorMetadata;
 pub use number_general::NumberType;
-pub use reduce::ReduceView;
+pub use owned::TensorExpression;
+pub use reduce::{ReduceView, StatisticsElement, TensorStatistics};
 pub use schema::{
-    AxisRange, Layout, Range, Shape, SparseIndexSchema, SparseTableSchema, Strides, TensorSchema,
-    contiguous_strides,
+    AxisRange, Layout, MAX_BLOCK_CAPACITY, Range, RowMajorCoords, Shape, Strides, TensorSchema,
+    contiguous_strides, row_major_coords,
 };
 pub use selection::WhereView;
+pub use sparse::{SparseCell, SparseNode};
+pub use storage::{BlockUpdates, StorageGeometry, StorageRead, TensorSource};
 pub use traits::{
-    BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray,
-    TensorBlockStore, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
-    TensorCompareScalar, TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar,
-    TensorMatrixUnary, TensorNumeric, TensorRead, TensorReduce, TensorReduceAll,
-    TensorReduceBoolean, TensorSparseIndex, TensorTransform, TensorTrig, TensorUnary,
+    BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray, TensorBoolean,
+    TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar, TensorGeometry,
+    TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric, TensorRead,
+    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig, TensorUnary,
     TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite, TensorWriteBulk,
     ValueBlockStream,
 };
@@ -150,6 +162,9 @@ pub use traits::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};
 
 pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 pub use unary::UnaryView;
+pub use validate::{
+    broadcast_reduce_axes, broadcast_shape, matmul_broadcast_shapes, reduction_axes,
+};
 pub use view::TensorView;
 
 pub(crate) const PORTABLE_INLINE_RANK: usize = 8;

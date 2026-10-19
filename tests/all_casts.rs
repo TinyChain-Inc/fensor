@@ -11,6 +11,10 @@ use common::{FsEntry, cleanup, fixture, numbers::same};
 
 mod common;
 
+// Numerical fixtures still retain typed index rows and file envelopes, even
+// when their scalar values encode to only a few bytes.
+const CACHE_BYTES: usize = 16 * 1024;
+
 async fn check_cast<From: TensorElement, To: TensorElement>(
     tensor: &Tensor<FsEntry, From>,
     expected: &[To],
@@ -84,7 +88,7 @@ where
             shape![input.len() as u64],
             layout,
             3,
-            1024,
+            CACHE_BYTES,
             input.iter().copied(),
         )
         .await;
@@ -176,7 +180,7 @@ where
             shape![input.len() as u64],
             layout,
             3,
-            1024,
+            CACHE_BYTES,
             input.iter().copied(),
         )
         .await;

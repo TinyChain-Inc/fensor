@@ -5,7 +5,6 @@ use fensor::{
     TensorWrite,
 };
 use ha_ndarray::{axes, shape};
-
 use number_general::DType;
 
 macro_rules! indexed_dtype {
@@ -25,13 +24,13 @@ macro_rules! indexed_dtype {
                 tensor.write_value(&[0, 1], 2 as $dtype).await.unwrap();
                 tensor.write_value(&[0, 8192], 3 as $dtype).await.unwrap();
                 assert_eq!(tensor.sum_all().await.unwrap(), 5 as $dtype);
-                assert_eq!(tensor.product_all().await.unwrap(), 6 as $dtype);
-                assert_eq!(tensor.min_all().await.unwrap(), 2 as $dtype);
+                assert_eq!(tensor.product_all().await.unwrap(), 0 as $dtype);
+                assert_eq!(tensor.min_all().await.unwrap(), 0 as $dtype);
                 assert_eq!(tensor.max_all().await.unwrap(), 3 as $dtype);
 
                 for view in [tensor.view(), tensor.view().flip(1).unwrap()] {
                     let reduced = view.product(axes![1], false).await.unwrap();
-                    assert_eq!(reduced.read_value(&[0]).await.unwrap(), 6 as $dtype);
+                    assert_eq!(reduced.read_value(&[0]).await.unwrap(), 0 as $dtype);
                     assert_eq!(reduced.read_value(&[1]).await.unwrap(), 0 as $dtype);
                 }
                 tensor.sync().await.unwrap();

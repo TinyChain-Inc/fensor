@@ -1,12 +1,13 @@
 //! One storage constructor consumes base tensors and geometric views as readers.
 
-use common::{FsEntry, new_dir};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema,
-    TensorTransform, TensorWrite,
+    TensorSource, TensorTransform, TensorWrite,
 };
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType, UIntType};
+
+use common::{FsEntry, new_dir};
 
 mod common;
 
@@ -24,19 +25,23 @@ async fn copy_base_and_geometric_readers_into_independent_storage() {
         .unwrap();
         source.write_value(&[1, 2], 255).await.unwrap();
         let (base_root, base_dir) = new_dir("copy_base").await;
-        let copied = Tensor::copy_from(base_dir, &source, 3).await.unwrap();
+        let copied = Tensor::copy_from(base_dir, &source, source.layout(), 3)
+            .await
+            .unwrap();
         assert_eq!(copied.schema(), source.schema());
-        assert_eq!(
-            copied.layout(),
-            match layout {
-                Layout::Dense => Layout::Dense,
-                Layout::Sparse { .. } => Layout::Sparse { axis: None },
-            }
-        );
+        assert_eq!(copied.layout(), layout);
         let view = source.view().transpose(Some(axes![1, 0])).unwrap();
         let (view_root, view_dir) = new_dir("copy_view").await;
-        let transposed = Tensor::copy_from(view_dir, &view, 2).await.unwrap();
+        let destination_layout = match layout {
+            Layout::Dense => Layout::Dense,
+            Layout::Sparse { .. } => Layout::Sparse { axis: Some(0) },
+        };
+        let transposed = Tensor::copy_from(view_dir, &view, destination_layout, 2)
+            .await
+            .unwrap();
         assert_eq!(transposed.shape(), &[3, 2]);
+        assert_eq!(transposed.layout(), destination_layout);
+        assert_eq!(transposed.storage_geometry().block_len(), 2);
 
         for coord in common::iter_coords(&[3, 2]) {
             assert_eq!(
@@ -69,18 +74,27 @@ async fn copy_propagates_source_and_destination_errors() {
     .unwrap();
     let (out_root, out_dir) = new_dir("copy_errors_out").await;
     assert!(matches!(
-        Tensor::copy_from(out_dir.clone(), &source, 0).await,
+        Tensor::copy_from(out_dir.clone(), &source, Layout::Sparse { axis: None }, 2).await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(out_dir.try_read().unwrap().is_empty());
+    assert!(matches!(
+        Tensor::copy_from(out_dir.clone(), &source, source.layout(), 0).await,
         Err(Error::InvalidSchema(_))
     ));
     let scalar = source.view().slice(range![AxisRange::At(0)]).unwrap();
     assert!(matches!(
-        Tensor::copy_from(out_dir.clone(), &scalar, 2).await,
+        Tensor::copy_from(out_dir.clone(), &scalar, scalar.layout(), 2).await,
         Err(Error::InvalidSchema(_))
     ));
     assert!(!out_root.join("blocks").exists());
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     blocks.write().await.delete("0").await;
-    assert!(Tensor::copy_from(out_dir, &source, 2).await.is_err());
+    assert!(
+        Tensor::copy_from(out_dir, &source, source.layout(), 2)
+            .await
+            .is_err()
+    );
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
 }
@@ -121,7 +135,7 @@ impl TensorRead for CoordinateReader<'_> {
 
 #[tokio::test]
 async fn coordinate_copy_validates_blocks_and_accepts_unordered_coverage() {
-    let (_, dir) = new_dir("coordinate_copy_source").await;
+    let (_dir_root, dir) = new_dir("coordinate_copy_source").await;
     let tensor = Tensor::<FsEntry, u8>::create(
         dir,
         TensorSchema::new(NumberType::UInt(UIntType::U8), shape![2]).unwrap(),
@@ -138,7 +152,7 @@ async fn coordinate_copy_validates_blocks_and_accepts_unordered_coverage() {
         vec![(vec![vec![0]], vec![1])],
         vec![(vec![vec![0], vec![1], vec![0]], vec![1, 2, 3])],
     ] {
-        let (_, dir) = new_dir("coordinate_copy_invalid").await;
+        let (_dir_root, dir) = new_dir("coordinate_copy_invalid").await;
         assert!(
             Tensor::<FsEntry, u8>::copy_from(
                 dir,
@@ -146,6 +160,7 @@ async fn coordinate_copy_validates_blocks_and_accepts_unordered_coverage() {
                     tensor: &tensor,
                     blocks
                 },
+                Layout::Dense,
                 1
             )
             .await
@@ -153,13 +168,14 @@ async fn coordinate_copy_validates_blocks_and_accepts_unordered_coverage() {
         );
     }
 
-    let (_, dir) = new_dir("coordinate_copy_valid").await;
+    let (_dir_root, dir) = new_dir("coordinate_copy_valid").await;
     let copy = Tensor::<FsEntry, u8>::copy_from(
         dir,
         &CoordinateReader {
             tensor: &tensor,
             blocks: vec![(vec![vec![1], vec![0]], vec![3, 2])],
         },
+        Layout::Dense,
         1,
     )
     .await
@@ -200,18 +216,18 @@ where
         drop(out_dir);
         let out_dir =
             freqfs::Cache::<FsEntry>::new(65_536, None, 0, std::time::Duration::from_secs(1))
-                .load(out_root.clone())
+                .load(out_root.to_path_buf())
                 .unwrap();
         let (other_root, other_dir) = new_dir("copy_concurrent_out").await;
         let (copied, other) = futures::try_join!(
-            Tensor::copy_from(out_dir, &view, 128),
-            Tensor::copy_from(other_dir, &view, 7),
+            Tensor::copy_from(out_dir, &view, view.layout(), 128),
+            Tensor::copy_from(other_dir, &view, view.layout(), 7),
         )
         .unwrap();
         copied.sync().await.unwrap();
         drop(copied);
         let dir = freqfs::Cache::<FsEntry>::new(65_536, None, 0, std::time::Duration::from_secs(1))
-            .load(out_root.clone())
+            .load(out_root.to_path_buf())
             .unwrap();
         let copied = Tensor::<FsEntry, T>::load(dir).await.unwrap();
         let mut blocks = copied.read_blocks().unwrap();
@@ -304,16 +320,140 @@ async fn dropped_copy_releases_guards_and_allows_source_reuse() {
     source.write_value(&[1], 255).await.unwrap();
     let paused = PausedReader(&source);
     let (partial_root, partial_dir) = new_dir("copy_cancel_partial").await;
-    let mut pending = Box::pin(Tensor::copy_from(partial_dir, &paused, 2));
+    let mut pending = Box::pin(Tensor::copy_from(partial_dir, &paused, paused.layout(), 2));
     assert!(futures::poll!(&mut pending).is_pending());
     drop(pending);
     source.write_value(&[0], 127).await.unwrap();
     let (out_root, out_dir) = new_dir("copy_cancel_reuse").await;
-    let output = Tensor::copy_from(out_dir, &source, 2).await.unwrap();
+    let output = Tensor::copy_from(out_dir, &source, source.layout(), 2)
+        .await
+        .unwrap();
     assert_eq!(output.read_value(&[0]).await.unwrap(), 127);
     assert_eq!(output.read_value(&[1]).await.unwrap(), 255);
 
     for path in [&root, &partial_root, &out_root] {
         common::cleanup(path).await;
+    }
+}
+
+struct SparseOnce {
+    starts: std::sync::atomic::AtomicUsize,
+    drops: std::sync::atomic::AtomicUsize,
+    malformed: bool,
+}
+
+impl TensorGeometry for SparseOnce {
+    type DType = f64;
+
+    fn dtype(&self) -> NumberType {
+        NumberType::Float(FloatType::F64)
+    }
+
+    fn shape(&self) -> &[u64] {
+        &[2, 8193]
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::Sparse { axis: Some(1) }
+    }
+}
+
+impl TensorRead for SparseOnce {
+    fn read_value<'a>(&'a self, _: &'a [u64]) -> fensor::BoxFuture<'a, fensor::Result<f64>> {
+        Box::pin(async { panic!("copy must consume the sparse stream once") })
+    }
+
+    fn read_sparse_elements_in_order<'a>(
+        &'a self,
+        _: fensor::Range,
+        _: ha_ndarray::Axes,
+    ) -> fensor::BoxFuture<'a, fensor::Result<fensor::SparseElementStream<'a, f64>>> {
+        use futures::StreamExt;
+        Box::pin(async move {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            struct Lease<'a>(&'a std::sync::atomic::AtomicUsize);
+
+            impl Drop for Lease<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let lease = Lease(&self.drops);
+            let malformed = self.malformed;
+            Ok(futures::stream::iter([
+                Ok((vec![0, 0], f64::NAN)),
+                Ok((vec![0, 4096], f64::INFINITY)),
+                Ok((
+                    if malformed {
+                        vec![0, 4096]
+                    } else {
+                        vec![1, 8192]
+                    },
+                    2.,
+                )),
+            ])
+            .map(move |entry| {
+                let _ = &lease;
+                entry
+            })
+            .boxed())
+        })
+    }
+}
+
+#[tokio::test]
+async fn sparse_copy_consumes_once_releases_source_and_rejects_duplicates() {
+    let source = SparseOnce {
+        starts: 0.into(),
+        drops: 0.into(),
+        malformed: false,
+    };
+
+    for layout in [Layout::Dense, Layout::Sparse { axis: Some(2) }] {
+        let (_root, dir) = new_dir("copy_reject_layout").await;
+        let result = Tensor::<FsEntry, f64>::copy_from(dir.clone(), &source, layout, 4096).await;
+        match layout {
+            Layout::Dense => assert!(matches!(result, Err(Error::Unsupported(_)))),
+            _ => assert!(matches!(result, Err(Error::InvalidSchema(_)))),
+        }
+        assert!(dir.try_read().unwrap().is_empty());
+        assert_eq!(source.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(source.drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    for (axis, malformed) in [
+        (Some(1), false),
+        (Some(0), false),
+        (None, false),
+        (Some(1), true),
+    ] {
+        let layout = Layout::Sparse { axis };
+        let source = SparseOnce {
+            starts: 0.into(),
+            drops: 0.into(),
+            malformed,
+        };
+        let (root, dir) = new_dir("copy_once").await;
+        let result = Tensor::<FsEntry, f64>::copy_from(dir.clone(), &source, layout, 4096).await;
+        assert_eq!(source.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(source.drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if malformed {
+            assert!(result.is_err());
+            assert!(Tensor::<FsEntry, f64>::load(dir).await.is_err());
+        } else {
+            let tensor = result.unwrap();
+            assert_eq!(tensor.layout(), layout);
+            assert_eq!(
+                tensor.storage_geometry().block_len(),
+                if axis == Some(0) { 4096 } else { 1 }
+            );
+            assert!(tensor.read_value(&[0, 0]).await.unwrap().is_nan());
+            assert_eq!(tensor.read_value(&[0, 4096]).await.unwrap(), f64::INFINITY);
+            assert_eq!(tensor.read_value(&[1, 8192]).await.unwrap(), 2.);
+            tensor.validate().await.unwrap();
+        }
+        common::cleanup(&root).await;
     }
 }
