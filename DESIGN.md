@@ -537,11 +537,10 @@ be included. Callers own reservations and publication; fensor owns neither.
 
 ### Adapter writes
 
-File adapters report retained allocation through `GetSize` and inspect encoded
-containers with bounded scratch in `FileLoad::load_size` before decoding payloads.
-Admission counts retained typed capacities, independently of serialized bytes;
-adapters bound temporary decoder allocations separately. Loading and publication
-of complete values retain cache admission. In-place mutations reconcile actual
+File adapters decode once and report actual retained allocation through `GetSize`.
+Freqfs admits complete decoded values before publication, independently of serialized
+bytes. Adapters retain structural decoding limits; decoded temporaries can occupy
+memory outside the cache target while awaiting admission. In-place mutations reconcile actual
 retained size when mutable guards are released; they can exceed the cache target
 before eviction. This is not a strict mutation-memory ceiling or a host OOM
 guarantee. The caller's cache must also fit simultaneously pinned native

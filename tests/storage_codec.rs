@@ -55,17 +55,6 @@ impl GetSize for JsonEntry {
 }
 
 impl FileLoad for JsonEntry {
-    async fn load_size(
-        _: &Path,
-        file: &mut tokio::fs::File,
-        _: &std::fs::Metadata,
-    ) -> io::Result<usize> {
-        destream_json::de::read_from::<_, common::file_size::Size>((), file)
-            .await
-            .map(|bound| bound.0)
-            .map_err(io::Error::other)
-    }
-
     async fn load(_: &Path, file: tokio::fs::File, _: std::fs::Metadata) -> io::Result<Self> {
         destream_json::de::read_from((), file)
             .await
@@ -89,7 +78,7 @@ impl FileSave for JsonEntry {
 }
 
 #[tokio::test]
-async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
+async fn file_decoding_preserves_containers_and_rejects_malformed_payloads() {
     let rank = fensor::Shape::new().inline_size() + 1;
     let entries = [
         FsEntry::U8(vec![3; 7]),
@@ -121,22 +110,13 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
             destream_json::de::try_decode((), destream_json::en::encode(&entry).unwrap())
                 .await
                 .unwrap();
-        let bound: common::file_size::Size =
-            destream_json::de::try_decode((), destream_json::en::encode(&entry).unwrap())
-                .await
-                .unwrap();
-        assert!(bound.0 >= json.get_size());
+        assert!(json.get_size() >= std::mem::size_of::<FsEntry>());
         let tbon: FsEntry = tbon::de::try_decode((), tbon::en::encode(&entry).unwrap())
             .await
             .unwrap();
-        let bound: common::file_size::Size =
-            tbon::de::try_decode((), tbon::en::encode(&entry).unwrap())
-                .await
-                .unwrap();
-        assert!(bound.0 >= tbon.get_size());
+        assert!(tbon.get_size() >= std::mem::size_of::<FsEntry>());
     }
     // This decoded page fits 16 KiB including retained row and payload capacities.
-    // Preflight must cover the owned containers, independently of encoded bytes.
     let tiny_page = FsEntry::SparseF64(b_table::Node::Leaf(vec![
         vec![
             fensor::SparseCell::Key(1),
@@ -144,15 +124,10 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
         ];
         128
     ]));
-    let bound: common::file_size::Size =
-        tbon::de::try_decode((), tbon::en::encode(&tiny_page).unwrap())
-            .await
-            .unwrap();
     let decoded: FsEntry = tbon::de::try_decode((), tbon::en::encode(&tiny_page).unwrap())
         .await
         .unwrap();
-    assert!(bound.0 >= decoded.get_size());
-    assert!(bound.0 <= 16 * 1024);
+    assert!(decoded.get_size() <= 16 * 1024);
 
     async fn reject_node(leaf: bool, rows: Vec<Vec<u64>>, child_count: usize) {
         use futures::{TryStreamExt, stream};
@@ -175,14 +150,7 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
             .await
             .is_err()
         );
-        assert!(
-            destream_json::de::try_decode::<_, _, common::file_size::Size>(
-                (),
-                stream::iter(json.into_iter().map(Ok::<_, std::io::Error>)),
-            )
-            .await
-            .is_err()
-        );
+
         let tbon = tbon::en::encode(&value)
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -192,14 +160,6 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
             tbon::de::try_decode::<_, _, FsEntry>(
                 (),
                 stream::iter(tbon.clone().into_iter().map(Ok::<_, std::io::Error>)),
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            tbon::de::try_decode::<_, _, common::file_size::Size>(
-                (),
-                stream::iter(tbon.into_iter().map(Ok::<_, std::io::Error>)),
             )
             .await
             .is_err()
@@ -214,12 +174,9 @@ async fn file_preflight_bounds_retained_containers_without_decoding_payloads() {
 
     let oversized = (1u8, vec![0f32; fensor::MAX_BLOCK_CAPACITY + 1]);
     assert!(
-        tbon::de::try_decode::<_, _, common::file_size::Size>(
-            (),
-            tbon::en::encode(&oversized).unwrap()
-        )
-        .await
-        .is_err()
+        tbon::de::try_decode::<_, _, FsEntry>((), tbon::en::encode(&oversized).unwrap())
+            .await
+            .is_err()
     );
 }
 

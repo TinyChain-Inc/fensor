@@ -1,7 +1,8 @@
 # Regression ownership
 
 Keep broad numerical cases separate from expensive full-consumer parity. Shared
-filesystem scaffolding lives in `common/mod.rs`, imported directly by unit tests.
+filesystem scaffolding lives in `common/mod.rs`; `common/file.rs` owns its
+test-only file representation and codec. Unit tests reuse the same support.
 Special codec/error/independent-adapter fixtures remain local to their contracts.
 
 | Contract | Primary coverage |
@@ -181,36 +182,17 @@ batch error boundaries, high-rank scratch, and expression integration coverage.
   construction futures are cancelled directly without an additional box.
 
 Private unit-test implementations live under `tests/unit/` and shared fixtures
-under `tests/common/`. Their existing Rust module names and targeted test commands
-are unchanged; see [test ownership](../CONTRIBUTING.md#test-ownership).
+under `tests/common/`. The test/benchmark filesystem adapter and its tagged
+codec live in `tests/common/file.rs`, re-exported as `common::FsEntry`.
+Existing unit-test module names and targeted test commands are unchanged; see [test ownership](../CONTRIBUTING.md#test-ownership).
 
-## Schema case consolidation
+## Schema validation
 
-The following former `schema::tests` functions are now named cases in four
-table-driven tests in `unit/schema/tests.rs`. All 18 inputs, expected shapes or
-strides, and `InvalidSchema` assertions remain; only 14 test functions were removed.
-This consolidation is separate from the unit-test file relocation.
-
-| Former function | Replacement test / named case |
-|---|---|
-| `contiguous_strides_rank_three` | `contiguous_strides_valid_shapes` / `rank_three` |
-| `contiguous_strides_rank_two` | `contiguous_strides_valid_shapes` / `rank_two` |
-| `contiguous_strides_single_dim` | `contiguous_strides_valid_shapes` / `single_dim` |
-| `contiguous_strides_all_ones` | `contiguous_strides_valid_shapes` / `all_ones` |
-| `contiguous_strides_leading_one` | `contiguous_strides_valid_shapes` / `leading_one` |
-| `contiguous_strides_trailing_one` | `contiguous_strides_valid_shapes` / `trailing_one` |
-| `contiguous_strides_empty_shape` | `contiguous_strides_reject_invalid_shapes` / `empty_shape` |
-| `contiguous_strides_zero_dim` | `contiguous_strides_reject_invalid_shapes` / `zero_dim` |
-| `contiguous_strides_overflow` | `contiguous_strides_reject_invalid_shapes` / `overflow` |
-| `greedy_block_shape_capacity_covers_whole_tensor` | `greedy_block_shape_valid_capacities` / `capacity_covers_whole_tensor` |
-| `greedy_block_shape_capacity_equals_total` | `greedy_block_shape_valid_capacities` / `capacity_equals_total` |
-| `greedy_block_shape_partial_fit_limits_outer_axis` | `greedy_block_shape_valid_capacities` / `partial_fit_limits_outer_axis` |
-| `greedy_block_shape_rank_two_partial` | `greedy_block_shape_valid_capacities` / `rank_two_partial` |
-| `greedy_block_shape_single_dim` | `greedy_block_shape_valid_capacities` / `single_dim` |
-| `greedy_block_shape_capacity_one` | `greedy_block_shape_valid_capacities` / `capacity_one` |
-| `greedy_block_shape_zero_capacity` | `greedy_block_shape_reject_invalid_inputs` / `zero_capacity` |
-| `greedy_block_shape_empty_shape` | `greedy_block_shape_reject_invalid_inputs` / `empty_shape` |
-| `greedy_block_shape_zero_dim` | `greedy_block_shape_reject_invalid_inputs` / `zero_dim` |
+`unit/schema/tests.rs` owns the named valid/invalid cases in
+`contiguous_strides_valid_shapes`, `contiguous_strides_reject_invalid_shapes`,
+`greedy_block_shape_valid_capacities`, and `greedy_block_shape_reject_invalid_inputs`.
+They cover rank, singleton dimensions, edge capacities, empty/zero dimensions,
+and overflow, retaining exact shape/stride and `InvalidSchema` assertions.
 
 Sparse owner locking is covered by
 `tensor::sparse_storage::validation_tests::table_guards_preserve_batch_reads_and_partial_updates`:
@@ -221,38 +203,27 @@ live in `tests/unit/tensor/sparse_storage/corruption.rs`; production exposes no
 sparse table or directory handles. Existing cancellation and validation-order
 fixtures acquire native table guards directly.
 
-Storage naming cleanup preserves all test names and integration targets.
-Dense construction moved from `construction::Dense` to
-`dense_storage::Construction`; construction tests retain their original module.
-Benchmark workloads moved from `common/adaptive_cases.rs` to
-`common/storage_cases.rs`; the suite selector is now `storage`. Existing workload
-record names and archived measurements are unchanged.
+Dense construction belongs to `dense_storage::Construction`; construction tests
+retain their owning module. Storage benchmarks live in `common/storage_cases.rs`
+and use the `storage` selector.
 
-Encapsulation cleanup retains the bounded batching assertions, relocated from
-`expression::tests::batching_only_consumes_its_bounded_prefix` to
-`traits::tests::batching_only_consumes_its_bounded_prefix`. Raw malformed mapping
-fixtures live in mapping-owned test support; dense file access lives in
-dense-storage-owned test support. Neither adds production visibility.
+`traits::tests::batching_only_consumes_its_bounded_prefix` owns bounded coordinate
+batching. Malformed mapping and dense-file fixtures live in their owners' test
+support without adding production visibility.
 
-Read validation: `unit/storage/traversal_tests.rs` checks reuse of computed bounds
-during padding validation. `unit/tensor/dense_storage/tests.rs` checks progress
-when the cache can admit only one dense payload, with both the default handle
-budget and a single file-handle permit. Existing storage and sparse
-consumer fixtures retain invalid-ID, corruption, ordering, and zero-row coverage.
+Read validation in `unit/storage/traversal_tests.rs` checks reuse of computed
+bounds during padding validation. Storage and sparse consumer fixtures cover
+invalid IDs, corruption, ordering, and absent rows.
 
-
-The sequential-consumer change replaces outer-window assertions with one-active-
-request assertions; borrowed/owned cancellation and source-release checks remain.
-`unordered_errors_cancel_pending_evaluation` is now
-`sequential_errors_stop_before_later_evaluation`, retaining injected failures and
-cleanup while asserting request-order errors.
-`numeric_terminals_accept_completion_schedules` is now
-`numeric_terminals_preserve_values_across_input_delays`; all numerical cases remain.
-The former one-payload-cache success fixture is now
-`dense_reads_delegate_capacity_and_release_failed_work`: sufficient-capacity
-success (including one handle), deterministic capacity failure, release, and retry.
-`buffered_reads_preserve_order_and_release_guards` owns ordinary dense-read
-buffering, duplicate positions, ordered corruption errors, and guard cancellation.
+Sequential-consumer fixtures check one active request, borrowed/owned cancellation,
+and source release. `sequential_errors_stop_before_later_evaluation` checks
+request-order errors; `numeric_terminals_preserve_values_across_input_delays`
+checks numerical results with delayed inputs.
+`dense_reads_delegate_capacity_and_release_failed_work`
+checks sufficient-capacity success (including one handle), deterministic capacity
+failure, release, and retry. `buffered_reads_preserve_order_and_release_guards`
+owns dense-read buffering, duplicate positions, ordered corruption errors, and
+guard cancellation.
 
 Small-cache binary, conditional, unary, reduction, and matrix copy fixtures keep
 their construction and destination budgets. They synchronize and reopen sources
