@@ -302,8 +302,9 @@ where
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let input = BatchRequest::rectangles(rectangles)?;
+                let expected = input.len();
                 let batch = context
-                    .evaluate(&self.source, std::sync::Arc::new(input.clone()))
+                    .evaluate(&self.source, std::sync::Arc::new(input))
                     .await?;
                 let array = expression::batch_array(batch.values)?
                     .reshape(ha_ndarray::shape![pack.len(), width])?;
@@ -313,11 +314,11 @@ where
                     .buffer()?
                     .to_slice()?
                     .into_vec();
-                if transformed.len() != input.len() {
+                if transformed.len() != expected {
                     return Err(Error::InvalidLayout(format!(
                         "{} output: expected {} elements, got {}",
                         O::NAME,
-                        input.len(),
+                        expected,
                         transformed.len()
                     )));
                 }

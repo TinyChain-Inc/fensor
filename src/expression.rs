@@ -127,6 +127,7 @@ macro_rules! reader_members {
         }
     };
 }
+
 pub(crate) use reader_members;
 
 pub fn coordinate_blocks<E: Expression + ?Sized>(
@@ -201,7 +202,6 @@ impl<T: TensorElement> Batch<T> {
 
     fn into_evaluated(self) -> Result<EvaluatedBatch<T>> {
         let expected = self.array.size();
-        self.validate(expected)?;
 
         let batch = EvaluatedBatch {
             values: self.array.buffer()?.to_slice()?.into_vec(),
@@ -400,7 +400,7 @@ where
     Ok(sparse_stream(source, requests))
 }
 
-/// Consume ordered candidates with one ordered buffer and no intermediate output collection.
+/// Consume ordered candidates sequentially without an intermediate output collection.
 pub(crate) fn sparse_stream<'a, H, R>(
     source: H,
     requests: R,
