@@ -41,12 +41,6 @@ expression registry is part of execution.
 
 ## Requests and evaluation
 
-Sparse geometry gives each prefix coordinate a full dense trailing region,
-independent of the storage block capacity. Zero writes validate their storage block and
-remove its row when all values are zero. The native sparse
-owner coordinates payload reads and mutations through native BTree guards;
-BTree guards are released before entering another ownership domain.
-
 Fourier views are bounded evaluation boundaries like reductions and matrix
 products. Each transformed axis is capped at `MAX_BATCH_ELEMENTS`; complete
 axis groups pack into requests within that same limit. Request-sized group keys
@@ -190,6 +184,15 @@ contract; boolean terminals preserve logical short-circuit/error boundaries.
 
 ## Mapping and shared storage reads
 
+Storage geometry maps base tensor coordinates to logical block IDs and offsets.
+View geometry maps output coordinates back to those base coordinates. Transform
+composition updates the latter without changing persisted block geometry or
+building an axis index. Dense and sparse owners consume the same bounded address
+plans. The sparse BTree orders block IDs, not multidimensional rectangles: a
+selection can require disjoint reads or scanning candidate keys. Indexed traversal
+eligibility is separate from the validity of the transform; see
+[slices and reductions](#slices-and-reductions) for its rejection boundaries.
+
 `CoordinateMap` shares geometric mapping between storage views and aggregate
 outputs. Its private mapping fields own identity and write-through decisions;
 callers borrow shape metadata. Identity and affine eligibility are derived structurally, without cached
@@ -224,7 +227,7 @@ callers may choose visible storage without rebuilding coordinates. Native
 present block synchronously. Dense and sparse reads borrow payloads; sparse reads
 group consecutive requested IDs into native BTree ranges and skip absent rows. Both
 paths use the same consumer for native reads and caller-owned visibility layers.
-Each table or file guard is released before entering another domain. Unit-stride
+Each BTree or file guard is released before entering another domain. Unit-stride
 runs copy slices; negative, zero, and other strides use the shared scatter loop.
 Missing sparse storage blocks yield zero; malformed stored blocks fail closed.
 Payload validation checks padding gaps between valid offsets without a validity
@@ -435,8 +438,9 @@ sparse storage uses BTree rows. A region may span multiple storage blocks.
 `tensor/dense_storage.rs` and `tensor/sparse_storage.rs` own their concrete reads,
 updates, replacements, validation, metadata publication, synchronization, and
 unpublished `Construction` processes. Storage handles remain private. Shared Tensor
-request planning uses `plan_read_groups`; owner `read_groups` performs I/O.
-Construction stream validation remains in `tensor/construction.rs`.
+request planning uses `StorageRead::plan`; `Tensor::visit_blocks` delegates I/O
+to the native owner. Construction stream validation remains in
+`tensor/construction.rs`.
 
 Native creation and loading select dense or sparse storage directly. The sparse
 owner creates or strictly loads one typed native BTree from validated geometry;
@@ -469,12 +473,11 @@ from indexed copying; no unsupported-error retry selects a different algorithm.
 Native clones share live storage and are not snapshots. Borrowed and owned
 consumption use one evaluator and one sequential request stream.
 
-For `Layout::Sparse { axis: Some(a) }`, axes through `a` select a full dense
-trailing region. Storage blocks have prefix extent one and bounded trailing
-extents. `axis: None` denotes scalar sparsity. `create_with_geometry` accepts
-validated geometry; normal creation chooses geometry and delegates. Metadata
-records shape, layout, sparse axis, and physical block shape. Storage block partitioning
-does not change logical values or the dense trailing region.
+The [public layout model](README.md#layout-and-geometric-views) defines sparse-axis
+regions independently of block capacity. `StorageGeometry` validates the selected
+layout and block shape; `create_with_geometry` accepts that geometry, while normal
+creation chooses it and delegates. Metadata records shape, layout, sparse axis,
+and block shape. Loading validates these fields without retessellating storage.
 
 Each sparse BTree row stores a logical block ID and dense typed vector.
 One private BTree schema validates the key and payload fields; geometry validation
@@ -496,12 +499,11 @@ block IDs. Exact singleton reads resolve semantic uniqueness before the callback
 Gaps retain separate reads so unrelated payload corruption remains outside the
 selection. Borrowed row references cannot escape the callback or span asynchronous
 consumer work; owned block reads remain available for read-modify-write.
-Replacement and read-modify-write
-hold one native BTree write guard. The owner resolves the old row once, validates
+Replacement and read-modify-write hold one native BTree write guard. The owner resolves the old row once, validates
 its payload, and computes the replacement. Existing rows use native in-place
 replacement; zero replacements remove the row. The `values/primary` directory
-and native node encoding are unchanged. Helpers receive the acquired
-guard instead of reacquiring it. A bounded batch holds one read guard
+holds the native BTree nodes. Helpers receive the acquired guard instead of
+reacquiring it. A bounded batch holds one read guard
 across all requested groups. Point reads and occupied pages acquire their own
 read guards inside the sparse owner. Operation guards are released before
 synchronization enters the directory hierarchy.
@@ -568,7 +570,7 @@ File adapters decode once and report actual retained allocation through `GetSize
 Freqfs admits complete decoded values before publication, independently of serialized
 bytes. Adapters retain structural decoding limits; decoded temporaries can occupy
 memory outside the cache target while awaiting admission. In-place mutations reconcile actual
-retained size when muBTree guards are released; they can exceed the cache target
+retained size when mutable file guards are released; they can exceed the cache target
 before eviction. This is not a strict mutation-memory ceiling or a host OOM
 guarantee. The caller's cache must also fit simultaneously pinned native
 split/merge pages; the node memory target is not the minimum usable whole-cache

@@ -16,7 +16,8 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
 ## Sparse traversal
 
 - Extend indexed ordered reads to additional mappings whose order can be provided
-  directly by native indexes. Incompatible geometry retains bounded logical evaluation.
+  by the existing block-ID index. Ordinary block reads retain bounded logical
+  evaluation; unsupported indexed mappings/orderings return structured errors.
 - Indexed sparse diagonal traversal; current diagonal reads select bounded
   coordinates and full scans remain proportional to logical diagonal length.
 - Indexed aggregate output candidates, preserving implicit-zero values and corruption/error contracts.
@@ -26,9 +27,9 @@ preserving the [logical geometry and collection rules](DESIGN.md#geometry-and-co
 - Sparse matrix algorithms that skip empty contraction intervals without losing
   zero-times-infinity behavior. Current matrix
   products scan logical contraction length.
-- Native table metadata scaling and bounded page compaction. Dense chunk rows
-  share pages and remove obsolete rows during replacement; execution batch
-  limits do not bound total filesystem metadata. Whole-index collection is prohibited.
+- Sparse BTree metadata scaling and bounded page compaction. Block payload rows
+  share pages; execution batch limits do not bound total filesystem metadata.
+  Whole-index collection is prohibited.
 
 ## Execution and storage costs
 

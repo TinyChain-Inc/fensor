@@ -17,7 +17,6 @@ Unary, binary, conditional, reduction, and matrix expressions remain lazy and
 read-only. Computed views implement neither `TensorWrite` nor `TensorArray`;
 geometric views retain constrained write-through access. View descriptions can
 be cloned without requiring the filesystem adapter to implement `Clone`.
-`TensorTransform` implementations provide all seven transformations;
 `TensorWriteBulk` implementations provide writes from buffers and fill. Each
 implementation validates supported geometry and input cardinality.
 
@@ -50,6 +49,49 @@ Import `Shape`, `Strides`, `Range`, `AxisRange`, and `Axes` from fensor.
 `TensorGeometry::size()` returns `Result<u64>`; geometric flat offsets use checked
 `i128`. Operation traits expose per-operation associated output types. Generic
 callers state the required dtype bounds, and cast destinations may need annotations.
+
+## Layout and geometric views
+
+Storage packing and view geometry are separate:
+
+| Layer | Responsibility |
+|---|---|
+| Stored `Tensor` | Fixed logical shape, layout, and block geometry recorded in metadata. |
+| `TensorView` | Maps its current coordinates to the source, without rearranging storage. |
+| Storage owner | Resolves logical block IDs and validates/reads their payloads. |
+
+Dense storage uses typed payload files. Sparse storage uses one native BTree,
+keyed by logical block ID, whose rows contain dense block payloads. Missing blocks
+represent zero; all-zero blocks are omitted. The BTree has no per-axis secondary
+indexes. Both layouts use the same geometric transforms and numerical kernels.
+
+For `Layout::Sparse { axis: Some(a) }`, coordinates through axis `a` select a
+dense trailing region. Blocks have extent one on that prefix and partition the
+trailing region within the configured capacity. `axis: None` selects scalar
+sparsity. Capacity changes packing, not tensor values; loading preserves the
+recorded block geometry. See [native storage](DESIGN.md#native-storage-and-sources)
+for validation and ownership details.
+
+`TensorTransform` provides slice, transpose (including arbitrary permutations),
+reshape, flip, broadcast, squeeze, and unsqueeze. These compose coordinate mappings;
+consumption turns bounded requests into source block IDs and offsets, then gathers
+values in the requested output geometry. For example, slicing a 2-D source with
+axis ranges `10..20` at step 2 and `30..40` at step 1, then swapping axes, produces
+shape `[10, 5]` with `view[i, j] = source[10 + 2*j, 30 + i]`.
+
+Transforms validate their input and supported composition. Reshape requires equal
+cardinality and contiguous row-major view geometry; it does not silently copy a transposed,
+flipped, or gathered view. Explicit copying can provide a new contiguous source.
+A view's reported layout describes its output and may drop a sparse-axis hint;
+it neither repacks the source nor selects destination allocation.
+
+A multidimensional selection need not be one contiguous BTree range. Eligible
+sparse traversal scans occupied block IDs and checks their geometry before reading
+payloads. Ordinary block reads can evaluate other supported mappings in bounded
+batches; indexed ordered reads have stricter geometry/order requirements, described
+under [sparse values](#sparse-values). Sparsity does not guarantee work proportional
+to nonzeros for every transform or aggregate. Rank-zero views cannot be streamed
+or copied, and empty-dimension tensor storage is unsupported.
 
 ## Supported operations
 
@@ -94,11 +136,8 @@ Unary composition nests sources, for example
 `UnaryView<UnaryView<Source, Round>, Exp>`. Public operation markers live in
 `unary`, `binary`, `scalar`, and `reduce`.
 
-`TensorTransform` provides reshape, broadcast, flip, slice, squeeze, transpose,
-and unsqueeze, returning `Self` subject to geometric validation. Elementwise
-transforms preserve operation order. Reduction and matrix output transforms map
-the output geometry instead of moving through the aggregate. Rank-zero views
-cannot be streamed or copied. Empty-dimension tensor storage is unsupported.
+Elementwise transforms preserve operation order. Reduction and matrix output
+transforms address the output geometry instead of moving through the aggregate.
 
 Numerical rules belong to ha-ndarray. Its
 [numerical contract](https://github.com/TinyChain-Inc/ha-ndarray/blob/main/NUMERICS.md)
@@ -196,17 +235,6 @@ zeros. Nested and 2D transforms may recompute groups; bounded memory does not im
 work proportional to nonzeros or optimal transform throughput.
 
 ## Streams, bounds, and concurrency
-
-For `Layout::Sparse { axis: Some(a) }`, coordinates through axis `a` select a
-dense trailing region. Storage blocks have extent one on that prefix and split
-the full trailing shape into at most 4,096 elements each. `axis: None` selects
-scalar sparsity. Storage block capacity does not change the logical dense region.
-Loading validates the recorded geometry without retessellating it.
-
-Sparse storage blocks are dense typed vectors in a native `b-tree`, keyed by logical
-block ID. Rows share native pages. Missing blocks are zero; all-zero blocks have
-no row. Omission changes physical storage only: every logical coordinate still
-has its ordinary numerical value.
 
 Native BTree guards coordinate sparse reads and replacement. Synchronization
 releases operation guards before entering the directory hierarchy; callers quiesce
@@ -348,8 +376,3 @@ streams with an input error convertible from `fensor::Error`. They require empty
 delegated storage and publish metadata only after successful construction; callers
 own cleanup after errors or cancellation. Published replacement requires existing,
 valid dense files and never creates or repairs missing payloads.
-
-Sparse block storage delegates directly to BTree, with the same `values/primary`
-layout and node encoding. Block-ID uniqueness, payload/padding validation, and
-native error classification remain fensor responsibilities. Borrowed native
-callbacks do not let page references escape into retained results.
