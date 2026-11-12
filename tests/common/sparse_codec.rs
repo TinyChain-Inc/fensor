@@ -123,8 +123,8 @@ pub struct Encoded<'a, T>(pub &'a SparseNode<T>);
 impl<'en, T: Bits> en::IntoStream<'en> for Encoded<'en, T> {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         let (leaf, rows, children) = match self.0 {
-            b_table::Node::Leaf(rows) => (true, rows, &[][..]),
-            b_table::Node::Index(rows, children) => (false, rows, children.as_slice()),
+            b_tree::Node::Leaf(rows) => (true, rows, &[][..]),
+            b_tree::Node::Index(rows, children) => (false, rows, children.as_slice()),
         };
         if !leaf && (rows.is_empty() || children.len() != rows.len() + 1) {
             return Err(en::Error::custom("invalid sparse separator count"));
@@ -354,12 +354,12 @@ impl<T: Bits> de::FromStream for Decoded<T> {
                     if !children.is_empty() {
                         return Err(de::Error::custom("leaf has children"));
                     }
-                    Ok(Decoded(b_table::Node::Leaf(rows)))
+                    Ok(Decoded(b_tree::Node::Leaf(rows)))
                 } else {
                     if rows.is_empty() || children.len() != rows.len() + 1 {
                         return Err(de::Error::custom("invalid sparse separator count"));
                     }
-                    Ok(Decoded(b_table::Node::Index(rows, children)))
+                    Ok(Decoded(b_tree::Node::Index(rows, children)))
                 }
             }
         }

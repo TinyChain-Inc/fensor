@@ -1,22 +1,24 @@
-//! Sparse storage is one native table of dense logical blocks.
+//! Sparse storage is one native BTree of dense logical blocks.
 
-use std::ops::{
-    Bound::{Excluded, Included},
-    Range,
-};
+use std::borrow::Borrow;
+use std::ops::Bound::{Excluded, Included};
+use std::ops::{ControlFlow, Range};
 
-use futures::TryStreamExt;
+use b_tree::{BTree, BTreeLock, BTreeWriteGuard};
+use freqfs::DirLock;
 
 use super::{METADATA, SPARSE_INDEX_PAGE_ENTRIES};
 use crate::sparse::{PayloadSchema, SparseCell, SparseCollator};
 use crate::{BoxFuture, Error, Result, StorageGeometry, Tensor, TensorElement, TensorFileEntry};
-use b_table::{ColumnRange, Table, TableLock, TableWriteGuard};
-use freqfs::DirLock;
 
-type Blocks<F, T> = TableLock<PayloadSchema<T>, PayloadSchema<T>, SparseCollator<T>, F>;
+const VALUES: &str = "values";
+const PRIMARY: &str = "primary";
+
+type Blocks<F, T> = BTreeLock<PayloadSchema<T>, SparseCollator<T>, F>;
 
 pub(super) struct SparseStorage<F, T> {
     metadata_dir: DirLock<F>,
+    values_dir: DirLock<F>,
     geometry: Box<StorageGeometry>,
     blocks: Blocks<F, T>,
 }
@@ -27,7 +29,7 @@ impl<F, T> SparseStorage<F, T> {
     }
 }
 
-type WriteBlocks<F, T> = TableWriteGuard<PayloadSchema<T>, PayloadSchema<T>, SparseCollator<T>, F>;
+type WriteBlocks<F, T> = BTreeWriteGuard<PayloadSchema<T>, SparseCollator<T>, F>;
 
 impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     pub(super) async fn create(
@@ -35,15 +37,17 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         metadata_dir: DirLock<F>,
         geometry: StorageGeometry,
     ) -> Result<Self> {
-        let values = dir.try_write()?.create_dir("values".into())?;
+        let values = dir.try_write()?.create_dir(VALUES.into())?;
+        let primary = values.try_write()?.create_dir(PRIMARY.into())?;
 
         Ok(Self {
-            blocks: TableLock::create(
+            blocks: BTreeLock::create(
                 PayloadSchema::new(geometry.block_len()),
                 SparseCollator::default(),
-                values,
+                primary,
             )
             .await?,
+            values_dir: values,
             metadata_dir,
             geometry: Box::new(geometry),
         })
@@ -58,7 +62,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
         if dir
             .iter()
-            .any(|(name, _)| name != "blocks" && name != "values")
+            .any(|(name, _)| name != super::BLOCKS && name != VALUES)
         {
             return Err(Error::InvalidLayout(
                 "unexpected sparse storage entry".into(),
@@ -66,16 +70,28 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         }
 
         let values = dir
-            .get_dir("values")
+            .get_dir(VALUES)
             .cloned()
             .ok_or_else(|| Error::InvalidLayout("missing sparse values".into()))?;
 
+        let primary = {
+            let entries = values.try_read()?;
+            if entries.len() != 1 {
+                return Err(Error::InvalidLayout("unexpected sparse index entry".into()));
+            }
+            entries
+                .get_dir(PRIMARY)
+                .cloned()
+                .ok_or_else(|| Error::InvalidLayout("missing sparse primary index".into()))?
+        };
+
         Ok(Self {
-            blocks: TableLock::load(
+            blocks: BTreeLock::load(
                 PayloadSchema::new(geometry.block_len()),
                 SparseCollator::default(),
-                values,
+                primary,
             )?,
+            values_dir: values,
             metadata_dir,
             geometry: Box::new(geometry),
         })
@@ -87,34 +103,51 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         Ok(values.iter().any(|v| *v != T::ZERO))
     }
 
-    fn row_values<'a>(&self, id: u64, row: &'a [SparseCell<T>]) -> Result<&'a [T]> {
-        if row.len() != 2 || row[0] != SparseCell::Key(id) {
-            return Err(Error::InvalidLayout("invalid sparse block key".into()));
-        }
-
-        let SparseCell::Payload(values) = &row[1] else {
-            return Err(Error::InvalidLayout("invalid sparse payload".into()));
+    fn row_values<'a, V: Borrow<SparseCell<T>>>(&self, id: u64, row: &'a [V]) -> Result<&'a [T]> {
+        let [key, payload] = row else {
+            return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                "invalid sparse block key",
+            )));
         };
 
-        if !self.validate_payload(id, values)? {
-            return Err(Error::InvalidLayout("empty sparse payload".into()));
+        if key.borrow() != &SparseCell::Key(id) {
+            return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                "invalid sparse block key",
+            )));
+        }
+
+        let SparseCell::Payload(values) = payload.borrow() else {
+            return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                "invalid sparse payload",
+            )));
+        };
+
+        if !self
+            .validate_payload(id, values)
+            .map_err(|error| Error::Io(freqfs::IntegrityError::invalid_data(error)))?
+        {
+            return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                "empty sparse payload",
+            )));
         }
 
         Ok(values)
     }
 
-    fn row_payload(&self, id: u64, mut row: b_table::Row<SparseCell<T>>) -> Result<Vec<T>> {
+    fn row_payload(&self, id: u64, mut row: b_tree::Key<SparseCell<T>>) -> Result<Vec<T>> {
         self.row_values(id, &row)?;
         match row.pop() {
             Some(SparseCell::Payload(values)) => Ok(values),
-            _ => Err(Error::InvalidLayout("invalid sparse payload".into())),
+            _ => Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                "invalid sparse payload",
+            ))),
         }
     }
 
-    // Reuse the acquired table guard, including across a read-modify-write.
+    // Reuse the acquired tree guard, including across a read-modify-write.
     async fn read_row<G>(
         &self,
-        table: &Table<PayloadSchema<T>, PayloadSchema<T>, SparseCollator<T>, G>,
+        table: &BTree<PayloadSchema<T>, SparseCollator<T>, G>,
         id: u64,
     ) -> Result<Option<Vec<T>>>
     where
@@ -124,78 +157,91 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         crate::read_metrics::record(|m| m.logical_payload_reads += 1);
 
         // Entry points validate IDs; grouped reads and construction use validated plans.
-        let row = table.get_row(&[SparseCell::Key(id)]).await?;
+        let row = table
+            .get(&[SparseCell::Key(id)])
+            .await
+            .map_err(freqfs::IntegrityError::from_read)?;
         row.map(|row| self.row_payload(id, row)).transpose()
     }
 
     // Read only consecutive requested IDs together. Gaps open separate native
     // ranges, so a corrupt payload outside the request is never consumed.
-    // One read guard keeps all groups coherent; the caller initializes output to zero.
-    pub(super) fn read_groups<'a>(
-        &'a self,
-        groups: &'a crate::storage_read::LogicalGroups,
-        output: &'a mut [T],
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let table = self.blocks.read().await;
-            let mut ids = groups.keys().copied().peekable();
+    // One read guard keeps all groups coherent; absent rows skip consumption.
+    pub(super) async fn visit_blocks<C>(&self, ids: &[u64], consume: &mut C) -> Result<()>
+    where
+        C: FnMut(u64, &[T]) -> Result<()> + Send,
+    {
+        let table = self.blocks.read().await;
+        let mut ids = ids.iter().copied().peekable();
 
-            while let Some(first) = ids.next() {
-                let mut last = first;
-                while let Some(&next) = ids.peek() {
-                    if last.checked_add(1) != Some(next) {
-                        break;
-                    }
-                    last = ids.next().expect("peeked block ID");
+        while let Some(first) = ids.next() {
+            let mut last = first;
+            while let Some(&next) = ids.peek() {
+                if last.checked_add(1) != Some(next) {
+                    break;
                 }
+                last = ids.next().expect("peeked block ID");
+            }
 
-                if first == last {
-                    let Some(block) = self.read_row(&table, first).await? else {
-                        // Missing rows already have their numerical zero in output.
-                        continue;
-                    };
+            #[cfg(test)]
+            crate::read_metrics::record(|m| m.logical_payload_reads += (last - first + 1) as usize);
 
-                    for run in &groups[&first] {
-                        run.scatter(&block, output)?;
-                    }
+            if first == last {
+                table
+                    .get_with(&[SparseCell::Key(first)], |row| {
+                        Ok::<_, std::io::Error>((|| {
+                            let block = self.row_values(first, row)?;
+                            #[cfg(test)]
+                            crate::read_metrics::record(|m| {
+                                m.borrows += 1;
+                                m.borrowed += block.len();
+                            });
+                            consume(first, block)
+                        })())
+                    })
+                    .await
+                    .map_err(freqfs::IntegrityError::from_read)?
+                    .transpose()?;
 
-                    continue;
-                }
+                continue;
+            }
 
-                #[cfg(test)]
-                crate::read_metrics::record(|m| {
-                    m.logical_payload_reads += (last - first + 1) as usize
-                });
-                let selection = [(
-                    "block",
-                    ColumnRange::In((
-                        Included(SparseCell::Key(first)),
-                        Included(SparseCell::Key(last)),
-                    )),
-                )]
-                .into_iter()
-                .collect();
-                let mut rows = table.rows(selection, &[], false, None).await?;
-                let mut previous = None;
-
-                while let Some(row) = rows.try_next().await? {
+            let selection = b_tree::Range::with_bounds(
+                Vec::new(),
+                (
+                    Included(SparseCell::Key(first)),
+                    Included(SparseCell::Key(last)),
+                ),
+            );
+            let mut previous = None;
+            table
+                .visit(selection, false, |row| {
                     let Some(SparseCell::Key(id)) = row.first() else {
-                        return Err(Error::InvalidLayout("invalid sparse block key".into()));
+                        return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                            "invalid sparse block key",
+                        )));
                     };
                     let id = *id;
                     if id < first || id > last || previous.is_some_and(|prior| prior >= id) {
-                        return Err(Error::InvalidLayout("invalid sparse block order".into()));
+                        return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                            "invalid sparse block order",
+                        )));
                     }
-                    let block = self.row_payload(id, row)?;
-                    for run in &groups[&id] {
-                        run.scatter(&block, output)?;
-                    }
-                    previous = Some(id);
-                }
-            }
 
-            Ok(())
-        })
+                    let block = self.row_values(id, row)?;
+                    #[cfg(test)]
+                    crate::read_metrics::record(|m| {
+                        m.borrows += 1;
+                        m.borrowed += block.len();
+                    });
+                    consume(id, block)?;
+                    previous = Some(id);
+                    Ok(ControlFlow::Continue(()))
+                })
+                .await?;
+        }
+
+        Ok(())
     }
 
     pub fn read(&self, id: u64) -> BoxFuture<'_, Result<Vec<T>>> {
@@ -212,14 +258,52 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     // Only unpublished construction appends rows whose block IDs increase.
     async fn append<S>(&self, table: &mut WriteBlocks<F, T>, rows: S) -> Result<()>
     where
-        S: futures::Stream<Item = std::io::Result<(Vec<SparseCell<T>>, Vec<SparseCell<T>>)>> + Send,
+        S: futures::Stream<Item = std::io::Result<Vec<SparseCell<T>>>> + Send,
     {
-        let _written = table.upsert_sorted(rows).await?;
+        let _written = table.insert_sorted(rows).await?;
         #[cfg(test)]
         super::copy_metrics::record(|m| {
             m.constructed_blocks += _written as usize;
             m.payload_writes += _written as usize;
         });
+        Ok(())
+    }
+
+    async fn publish_block(
+        table: &mut WriteBlocks<F, T>,
+        id: u64,
+        previous: Option<&[SparseCell<T>]>,
+        replacement: Option<Vec<T>>,
+    ) -> Result<()> {
+        match (previous, replacement) {
+            (Some(previous), Some(values)) => {
+                if !table
+                    .replace(
+                        previous,
+                        vec![SparseCell::Key(id), SparseCell::Payload(values)],
+                    )
+                    .await?
+                {
+                    return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                        "missing sparse block row",
+                    )));
+                }
+            }
+            (Some(previous), None) => {
+                if !table.delete(previous).await? {
+                    return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                        "missing sparse block row",
+                    )));
+                }
+            }
+            (None, Some(values)) => {
+                table
+                    .insert(vec![SparseCell::Key(id), SparseCell::Payload(values)])
+                    .await?;
+            }
+            (None, None) => {}
+        }
+
         Ok(())
     }
 
@@ -229,31 +313,22 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
         id: u64,
         updates: &[(usize, T)],
     ) -> Result<bool> {
-        let mut inserted = false;
-        #[cfg(test)]
-        let mut written = false;
         #[cfg(test)]
         crate::read_metrics::record(|m| m.logical_payload_reads += 1);
-
-        table
-            .try_update(vec![SparseCell::Key(id)], |previous| {
-                let mut values = match previous {
-                    Some(row) => self.row_values(id, row)?.to_vec(),
-                    None => vec![T::ZERO; self.geometry.block_len()],
-                };
-                super::apply_block_updates(&mut values, self.geometry.block_len(), updates)?;
-                let nonzero = self.validate_payload(id, &values)?;
-                #[cfg(test)]
-                {
-                    written = nonzero;
-                }
-                inserted = previous.is_none() && nonzero;
-                Ok::<_, Error>(nonzero.then(|| vec![SparseCell::Payload(values)]))
-            })
-            .await?;
-
+        let previous = table
+            .get(&[SparseCell::Key(id)])
+            .await
+            .map_err(freqfs::IntegrityError::from_read)?;
+        let mut values = match previous.as_deref() {
+            Some(row) => self.row_values(id, row)?.to_vec(),
+            None => vec![T::ZERO; self.geometry.block_len()],
+        };
+        super::apply_block_updates(&mut values, self.geometry.block_len(), updates)?;
+        let nonzero = self.validate_payload(id, &values)?;
+        let inserted = previous.is_none() && nonzero;
+        Self::publish_block(table, id, previous.as_deref(), nonzero.then_some(values)).await?;
         #[cfg(test)]
-        super::copy_metrics::record(|m| m.payload_writes += usize::from(written));
+        super::copy_metrics::record(|m| m.payload_writes += usize::from(nonzero));
         Ok(inserted)
     }
 
@@ -265,23 +340,30 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                     "invalid replacement block length".into(),
                 ));
             }
-            let mut table = self.blocks.write().await;
 
+            let mut table = self.blocks.write().await;
             let nonzero = self.validate_payload(id, &values)?;
             #[cfg(test)]
             crate::read_metrics::record(|m| m.logical_payload_reads += 1);
-            table
-                .try_update(vec![SparseCell::Key(id)], |previous| {
-                    if let Some(row) = previous {
-                        self.row_values(id, row)?;
-                    }
-                    #[cfg(test)]
-                    super::copy_metrics::record(|m| m.replaced_blocks += 1);
-                    Ok::<_, Error>(nonzero.then(|| vec![SparseCell::Payload(values)]))
-                })
-                .await?;
+            let previous = table
+                .get(&[SparseCell::Key(id)])
+                .await
+                .map_err(freqfs::IntegrityError::from_read)?;
+            if let Some(row) = previous.as_deref() {
+                self.row_values(id, row)?;
+            }
+            Self::publish_block(
+                &mut table,
+                id,
+                previous.as_deref(),
+                nonzero.then_some(values),
+            )
+            .await?;
             #[cfg(test)]
-            super::copy_metrics::record(|m| m.payload_writes += usize::from(nonzero));
+            super::copy_metrics::record(|m| {
+                m.replaced_blocks += 1;
+                m.payload_writes += usize::from(nonzero);
+            });
             Ok(())
         })
     }
@@ -306,7 +388,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
     where
         F: freqfs::FileSave + Clone,
     {
-        self.blocks.sync().await?;
+        self.values_dir.sync().await?;
         self.metadata_dir.sync().await?;
         Ok(())
     }
@@ -322,6 +404,15 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
 
     pub fn validate(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
+            {
+                let entries = self.values_dir.read().await;
+                if entries.len() != 1 || entries.get_dir(PRIMARY).is_none() {
+                    return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                        "invalid sparse index directory",
+                    )));
+                }
+            }
+
             self.blocks.validate().await?;
             {
                 let blocks = self.metadata_dir.read().await;
@@ -334,21 +425,33 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
                     ));
                 }
             }
+
             let table = self.blocks.read().await;
-            let mut rows = table.rows(Default::default(), &[], false, None).await?;
             let mut previous = None;
-            while let Some(row) = rows.try_next().await? {
-                let [SparseCell::Key(id), SparseCell::Payload(values)] = row.as_slice() else {
-                    return Err(Error::InvalidLayout("invalid sparse block row".into()));
-                };
-                if previous.is_some_and(|last| last >= *id) {
-                    return Err(Error::InvalidLayout("invalid sparse block order".into()));
-                }
-                if !self.validate_payload(*id, values)? {
-                    return Err(Error::InvalidLayout("empty sparse payload".into()));
-                }
-                previous = Some(*id);
-            }
+            table
+                .visit(b_tree::Range::<SparseCell<T>>::default(), false, |row| {
+                    let [SparseCell::Key(id), SparseCell::Payload(values)] = row else {
+                        return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                            "invalid sparse block row",
+                        )));
+                    };
+                    if previous.is_some_and(|last| last >= *id) {
+                        return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                            "invalid sparse block order",
+                        )));
+                    }
+                    if !self
+                        .validate_payload(*id, values)
+                        .map_err(|error| Error::Io(freqfs::IntegrityError::invalid_data(error)))?
+                    {
+                        return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                            "empty sparse payload",
+                        )));
+                    }
+                    previous = Some(*id);
+                    Ok(ControlFlow::Continue(()))
+                })
+                .await?;
 
             Ok(())
         })
@@ -365,35 +468,38 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseStorage<F, T> {
             return Ok(Vec::new());
         }
 
-        let selection = [(
-            "block",
-            ColumnRange::In((
+        let selection = b_tree::Range::with_bounds(
+            Vec::new(),
+            (
                 Included(SparseCell::Key(range.start)),
                 Excluded(SparseCell::Key(range.end)),
-            )),
-        )]
-        .into_iter()
-        .collect();
+            ),
+        );
         let table = self.blocks.read().await;
-        let mut rows = table.rows(selection, &[], false, Some(&["block"])).await?;
         let mut keys = Vec::new();
-
-        while let Some(row) = rows.try_next().await? {
-            let [SparseCell::Key(id)] = row.as_slice() else {
-                return Err(Error::InvalidLayout("invalid sparse block key".into()));
-            };
-            if !range.contains(id) || keys.last().is_some_and(|last| *last >= *id) {
-                return Err(Error::InvalidLayout("invalid occupied block order".into()));
-            }
-            #[cfg(test)]
-            crate::read_metrics::record(|m| m.index_entries += 1);
-            // Inspect one extra key so a duplicate at a page boundary cannot be skipped
-            // by exclusive continuation. The next page still owns that extra key.
-            if keys.len() == SPARSE_INDEX_PAGE_ENTRIES {
-                break;
-            }
-            keys.push(*id);
-        }
+        table
+            .visit(selection, false, |row| {
+                let [SparseCell::Key(id), _] = row else {
+                    return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                        "invalid sparse block key",
+                    )));
+                };
+                if !range.contains(id) || keys.last().is_some_and(|last| *last >= *id) {
+                    return Err(Error::Io(freqfs::IntegrityError::invalid_data(
+                        "invalid occupied block order",
+                    )));
+                }
+                #[cfg(test)]
+                crate::read_metrics::record(|m| m.index_entries += 1);
+                // Inspect one extra key so a duplicate at a page boundary cannot be skipped
+                // by exclusive continuation. The next page still owns that extra key.
+                if keys.len() == SPARSE_INDEX_PAGE_ENTRIES {
+                    return Ok(ControlFlow::Break(()));
+                }
+                keys.push(*id);
+                Ok(ControlFlow::Continue(()))
+            })
+            .await?;
 
         Ok(keys)
     }
@@ -459,6 +565,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                     previous = Some(id);
                 }
             }
+
             if let Some((current, block)) = &mut self.current {
                 let mut input = coords.iter().zip(values);
                 let rows = std::iter::from_fn(|| {
@@ -473,10 +580,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                             *current = Some(id);
                             block[offset] = value;
                             if complete.iter().any(|value| *value != T::ZERO) {
-                                let row = (
-                                    vec![SparseCell::Key(previous)],
-                                    vec![SparseCell::Payload(complete)],
-                                );
+                                let row =
+                                    vec![SparseCell::Key(previous), SparseCell::Payload(complete)];
                                 return Some(Ok::<_, std::io::Error>(row));
                             }
                             continue;
@@ -511,7 +616,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
 
                 match self.current.take() {
                     Some((Some(id), values)) if owner.validate_payload(id, &values)? => {
-                        let row = (vec![SparseCell::Key(id)], vec![SparseCell::Payload(values)]);
+                        let row = vec![SparseCell::Key(id), SparseCell::Payload(values)];
                         owner
                             .append(&mut table, futures::stream::iter([Ok(row)]))
                             .await?;
@@ -519,6 +624,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                     _ => {}
                 }
             }
+
             self.tensor.publish_metadata().await?;
             Ok(self.tensor)
         })

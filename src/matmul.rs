@@ -460,7 +460,12 @@ where
     fn preferred_step<'a>(
         &'a self,
         shape: &'a [u64],
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Preferred<'a>> {
+        if mapping.is_some() {
+            return Ok(expression::traversal::Preferred::Ready(None));
+        }
+
         let requests: expression::RequestIterator = if shape.len() < 2 {
             Box::new(request::linear_requests(shape)?)
         } else {

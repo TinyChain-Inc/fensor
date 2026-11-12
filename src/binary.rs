@@ -1,7 +1,8 @@
 //! Typed, read-only elementwise expressions over two sources.
 
 use ha_ndarray::{
-    ArrayAccess, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, NDArrayRead, Number, Real,
+    ArrayBuf, Buffer, Float, NDArrayBoolean, NDArrayCompare, NDArrayMath, NDArrayRead, Number,
+    Platform, Real,
 };
 
 use crate::expression::{self, Batch, Expression};
@@ -24,9 +25,9 @@ pub trait BinaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
 
     fn apply(
         &self,
-        left: ArrayAccess<'static, T>,
-        right: ArrayAccess<'static, T>,
-    ) -> Result<ArrayAccess<'static, Self::Output>>;
+        left: ArrayBuf<T, Buffer<T>>,
+        right: ArrayBuf<T, Buffer<T>>,
+    ) -> Result<impl NDArrayRead<DType = Self::Output, Platform = Platform>>;
 }
 
 /// A read-only expression retaining both source descriptions.
@@ -142,6 +143,7 @@ where
         } else {
             O::Output::ZERO
         };
+
         Ok(Self {
             left,
             right,
@@ -167,10 +169,10 @@ macro_rules! binary_op {
 
             fn apply(
                 &self,
-                left: ArrayAccess<'static, $ty>,
-                right: ArrayAccess<'static, $ty>,
-            ) -> Result<ArrayAccess<'static, Self::Output>> {
-                Ok(ArrayAccess::from(left.$method(right)?))
+                left: ArrayBuf<$ty, Buffer<$ty>>,
+                right: ArrayBuf<$ty, Buffer<$ty>>,
+            ) -> Result<impl NDArrayRead<DType = Self::Output, Platform = Platform>> {
+                Ok(left.$method(right)?)
             }
         }
     };
@@ -292,13 +294,16 @@ where
     fn selection_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Selection<'_>> {
-        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
+        expression::traversal::ordered(self, slice, mapping)
+            .map(expression::traversal::Selection::Ready)
     }
 
     fn ordered_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Ordered<'_>> {
         if matches!(self.layout(), Layout::Dense) {
             return Ok(expression::traversal::Ordered::Ready(slice.stream()));
@@ -306,18 +311,19 @@ where
 
         let left_slice = slice.clone();
         Ok(expression::traversal::Ordered::Sources(vec![
-            (&self.left, left_slice),
-            (&self.right, slice),
+            (&self.left, (left_slice, mapping.clone())),
+            (&self.right, (slice, mapping)),
         ]))
     }
 
     fn preferred_step<'a>(
         &'a self,
         shape: &'a [u64],
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Preferred<'a>> {
         Ok(expression::traversal::Preferred::Sources(vec![
-            (&self.left, shape),
-            (&self.right, shape),
+            (&self.left, (shape, mapping.clone())),
+            (&self.right, (shape, mapping)),
         ]))
     }
 }

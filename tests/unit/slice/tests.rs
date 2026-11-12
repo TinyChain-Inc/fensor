@@ -3,12 +3,10 @@ use ha_ndarray::{axes, shape};
 use number_general::DType;
 
 use super::*;
-use crate::AxisRange;
-use crate::TensorSource;
 use crate::test_support::{FsEntry, new_dir};
 use crate::{
-    Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
-    TensorUnary, TensorWrite,
+    AxisRange, Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema,
+    TensorSource, TensorTransform, TensorUnary, TensorWrite,
 };
 
 #[test]
@@ -51,6 +49,22 @@ fn ordered_coverage_and_permanent_exhaustion() {
     let mut scalar = Slice::new(&[], vec![]).unwrap().requests();
     assert_eq!(scalar.next().unwrap().len(), 1);
     assert!(scalar.next().is_none());
+
+    let slice = Slice::new(&[4], vec![Axis::Selected(vec![3, 1, 3])]).unwrap();
+    let axes = slice.axes.as_ptr();
+    let Axis::Selected(values) = &slice.axes[0] else {
+        panic!("explicit selection");
+    };
+    let selection = values.as_ptr();
+    let mut requests = slice.requests();
+    let rectangle = requests.next_rectangle().unwrap();
+    assert_eq!(rectangle.axes().as_ptr(), axes);
+    let Axis::Selected(values) = &rectangle.axes()[0] else {
+        panic!("explicit selection");
+    };
+    assert_eq!(values.as_ptr(), selection);
+    assert_eq!(values, &[3, 1, 3]);
+    assert!(requests.next_rectangle().is_none());
 }
 
 #[test]
@@ -188,7 +202,7 @@ async fn sparse_regions_filter_corruption_and_validate_grid_keys() {
             .occupied_blocks(0..tensor.storage_geometry().block_count())
             .try_collect::<Vec<_>>()
             .await,
-        Err(Error::InvalidLayout(_))
+        Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
     ));
     assert!(tensor.validate().await.is_err());
     crate::test_support::cleanup(&root).await;

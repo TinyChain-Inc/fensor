@@ -12,7 +12,7 @@ pub(crate) type Requests<'a> = BoxStream<'a, Result<BatchRequest>>;
 #[derive(Clone)]
 pub struct Slice {
     // Rank-sized metadata plus caller-supplied explicit selections.
-    shape: crate::Shape,
+    pub(crate) shape: crate::Shape,
     pub(crate) axes: Vec<Axis>,
     len: u64,
 }
@@ -129,6 +129,12 @@ impl SliceRequests {
     pub(crate) fn next_rectangle(&mut self) -> Option<Cartesian> {
         if self.done {
             return None;
+        }
+
+        if self.slice.len <= MAX_BATCH_ELEMENTS as u64 {
+            self.done = true;
+            let axes = std::mem::take(&mut self.slice.axes);
+            return Some(Cartesian::new(axes).expect("validated slice chunk"));
         }
 
         let axes = self

@@ -1,5 +1,6 @@
 //! Native u8 storage and lazy boolean expressions over real filesystem tensors.
 
+use common::{FsEntry, new_dir};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorGeometry, TensorNumeric,
     TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
@@ -10,8 +11,6 @@ use ha_ndarray::{
     shape,
 };
 use number_general::{FloatType, NumberType, UIntType};
-
-use common::{FsEntry, new_dir};
 mod common;
 
 macro_rules! float_predicates {
@@ -37,6 +36,7 @@ macro_rules! float_predicates {
                     input.iter().copied(),
                 )
                 .await;
+
                 macro_rules! check {
                     ($method:ident) => {{
                         let array = ArrayAccess::from(
@@ -312,11 +312,11 @@ async fn u8_malformed_blocks_fail_closed() {
     file.write::<Vec<u8>>().await.unwrap().truncate(1);
     assert!(matches!(
         tensor.read_value(&[0]).await,
-        Err(Error::InvalidLayout(_))
+        Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
     ));
     assert!(matches!(
         tensor.write_value(&[0], 255).await,
-        Err(Error::InvalidLayout(_))
+        Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
     ));
     assert!(
         tensor

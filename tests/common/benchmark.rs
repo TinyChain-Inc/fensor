@@ -242,10 +242,10 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
     }
 }
 
-fn node_metrics<V: GetSize>(node: &b_table::Node<V>) -> (bool, usize, usize) {
+fn node_metrics<V: GetSize>(node: &b_tree::Node<Vec<Vec<V>>>) -> (bool, usize, usize) {
     let (leaf, rows) = match node {
-        b_table::Node::Leaf(rows) => (true, rows),
-        b_table::Node::Index(rows, _) => (false, rows),
+        b_tree::Node::Leaf(rows) => (true, rows),
+        b_tree::Node::Index(rows, _) => (false, rows),
     };
     (leaf, rows.len(), node.get_size())
 }

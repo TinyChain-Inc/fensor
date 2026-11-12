@@ -1,5 +1,7 @@
 //! Storage contracts are parameterized independently of the numerical matrix.
 
+use common::numbers::same;
+use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Error, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
     TensorSchema, TensorTransform, TensorWrite, TensorWriteBulk,
@@ -7,7 +9,6 @@ use fensor::{
 use ha_ndarray::shape;
 
 use crate::test_support as common;
-use common::{FsEntry, cleanup, fixture, numbers::same};
 
 async fn storage<T: TensorElement>(samples: Option<[T; 2]>)
 where
@@ -137,22 +138,22 @@ where
             crate::tensor::corruption::corrupt_sparse_payload(&tensor, 2).await;
             assert!(matches!(
                 tensor.read_value(&[2]).await,
-                Err(Error::InvalidLayout(_))
+                Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
             assert!(matches!(
                 tensor.write_value(&[2], T::ONE).await,
-                Err(Error::InvalidLayout(_))
+                Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
         } else {
             let file = blocks.read().await.get_file("0").unwrap().clone();
             file.write::<Vec<T>>().await.unwrap().clear();
             assert!(matches!(
                 tensor.read_value(&[2]).await,
-                Err(Error::InvalidLayout(_))
+                Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
             assert!(matches!(
                 tensor.write_value(&[2], T::ONE).await,
-                Err(Error::InvalidLayout(_))
+                Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
             assert!(file.read::<Vec<T>>().await.unwrap().is_empty());
         }

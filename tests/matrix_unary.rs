@@ -66,7 +66,7 @@ macro_rules! parity {
                     )
                     .unwrap();
                     let expected = array
-                        .clone()
+                        .as_ref()
                         .mt()
                         .unwrap()
                         .buffer()

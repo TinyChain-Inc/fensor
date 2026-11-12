@@ -1,8 +1,10 @@
 //! Typed, paged sparse payloads. Serialization belongs to file adapters.
 
-use std::{cmp::Ordering, io, marker::PhantomData};
+use std::cmp::Ordering;
+use std::io;
+use std::marker::PhantomData;
 
-use b_table::{BTreeSchema, IndexSchema, Schema};
+use b_tree::Schema;
 use collate::Collate;
 use number_general::{Float, Number, NumberInstance};
 
@@ -122,9 +124,9 @@ impl<T: TensorElement> Collate for SparseCollator<T> {
 
 /// Caller-owned native payload node. Leaves contain a block key and dense payload;
 /// internal separators may retain only the block key.
-pub type SparseNode<T> = b_table::Node<SparseCell<T>>;
+pub type SparseNode<T> = b_tree::Node<Vec<Vec<SparseCell<T>>>>;
 
-// One schema serves both the table and its primary index; there are no auxiliary indexes.
+// Sparse blocks use one native index keyed by their logical block ID.
 #[derive(Clone, Debug)]
 pub(crate) struct PayloadSchema<T> {
     block_len: usize,
@@ -152,7 +154,7 @@ fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid sparse payload row")
 }
 
-impl<T: TensorElement> BTreeSchema for PayloadSchema<T> {
+impl<T: TensorElement> Schema for PayloadSchema<T> {
     type Error = io::Error;
     type Value = SparseCell<T>;
 
@@ -165,7 +167,7 @@ impl<T: TensorElement> BTreeSchema for PayloadSchema<T> {
     }
 
     fn order(&self) -> usize {
-        let header = std::mem::size_of::<b_table::Node<SparseCell<T>>>();
+        let header = std::mem::size_of::<b_tree::Node<Vec<Vec<SparseCell<T>>>>>();
         let row = std::mem::size_of::<Vec<SparseCell<T>>>()
             + 2 * std::mem::size_of::<SparseCell<T>>()
             + self.block_len * std::mem::size_of::<T>()
@@ -192,53 +194,5 @@ impl<T: TensorElement> BTreeSchema for PayloadSchema<T> {
         self.validate_prefix(&row)?;
 
         Ok(row)
-    }
-}
-
-impl<T: TensorElement> IndexSchema for PayloadSchema<T> {
-    type Id = &'static str;
-
-    fn columns(&self) -> &[Self::Id] {
-        &["block", "payload"]
-    }
-}
-
-impl<T: TensorElement> Schema for PayloadSchema<T> {
-    type Id = &'static str;
-    type Error = io::Error;
-    type Value = SparseCell<T>;
-    type Index = Self;
-
-    fn key(&self) -> &[Self::Id] {
-        &["block"]
-    }
-
-    fn values(&self) -> &[Self::Id] {
-        &["payload"]
-    }
-
-    fn primary(&self) -> &Self {
-        self
-    }
-
-    fn auxiliary(&self) -> &[(String, Self)] {
-        &[]
-    }
-
-    fn validate_key(&self, key: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if !matches!(key.as_slice(), [SparseCell::Key(_)]) {
-            return Err(invalid());
-        }
-
-        Ok(key)
-    }
-
-    fn validate_values(&self, v: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if !matches!(v.as_slice(), [SparseCell::Payload(values)] if values.len() == self.block_len)
-        {
-            return Err(invalid());
-        }
-
-        Ok(v)
     }
 }

@@ -222,10 +222,12 @@ async fn dense_replacement_validates_required_payload_without_repair() {
         let point = tensor.write_value(&[0], 3.).await;
         assert!(point.is_err());
         if malformed == 0 {
-            assert!(matches!(point, Err(Error::InvalidLayout(_))));
+            assert!(
+                matches!(point, Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error))
+            );
             assert!(matches!(
                 tensor.read_logical_block(0).await,
-                Err(Error::InvalidLayout(_))
+                Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
         }
 

@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::HashMap;
 
+use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 use fensor::{
     AxisRange, Error, Layout, Range, Shape, Tensor, TensorArray, TensorGeometry, TensorRead,
     TensorSchema, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
@@ -9,8 +10,6 @@ use fensor::{
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
-
-use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 
 fn schema_f32(shape: Shape) -> TensorSchema {
     TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema")
@@ -127,39 +126,6 @@ mod section_a_access_parity {
         }
 
         cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn dense_sparse_parity_after_writes() {
-        let (dense_root, dense, _) = create_dense("a_par_dense", shape![2, 3, 4], 4).await;
-        let (sparse_root, sparse, _) =
-            create_sparse("a_par_sparse", shape![2, 3, 4], 4, Some(1)).await;
-
-        let writes: HashMap<Vec<u64>, f32> = [
-            (vec![0u64, 0, 0], 1.0),
-            (vec![1, 2, 3], 9.0),
-            (vec![1, 0, 1], 4.0),
-            (vec![0, 2, 2], 7.0),
-        ]
-        .into_iter()
-        .collect();
-
-        for (coord, value) in &writes {
-            dense.write_value(coord, *value).await.expect("dense write");
-            sparse
-                .write_value(coord, *value)
-                .await
-                .expect("sparse write");
-        }
-
-        for coord in iter_coords(dense.shape()) {
-            let d = dense.read_value(&coord).await.expect("dense read");
-            let s = sparse.read_value(&coord).await.expect("sparse read");
-            assert_eq!(d, s, "parity at {:?}", coord);
-        }
-
-        cleanup(&dense_root).await;
-        cleanup(&sparse_root).await;
     }
 
     #[tokio::test]
@@ -1913,8 +1879,11 @@ mod section_h_persistence {
 
         for coord in iter_coords(&[2, 3, 4]) {
             if let Err(err) = tensor.read_value(&coord).await {
-                // Required dense reads share the native storage corruption error.
-                assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+                // Required dense reads preserve local storage-integrity provenance.
+                assert!(
+                    matches!(err, Error::Io(ref error) if freqfs::IntegrityError::is_marked(error)),
+                    "got {err:?}"
+                );
                 saw_invalid_layout = true;
             }
         }

@@ -1,21 +1,21 @@
 #![cfg(feature = "complex")]
 
+use common::numbers::same;
+use common::{FsEntry, cleanup, fixture, new_dir};
+use fensor::complex::{Complex32, Complex64};
+use fensor::fft::{Fft, FourierOp, Ifft, fft2, ifft2};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorElement, TensorExpression, TensorFileEntry,
     TensorFourier, TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnaryComplex, TensorRead,
     TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics,
     TensorWrite,
-    complex::{Complex32, Complex64},
-    fft::{Fft, FourierOp, Ifft, fft2, ifft2},
 };
 use futures::TryStreamExt;
 use ha_ndarray::{
-    Array, ArrayAccess, Buffer, Complex, NDArrayFourier, NDArrayRead, NDArrayTransform, shape,
+    Array, ArrayBuf, Buffer, Complex, NDArrayFourier, NDArrayRead, NDArrayTransform, shape,
 };
 use number_general::DType;
 use safecast::CastFrom;
-
-use common::{FsEntry, cleanup, fixture, new_dir, numbers::same};
 
 mod common;
 
@@ -68,7 +68,7 @@ where
     FsEntry: TensorFileEntry<T>,
     Fft: FourierOp<T>,
     Ifft: FourierOp<T>,
-    ArrayAccess<'static, T>: NDArrayFourier<DType = T, Platform = ha_ndarray::Platform>,
+    ArrayBuf<T, Buffer<T>>: NDArrayFourier<DType = T, Platform = ha_ndarray::Platform>,
 {
     for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
         for n in [1, 3, 8, 17] {
@@ -86,12 +86,12 @@ where
             )
             .await;
             let source = tensor.view();
-            let backend =
-                ArrayAccess::from(Array::new(Buffer::from(input.clone()), shape![3, n]).unwrap());
+            let backend = Array::new(Buffer::from(input.clone()), shape![3, n]).unwrap();
             let forward = source.fft().await.unwrap();
             let inverse = source.ifft().await.unwrap();
             let expected = backend
-                .clone()
+                .copy()
+                .unwrap()
                 .fft()
                 .unwrap()
                 .buffer()
@@ -256,16 +256,19 @@ where
             .fold(0., f64::max);
         let bound = delta * scale;
 
-        let backend =
-            ArrayAccess::from(Array::new(Buffer::from(input.clone()), shape![2, 2, 3]).unwrap());
+        let backend = Array::new(Buffer::from(input.clone()), shape![2, 2, 3]).unwrap();
         let axes = ha_ndarray::axes![0, 2, 1];
         let first = Fft
-            .apply(backend.clone())
+            .apply(backend.copy().unwrap())
+            .unwrap()
+            .into_read()
             .unwrap()
             .transpose(axes.clone())
             .unwrap();
         let expected_forward = Fft
-            .apply(ArrayAccess::from(first))
+            .apply(first.into_read().unwrap())
+            .unwrap()
+            .into_read()
             .unwrap()
             .transpose(axes.clone())
             .unwrap()
@@ -275,12 +278,20 @@ where
             .unwrap()
             .to_vec();
         let first = Ifft
-            .apply(ArrayAccess::from(backend.transpose(axes.clone()).unwrap()))
+            .apply(
+                backend
+                    .transpose(axes.clone())
+                    .unwrap()
+                    .into_read()
+                    .unwrap(),
+            )
+            .unwrap()
+            .into_read()
             .unwrap()
             .transpose(axes)
             .unwrap();
         let expected_inverse = Ifft
-            .apply(ArrayAccess::from(first))
+            .apply(first.into_read().unwrap())
             .unwrap()
             .buffer()
             .unwrap()

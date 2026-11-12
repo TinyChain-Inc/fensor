@@ -1,4 +1,5 @@
 //! Reproducible storage-shape workloads; measurements are evidence, not thresholds.
+
 use std::time::Instant;
 
 use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
@@ -255,11 +256,18 @@ pub async fn traversal() {
         .await
         .unwrap();
         let g = tensor.storage_geometry();
+        let mut expected_occupied = 0;
+
         for id in 0..g.block_count() {
             let mut values = vec![0.; g.block_len()];
             for (offset, coord) in common::block_entries(&g, id) {
                 values[offset] = if coord[1] % 4 == 0 { 2. } else { 0. };
             }
+
+            if values.iter().any(|value| *value != 0.) {
+                expected_occupied += 1;
+            }
+
             tensor.replace_logical_block(id, values).await.unwrap();
         }
         let start = Instant::now();
@@ -325,6 +333,32 @@ pub async fn traversal() {
             "count",
             repeats as u128,
         );
+
+        if matches!(layout, Layout::Sparse { .. }) {
+            benchmark::measure(&name, "occupied_ids", "warm", async {
+                let mut count = 0;
+
+                for _ in 0..repeats {
+                    let mut ids = tensor.occupied_blocks(0..g.block_count());
+                    let mut previous = None;
+                    let mut occupied = 0;
+
+                    while let Some(id) = ids.try_next().await.unwrap() {
+                        assert!(id < g.block_count());
+                        assert!(previous.is_none_or(|previous| previous < id));
+                        previous = Some(id);
+                        occupied += 1;
+                    }
+
+                    assert_eq!(occupied, expected_occupied);
+                    count += occupied;
+                }
+
+                count
+            })
+            .await;
+        }
+
         common::cleanup(&root).await;
     }
     Box::pin(sparse_output()).await;

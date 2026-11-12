@@ -20,13 +20,23 @@ The opt-in `benchmarks` feature compiles two ignored tests which use the same wo
 - Integration `benchmark` measures production execution without internal metrics.
 - Unit `profiling::profile` additionally observes task-local read/copy counters.
 
-`FENSOR_BENCH_SUITE` selects `matrix`, `reduction`, `completion`, `pipeline`,
-`copy`, `sparse`, `storage`, `mutation`, `traversal`, `read-ahead`, `reopen`, or `all` (default). Matrix cases include storage reads, affine/gather transforms,
+`FENSOR_BENCH_SUITE` selects `matrix`, `reduction`, `completion`, `owned`, `pipeline`,
+`copy`, `sparse`, `storage`, `mutation`, `traversal`, `layout`, `read-ahead`,
+`reopen`, or `all` (default). Matrix cases include storage reads, affine/gather transforms,
 regular/irregular selections, batches, nested products and extreme shapes.
 Reduction cases include short/long groups, axes, strided and nested sources.
 Completion cases compare streams and numeric terminals. Pipeline/copy cases vary
 destination capacity, layout and cache pressure. Workload generators remain the
 source of truth; capacities include 1, 7, 31, 128 and 4096.
+
+The `layout` suite compares borrowed and owned transformed unary consumption and
+four nested mappings over shape `[8, 2049]`. Dense and block-sparse sources use
+capacities 64, 512, and 4096; scalar-sparse sources use capacity 1. Isolated and
+fully populated controls share a 64 MiB cache. Row-major reads, full coordinate
+reads, and terminal sums warm once before four measured repetitions. The runtime
+is current-thread Tokio; numerical worker counts remain explicit. Profiling
+records existing block-bound construction and mapped-run counts alongside native
+reads; these counters do not measure heap allocations or every mapping operation.
 
 Source construction, writes/sync and fixture assertions precede measurement.
 Matrix, completion, and pipeline sources use the existing large fixture cache for construction, then
@@ -145,8 +155,11 @@ out of project documentation. Timing thresholds do not belong in ordinary CI.
 
 The same harness selects `storage` for sparse vectors, narrow and trailing-axis
 regions, low occupancy, and nearly full blocks; `mutation` for scalar/fill and
-dense replacement; `traversal` for point/stream/reduction/transformed reads; and
-`reopen` for strict loading. Storage accounting includes native dense-block row pages and dense payload files. It reads one synchronized page at a time outside timing.
+dense replacement; `traversal` for point/stream/reduction/transformed reads and
+isolated sparse occupied-block-ID traversal, measured separately from sparse
+element and payload consumption; and `reopen` for strict loading. Storage
+accounting includes native dense-block row pages and dense payload files. It
+reads one synchronized page at a time outside timing.
 
 ```sh
 FENSOR_BENCH_SUITE=storage cargo test --release --features benchmarks --test benchmark -- --ignored --nocapture --test-threads=1

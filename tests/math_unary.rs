@@ -1,6 +1,7 @@
 //! Integration tests for `TensorUnary` (`exp`, `ln`, `round`) via lazy
 //! typed `UnaryView` chains over filesystem-backed geometric views.
 
+use common::{FsEntry, create_dense_tensor, create_sparse_tensor, iter_coords, new_dir};
 use fensor::unary::{Exp, Round};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorAbs, TensorExpression, TensorGeometry, TensorRead,
@@ -10,8 +11,6 @@ use fensor::{
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
-
-use common::{FsEntry, create_dense_tensor, create_sparse_tensor, iter_coords, new_dir};
 
 mod common;
 
@@ -845,7 +844,7 @@ async fn dense_scalar_write_rejects_malformed_existing_block() {
     file.write::<Vec<f32>>().await.unwrap().truncate(1);
     assert!(matches!(
         tensor.write_value(&[0], 2.0).await,
-        Err(Error::InvalidLayout(_))
+        Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
     ));
     assert_eq!(*file.read::<Vec<f32>>().await.unwrap(), vec![0.0]);
     common::cleanup(&root).await;

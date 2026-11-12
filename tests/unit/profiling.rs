@@ -23,6 +23,8 @@ async fn observe(
                     let m = m.borrow();
 
                     for (metric, value) in [
+                        ("block_bounds", m.block_bounds as u128),
+                        ("mapped_runs", m.mapped_runs as u128),
                         ("slice_requests", m.slice_requests as u128),
                         ("index_entries", m.index_entries as u128),
                         ("reduction_calls", m.reduction_calls as u128),

@@ -121,3 +121,44 @@ async fn buffered_reads_preserve_order_and_release_guards() {
     assert!(read.await.unwrap_err().to_string().contains("length"));
     drop(first.try_write::<Vec<f32>>().unwrap());
 }
+
+#[tokio::test]
+async fn dense_padding_is_validated_before_write_and_after_storage_reads() {
+    use crate::{StorageGeometry, TensorRead};
+
+    let (root, dir) = new_dir("dense_padding_contract").await;
+    let geometry = StorageGeometry::new(
+        TensorSchema::new(f32::dtype(), shape![3]).unwrap(),
+        Layout::Dense,
+        shape![4],
+    )
+    .unwrap();
+    let tensor = Tensor::<FsEntry, f32>::create_with_geometry(dir.clone(), geometry)
+        .await
+        .unwrap();
+    assert!(
+        tensor
+            .replace_logical_block(0, vec![1., 2., 3., 9.])
+            .await
+            .is_err()
+    );
+    assert_eq!(tensor.read_value(&[0]).await.unwrap(), 0.);
+    tensor
+        .replace_logical_block(0, vec![1., 2., 3., 0.])
+        .await
+        .unwrap();
+    let crate::tensor::Storage::Dense(owner) = tensor.storage.as_ref() else {
+        unreachable!()
+    };
+    let file = owner.blocks.read().await.get_file("0").unwrap().clone();
+    file.write::<Vec<f32>>().await.unwrap()[3] = 9.;
+    assert!(
+        matches!(tensor.read_value(&[0]).await, Err(crate::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error))
+    );
+    assert!(tensor.validate().await.is_err());
+    tensor.sync_all().await.unwrap();
+    drop(file);
+    drop(tensor);
+    assert!(Tensor::<FsEntry, f32>::load(dir).await.is_err());
+    crate::test_support::cleanup(&root).await;
+}

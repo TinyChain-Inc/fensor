@@ -170,7 +170,8 @@ impl StorageGeometry {
         Ok((position.block_id, position.offset_in_block))
     }
 
-    pub(crate) fn validate_id(&self, id: u64) -> Result<()> {
+    /// Validate a logical block ID without allocating bounds or accessing storage.
+    pub fn validate_id(&self, id: u64) -> Result<()> {
         if id >= self.block_count() {
             return Err(Error::InvalidCoord("logical block out of bounds".into()));
         }
@@ -203,16 +204,15 @@ impl StorageGeometry {
             return Err(Error::InvalidLayout("invalid logical block length".into()));
         }
 
-        let bounds = self.block_bounds(id)?;
-
-        if bounds
-            .iter()
-            .zip(self.block_shape())
-            .all(|(&(lo, hi), &len)| hi - lo == len)
-        {
+        // The quotient counts complete blocks without computing an overflowing end.
+        if (0..self.schema.shape().len()).all(|axis| {
+            let grid = (id / self.storage.strides[axis]) % self.storage.shape[axis];
+            grid < self.schema.shape()[axis] / self.block_shape()[axis]
+        }) {
             return Ok(());
         }
 
+        let bounds = self.block_bounds(id)?;
         #[cfg(test)]
         crate::read_metrics::record(|m| m.padding_walks += 1);
         let mut next = 0;
@@ -251,6 +251,75 @@ pub struct StorageRead<'a> {
     pub(crate) mapping: Option<&'a CoordinateMap>,
 }
 
+impl StorageRead<'_> {
+    /// Validate and group this bounded request without accessing storage.
+    pub fn plan(&self, geometry: &StorageGeometry) -> Result<StorageReadPlan> {
+        let shape = crate::storage_read::StorageShape {
+            shape: geometry.schema.shape(),
+            strides: geometry.schema.strides(),
+            block_shape: geometry.block_shape(),
+            block_strides: &geometry.storage.block_schema.strides,
+            grid_strides: &geometry.storage.strides,
+        };
+
+        let groups = shape.plan(self.request, self.mapping)?;
+
+        Ok(StorageReadPlan {
+            groups,
+            len: self.request.len(),
+            block_len: geometry.block_len(),
+        })
+    }
+}
+
+/// A bounded logical-block selection with validated scatter positions.
+/// Callers select visible storage; the plan preserves request order and duplicates.
+pub struct StorageReadPlan {
+    groups: crate::storage_read::LogicalGroups,
+    len: usize,
+    block_len: usize,
+}
+
+impl StorageReadPlan {
+    /// Number of requested numerical values, including repeated selections.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Requested logical block IDs in strictly increasing order.
+    pub fn block_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.groups.keys().copied()
+    }
+
+    /// Copy one complete logical block into its requested output positions.
+    /// Unrequested IDs and incorrect buffer lengths are rejected before scattering.
+    pub fn scatter<T: Copy>(&self, id: u64, block: &[T], output: &mut [T]) -> Result<()> {
+        if block.len() != self.block_len {
+            return Err(Error::InvalidLayout("invalid logical block length".into()));
+        }
+        if output.len() != self.len {
+            return Err(Error::InvalidLayout(
+                "invalid storage read output length".into(),
+            ));
+        }
+
+        let runs = self
+            .groups
+            .get(&id)
+            .ok_or_else(|| Error::InvalidCoord("logical block is not in the read plan".into()))?;
+
+        for run in runs {
+            run.scatter(block, output)?;
+        }
+
+        Ok(())
+    }
+}
+
 /// A statically typed source for fensor's existing geometric and computed views.
 /// A returned logical block includes edge padding and has exactly `block_len`
 /// values. Sparse absence is represented by a zero block, never a missing file.
@@ -274,27 +343,12 @@ where
         read: StorageRead<'a>,
     ) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
         Box::pin(async move {
-            let geometry = self.storage_geometry();
-            let shape = crate::storage_read::StorageShape {
-                shape: self.shape(),
-                strides: self.strides(),
-                block_shape: geometry.block_shape(),
-                block_strides: &geometry.storage.block_schema.strides,
-                grid_strides: &geometry.storage.strides,
-            };
+            let plan = read.plan(&self.storage_geometry())?;
+            let mut values = vec![Self::DType::default(); plan.len()];
 
-            let groups = shape.plan(read.request, read.mapping)?;
-            let mut values = vec![Self::DType::default(); read.request.len()];
-
-            for (id, runs) in groups {
+            for id in plan.block_ids() {
                 let block = self.read_logical_block(id).await?;
-                if block.len() != geometry.block_len() {
-                    return Err(Error::InvalidLayout("invalid logical block length".into()));
-                }
-
-                for run in runs {
-                    run.scatter(&block, &mut values)?;
-                }
+                plan.scatter(id, &block, &mut values)?;
             }
 
             Ok(values)
@@ -316,7 +370,6 @@ where
         return Ok(slice.stream());
     }
 
-    let source = source.clone();
     let geometry = source.storage_geometry();
     let mapping = mapping.unwrap_or_else(|| crate::mapping::StorageSlice::identity(source.shape()));
     // Bound the selection in block order using only rank-sized mapping metadata.
@@ -344,6 +397,7 @@ where
         first[base] = mapped(lo)?;
         last[base] = mapped(hi)?;
     }
+
     let first = geometry.block_position(&first)?.0;
     let end = geometry.block_position(&last)?.0 + 1;
 
@@ -413,33 +467,201 @@ where
     .boxed())
 }
 
-/// Use indexed requests only when their region order is already logical order.
-/// Other geometry uses bounded logical evaluation, without sorting or persistence.
+/// Preserve row-major candidate order without sorting or scanning implicit zeros.
 pub(crate) fn ordered_requests<S: TensorSource>(
     source: &S,
     slice: crate::slice::Slice,
-    mapping: StorageSlice,
+    mapping: Option<StorageSlice>,
 ) -> Result<crate::slice::Requests<'static>>
 where
     S::DType: TensorElement,
 {
-    if matches!(source.layout(), Layout::Dense)
-        || mapping.axes.windows(2).any(|axes| axes[0].0 >= axes[1].0)
-    {
+    if slice.len() <= crate::MAX_BATCH_ELEMENTS as u64 || matches!(source.layout(), Layout::Dense) {
         return Ok(slice.stream());
     }
+
+    let mapping = mapping.unwrap_or_else(|| StorageSlice::identity(source.shape()));
     let geometry = source.storage_geometry();
-    // A region must be a contiguous row-major run. Earlier axes are singleton;
-    // after the first multi-element axis all block extents cover the full axis.
+    let mut previous = None;
     let mut spans = false;
 
-    for (&block, &dim) in geometry.block_shape().iter().zip(source.shape()) {
-        if spans && block < dim {
-            return Ok(slice.stream());
+    // Fixed and singleton axes do not constrain traversal order. Once a block
+    // spans an active axis, every later active axis must stay within one block.
+    for (selection, &(base, step)) in slice.axes.iter().zip(&mapping.axes) {
+        if selection.len() <= 1 {
+            continue;
         }
-        spans |= block > 1;
+
+        let (first, last) = match selection {
+            crate::request::Axis::Span { .. } => {
+                (selection.at(0), selection.at(selection.len() - 1))
+            }
+            crate::request::Axis::Selected(values) => (
+                *values.iter().min().expect("nonempty selection"),
+                *values.iter().max().expect("nonempty selection"),
+            ),
+        };
+
+        let first = first
+            .checked_mul(step)
+            .and_then(|n| mapping.origins[base].checked_add(n))
+            .ok_or_else(|| Error::InvalidCoord("sparse selection bound overflow".into()))?;
+        let last = last
+            .checked_mul(step)
+            .and_then(|n| mapping.origins[base].checked_add(n))
+            .ok_or_else(|| Error::InvalidCoord("sparse selection bound overflow".into()))?;
+        let block = geometry.block_shape()[base];
+
+        if previous.is_some_and(|previous| previous >= base)
+            || (spans && first / block != last / block)
+        {
+            return Err(Error::Unsupported(
+                "sparse block order does not preserve this selection's row-major order; use copy_from_values to materialize this layout".into()
+            ));
+        }
+        previous = Some(base);
+        let stride = match selection {
+            crate::request::Axis::Span {
+                step: selected_step,
+                ..
+            } => step.checked_mul(*selected_step),
+            crate::request::Axis::Selected(_) => Some(step),
+        };
+        spans |= stride.is_some_and(|stride| stride < block);
     }
+
     slice_requests(source, slice, Some(mapping))
+}
+
+/// Full-coverage physical traversal for consumers which retain coordinates.
+/// Sparse occupancy is deliberately irrelevant: implicit zeros are values too.
+pub(crate) fn preferred_requests<S: TensorSource>(
+    source: &S,
+    shape: &[u64],
+    mapping: Option<StorageSlice>,
+) -> Result<Option<crate::expression::RequestIterator>>
+where
+    S::DType: TensorElement,
+{
+    let geometry = source.storage_geometry();
+    let identity = shape == source.shape()
+        && mapping.as_ref().is_none_or(|mapping| {
+            mapping.origins.iter().all(|&origin| origin == 0)
+                && mapping
+                    .axes
+                    .iter()
+                    .enumerate()
+                    .all(|(axis, &(base, step))| shape[axis] == 1 || (base == axis && step == 1))
+        });
+    if identity {
+        let mut spans = false;
+        let logical_order =
+            geometry
+                .block_shape()
+                .iter()
+                .zip(source.shape())
+                .all(|(&block, &dim)| {
+                    let ordered = !spans || block >= dim;
+                    spans |= block > 1;
+                    ordered
+                });
+        if logical_order {
+            return Ok(None);
+        }
+    }
+
+    let mapping = mapping.unwrap_or_else(|| StorageSlice::identity(source.shape()));
+    let slice = crate::slice::Slice::full(shape)?;
+    let mut last = mapping.origins.clone();
+    let mut axes = vec![None; source.shape().len()];
+    for (axis, (&dim, &(base, step))) in shape.iter().zip(&mapping.axes).enumerate() {
+        last[base] = (dim - 1)
+            .checked_mul(step)
+            .and_then(|n| mapping.origins[base].checked_add(n))
+            .ok_or_else(|| Error::InvalidCoord("storage slice bound overflow".into()))?;
+        axes[base] = Some((axis, step));
+    }
+    geometry.block_position(&mapping.origins)?;
+    geometry.block_position(&last)?;
+    let fastest = axes
+        .iter()
+        .rposition(|axis| axis.is_some_and(|(axis, _)| shape[axis] > 1));
+    let mut coordinates = mapping.origins.clone();
+    let mut done = false;
+
+    let regions = std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+
+        let id = geometry
+            .block_position(&coordinates)
+            .expect("validated storage slice")
+            .0;
+        let mut bounds = geometry.block_bounds(id).expect("validated storage block");
+        let mut consumer_bounds = mapping.bounds(&bounds).expect("selected storage region");
+        if let Some(base) = fastest {
+            let (axis, _) = axes[base].expect("varying storage axis");
+            // Concatenating adjacent physical regions preserves their sequence
+            // when all preceding consumer axes are singleton within the region.
+            // Faster storage axes are fixed; bounded batching still owns splitting.
+            let consecutive = consumer_bounds[..axis]
+                .iter()
+                .zip(&slice.axes)
+                .all(|(&(lo, hi), selection)| hi.min(selection.len()).saturating_sub(lo) <= 1);
+            if consecutive {
+                bounds[base].1 = geometry.schema.shape()[base];
+                consumer_bounds[axis].1 = slice.axes[axis].len();
+            }
+        }
+
+        let requests = slice
+            .intersect(&consumer_bounds)
+            .expect("validated region intersection")
+            .requests();
+        done = true;
+
+        for base in (0..coordinates.len()).rev() {
+            if let Some((axis, step)) = axes[base] {
+                // Jump over empty block regions, rather than advancing each block
+                // between widely separated selected coordinates.
+                let next = bounds[base]
+                    .1
+                    .saturating_sub(mapping.origins[base])
+                    .div_ceil(step);
+                if next < slice.axes[axis].len() {
+                    coordinates[base] = mapping.origins[base] + next * step;
+                    done = false;
+                    break;
+                }
+            }
+            coordinates[base] = mapping.origins[base];
+        }
+        Some(requests)
+    });
+    let mut rectangles =
+        regions.flat_map(|mut requests| std::iter::from_fn(move || requests.next_rectangle()));
+    let mut overflow = None;
+    let requests = std::iter::from_fn(move || {
+        let mut output = Vec::new();
+        let mut len = 0;
+
+        while let Some(rectangle) = overflow.take().or_else(|| rectangles.next()) {
+            if rectangle.len() > crate::MAX_BATCH_ELEMENTS - len {
+                overflow = Some(rectangle);
+                break;
+            }
+            len += rectangle.len();
+            output.push(rectangle);
+            if len == crate::MAX_BATCH_ELEMENTS {
+                break;
+            }
+        }
+
+        (!output.is_empty())
+            .then(|| BatchRequest::rectangles(output).expect("bounded storage regions"))
+    });
+    Ok(Some(Box::new(requests)))
 }
 
 #[cfg(test)]

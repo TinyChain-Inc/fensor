@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fensor::{
-    BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorArray, TensorExpression,
-    TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorSchema, TensorSource,
-    TensorTransform, TensorUnary, TensorView, TensorWrite,
+    BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorAbs, TensorArray,
+    TensorExpression, TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorSchema,
+    TensorSource, TensorTransform, TensorUnary, TensorView, TensorWrite,
 };
 use futures::{StreamExt, TryStreamExt};
 use number_general::FloatType;
@@ -180,6 +180,23 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
             [0.0f64, 1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 3.0],
         )
         .await;
+        // Caller callback errors must not acquire native-corruption provenance.
+        // Cover both unique lookup and consecutive borrowed visitation.
+        for ids in [&[1][..], &[0, 1][..]] {
+            let error = tensor
+                .visit_blocks(ids, |_, _| {
+                    Err(fensor::Error::Io(std::io::Error::other("consumer failure")))
+                })
+                .await
+                .unwrap_err();
+            let fensor::Error::Io(error) = error else {
+                panic!("expected callback error")
+            };
+            assert_eq!(error.to_string(), "consumer failure");
+            assert!(!freqfs::IntegrityError::is_marked(&error));
+            // Acquiring the writer proves the failed callback released the reader.
+            tensor.write_value(&[0, 0], 0.).await.unwrap();
+        }
         // Rounding makes the stored value 1 an intermediate zero. The other
         // operand restores its value; NaN and infinities retain their classifications.
         let inner = tensor
@@ -271,8 +288,8 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         first: vec![2.; 2],
         scans: Arc::clone(&scans),
     };
-    let expression = TensorExpression::new(TensorView::new(source)).unwrap();
-    let mut entries = expression.into_sparse_elements().unwrap();
+    let expression = TensorExpression::new(TensorView::new(source.clone())).unwrap();
+    let mut entries = expression.clone().into_sparse_elements().unwrap();
     let mut count = 0;
     while let Some((coord, value)) = entries.try_next().await.unwrap() {
         assert_eq!(coord, [count / 2, count % 2]);
@@ -281,4 +298,129 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
     }
     assert_eq!(count, rows * 2);
     assert_eq!(scans.load(Ordering::Relaxed), 1);
+    drop(entries);
+
+    let select_column = || vec![fensor::AxisRange::In(0, rows, 1), fensor::AxisRange::At(1)].into();
+    let before_ownership = TensorExpression::new(
+        TensorView::new(source)
+            .abs()
+            .await
+            .unwrap()
+            .slice(select_column())
+            .unwrap(),
+    )
+    .unwrap();
+    let after_ownership = TensorExpression::new(expression.clone().abs().await.unwrap())
+        .unwrap()
+        .slice(select_column())
+        .unwrap();
+    let nested = TensorExpression::new(expression.clone().transpose(None).unwrap())
+        .unwrap()
+        .transpose(None)
+        .unwrap()
+        .slice(select_column())
+        .unwrap();
+
+    for selected in [before_ownership, after_ownership, nested] {
+        scans.store(0, Ordering::Relaxed);
+        let mut entries = selected.into_sparse_elements().unwrap();
+        let mut count = 0;
+        while let Some((coord, value)) = entries.try_next().await.unwrap() {
+            assert_eq!(coord, [count]);
+            assert_eq!(value, 2.);
+            count += 1;
+        }
+        assert_eq!(count, rows);
+        assert_eq!(scans.load(Ordering::Relaxed), 1);
+    }
+
+    // A transformed union emits consumer coordinates, and consumes colliding
+    // candidates once while retaining both operand reads.
+    let combined = TensorExpression::new(expression.add(&expression).await.unwrap())
+        .unwrap()
+        .slice(select_column())
+        .unwrap();
+    scans.store(0, Ordering::Relaxed);
+    let mut entries = combined.into_sparse_elements().unwrap();
+    let mut count = 0;
+    while let Some((coord, value)) = entries.try_next().await.unwrap() {
+        assert_eq!(coord, [count]);
+        assert_eq!(value, 4.);
+        count += 1;
+    }
+    assert_eq!(count, rows);
+    assert_eq!(scans.load(Ordering::Relaxed), 2);
+    drop(entries);
+
+    let singleton = expression
+        .clone()
+        .slice(
+            vec![
+                fensor::AxisRange::In(0, rows, 1),
+                fensor::AxisRange::In(1, 2, 1),
+            ]
+            .into(),
+        )
+        .unwrap()
+        .transpose(None)
+        .unwrap();
+    scans.store(0, Ordering::Relaxed);
+    let mut entries = singleton.into_sparse_elements().unwrap();
+    let mut count = 0;
+    while let Some((coord, value)) = entries.try_next().await.unwrap() {
+        assert_eq!(coord, [0, count]);
+        assert_eq!(value, 2.);
+        count += 1;
+    }
+    assert_eq!(count, rows);
+    assert_eq!(scans.load(Ordering::Relaxed), 1);
+    drop(entries);
+
+    let transposed = expression.clone().transpose(None).unwrap();
+    scans.store(0, Ordering::Relaxed);
+    assert!(matches!(
+        transposed.clone().into_sparse_elements(),
+        Err(fensor::Error::Unsupported(_))
+    ));
+    assert_eq!(scans.load(Ordering::Relaxed), 0);
+    let mut blocks = transposed.read_coordinate_blocks().unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((coordinates, values)) = blocks.try_next().await.unwrap() {
+        assert_eq!(coordinates.len(), values.len());
+        for (coord, value) in coordinates.into_iter().zip(values) {
+            assert!(seen.insert(coord));
+            assert_eq!(value, 2.);
+        }
+    }
+    assert_eq!(seen.len() as u64, rows * 2);
+    assert_eq!(scans.load(Ordering::Relaxed), 0);
+
+    for unsupported in [
+        expression.clone().flip(0).unwrap(),
+        expression
+            .slice(
+                vec![
+                    fensor::AxisRange::Of((0..rows).collect()),
+                    fensor::AxisRange::In(0, 2, 1),
+                ]
+                .into(),
+            )
+            .unwrap(),
+    ] {
+        assert!(matches!(
+            unsupported.clone().into_sparse_elements(),
+            Err(fensor::Error::Unsupported(_))
+        ));
+        assert_eq!(unsupported.read_value(&[0, 0]).await.unwrap(), 2.);
+        assert_eq!(
+            unsupported
+                .read_blocks()
+                .unwrap()
+                .try_concat()
+                .await
+                .unwrap()
+                .len() as u64,
+            rows * 2
+        );
+    }
 }

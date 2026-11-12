@@ -5,7 +5,9 @@
 use std::ops::Deref;
 
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
-use ha_ndarray::{Array, ArrayAccess, Buffer, NDArray, NDArrayRead, Number};
+use ha_ndarray::{
+    Array, ArrayBuf, Buffer, BufferConverter, NDArray, NDArrayRead, Number, Platform,
+};
 
 use crate::request::{self, BatchRequest};
 use crate::traits::BoxFuture;
@@ -90,7 +92,7 @@ pub(crate) fn read_blocks<'a, H>(
     source: H,
 ) -> Result<crate::ValueBlockStream<'a, <H::Target as TensorGeometry>::DType>>
 where
-    H: Deref + Clone + Send + Sync + 'a,
+    H: Deref + Send + Sync + 'a,
     H::Target: Expression,
     <H::Target as TensorGeometry>::DType: TensorElement,
 {
@@ -149,7 +151,7 @@ pub(crate) fn preferred_batches<'a, H>(
     expression: H,
 ) -> Result<BatchStream<'a, <H::Target as TensorGeometry>::DType>>
 where
-    H: Deref + Clone + Send + Sync + 'a,
+    H: Deref + Send + Sync + 'a,
     H::Target: Expression,
     <H::Target as TensorGeometry>::DType: TensorElement,
 {
@@ -165,22 +167,24 @@ where
 }
 
 pub struct Batch<T: TensorElement> {
-    array: ArrayAccess<'static, T>,
+    array: ArrayBuf<T, Buffer<T>>,
 }
 
-pub fn batch_array<T: TensorElement>(values: Vec<T>) -> Result<ArrayAccess<'static, T>> {
+pub fn batch_array<T: TensorElement>(values: Vec<T>) -> Result<ArrayBuf<T, Buffer<T>>> {
     validate_bound("batch array", values.len())?;
     let shape = std::iter::once(values.len()).collect();
 
-    Ok(ArrayAccess::from(Array::new(Buffer::from(values), shape)?))
+    Ok(Array::new(Buffer::from(values), shape)?)
 }
 
 impl<T: TensorElement> Batch<T> {
     /// Complete a numerical operation before another expression layer can use it.
-    pub(crate) fn from_array(array: ArrayAccess<'static, T>) -> Result<Self> {
+    pub(crate) fn from_array(
+        array: impl NDArrayRead<DType = T, Platform = Platform>,
+    ) -> Result<Self> {
         validate_bound("batch expression", array.size())?;
         Ok(Self {
-            array: ArrayAccess::from(array.into_read()?),
+            array: array.into_read()?,
         })
     }
 
@@ -191,7 +195,7 @@ impl<T: TensorElement> Batch<T> {
         })
     }
 
-    pub(crate) fn into_array(self) -> ArrayAccess<'static, T> {
+    pub(crate) fn into_array(self) -> ArrayBuf<T, Buffer<T>> {
         self.array
     }
 
@@ -204,7 +208,9 @@ impl<T: TensorElement> Batch<T> {
         let expected = self.array.size();
 
         let batch = EvaluatedBatch {
-            values: self.array.buffer()?.to_slice()?.into_vec(),
+            values: BufferConverter::from(self.array.into_access().into_inner())
+                .to_slice()?
+                .into_vec(),
         };
         batch.validate(expected)?;
 
@@ -291,37 +297,25 @@ pub(crate) fn evaluate_requests<'a, H, R>(
     requests: R,
 ) -> BatchStream<'a, <H::Target as TensorGeometry>::DType>
 where
-    H: Deref + Clone + Send + Sync + 'a,
+    H: Deref + Send + Sync + 'a,
     H::Target: Expression,
     <H::Target as TensorGeometry>::DType: TensorElement,
     R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,
 {
-    requests
-        .then(move |request| {
-            let expression = expression.clone();
-
-            async move {
+    futures::stream::unfold(
+        (expression, Box::pin(requests)),
+        |(expression, mut requests)| async move {
+            let request = requests.next().await?;
+            let result = async {
                 let request = request?;
                 let values = evaluate_batch(&*expression, &request).await?;
                 Ok((request, values))
             }
-        })
-        .boxed()
-}
-
-impl<S: crate::TensorSource> crate::expression::traversal::Plan for TensorView<S>
-where
-    S::DType: TensorElement,
-{
-    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
-        self.slice_requests_for_storage(slice)
-            .map(traversal::Selection::Ready)
-    }
-
-    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
-        self.ordered_storage_requests(slice)
-            .map(traversal::Ordered::Ready)
-    }
+            .await;
+            Some((result, (expression, requests)))
+        },
+    )
+    .boxed()
 }
 
 impl<S: crate::TensorSource> Expression for TensorView<S>
@@ -346,17 +340,28 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
-        crate::storage::slice_requests(self, slice, None).map(traversal::Selection::Ready)
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+        mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<traversal::Preferred<'a>> {
+        crate::storage::preferred_requests(self, shape, mapping).map(traversal::Preferred::Ready)
     }
 
-    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
-        crate::storage::ordered_requests(
-            self,
-            slice,
-            crate::mapping::StorageSlice::identity(self.shape()),
-        )
-        .map(traversal::Ordered::Ready)
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<traversal::Selection<'_>> {
+        crate::storage::slice_requests(self, slice, mapping).map(traversal::Selection::Ready)
+    }
+
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<traversal::Ordered<'_>> {
+        crate::storage::ordered_requests(self, slice, mapping).map(traversal::Ordered::Ready)
     }
 }
 
@@ -391,12 +396,12 @@ pub(crate) fn ordered_sparse<'a, H>(
     order: crate::Axes,
 ) -> Result<crate::SparseElementStream<'a, <H::Target as TensorGeometry>::DType>>
 where
-    H: Deref + Clone + Send + Sync + 'a,
+    H: Deref + Send + Sync + 'a,
     H::Target: Expression,
     <H::Target as TensorGeometry>::DType: TensorElement,
 {
     let slice = crate::traits::sparse_slice(&*source, range, order)?;
-    let requests = traversal::ordered(&*source, slice)?;
+    let requests = traversal::ordered(&*source, slice, None)?;
     Ok(sparse_stream(source, requests))
 }
 
@@ -406,7 +411,7 @@ pub(crate) fn sparse_stream<'a, H, R>(
     requests: R,
 ) -> crate::SparseElementStream<'a, <H::Target as TensorGeometry>::DType>
 where
-    H: Deref + Clone + Send + Sync + 'a,
+    H: Deref + Send + Sync + 'a,
     H::Target: Expression,
     <H::Target as TensorGeometry>::DType: TensorElement,
     R: futures::Stream<Item = Result<BatchRequest>> + Send + 'a,

@@ -7,12 +7,14 @@ use fensor::{
     CoordinateBlockStream, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorWrite,
 };
 use freqfs::{DirLock, FileWriteGuardOwned};
-use futures::{FutureExt, StreamExt, channel::oneshot};
+use futures::channel::oneshot;
+use futures::{FutureExt, StreamExt};
 use ha_ndarray::shape;
 use number_general::{DType, NumberType};
 
 mod common;
-use common::{FsEntry, counters::Counter};
+use common::FsEntry;
+use common::counters::Counter;
 
 type GuardSender = oneshot::Sender<FileWriteGuardOwned<FsEntry, Vec<u8>>>;
 
@@ -197,7 +199,7 @@ async fn cancellation_and_errors_release_the_active_operation_and_source() {
             if corrupt {
                 assert!(matches!(
                     copy.as_mut().await,
-                    Err(fensor::Error::InvalidLayout(_))
+                    Err(fensor::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
                 ));
                 assert_eq!(
                     reader.reads.read(),

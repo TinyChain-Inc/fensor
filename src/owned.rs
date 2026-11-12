@@ -11,7 +11,7 @@ use crate::expression::{self, Batch, Expression};
 use crate::mapping::CoordinateMap;
 use crate::request::BatchRequest;
 use crate::{
-    BoxFuture, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
+    BoxFuture, Error, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
     TensorViewSemantics,
 };
 
@@ -102,13 +102,13 @@ impl<T: TensorElement> TensorExpression<T> {
 
     /// A pull-driven owned stream. Dropping it releases all source handles.
     pub fn into_blocks(self) -> Result<BoxStream<'static, Result<Vec<T>>>> {
-        expression::read_blocks(Arc::new(self))
+        expression::read_blocks(Box::new(self))
     }
 
     pub fn into_sparse_elements(self) -> Result<crate::SparseElementStream<'static, T>> {
         let requests =
-            expression::traversal::ordered(&self, crate::slice::Slice::full(self.shape())?)?;
-        Ok(expression::sparse_stream(Arc::new(self), requests))
+            expression::traversal::ordered(&self, crate::slice::Slice::full(self.shape())?, None)?;
+        Ok(expression::sparse_stream(Box::new(self), requests))
     }
 }
 
@@ -149,43 +149,80 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
     fn preferred_step<'a>(
         &'a self,
         shape: &'a [u64],
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Preferred<'a>> {
+        let mapping = if self.mapping.is_base_mapping(self.source().shape()) {
+            mapping
+        } else {
+            let strides = crate::contiguous_strides(self.source().shape())?;
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.source().shape(), &strides)?
+            else {
+                return Ok(expression::traversal::Preferred::Ready(None));
+            };
+            Some(local.compose(mapping)?)
+        };
+
         Ok(expression::traversal::Preferred::Sources(vec![(
             self.source(),
-            shape,
+            (shape, mapping),
         )]))
     }
 
     fn selection_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Selection<'_>> {
-        if matches!(self.layout(), Layout::Dense) {
+        if matches!(self.layout(), Layout::Dense) || slice.len() <= crate::MAX_BATCH_ELEMENTS as u64
+        {
             return Ok(expression::traversal::Selection::Ready(slice.stream()));
         }
-        let strides = crate::contiguous_strides(self.source().shape())?;
 
-        Ok(if self.is_identity(&strides) {
-            expression::traversal::Selection::Source(self.source(), slice)
+        let mapping = if self.mapping.is_base_mapping(self.source().shape()) {
+            mapping
         } else {
-            expression::traversal::Selection::Ready(slice.stream())
-        })
+            let strides = crate::contiguous_strides(self.source().shape())?;
+            let local = self.mapping.storage_slice(self.source().shape(), &strides)?
+                .ok_or_else(|| Error::Unsupported(
+                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
+                ))?;
+            Some(local.compose(mapping)?)
+        };
+
+        Ok(expression::traversal::Selection::Source(
+            self.source(),
+            slice,
+            mapping,
+        ))
     }
 
     fn ordered_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Ordered<'_>> {
-        if matches!(self.layout(), Layout::Dense) {
+        if matches!(self.layout(), Layout::Dense) || slice.len() <= crate::MAX_BATCH_ELEMENTS as u64
+        {
             return Ok(expression::traversal::Ordered::Ready(slice.stream()));
         }
-        let strides = crate::contiguous_strides(self.source().shape())?;
 
-        Ok(if self.is_identity(&strides) {
-            expression::traversal::Ordered::Sources(vec![(self.source(), slice)])
+        let mapping = if self.mapping.is_base_mapping(self.source().shape()) {
+            mapping
         } else {
-            expression::traversal::Ordered::Ready(slice.stream())
-        })
+            let strides = crate::contiguous_strides(self.source().shape())?;
+            let local = self.mapping.storage_slice(self.source().shape(), &strides)?
+                .ok_or_else(|| Error::Unsupported(
+                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
+                ))?;
+            Some(local.compose(mapping)?)
+        };
+
+        Ok(expression::traversal::Ordered::Sources(vec![(
+            self.source(),
+            (slice, mapping),
+        )]))
     }
 }
 

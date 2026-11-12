@@ -27,12 +27,20 @@ impl TensorGeometry for Provider<'_> {
 }
 
 impl crate::expression::traversal::Plan for Provider<'_> {
-    fn preferred_step<'a>(&'a self, shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+        _mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<traversal::Preferred<'a>> {
         self.calls.increment();
         (self.provide)(shape).map(traversal::Preferred::Ready)
     }
 
-    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<traversal::Ordered<'_>> {
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+        _mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<traversal::Ordered<'_>> {
         self.calls.increment();
         Ok(traversal::Ordered::Ready(
             match (self.provide)(self.shape())? {
@@ -166,7 +174,8 @@ async fn ordered_providers_visit_operands_left_to_right() {
             .abs()
             .await
             .unwrap();
-        let requests = traversal::ordered(&selected, crate::slice::Slice::full(&[6]).unwrap());
+        let requests =
+            traversal::ordered(&selected, crate::slice::Slice::full(&[6]).unwrap(), None);
         assert_eq!(requests.is_err(), fails);
         assert_eq!(calls.each_ref().map(|n| n.read()), expected);
         if let Ok(mut requests) = requests {
@@ -191,6 +200,7 @@ async fn ordered_providers_visit_operands_left_to_right() {
             traversal::ordered(
                 &left.add(&right).await.unwrap(),
                 crate::slice::Slice::full(&[6]).unwrap(),
+                None,
             )
             .is_err()
         );
@@ -384,7 +394,10 @@ fn malformed_batches_fail_closed() {
         ha_ndarray::shape![MAX_BATCH_ELEMENTS + 1],
     )
     .unwrap();
-    assert!(Batch::from_array(ArrayAccess::from(oversized)).is_err());
+    assert!(Batch::from_array(oversized).is_err());
+    // A malformed batch must be rejected before reading or realizing its source.
+    let unread = Array::new(UnreadBatch, ha_ndarray::shape![MAX_BATCH_ELEMENTS + 1]).unwrap();
+    assert!(Batch::from_array(unread).is_err());
     let batch = Batch::from_values(vec![1u8, 2]).unwrap();
     assert!(batch.validate(1).is_err());
     let evaluated = EvaluatedBatch { values: vec![1u8] };
@@ -393,4 +406,139 @@ fn malformed_batches_fail_closed() {
         values: vec![0u8; MAX_BATCH_ELEMENTS + 1],
     };
     assert!(evaluated.validate(MAX_BATCH_ELEMENTS + 1).is_err());
+}
+
+// No Clone implementation: stream consumption must retain this owner directly.
+struct StreamSource {
+    _lease: std::sync::Arc<()>,
+    pending: bool,
+}
+
+impl TensorGeometry for StreamSource {
+    type DType = f64;
+
+    fn dtype(&self) -> crate::NumberType {
+        <f64 as number_general::DType>::dtype()
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::Dense
+    }
+
+    fn shape(&self) -> &[u64] {
+        &[2]
+    }
+}
+
+impl traversal::Plan for StreamSource {}
+
+impl Expression for StreamSource {
+    fn build<'a>(
+        &'a self,
+        _: Context<'a>,
+        request: std::sync::Arc<BatchRequest>,
+    ) -> BoxFuture<'a, Result<Batch<f64>>> {
+        Box::pin(async move {
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            if request.len() != 1 {
+                return Err(Error::InvalidLayout("injected evaluation error".into()));
+            }
+
+            Batch::from_values(vec![7.0; request.len()])
+        })
+    }
+}
+
+#[tokio::test]
+async fn request_stream_moves_nonclone_source_and_preserves_error_items() {
+    let lease = std::sync::Arc::new(());
+    let observed = std::sync::Arc::downgrade(&lease);
+    let source = Box::new(StreamSource {
+        _lease: lease,
+        pending: false,
+    });
+    let requests = futures::stream::iter([
+        Ok(BatchRequest::point(&[0])),
+        Err(Error::InvalidLayout("injected request error".into())),
+        Ok(BatchRequest::linear(0, 2).unwrap()),
+        Ok(BatchRequest::point(&[1])),
+    ]);
+    let mut stream = evaluate_requests(source, requests);
+    assert!(observed.upgrade().is_some());
+    assert_eq!(stream.next().await.unwrap().unwrap().1.values, vec![7.0]);
+    for expected in ["injected request error", "injected evaluation error"] {
+        let error = stream.next().await.unwrap().err().unwrap();
+        assert!(error.to_string().contains(expected));
+    }
+    assert_eq!(stream.next().await.unwrap().unwrap().1.values, vec![7.0]);
+    assert!(stream.next().await.is_none());
+    assert!(observed.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn request_stream_releases_unpolled_and_pending_sources() {
+    for poll in [false, true] {
+        let lease = std::sync::Arc::new(());
+        let observed = std::sync::Arc::downgrade(&lease);
+        let source = Box::new(StreamSource {
+            _lease: lease,
+            pending: true,
+        });
+        let mut stream = evaluate_requests(
+            source,
+            futures::stream::iter([Ok(BatchRequest::point(&[0]))]),
+        );
+        if poll {
+            assert!(futures::poll!(stream.next()).is_pending());
+        }
+        assert!(observed.upgrade().is_some());
+        drop(stream);
+        assert!(observed.upgrade().is_none());
+    }
+}
+
+#[test]
+fn completed_host_batches_transfer_their_buffer() {
+    let values = vec![3.5; MAX_BATCH_ELEMENTS];
+    let pointer = values.as_ptr();
+    let evaluated = Batch::from_values(values)
+        .unwrap()
+        .into_evaluated()
+        .unwrap();
+    assert_eq!(evaluated.values.as_ptr(), pointer);
+    assert_eq!(evaluated.values, vec![3.5; MAX_BATCH_ELEMENTS]);
+    let values = vec![2.5; MAX_BATCH_ELEMENTS];
+    let pointer = values.as_ptr();
+    let batch = Batch::from_array(batch_array(values).unwrap()).unwrap();
+    let completed_pointer = batch
+        .array
+        .buffer()
+        .unwrap()
+        .to_slice()
+        .unwrap()
+        .as_ref()
+        .as_ptr();
+    assert_eq!(completed_pointer, pointer);
+    let evaluated = batch.into_evaluated().unwrap();
+    assert_eq!(evaluated.values.as_ptr(), pointer);
+    assert_eq!(evaluated.values, vec![2.5; MAX_BATCH_ELEMENTS]);
+}
+
+#[derive(Debug)]
+struct UnreadBatch;
+
+impl ha_ndarray::BufferInstance<u8> for UnreadBatch {
+    fn read(&self) -> BufferConverter<'_, u8> {
+        panic!("an oversized batch was read before validation")
+    }
+
+    fn read_value(&self, _offset: usize) -> std::result::Result<u8, ha_ndarray::Error> {
+        panic!("an oversized batch was read before validation")
+    }
+
+    fn len(&self) -> usize {
+        MAX_BATCH_ELEMENTS + 1
+    }
 }

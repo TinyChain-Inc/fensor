@@ -86,18 +86,18 @@ async fn file_decoding_preserves_containers_and_rejects_malformed_payloads() {
         FsEntry::MetadataF32(
             TensorMetadata::new(vec![1; rank].into(), Layout::Dense, vec![1; rank].into()).unwrap(),
         ),
-        FsEntry::SparseF64(b_table::Node::Leaf(vec![
+        FsEntry::SparseF64(b_tree::Node::Leaf(vec![
             vec![
                 fensor::SparseCell::Key(1),
                 fensor::SparseCell::Payload(vec![3.]),
             ];
             17
         ])),
-        FsEntry::SparseF64(b_table::Node::Index(
+        FsEntry::SparseF64(b_tree::Node::Index(
             vec![vec![fensor::SparseCell::Key(2)]],
             vec![Default::default(); 2],
         )),
-        FsEntry::SparseF64(b_table::Node::Index(
+        FsEntry::SparseF64(b_tree::Node::Index(
             vec![vec![
                 fensor::SparseCell::Key(2),
                 fensor::SparseCell::Payload(vec![3., -0.]),
@@ -117,7 +117,7 @@ async fn file_decoding_preserves_containers_and_rejects_malformed_payloads() {
         assert!(tbon.get_size() >= std::mem::size_of::<FsEntry>());
     }
     // This decoded page fits 16 KiB including retained row and payload capacities.
-    let tiny_page = FsEntry::SparseF64(b_table::Node::Leaf(vec![
+    let tiny_page = FsEntry::SparseF64(b_tree::Node::Leaf(vec![
         vec![
             fensor::SparseCell::Key(1),
             fensor::SparseCell::Payload(vec![3.]),
@@ -131,8 +131,8 @@ async fn file_decoding_preserves_containers_and_rejects_malformed_payloads() {
 
     async fn reject_node(leaf: bool, rows: Vec<Vec<u64>>, child_count: usize) {
         use futures::{TryStreamExt, stream};
-        let b_table::Node::Index(_, children) =
-            b_table::Node::<u64>::Index(Vec::new(), vec![Default::default(); child_count])
+        let b_tree::Node::Index(_, children) =
+            b_tree::Node::<Vec<Vec<u64>>>::Index(Vec::new(), vec![Default::default(); child_count])
         else {
             unreachable!()
         };

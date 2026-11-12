@@ -338,7 +338,7 @@ impl BatchRequest {
         self.validate(mapping.shape())?;
         let mut runs = Vec::new();
         let affine = match self.kind {
-            RequestKind::Explicit(_) | RequestKind::FlatRuns(_) => None,
+            RequestKind::Explicit(_) => None,
             _ => mapping.affine()?,
         };
 
@@ -602,7 +602,7 @@ pub(crate) fn tiled_requests(
     }))
 }
 
-// Invoke once per fastest-axis arithmetic progression, not per output element.
+// Visit affine runs at axis and mixed-radix boundaries, not per output element.
 // Selected-axis scans use caller-bounded metadata and preserve duplicates/order.
 pub(crate) fn progressions(
     request: &BatchRequest,
@@ -692,8 +692,59 @@ pub(crate) fn progressions(
                 }
             }
         }
-        RequestKind::Explicit(_) | RequestKind::FlatRuns(_) => {
-            unreachable!("non-affine requests use the coordinate cursor")
+        RequestKind::FlatRuns(runs) => {
+            let mut delta = Coord::from_elem(0, rank);
+
+            for run in runs {
+                let magnitude = if run.len == 1 {
+                    0
+                } else {
+                    u64::try_from(run.step.checked_abs().ok_or_else(invalid)?)
+                        .map_err(|_| invalid())?
+                };
+                decode_flat(magnitude, shape, &mut delta)?;
+                let mut done = 0;
+
+                while done < run.len {
+                    let index = run.start + run.step * done as i128;
+                    decode_flat(
+                        u64::try_from(index).map_err(|_| invalid())?,
+                        shape,
+                        &mut coord,
+                    )?;
+                    let mut len = run.len - done;
+
+                    // A flat step has constant mixed-radix digits until a carry
+                    // or borrow. Recompute coordinates only at those boundaries.
+                    for ((&coord, &delta), &dim) in coord.iter().zip(&delta).zip(shape) {
+                        let room = if run.step < 0 { coord } else { dim - 1 - coord };
+                        if let Some(steps) = room.checked_div(delta) {
+                            len = (len as u64).min(steps.saturating_add(1)) as usize;
+                        }
+                    }
+
+                    let step = if len == 1 {
+                        0
+                    } else {
+                        delta.iter().zip(strides).try_fold(0i128, |n, (&d, &s)| {
+                            s.checked_mul(d as i128)
+                                .and_then(|d| d.checked_mul(run.step.signum()))
+                                .and_then(|d| n.checked_add(d))
+                                .ok_or_else(invalid)
+                        })?
+                    };
+                    emit(Progression {
+                        output: run.output + done,
+                        start: flat(&coord)?,
+                        step,
+                        len,
+                    })?;
+                    done += len;
+                }
+            }
+        }
+        RequestKind::Explicit(_) => {
+            unreachable!("explicit requests use the coordinate cursor")
         }
     }
 

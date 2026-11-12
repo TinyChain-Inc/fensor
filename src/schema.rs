@@ -28,7 +28,7 @@ pub enum AxisRange {
 /// Maximum tensor values per storage block, independent of execution batches.
 pub const MAX_BLOCK_CAPACITY: usize = 4096;
 
-/// Sparse-index leaf size in bytes, as required by b_table::BTreeSchema.
+/// Sparse-index leaf size in bytes, as required by b_tree::Schema.
 pub(crate) const SPARSE_INDEX_BLOCK_BYTES: usize = 4096;
 
 /// Target retained bytes per sparse node, independent of tensor block capacity.

@@ -29,8 +29,8 @@ where
         macro_rules! arithmetic {
             ($method:ident, $scalar:ident, $binary_source:ident, $scalar_source:ident) => {
                 let expected = backend
-                    .clone()
-                    .$method(backend.clone())
+                    .as_ref()
+                    .$method(backend.as_ref())
                     .unwrap()
                     .buffer()
                     .unwrap()
@@ -44,7 +44,7 @@ where
                 )
                 .await;
                 let expected = backend
-                    .clone()
+                    .as_ref()
                     .$scalar(T::ONE)
                     .unwrap()
                     .buffer()

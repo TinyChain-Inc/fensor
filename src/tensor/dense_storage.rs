@@ -3,29 +3,27 @@
 use freqfs::{Dir, DirLock, FileLoad, FileLock, FileReadGuardOwned};
 use futures::{StreamExt, TryStreamExt, stream};
 
-use super::{
-    Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates, validate_stored_length,
-};
+use super::{Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates};
 use crate::request::BatchRequest;
 use crate::schema::StorageSchema;
-use crate::{BoxFuture, Error, Result, TensorSource};
+use crate::{BoxFuture, Error, Result, StorageGeometry, TensorSource};
 
 pub(super) struct DenseStorage<FE> {
     blocks: DirLock<FE>,
-    storage_schema: StorageSchema,
+    geometry: Box<StorageGeometry>,
 }
 
 // Boxed storage futures bound stack usage in deeply composed consumers.
 impl<FE> DenseStorage<FE> {
-    pub(super) fn new(blocks: DirLock<FE>, storage_schema: StorageSchema) -> Self {
+    pub(super) fn new(blocks: DirLock<FE>, geometry: StorageGeometry) -> Self {
         Self {
             blocks,
-            storage_schema,
+            geometry: Box::new(geometry),
         }
     }
 
     pub(super) fn storage_schema(&self) -> &StorageSchema {
-        &self.storage_schema
+        &self.geometry.storage
     }
 
     pub(super) async fn initialize<T>(&self) -> Result<()>
@@ -33,7 +31,7 @@ impl<FE> DenseStorage<FE> {
         FE: TensorFileEntry<T>,
         T: TensorElement,
     {
-        for id in 0..self.storage_schema.shape.iter().product::<u64>() {
+        for id in 0..self.geometry.storage.shape.iter().product::<u64>() {
             let values = vec![T::default(); self.block_len()];
             self.blocks
                 .write()
@@ -50,7 +48,7 @@ impl<FE> DenseStorage<FE> {
         FE: TensorFileEntry<T>,
         T: TensorElement,
     {
-        for id in 0..self.storage_schema.shape.iter().product::<u64>() {
+        for id in 0..self.geometry.storage.shape.iter().product::<u64>() {
             drop(self.read::<T>(id).await?);
         }
 
@@ -82,7 +80,8 @@ impl<FE> DenseStorage<FE> {
     }
 
     fn block_len(&self) -> usize {
-        self.storage_schema
+        self.geometry
+            .storage
             .block_schema
             .shape
             .iter()
@@ -90,7 +89,7 @@ impl<FE> DenseStorage<FE> {
     }
 
     fn validate_id(&self, id: u64) -> Result<()> {
-        if id >= self.storage_schema.shape.iter().product::<u64>() {
+        if id >= self.geometry.storage.shape.iter().product::<u64>() {
             return Err(Error::InvalidCoord("logical block out of bounds".into()));
         }
 
@@ -102,16 +101,21 @@ impl<FE> DenseStorage<FE> {
         FE: TensorFileEntry<T>,
         T: TensorElement,
     {
-        self.validate_id(id)?;
-        if block.len() != self.block_len() {
-            return Err(Error::InvalidLayout(
-                "invalid replacement block length".into(),
-            ));
-        }
+        self.geometry.validate_block(id, &block)?;
 
         let file = required_file(&*self.blocks.read().await, id)?;
-        let mut stored = file.write::<Vec<T>>().await?;
-        validate_stored_length(&stored, self.block_len())?;
+        // Acquiring this guard only decodes/checks the existing payload type;
+        // replacement values are applied below, after stored-data validation.
+        let mut stored = file
+            .write::<Vec<T>>()
+            .await
+            .map_err(freqfs::IntegrityError::from_read)?;
+        self.geometry.validate_block(id, &stored).map_err(|error| {
+            Error::Io(freqfs::IntegrityError::mark(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?;
         *stored = block;
         Ok(())
     }
@@ -121,8 +125,35 @@ impl<FE> DenseStorage<FE> {
         FE: TensorFileEntry<T>,
         T: TensorElement,
     {
+        self.geometry.validate_id(id)?;
         let file = required_file(&*self.blocks.read().await, id)?;
-        let mut block = file.write::<Vec<T>>().await?;
+        // No update input reaches the file while its existing type is checked.
+        let mut block = file
+            .write::<Vec<T>>()
+            .await
+            .map_err(freqfs::IntegrityError::from_read)?;
+        self.geometry.validate_block(id, &block).map_err(|error| {
+            Error::Io(freqfs::IntegrityError::mark(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?;
+        for &(offset, value) in updates {
+            if offset >= self.block_len() {
+                return Err(Error::InvalidLayout("invalid block update offset".into()));
+            }
+            if value != T::ZERO
+                && (0..self.geometry.schema.shape().len()).any(|axis| {
+                    let storage = &self.geometry.storage;
+                    let extent = self.geometry.block_shape()[axis];
+                    let grid = (id / storage.strides[axis]) % storage.shape[axis];
+                    let local = (offset as u64 / storage.block_schema.strides[axis]) % extent;
+                    local >= self.geometry.schema.shape()[axis] - grid * extent
+                })
+            {
+                return Err(Error::InvalidLayout("nonzero logical block padding".into()));
+            }
+        }
         apply_block_updates(&mut block, self.block_len(), updates)
     }
 
@@ -134,40 +165,41 @@ impl<FE> DenseStorage<FE> {
         Box::pin(async move {
             self.validate_id(id)?;
             let file = required_file(&*self.blocks.read().await, id)?;
-            let block = file.into_read::<Vec<T>>().await?;
-            validate_stored_length(&block, self.block_len())?;
+            let block = file
+                .into_read::<Vec<T>>()
+                .await
+                .map_err(freqfs::IntegrityError::from_read)?;
+            self.geometry.validate_block(id, &block).map_err(|error| {
+                Error::Io(freqfs::IntegrityError::mark(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error,
+                )))
+            })?;
             Ok(block)
         })
     }
 
-    pub(super) async fn read_groups<T>(
-        &self,
-        groups: crate::storage_read::LogicalGroups,
-        values: &mut [T],
-    ) -> Result<()>
+    pub(super) async fn visit_blocks<T, C>(&self, ids: &[u64], consume: &mut C) -> Result<()>
     where
         FE: TensorFileEntry<T>,
         T: TensorElement,
+        C: FnMut(u64, &[T]) -> Result<()> + Send,
     {
         // Ordinary reads retain their guards until consumed. Cache admission may
         // fail when these reads or independent consumers pin too much capacity.
-        let reads = stream::iter(groups)
-            .map(|(id, positions)| async move {
-                self.read::<T>(id).await.map(|block| (positions, block))
-            })
+        let reads = stream::iter(ids.iter().copied())
+            .map(|id| async move { self.read::<T>(id).await.map(|block| (id, block)) })
             .buffered(num_cpus::get().max(1));
         let mut reads = std::pin::pin!(reads);
 
-        while let Some((positions, block)) = reads.try_next().await? {
+        while let Some((id, block)) = reads.try_next().await? {
             #[cfg(test)]
             crate::read_metrics::record(|m| {
                 m.borrows += 1;
                 m.borrowed += block.len();
             });
 
-            for run in positions {
-                run.scatter(&block, values)?;
-            }
+            consume(id, &block)?;
         }
 
         Ok(())
@@ -185,6 +217,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                     "dense construction requires dense storage".into(),
                 ));
             };
+
             let updates =
                 crate::storage::plan_updates(&tensor.storage_geometry(), None, &request, values)?;
             #[cfg(test)]
@@ -223,10 +256,11 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
 }
 
 fn required_file<FE: FileLoad>(blocks: &Dir<FE>, id: u64) -> Result<FileLock<FE>> {
-    blocks
-        .get_file(&id.to_string())
-        .cloned()
-        .ok_or_else(|| Error::InvalidLayout("missing required tensor payload".into()))
+    blocks.get_file(&id.to_string()).cloned().ok_or_else(|| {
+        Error::Io(freqfs::IntegrityError::invalid_data(
+            "missing required tensor payload",
+        ))
+    })
 }
 
 #[cfg(test)]

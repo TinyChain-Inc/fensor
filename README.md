@@ -17,7 +17,6 @@ Unary, binary, conditional, reduction, and matrix expressions remain lazy and
 read-only. Computed views implement neither `TensorWrite` nor `TensorArray`;
 geometric views retain constrained write-through access. View descriptions can
 be cloned without requiring the filesystem adapter to implement `Clone`.
-`TensorTransform` implementations provide all seven transformations;
 `TensorWriteBulk` implementations provide writes from buffers and fill. Each
 implementation validates supported geometry and input cardinality.
 
@@ -32,8 +31,9 @@ or accumulators in the same process. They never persist computed intermediates.
 Nested expressions can recompute values, and source reads/cache spill can do I/O.
 
 `Tensor::copy_from(dir, &expression, destination_layout, max_capacity).await?`
-creates independent filesystem storage with caller-selected packing. Copying is
-never necessary between operations. The destination adapter can differ from the
+creates independent filesystem storage with caller-selected packing. Supported
+operations compose without copying; unsupported sparse traversal can be made
+explicit through `Tensor::copy_from_values`. The destination adapter can differ from the
 source adapter and must support the output dtype. `max_capacity` limits block
 capacity; it does not select an exact block shape. Sparse copying accepts a new
 sparse axis and omits final numerical zeros. A reader's reported layout describes
@@ -49,6 +49,49 @@ Import `Shape`, `Strides`, `Range`, `AxisRange`, and `Axes` from fensor.
 `TensorGeometry::size()` returns `Result<u64>`; geometric flat offsets use checked
 `i128`. Operation traits expose per-operation associated output types. Generic
 callers state the required dtype bounds, and cast destinations may need annotations.
+
+## Layout and geometric views
+
+Storage packing and view geometry are separate:
+
+| Layer | Responsibility |
+|---|---|
+| Stored `Tensor` | Fixed logical shape, layout, and block geometry recorded in metadata. |
+| `TensorView` | Maps its current coordinates to the source, without rearranging storage. |
+| Storage owner | Resolves logical block IDs and validates/reads their payloads. |
+
+Dense storage uses typed payload files. Sparse storage uses one native BTree,
+keyed by logical block ID, whose rows contain dense block payloads. Missing blocks
+represent zero; all-zero blocks are omitted. The BTree has no per-axis secondary
+indexes. Both layouts use the same geometric transforms and numerical kernels.
+
+For `Layout::Sparse { axis: Some(a) }`, coordinates through axis `a` select a
+dense trailing region. Blocks have extent one on that prefix and partition the
+trailing region within the configured capacity. `axis: None` selects scalar
+sparsity. Capacity changes packing, not tensor values; loading preserves the
+recorded block geometry. See [native storage](DESIGN.md#native-storage-and-sources)
+for validation and ownership details.
+
+`TensorTransform` provides slice, transpose (including arbitrary permutations),
+reshape, flip, broadcast, squeeze, and unsqueeze. These compose coordinate mappings;
+consumption turns bounded requests into source block IDs and offsets, then gathers
+values in the requested output geometry. For example, slicing a 2-D source with
+axis ranges `10..20` at step 2 and `30..40` at step 1, then swapping axes, produces
+shape `[10, 5]` with `view[i, j] = source[10 + 2*j, 30 + i]`.
+
+Transforms validate their input and supported composition. Reshape requires equal
+cardinality and contiguous row-major view geometry; it does not silently copy a transposed,
+flipped, or gathered view. Explicit copying can provide a new contiguous source.
+A view's reported layout describes its output and may drop a sparse-axis hint;
+it neither repacks the source nor selects destination allocation.
+
+A multidimensional selection need not be one contiguous BTree range. Eligible
+sparse traversal scans occupied block IDs and checks their geometry before reading
+payloads. Ordinary block reads can evaluate other supported mappings in bounded
+batches; indexed ordered reads have stricter geometry/order requirements, described
+under [sparse values](#sparse-values). Sparsity does not guarantee work proportional
+to nonzeros for every transform or aggregate. Rank-zero views cannot be streamed
+or copied, and empty-dimension tensor storage is unsupported.
 
 ## Supported operations
 
@@ -93,11 +136,8 @@ Unary composition nests sources, for example
 `UnaryView<UnaryView<Source, Round>, Exp>`. Public operation markers live in
 `unary`, `binary`, `scalar`, and `reduce`.
 
-`TensorTransform` provides reshape, broadcast, flip, slice, squeeze, transpose,
-and unsqueeze, returning `Self` subject to geometric validation. Elementwise
-transforms preserve operation order. Reduction and matrix output transforms map
-the output geometry instead of moving through the aggregate. Rank-zero views
-cannot be streamed or copied. Empty-dimension tensor storage is unsupported.
+Elementwise transforms preserve operation order. Reduction and matrix output
+transforms address the output geometry instead of moving through the aggregate.
 
 Numerical rules belong to ha-ndarray. Its
 [numerical contract](https://github.com/TinyChain-Inc/ha-ndarray/blob/main/NUMERICS.md)
@@ -133,9 +173,12 @@ views, and reject other orders with `UnsupportedSparseIterationOrder`. They sort
 and deduplicate explicit selections for this reader only; geometric slicing retains
 selection order and duplicates. Compatible geometry traverses occupied logical blocks
 through paginated indexes. Eligible pointwise expressions delegate and merge these
-candidates incrementally. Other mappings and aggregate operations retain bounded
-logical evaluation; sparse storage alone does not guarantee work proportional to
-nonzero values. See [slice traversal](DESIGN.md#slices-and-reductions).
+candidates incrementally. Runtime-owned forward slices and permutations retain the same indexed planning.
+Unsupported mappings or ordering return a structured error for selections larger
+than one execution batch; use `Tensor::copy_from_values` to explicitly materialize
+them. Bounded point reads and row-major `read_blocks` remain available. Aggregate
+outputs retain their own logical evaluation; sparse storage alone does not guarantee
+work proportional to nonzero values. See [slice traversal](DESIGN.md#slices-and-reductions).
 
 ## Reductions and matrix operations
 
@@ -193,18 +236,7 @@ work proportional to nonzeros or optimal transform throughput.
 
 ## Streams, bounds, and concurrency
 
-For `Layout::Sparse { axis: Some(a) }`, coordinates through axis `a` select a
-dense trailing region. Storage blocks have extent one on that prefix and split
-the full trailing shape into at most 4,096 elements each. `axis: None` selects
-scalar sparsity. Storage block capacity does not change the logical dense region.
-Loading validates the recorded geometry without retessellating it.
-
-Sparse storage blocks are dense typed vectors in a native `b-table`, keyed by logical
-block ID. Rows share native pages. Missing blocks are zero; all-zero blocks have
-no row. Omission changes physical storage only: every logical coordinate still
-has its ordinary numerical value.
-
-Native table guards coordinate sparse reads and replacement. Synchronization
+Native BTree guards coordinate sparse reads and replacement. Synchronization
 releases operation guards before entering the directory hierarchy; callers quiesce
 mutations when they need a precise durable boundary. Validation is not a
 transaction snapshot across concurrent writes. After a failed or cancelled
@@ -224,7 +256,9 @@ responsible for limiting decoding allocations before fensor receives a payload.
 
 A successful complete coordinate stream visits every logical coordinate exactly
 once, including zeros. Its default adapter pairs row-major values with coordinates;
-built-in expressions can generate tiled requests. Request traversal is distinct
+built-in sources visit intersecting physical blocks, and matrix expressions can
+generate tiled requests. Transformed source planning retains consumer coordinates;
+absent sparse blocks still contribute their zero-valued coordinates. Request traversal is distinct
 from batch delivery order. Each stream is independent and live, not a snapshot.
 Concurrent source writes are not isolated. Dropping a stream cancels pending work.
 
@@ -274,8 +308,17 @@ Use `tensor.sync_all().await?` for delegated durable synchronization. Callers ow
 transaction and recovery policy.
 fensor provides no commit, rollback, or isolation semantics.
 
-Copying groups bounded destination updates and finishes each batch before requesting
-the next source batch. It adds no lookahead or background work. Validation and errors
+`Tensor::copy_from` retains indexed sparse copying and rejects unsupported ordered
+traversal. `Tensor::copy_from_values` is the explicit full-value alternative: it
+consumes logical row-major batches once, validates and counts each batch before
+omitting sparse zeros, and requires exact total cardinality before publication. It
+uses the same storage construction. It can be expensive for huge
+sparse shapes; neither operation retries through the other. Both retain the existing
+requirement to convert dense/sparse kinds explicitly before copying.
+
+Copying performs destination updates sequentially. Sparse construction may assemble
+a bounded batch of nonzeros from several input batches; it adds no speculative
+lookahead or background work. Validation and errors
 remain non-transactional: failures propagate and can leave partial output without
 loadable metadata or a guaranteed write prefix. Synchronization and cleanup remain
 caller responsibilities.
@@ -309,7 +352,7 @@ and releases its retained source handles without following expression depth on t
 worker stack. Physical payload and index mutation are private to the native owner.
 Storage itself is never erased.
 `replace_logical_block` coordinates native sparse
-payload/index changes and preserves other logical blocks sharing native table pages.
+payload/index changes and preserves other logical blocks sharing native BTree pages.
 
 `Tensor::load` is strict and non-mutating: missing metadata, blocks or indexes,
 wrong payload types, invalid lengths, duplicate logical keys, and inconsistent

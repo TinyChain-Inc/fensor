@@ -4,7 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use ha_ndarray::{ArrayAccess, NDArrayFourier, NDArrayRead, NDArrayTransform, Number};
+use ha_ndarray::{
+    ArrayBuf, Buffer, BufferConverter, NDArrayFourier, NDArrayRead, NDArrayTransform, Number,
+    Platform,
+};
 
 use crate::expression::{self, Batch, Expression, MAX_BATCH_ELEMENTS};
 use crate::mapping::CoordinateMap;
@@ -24,7 +27,10 @@ mod sealed {
 pub trait FourierOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     const NAME: &'static str;
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>>;
+    fn apply(
+        &self,
+        array: ArrayBuf<T, Buffer<T>>,
+    ) -> Result<impl NDArrayRead<DType = T, Platform = Platform>>;
 }
 
 /// Unnormalized forward Fourier transform.
@@ -41,27 +47,31 @@ impl sealed::Sealed for Ifft {}
 
 impl<T: TensorElement> FourierOp<T> for Fft
 where
-    ArrayAccess<'static, T>: NDArrayFourier<DType = T, Platform = ha_ndarray::Platform>,
-    <ArrayAccess<'static, T> as NDArrayFourier>::Output: Into<ha_ndarray::Accessor<'static, T>>,
+    ArrayBuf<T, Buffer<T>>: NDArrayFourier<DType = T, Platform = ha_ndarray::Platform>,
     T: ha_ndarray::Complex,
 {
     const NAME: &'static str = "fft";
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.fft()?))
+    fn apply(
+        &self,
+        array: ArrayBuf<T, Buffer<T>>,
+    ) -> Result<impl NDArrayRead<DType = T, Platform = Platform>> {
+        Ok(array.fft()?)
     }
 }
 
 impl<T: TensorElement> FourierOp<T> for Ifft
 where
-    ArrayAccess<'static, T>: NDArrayFourier<DType = T, Platform = ha_ndarray::Platform>,
-    <ArrayAccess<'static, T> as NDArrayFourier>::Output: Into<ha_ndarray::Accessor<'static, T>>,
+    ArrayBuf<T, Buffer<T>>: NDArrayFourier<DType = T, Platform = ha_ndarray::Platform>,
     T: ha_ndarray::Complex,
 {
     const NAME: &'static str = "ifft";
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, T>> {
-        Ok(ArrayAccess::from(array.ifft()?))
+    fn apply(
+        &self,
+        array: ArrayBuf<T, Buffer<T>>,
+    ) -> Result<impl NDArrayRead<DType = T, Platform = Platform>> {
+        Ok(array.ifft()?)
     }
 }
 
@@ -308,10 +318,8 @@ where
                     .await?;
                 let array = expression::batch_array(batch.values)?
                     .reshape(ha_ndarray::shape![pack.len(), width])?;
-                let transformed = self
-                    .op
-                    .apply(ArrayAccess::from(array))?
-                    .buffer()?
+                let transformed = self.op.apply(array)?.into_read()?;
+                let transformed = BufferConverter::from(transformed.into_access().into_inner())
                     .to_slice()?
                     .into_vec();
                 if transformed.len() != expected {

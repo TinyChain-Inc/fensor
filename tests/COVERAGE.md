@@ -7,7 +7,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 
 | Contract | Primary coverage |
 |---|---|
-| Public downstream composition, geometric mutation, logical-block access, copy/sync/reload | `handoff` (f32 dense/trailing-axis sparse); no transaction-readiness claim |
+| Public downstream composition, geometric mutation, logical-block access, copy/sync/reload | `handoff` (f32 dense/sparse sources, explicitly dense expression); no transaction-readiness claim |
 | Logical u64 geometry, inline rank spilling, overflow, large-coordinate persistence | `geometry`; request/mapping/storage-run unit bounds |
 | Matrix transpose/diagonal dtype and consumer parity, output transforms, huge selected reads, corruption, cache pressure, cancellation and write constraints | `matrix_unary`; matrix unit request counters; diagonal doctests |
 | Matrix shapes, dtypes, operand layouts and backend agreement | `matmul` numerical parity matrix, block streams |
@@ -25,7 +25,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Ordinary implicit zeros, dense-equivalent statistics, explicit dense conversion and bounded groups | `dense_sparse_rows`; `sparse_semantics`; reduction zero-gap integration/unit cases |
 | Expression zero signs during indexed gap aggregation | Reduction unit `zero_gap_products_preserve_expression_signed_zeros` |
 | Corruption, boolean decision boundaries, cache pressure, cancellation and live reads | Native `tensor::physical_tests` and `tensor::dtype_storage`; dedicated copy cases |
-| No implicit result storage and transformed leaf parity | `storage_runs` |
+| Reshape/slice, repeated flips, gather/flip, slice/broadcast, and no implicit result storage | `storage_runs` (streams versus point reads across sparse axes and block capacities) |
 | Recursive operand order, first-error propagation, and final-argument ownership | Mapping unit `recursive_transforms_stop_at_first_error_and_move_the_final_argument` |
 | Transform input rejection and structured sparse-order errors | Public access integration cases; view unit tests retain mapping/write-through contracts |
 | Sparse axis bounds on creation and reload | `foundations::public_create_rejects_invalid_sparse_axis_hint`, `storage_codec::reload_rejects_out_of_bounds_sparse_axis` |
@@ -121,6 +121,10 @@ bounded requests and execution with the structural suites listed above.
 - `access_matrix` parameterizes dense/sparse slice, transpose, chained transpose/
   slice, squeeze, and unsqueeze while retaining original geometry, sparse axes,
   capacities, and values. Dense reload and sparse index-update reload stay distinct.
+  Its sparse slice/permutation and squeeze/unsqueeze cases complement `storage_runs`.
+  Coverage is representative: some longer chains are dense-only, and stream/point
+  comparisons share coordinate mapping rather than providing an independent oracle.
+  Supported transform composition does not imply indexed sparse traversal support.
 - `tensor::dtype_storage::f64_storage` includes PI/E values and full schema checks
   after reopening; it subsumes the former standalone f64 roundtrip smoke test.
 
@@ -138,7 +142,7 @@ bounded requests and execution with the structural suites listed above.
 | Creation-only metadata publication preserves existing contents | Native metadata tests |
 | Occupied-key validation and full cursor continuation | Native page tests |
 | Shared metadata fields and extra-field rejection | `storage_codec` |
-| Ordered insertion errors, duplicates, cancellation, reopening and subsequent mutation | b-tree example tests; b-table examples own ordered auxiliary-index ingestion and replacement |
+| Ordered insertion errors, duplicates, cancellation, reopening and subsequent mutation | b-tree example tests |
 | Transaction overlay suppression and prefetched-workspace cleanup | Collection storage tests |
 
 `common::fixture::reads` checks blocks, every point and sparse entries; `copied`
@@ -195,13 +199,13 @@ They cover rank, singleton dimensions, edge capacities, empty/zero dimensions,
 and overflow, retaining exact shape/stride and `InvalidSchema` assertions.
 
 Sparse owner locking is covered by
-`tensor::sparse_storage::validation_tests::table_guards_preserve_batch_reads_and_partial_updates`:
-a blocked payload read retains its table guard across consecutive and separated
+`tensor::sparse_storage::validation_tests::index_guards_preserve_batch_reads_and_partial_updates`:
+a blocked payload read retains its BTree guard across consecutive and separated
 ID groups, concurrent partial updates preserve both values, and quiesced sync
 reopens successfully after overlapping native operations. Raw corruption helpers
 live in `tests/unit/tensor/sparse_storage/corruption.rs`; production exposes no
-sparse table or directory handles. Existing cancellation and validation-order
-fixtures acquire native table guards directly.
+sparse BTree or directory handles. Existing cancellation and validation-order
+fixtures acquire native BTree guards directly.
 
 Dense construction belongs to `dense_storage::Construction`; construction tests
 retain their owning module. Storage benchmarks live in `common/storage_cases.rs`
@@ -211,9 +215,10 @@ and use the `storage` selector.
 batching. Malformed mapping and dense-file fixtures live in their owners' test
 support without adding production visibility.
 
-Read validation in `unit/storage/traversal_tests.rs` checks reuse of computed
-bounds during padding validation. Storage and sparse consumer fixtures cover
-invalid IDs, corruption, ordering, and absent rows.
+Read validation in `unit/storage/traversal_tests.rs` checks allocation-free full
+blocks, reuse of computed bounds during edge-padding validation, validation
+precedence, and `u64` boundary geometry. Storage and sparse consumer fixtures
+cover invalid IDs, corruption, ordering, and absent rows.
 
 Sequential-consumer fixtures check one active request, borrowed/owned cancellation,
 and source release. `sequential_errors_stop_before_later_evaluation` checks

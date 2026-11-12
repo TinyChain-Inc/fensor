@@ -24,7 +24,7 @@ use crate::request::BatchRequest;
 use crate::schema::{BlockPosition, Layout, MAX_BLOCK_CAPACITY, StorageSchema, TensorSchema};
 use crate::traits::{
     BoxFuture, TensorArray, TensorGeometry, TensorRead, TensorTransform, TensorWrite,
-    TensorWriteBulk,
+    TensorWriteBulk, ValueBlockStream,
 };
 use crate::view::TensorView;
 use crate::{Range, TensorMetadata, TensorSource, validate};
@@ -202,7 +202,7 @@ where
 
         let schema = geometry.schema.clone();
         let storage = match geometry.layout() {
-            Layout::Dense => Storage::Dense(DenseStorage::new(blocks, geometry.storage)),
+            Layout::Dense => Storage::Dense(DenseStorage::new(blocks, geometry)),
             Layout::Sparse { .. } => Storage::Sparse(
                 sparse_storage::SparseStorage::create(&dir, blocks, geometry).await?,
             ),
@@ -370,6 +370,104 @@ where
         output.finish().await
     }
 
+    /// Explicitly materialize every logical value in row-major order.
+    ///
+    /// Unlike [`Self::copy_from`], this does not require indexed sparse traversal.
+    /// It reads implicit zeros too, so its cost follows logical cardinality rather
+    /// than sparse occupancy. Each batch is bounded and counted before sparse
+    /// zero filtering; exact total cardinality is required before publication.
+    /// The destination retains the source's dense/sparse kind; callers choose its
+    /// layout and capacity.
+    /// Failed or cancelled construction publishes no loadable metadata and releases
+    /// the source stream. The caller owns cleanup of partial destination storage.
+    pub async fn copy_from_values<'a, R>(
+        dir: DirLock<FE>,
+        source: &'a R,
+        destination_layout: Layout,
+        max_capacity: usize,
+    ) -> Result<Self>
+    where
+        R: TensorRead<DType = T> + ?Sized,
+    {
+        let schema =
+            TensorSchema::new(<T as number_general::DType>::dtype(), source.shape().into())?;
+        if matches!(source.layout(), Layout::Dense) != matches!(destination_layout, Layout::Dense) {
+            return Err(Error::Unsupported(
+                "copy requires matching dense/sparse kinds; convert the source explicitly first"
+                    .into(),
+            ));
+        }
+
+        let output = Self::unpublished(dir, schema, destination_layout, max_capacity).await?;
+        let expected = crate::schema::checked_product(source.shape())?;
+        let blocks = futures::stream::try_unfold(
+            (source.read_blocks()?, 0u64),
+            move |(mut blocks, received): (ValueBlockStream<'a, T>, u64)| async move {
+                tokio::task::coop::consume_budget().await;
+                let Some(values) = blocks.try_next().await? else {
+                    return if received == expected {
+                        Ok(None)
+                    } else {
+                        Err(Error::InvalidLayout(
+                            "reader returned fewer values than its shape".into(),
+                        ))
+                    };
+                };
+
+                if values.len() > crate::expression::MAX_BATCH_ELEMENTS {
+                    return Err(Error::InvalidLayout(format!(
+                        "copy block: expected at most {} values, got {}",
+                        crate::expression::MAX_BATCH_ELEMENTS,
+                        values.len()
+                    )));
+                }
+                let end = received
+                    .checked_add(values.len() as u64)
+                    .filter(|n| *n <= expected)
+                    .ok_or_else(|| {
+                        Error::InvalidLayout("reader returned more values than its shape".into())
+                    })?;
+                Ok(Some(((received, values), (blocks, end))))
+            },
+        )
+        .boxed();
+
+        if matches!(destination_layout, Layout::Sparse { .. }) {
+            let shape = source.shape();
+            let entries = blocks
+                .map_ok(move |(start, values)| {
+                    let mut coord = crate::schema::Coord::new();
+                    futures::stream::iter(
+                        values
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(_, value)| *value != T::ZERO)
+                            .map(move |(offset, value)| {
+                                crate::request::decode_flat(
+                                    start + offset as u64,
+                                    shape,
+                                    &mut coord,
+                                )?;
+                                Ok((coord.to_vec(), value))
+                            }),
+                    )
+                })
+                .try_flatten();
+            return construction::sparse(output, entries).await;
+        }
+
+        let output = dense_storage::Construction(output);
+        let mut blocks = blocks;
+
+        while let Some((start, values)) = blocks.try_next().await? {
+            output
+                .stage(BatchRequest::linear(start, values.len())?, values)
+                .await?;
+        }
+
+        output.finish().await
+    }
+
     /// Strictly reopen materialized storage without creating or repairing files.
     /// The caller excludes concurrent native writes while loading and validating.
     pub async fn load(dir: DirLock<FE>) -> Result<Self> {
@@ -388,7 +486,7 @@ where
                         "dense tensor contains a sparse index".into(),
                     ));
                 }
-                Storage::Dense(DenseStorage::new(blocks, geometry.storage))
+                Storage::Dense(DenseStorage::new(blocks, geometry))
             }
             Layout::Sparse { .. } => {
                 Storage::Sparse(sparse_storage::SparseStorage::load(&dir, blocks, geometry)?)
@@ -496,20 +594,45 @@ where
         }
     }
 
-    /// Plan one bounded request by logical block and scatter position.
-    fn plan_read_groups(
-        &self,
-        request: &BatchRequest,
-        mapping: Option<&CoordinateMap>,
-    ) -> Result<crate::storage_read::LogicalGroups> {
-        let storage = crate::storage_read::StorageShape {
-            shape: self.shape(),
-            strides: self.strides(),
-            block_shape: self.block_shape(),
-            block_strides: self.block_strides(),
-            grid_strides: self.grid_strides(),
-        };
-        storage.plan(request, mapping)
+    /// Visit a bounded, strictly increasing selection of logical blocks.
+    /// Payloads are borrowed until the synchronous callback returns; sparse
+    /// absence skips the callback. No payload or native guard escapes the callback.
+    /// All IDs are validated before I/O. Errors are delivered in block order.
+    pub fn visit_blocks<'a, C>(
+        &'a self,
+        ids: &'a [u64],
+        mut consume: C,
+    ) -> BoxFuture<'a, Result<()>>
+    where
+        C: FnMut(u64, &[T]) -> Result<()> + Send + 'a,
+    {
+        Box::pin(async move {
+            if ids.len() > crate::expression::MAX_BATCH_ELEMENTS {
+                return Err(Error::InvalidLayout(
+                    "too many logical blocks in read batch".into(),
+                ));
+            }
+            if ids.is_empty() {
+                return Ok(());
+            }
+
+            let count = self.storage.storage_schema().shape.iter().product::<u64>();
+            for (index, &id) in ids.iter().enumerate() {
+                if id >= count {
+                    return Err(Error::InvalidCoord("logical block out of bounds".into()));
+                }
+                if index != 0 && ids[index - 1] >= id {
+                    return Err(Error::InvalidCoord(
+                        "logical block IDs must be sorted and unique".into(),
+                    ));
+                }
+            }
+
+            match self.storage.as_ref() {
+                Storage::Dense(dense) => dense.visit_blocks(ids, &mut consume).await,
+                Storage::Sparse(sparse) => sparse.visit_blocks(ids, &mut consume).await,
+            }
+        })
     }
 
     /// Borrow each needed block once; all requests and results fit one execution batch.
@@ -518,22 +641,11 @@ where
         request: &BatchRequest,
         mapping: Option<&CoordinateMap>,
     ) -> Result<Vec<T>> {
-        let dense = match self.storage.as_ref() {
-            Storage::Sparse(sparse) => {
-                let groups = self.plan_read_groups(request, mapping)?;
-                let mut values = vec![T::ZERO; request.len()];
-
-                sparse.read_groups(&groups, &mut values).await?;
-                return Ok(values);
-            }
-            Storage::Dense(dense) => dense,
-        };
-
-        let groups = self.plan_read_groups(request, mapping)?;
-
-        let mut values = vec![T::ZERO; request.len()];
-
-        dense.read_groups(groups, &mut values).await?;
+        let plan = crate::StorageRead { request, mapping }.plan(&self.storage_geometry())?;
+        let ids: Vec<_> = plan.block_ids().collect();
+        let mut values = vec![T::ZERO; plan.len()];
+        self.visit_blocks(&ids, |id, block| plan.scatter(id, block, &mut values))
+            .await?;
 
         Ok(values)
     }
@@ -701,7 +813,7 @@ where
 // Dense reads and replacement require an existing, correctly typed payload.
 fn validate_stored_length<T>(block: &[T], expected: usize) -> Result<()> {
     if block.len() != expected {
-        return Err(Error::InvalidLayout("invalid stored block length".into()));
+        return Err(freqfs::IntegrityError::invalid_data("invalid stored block length").into());
     }
 
     Ok(())

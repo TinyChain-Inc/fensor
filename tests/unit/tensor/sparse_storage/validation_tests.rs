@@ -6,8 +6,9 @@ use crate::{Error, Layout, StorageGeometry, Tensor, TensorSchema, TensorSource};
 
 #[tokio::test]
 async fn replacement_validation_preserves_lock_precedence() {
+    use b_tree::Schema;
+
     use crate::sparse::{PayloadSchema, SparseCell};
-    use b_table::BTreeSchema;
 
     let schema = PayloadSchema::<f32>::new(2);
     for prefix in [
@@ -84,7 +85,7 @@ async fn replacement_validation_preserves_lock_precedence() {
 }
 
 #[tokio::test]
-async fn table_guards_preserve_batch_reads_and_partial_updates() {
+async fn index_guards_preserve_batch_reads_and_partial_updates() {
     use crate::request::BatchRequest;
     use crate::sparse::SparseCell;
 
@@ -102,7 +103,7 @@ async fn table_guards_preserve_batch_reads_and_partial_updates() {
         storage.replace(id, vec![1.; 2]).await.unwrap();
     }
 
-    // Stall the first range at its payload, after the batch acquired its table guard.
+    // Stall the first range at its payload, after the batch acquired its tree guard.
     let values = dir.read().await.get_dir("values").cloned().unwrap();
     let primary = values.read().await.get_dir("primary").cloned().unwrap();
     let file = primary.read().await.files().next().unwrap().clone();
@@ -156,7 +157,7 @@ async fn table_guards_preserve_batch_reads_and_partial_updates() {
             .blocks
             .read()
             .await
-            .get_row(&[SparseCell::Key(3)])
+            .get(&[SparseCell::Key(3)])
             .await
             .unwrap()
             .unwrap()[1],

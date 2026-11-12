@@ -72,6 +72,10 @@ async fn clearing_one_value_preserves_the_rest_of_its_sparse_key() {
     tensor.write_value(&[0, 1], 0.).await.unwrap();
     assert!(block_id_for_coord(&tensor, &[0, 1]).await.is_none());
     assert_eq!(tensor.read_logical_block(id).await.unwrap(), vec![0.; 2]);
+    tensor
+        .visit_blocks(&[id], |_, _| panic!("absent sparse block"))
+        .await
+        .unwrap();
     assert!(
         tensor
             .occupied_blocks(0..tensor.storage_geometry().block_count())
@@ -168,7 +172,7 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
         let owner = tensor.storage.sparse().unwrap();
         {
             use futures::FutureExt;
-            let held = crate::tensor::corruption::block_table(owner).write().await;
+            let held = crate::tensor::corruption::block_index(owner).write().await;
             assert!(matches!(
                 tensor
                     .replace_logical_block(owner.geometry().block_count(), vec![])
@@ -186,7 +190,7 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
             );
         }
         // Cancellation while waiting for native table access leaves no held guards.
-        let guard = crate::tensor::corruption::block_table(owner).write().await;
+        let guard = crate::tensor::corruption::block_index(owner).write().await;
         {
             let mut replacement =
                 std::pin::pin!(tensor.replace_logical_block(0, vec![2.; len as usize]));
@@ -194,17 +198,17 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
         }
         drop(guard);
         assert!(
-            crate::tensor::corruption::block_table(owner)
+            crate::tensor::corruption::block_index(owner)
                 .try_write()
                 .is_ok()
         );
         // This fixture stopped before any table mutation. Inspect native data
         // directly, then follow the caller contract by discarding both handles.
         assert_eq!(
-            crate::tensor::corruption::block_table(owner)
+            crate::tensor::corruption::block_index(owner)
                 .read()
                 .await
-                .get_row(&[crate::SparseCell::Key(0)])
+                .get(&[crate::SparseCell::Key(0)])
                 .await
                 .unwrap()
                 .unwrap()[1],
@@ -333,8 +337,87 @@ async fn storage_batches_group_blocks_and_preserve_order() {
         tensor.write_value(&[1, 1], 4.).await.unwrap();
 
         let coords = vec![vec![1, 1], vec![0, 3], vec![0, 0], vec![0, 3]];
-        let groups: BTreeMap<_, _> = tensor
-            .plan_read_groups(&BatchRequest::explicit(coords.clone()).unwrap(), None)
+        let request = BatchRequest::explicit(coords.clone()).unwrap();
+        let geometry = tensor.storage_geometry();
+        let storage = crate::storage_read::StorageShape {
+            shape: tensor.shape(),
+            strides: tensor.strides(),
+            block_shape: tensor.block_shape(),
+            block_strides: tensor.block_strides(),
+            grid_strides: tensor.grid_strides(),
+        };
+        let groups: BTreeMap<_, _> = storage.plan(&request, None).unwrap();
+        let plan = crate::StorageRead {
+            request: &request,
+            mapping: None,
+        }
+        .plan(&geometry)
+        .unwrap();
+        assert_eq!(plan.len(), coords.len());
+        assert!(!plan.is_empty());
+        assert_eq!(plan.block_ids().collect::<Vec<_>>(), vec![0, 1]);
+        let mut values = vec![0.; plan.len()];
+        let mut visited = Vec::new();
+        tensor
+            .visit_blocks(&[0, 1], |id, block| {
+                visited.push(id);
+                plan.scatter(id, block, &mut values)
+            })
+            .await
+            .unwrap();
+        assert_eq!(visited, [0, 1]);
+        assert_eq!(values, [4., 3., 2., 3.]);
+        if matches!(layout, Layout::Sparse { .. }) {
+            let (node, slot) = corruption::sparse_row(&tensor, 0).await;
+            let b_tree::Node::Leaf(rows) = &*node else {
+                panic!("expected sparse leaf")
+            };
+            let crate::sparse::SparseCell::Payload(stored) = &rows[slot][1] else {
+                panic!("expected sparse payload")
+            };
+            for ids in [vec![0], vec![0, 1]] {
+                let mut observed = false;
+                tensor
+                    .visit_blocks(&ids, |id, block| {
+                        if id == 0 {
+                            assert!(std::ptr::eq(block, stored.as_slice()));
+                            observed = true;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert!(observed);
+            }
+        }
+        for (id, block, len) in [
+            (0, vec![0.; 3], 4),
+            (0, vec![0.; 4], 3),
+            (2, vec![0.; 4], 4),
+        ] {
+            let mut output = vec![-1.; len];
+            assert!(plan.scatter(id, &block, &mut output).is_err());
+            assert_eq!(output, vec![-1.; len]);
+        }
+        for ids in [vec![0], vec![0, 1]] {
+            visited.clear();
+            let error = tensor
+                .visit_blocks(&ids, |id, _| {
+                    visited.push(id);
+                    Err(Error::Unsupported("stopped consumption".into()))
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::Unsupported(message) if message == "stopped consumption")
+            );
+            assert_eq!(visited, [0]);
+            // Consumer errors release all native guards, including buffered reads.
+            tensor.write_value(&[0, 0], 2.).await.unwrap();
+        }
+        tensor
+            .visit_blocks(&[], |_, _| panic!("empty block selection"))
+            .await
             .unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(
@@ -390,10 +473,46 @@ async fn storage_batches_group_blocks_and_preserve_order() {
             tensor
                 .read_batch(&BatchRequest::explicit(coords.clone()).unwrap(), None)
                 .await,
+            Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
+        ));
+        // Validate every ID before accessing the corrupted first payload.
+        for ids in [vec![0, 2], vec![0, 0], vec![1, 0]] {
+            assert!(matches!(
+                tensor
+                    .visit_blocks(&ids, |_, _| panic!("invalid block selection"))
+                    .await,
+                Err(Error::InvalidCoord(_))
+            ));
+        }
+        let oversized = vec![0; crate::expression::MAX_BATCH_ELEMENTS + 1];
+        assert!(matches!(
+            tensor
+                .visit_blocks(&oversized, |_, _| panic!("oversized block selection"))
+                .await,
             Err(Error::InvalidLayout(_))
         ));
+        drop(tensor);
         cleanup(&root).await;
     }
+}
+
+#[tokio::test]
+async fn sparse_singleton_rejects_ambiguity_before_borrowing_payload() {
+    let (root, tensor) = create_sparse("ambiguous_borrow", shape![2, 4], 4, Some(0)).await;
+    tensor.write_value(&[0, 0], 2.).await.unwrap();
+    tensor.write_value(&[1, 0], 3.).await.unwrap();
+    corruption::corrupt_sparse_key(&tensor, 1, 0).await;
+    let error = tensor
+        .visit_blocks(&[0], |_, _| panic!("ambiguous row reached consumer"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ambiguous semantic key"));
+    let Error::Io(error) = error else {
+        panic!("native sparse storage error")
+    };
+    assert!(freqfs::IntegrityError::is_marked(&error));
+    drop(tensor);
+    cleanup(&root).await;
 }
 
 #[tokio::test]
@@ -819,10 +938,10 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
             // Completion has persisted its row before waiting for metadata. This
             // exercises cancellation after mutation, independently of table locks.
             assert!(
-                crate::tensor::corruption::block_table(owner)
+                crate::tensor::corruption::block_index(owner)
                     .read()
                     .await
-                    .get_row(&[crate::SparseCell::Key(0)])
+                    .get(&[crate::SparseCell::Key(0)])
                     .await
                     .unwrap()
                     .is_some()
@@ -830,7 +949,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
             drop(future);
             drop(held);
         } else {
-            let held = crate::tensor::corruption::block_table(owner).write().await;
+            let held = crate::tensor::corruption::block_index(owner).write().await;
             let coords = [vec![1, 0]];
             let mut future = builder.stage(&coords, vec![2.]);
             assert!(
@@ -844,7 +963,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
         }
 
         assert!(
-            crate::tensor::corruption::block_table(owner)
+            crate::tensor::corruption::block_index(owner)
                 .try_write()
                 .is_ok()
         );
@@ -1105,12 +1224,19 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
                 } else {
                     vec![1., 2.]
                 };
-                crate::tensor::corruption::block_table(owner)
-                    .write()
+                let mut index = crate::tensor::corruption::block_index(owner).write().await;
+                let previous = index
+                    .get(&[crate::SparseCell::Key(1)])
                     .await
-                    .upsert(
-                        vec![crate::SparseCell::Key(1)],
-                        vec![crate::SparseCell::Payload(values)],
+                    .unwrap()
+                    .unwrap();
+                index
+                    .replace(
+                        &previous,
+                        vec![
+                            crate::SparseCell::Key(1),
+                            crate::SparseCell::Payload(values),
+                        ],
                     )
                     .await
                     .unwrap();
