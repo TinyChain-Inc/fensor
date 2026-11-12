@@ -44,8 +44,8 @@ expression registry is part of execution.
 Sparse geometry gives each prefix coordinate a full dense trailing region,
 independent of the storage block capacity. Zero writes validate their storage block and
 remove its row when all values are zero. The native sparse
-owner coordinates payload reads and mutations through native table guards;
-table guards are released before entering another ownership domain.
+owner coordinates payload reads and mutations through native BTree guards;
+BTree guards are released before entering another ownership domain.
 
 Fourier views are bounded evaluation boundaries like reductions and matrix
 products. Each transformed axis is capped at `MAX_BATCH_ELEMENTS`; complete
@@ -130,9 +130,15 @@ returns an iterator or no preference. Matrix products
 generate tiles for the consuming expression's current shape, using linear requests
 below rank two. Unary/scalar nodes delegate; binary nodes consult left then right;
 conditionals consult condition, then, else. The first iterator or error ends the
-search. Geometric sources and reductions have no preference, so their consumers
-generate linear requests. Reduction output remains a traversal boundary even over
-a matrix source. Output mappings are independent of request traversal. The walker
+search. Geometric sources provide bounded requests in intersecting physical-block order
+when their mapping is positive and separable. They advance directly past untouched
+block regions, including stepped gaps, and include absent sparse blocks for complete
+coordinate coverage. Reduction output remains a traversal boundary even over
+a matrix source. The planner carries the original consumer selection plus optional rank-sized
+`StorageSlice` metadata. Owned and native views compose positive separable mappings
+with checked arithmetic; identity delegation adds no mapping allocation. Native
+leaves emit requests directly in consumer coordinates, without nested stream
+adapters. The walker
 owns borrowed-child ordering, fallible stack allocation, and the
 expression traversal limit. Its consumers retain first-provider selection and
 ordered union respectively; single-child selection remains an explicit loop.
@@ -151,8 +157,10 @@ retain their caller-provided bounded coordinates. Request metadata and rank-size
 scratch scale with the bounded leaf count, separately from numerical payloads.
 Both union polling and empty-request traversal yield cooperatively.
 
-Borrowed and owned block streams share request selection and ordered consumption;
-the owned stream retains its expression through an `Arc`.
+Borrowed and owned block streams share request selection and ordered consumption.
+Sparse request planning borrows its source during setup; the returned stream owns
+its geometry, mapping, and occupied-block cursor independently. Sequential owned
+evaluation retains its source once and borrows it for each batch.
 
 One sequential stream evaluates each request before pulling the next. Row-major,
 sparse, coordinate, update, and terminal consumers share this implementation.
@@ -161,7 +169,7 @@ not be row-major; delivery follows that partitioning without a completion queue.
 
 ha-ndarray owns numerical parallelism. Dense storage uses ordinary read futures
 with `buffered(num_cpus::get().max(1))`, retaining validated borrowed payloads
-until their ordered scatter completes. There is no second expression-batch buffer,
+until their ordered consumer completes. There is no second expression-batch buffer,
 prefetch phase, or payload-copy queue. Independent consumers remain concurrent.
 freqfs owns resource admission; a cache too small for pinned reads can return a
 bounded capacity error. Successful execution with a one-block cache is not required.
@@ -199,7 +207,9 @@ selects bounded coordinate mapping.
 Storage leaves split progressions at base-coordinate carries, block boundaries, or
 sparse-key changes. Each storage run holds destination start, source-block offset,
 signed stride, and count. At most one run per requested element is retained.
-Gather mappings and explicit requests emit/coalesce singleton runs using the same
+Nested affine `FlatRuns` compose directly, splitting at mixed-radix carries and
+borrows while retaining signed and zero strides. Gather mappings and explicit
+requests emit/coalesce singleton runs using the same
 mapping logic and rank-sized scratch, without collecting mapped base coordinates.
 
 Request cursors, affine leaves, and matrix rows share checked logical decoding and
@@ -207,14 +217,18 @@ lazy segment iteration. Storage owns block/carry splitting; matrix products own
 tile intersection and scattering. Consumers obtain these behaviors through ordinary
 expression delegation, without selecting a planning strategy.
 
-The shared reader validates positions into bounded logical-address groups before
-I/O. Dense reads retain native borrowed-block validation and scatter. Sparse reads
-read a bounded dense vector from its typed native table row before scattering.
+`StorageRead::plan` validates positions into bounded logical-address groups before
+I/O. The opaque plan retains scatter positions, including repeated selections;
+callers may choose visible storage without rebuilding coordinates. Native
+`Tensor::visit_blocks` validates a bounded sorted ID selection and consumes each
+present block synchronously. Dense and sparse reads borrow payloads; sparse reads
+group consecutive requested IDs into native BTree ranges and skip absent rows. Both
+paths use the same consumer for native reads and caller-owned visibility layers.
 Each table or file guard is released before entering another domain. Unit-stride
 runs copy slices; negative, zero, and other strides use the shared scatter loop.
 Missing sparse storage blocks yield zero; malformed stored blocks fail closed.
 Payload validation checks padding gaps between valid offsets without a validity
-mask. Full blocks need no padding traversal.
+mask. Full blocks need neither bounds allocation nor padding traversal.
 
 Native shape helpers describe broadcasting and normalize reduction axes without
 narrowing logical dimensions. Callers choose automatic versus explicit broadcasting
@@ -246,8 +260,11 @@ Index pages are bounded and release guards before value reads. Small intersectin
 regions pack into bounded batches, with one overflow rectangle retained.
 
 Base-coordinate slices, forward separable mappings, and supported permutations
-can use indexed traversal. Gathers, reversals, broadcasts, incompatible reshapes,
-and aggregate sources use compact logical requests. Eligible binary and conditional
+can use indexed traversal. Selections within one execution batch retain compact logical requests. Larger
+indexed selections reject unsupported gathers, reversals, broadcasts, and incompatible
+reshapes instead of silently scanning the logical shape. Ordered candidates also
+require compatible block order; fixed and singleton selected axes do not constrain
+that order. Computed aggregate outputs retain their logical planning boundary. Eligible binary and conditional
 sources merge their ordered candidates.
 Unary/scalar nodes inherit their source's slice requests and evaluate the complete
 expression; they never consume an intermediate zero-filtered reader. Boolean
@@ -413,7 +430,7 @@ operation. See [collection rules](CODE_STYLE.md#collections-and-geometry).
 Terminology: a **dense trailing region** is selected by a sparse-axis prefix;
 a **storage block** is a bounded piece addressed by a logical block ID; its
 **payload** is the dense numerical buffer. Dense storage uses payload files and
-sparse storage uses table rows. A region may span multiple storage blocks.
+sparse storage uses BTree rows. A region may span multiple storage blocks.
 
 `tensor/dense_storage.rs` and `tensor/sparse_storage.rs` own their concrete reads,
 updates, replacements, validation, metadata publication, synchronization, and
@@ -422,7 +439,7 @@ request planning uses `plan_read_groups`; owner `read_groups` performs I/O.
 Construction stream validation remains in `tensor/construction.rs`.
 
 Native creation and loading select dense or sparse storage directly. The sparse
-owner creates or strictly loads one typed native table from validated geometry;
+owner creates or strictly loads one typed native BTree from validated geometry;
 loading never enters creation code. Creation requires empty delegated storage and
 withholds metadata until construction succeeds. Metadata publication is
 creation-only: existing metadata is an error, never an overwrite.
@@ -445,7 +462,11 @@ value description; storage remains statically typed. Its lazy `into_dense()`
 conversion includes implicit zeros without copying storage or changing shared
 clones. Nonidentity output mappings conservatively report scalar sparse layout
 instead of retaining a stale dense-suffix axis. External handles may retain read
-leases. Native clones share live storage and are not snapshots. Borrowed and owned
+leases. Explicit `copy_from_values` consumes the row-major reader and delegates to the
+existing construction owners. Each batch is validated and counted before zero
+filtering; exact total cardinality is required before publication. It is separate
+from indexed copying; no unsupported-error retry selects a different algorithm.
+Native clones share live storage and are not snapshots. Borrowed and owned
 consumption use one evaluator and one sequential request stream.
 
 For `Layout::Sparse { axis: Some(a) }`, axes through `a` select a full dense
@@ -455,39 +476,44 @@ validated geometry; normal creation chooses geometry and delegates. Metadata
 records shape, layout, sparse axis, and physical block shape. Storage block partitioning
 does not change logical values or the dense trailing region.
 
-Each sparse table row stores a logical block ID and dense typed vector.
-One private schema describes the table and its primary index using static column
-identifiers; geometry validation and adapter-owned serialization remain separate.
+Each sparse BTree row stores a logical block ID and dense typed vector.
+One private BTree schema validates the key and payload fields; geometry validation
+and adapter-owned serialization remain separate.
 `SparseCell<T>` separates integer keys from typed payloads;
 its equality compares numerical values, treating signed zeros as equal and NaNs
 as one equality class. Complex equality compares components; the explicit collator
 orders complex values by norm and places NaN norms after non-NaN norms. No bit
 representation participates in comparison. Native replacement always writes the
 supplied payload, preserving signed zeros and NaN payloads through persistence. Adapters own `SparseNode<T>` serialization, explicit
-payload tags, and bounded decoding allocations. Rows share native table pages;
+payload tags, and bounded decoding allocations. Rows share native BTree pages;
 there is no separate descriptor, occupancy table, or payload-file representation.
 
 An absent storage block is all-zero. Removing a block's last nonzero value
 removes its row. Invalid padding, malformed lengths, empty stored blocks, and
-incorrect block IDs are errors. Batch reads share a native table range for
-consecutive requested block IDs. Gaps retain separate reads so unrelated payload
-corruption remains outside the selection. Replacement and read-modify-write
-hold one native table write guard. Table resolves the old row once and lends it
-to a synchronous update callback for payload validation and block mathematics,
-then maintains its indexes using that same row. Helpers receive the acquired
+incorrect block IDs are errors. Batch reads borrow native rows for synchronous
+payload validation and consumption, sharing a BTree range for consecutive requested
+block IDs. Exact singleton reads resolve semantic uniqueness before the callback.
+Gaps retain separate reads so unrelated payload corruption remains outside the
+selection. Borrowed row references cannot escape the callback or span asynchronous
+consumer work; owned block reads remain available for read-modify-write.
+Replacement and read-modify-write
+hold one native BTree write guard. The owner resolves the old row once, validates
+its payload, and computes the replacement. Existing rows use native in-place
+replacement; zero replacements remove the row. The `values/primary` directory
+and native node encoding are unchanged. Helpers receive the acquired
 guard instead of reacquiring it. A bounded batch holds one read guard
 across all requested groups. Point reads and occupied pages acquire their own
 read guards inside the sparse owner. Operation guards are released before
 synchronization enters the directory hierarchy.
 
 Failed or cancelled mutation may leave partial changes. Callers must discard all
-handles to the affected storage and coordinate recovery before reuse. Transaction
-abort-only state belongs to callers such as tc-collection; fensor retains no
-recovery state and neither marks clones invalid nor repairs partial writes.
+handles to the affected storage and coordinate recovery before reuse. Callers own
+transaction cleanup and safe reuse; fensor retains no recovery state and neither
+marks clones invalid nor repairs partial writes.
 
 Strict loading requires typed metadata, directories, every dense file, and a valid
-sparse table. It validates structure, ordering, geometry, payloads, and block IDs
-without creating or repairing storage. `sync` writes native payloads and the sparse table root; `sync_all` additionally performs delegated
+sparse BTree. It validates structure, ordering, geometry, payloads, and block IDs
+without creating or repairing storage. `sync` writes native payloads and the sparse BTree root; `sync_all` additionally performs delegated
 durable synchronization. Neither method creates transaction visibility or records
 a commit decision. Synchronization does not exclude mutation for its entire call;
 callers quiesce writes when they require a precise durable boundary. Structural
@@ -515,12 +541,13 @@ are filtered at the public sparse output boundary. Pointwise construction reject
 operations which change the implicit zero background with `Error::WouldDensify`;
 explicit `TensorExpression::new(source)?.into_dense()` permits full evaluation.
 
-Geometries whose index order is incompatible (including general reordered,
-negative-stride, broadcast, and gather mappings), transformed owned expressions,
-and aggregate outputs use bounded logical evaluation. Their cost may be
-proportional to selected logical cardinality. There is no external sort, result
-cache, or implicit persisted intermediate. Eligible native sparse copies consume
-ordered entries and reuse the existing bounded destination batch writer.
+Positive separable mappings compose through owned expressions. Indexed selections
+larger than one batch reject incompatible mappings or ordered traversal; fixed and
+singleton selected axes do not constrain ordering. Small selections and computed
+aggregate outputs retain bounded logical evaluation. Explicit `copy_from_values`
+may scan the entire logical shape and reuses the existing destination construction.
+Ordinary indexed copying never retries through it. There is no external sort, result
+cache, or implicit persisted intermediate.
 
 Mean, population standard deviation, and Euclidean norm reuse numeric terminal
 batching and axis-group traversal. Counts include all logical values, including
@@ -541,7 +568,7 @@ File adapters decode once and report actual retained allocation through `GetSize
 Freqfs admits complete decoded values before publication, independently of serialized
 bytes. Adapters retain structural decoding limits; decoded temporaries can occupy
 memory outside the cache target while awaiting admission. In-place mutations reconcile actual
-retained size when mutable guards are released; they can exceed the cache target
+retained size when muBTree guards are released; they can exceed the cache target
 before eviction. This is not a strict mutation-memory ceiling or a host OOM
 guarantee. The caller's cache must also fit simultaneously pinned native
 split/merge pages; the node memory target is not the minimum usable whole-cache
@@ -554,8 +581,8 @@ flush before returning from `FileSave`. This does not change encoded bytes or ma
 Occupied scans retain cursors and bounded native page lookahead until consumed or
 dropped. Expression consumers retain the scan across output batches. Native pages
 validate ordered block IDs before returning keys; consumers need no second
-membership lookup. Payload reads validate the selected dense blocks. Dense
-validation borrows required payloads without cloning them. Native fills visit valid offsets while retaining old-value
+membership lookup. Payload reads validate the selected dense blocks. Dense and sparse
+validation borrow required payloads without cloning them. Native fills visit valid offsets while retaining old-value
 validation and zero padding.
 
 Geometry owns address validation; storage owns payload validation and file access.
@@ -563,4 +590,18 @@ Reuse computed block bounds for padding traversal. Buffered dense reads retain a
 most the CPU-derived window of payload guards.
 Each consumed guard is released after scatter. Insufficient pinned capacity returns
 freqfs's bounded admission error; error or cancellation drops the stream and its
-guards. Sparse storage retains its coherent table guard and no read-ahead queue.
+guards. Sparse storage retains its coherent BTree guard and no read-ahead queue.
+
+## Completed-buffer ownership
+
+A batch retains a concrete completed array buffer until numerical delegation or
+output extraction. Unary, binary, scalar, conditional, reduction, matrix, and
+Fourier operations consume concrete arrays directly; temporary operands and
+operation results do not require shared accessor erasure. Operation helpers return
+lazy concrete readers. Batch realization checks the bound before consuming the
+reader; implicit-zero probes still read one value without realizing a full buffer.
+Host output extraction consumes that buffer; backend transfers continue through
+ha-ndarray. Fourier extraction also consumes its completed result. Sequential request streams retain one source owner
+and borrow it during evaluation, without cloning that owner per request. Shared
+expression operands and iterative destruction still preserve independently
+retained sources and stack safety.

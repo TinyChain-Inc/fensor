@@ -62,14 +62,9 @@ impl<'a> Context<'a> {
         });
 
         {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?;
+            let mut pending = self.pending.lock().expect("evaluation driver poisoned");
 
-            if pending.is_some() {
-                return Err(Error::InvalidLayout("concurrent child evaluation".into()));
-            }
+            assert!(pending.is_none(), "concurrent child evaluation");
 
             *pending = Some(frame as Frame<'a>);
         }
@@ -141,7 +136,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                 .context
                 .pending
                 .lock()
-                .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?
+                .expect("evaluation driver poisoned")
                 .take();
 
             if let Some(frame) = pending {
@@ -162,11 +157,9 @@ impl<T: TensorElement> Future for Driver<'_, T> {
             }
 
             let Some(frame) = this.frames.last_mut() else {
-                return Pin::new(&mut this.receive).poll(cx).map(|result| {
-                    result.unwrap_or_else(|_| {
-                        Err(Error::InvalidLayout("evaluation result missing".into()))
-                    })
-                });
+                return Pin::new(&mut this.receive)
+                    .poll(cx)
+                    .map(|result| result.expect("evaluation result missing"));
             };
 
             match frame.as_mut().poll(cx) {
@@ -179,7 +172,7 @@ impl<T: TensorElement> Future for Driver<'_, T> {
                         .context
                         .pending
                         .lock()
-                        .map_err(|_| Error::InvalidLayout("evaluation driver poisoned".into()))?
+                        .expect("evaluation driver poisoned")
                         .is_none()
                     {
                         return Poll::Pending;

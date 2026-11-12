@@ -28,14 +28,16 @@ rebuilds only its affected target. Use `cargo test --test math_unary`,
 `--test math_trig`, or `--test math_cast`; no aggregate target is required.
 
 
-Before review, run the correctness suite and lint gate once on the final changes:
+Before review, run the affected library/integration targets and their strict
+Clippy configurations. Shared storage/planning changes select their affected
+consumer families. Complete owner validation, required before release, is:
 
 ```sh
 cargo fmt --check
 cargo test
 cargo test --features complex
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --features complex -- -D warnings
 git diff --check
 ```
 

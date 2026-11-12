@@ -5,8 +5,8 @@ use std::marker::PhantomData;
 #[cfg(feature = "complex")]
 use ha_ndarray::NDArrayComplex;
 use ha_ndarray::{
-    ArrayAccess, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayRead, NDArrayTrig, NDArrayUnary,
-    NDArrayUnaryBoolean, Number,
+    ArrayBuf, Buffer, NDArrayAbs, NDArrayCast, NDArrayNumeric, NDArrayRead, NDArrayTrig,
+    NDArrayUnary, NDArrayUnaryBoolean, Number, Platform,
 };
 
 use crate::expression::{self, Batch, Expression};
@@ -32,7 +32,10 @@ pub trait UnaryOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
 
     const NAME: &'static str;
 
-    fn apply(&self, array: ArrayAccess<'static, T>) -> Result<ArrayAccess<'static, Self::Output>>;
+    fn apply(
+        &self,
+        array: ArrayBuf<T, Buffer<T>>,
+    ) -> Result<impl NDArrayRead<DType = Self::Output, Platform = Platform>>;
 }
 
 // Each declaration preserves its explicit dtype bounds and backend operation.
@@ -53,9 +56,9 @@ macro_rules! unary_op {
 
             fn apply(
                 &self,
-                array: ArrayAccess<'static, $ty>,
-            ) -> Result<ArrayAccess<'static, Self::Output>> {
-                Ok(ArrayAccess::from(array.$method()?))
+                array: ArrayBuf<$ty, Buffer<$ty>>,
+            ) -> Result<impl NDArrayRead<DType = Self::Output, Platform = Platform>> {
+                Ok(array.$method()?)
             }
         }
     };
@@ -152,8 +155,11 @@ impl<From: TensorElement, To: TensorElement> UnaryOp<From> for Cast<To> {
 
     const NAME: &'static str = "cast";
 
-    fn apply(&self, array: ArrayAccess<'static, From>) -> Result<ArrayAccess<'static, To>> {
-        Ok(ArrayAccess::from(array.cast()?))
+    fn apply(
+        &self,
+        array: ArrayBuf<From, Buffer<From>>,
+    ) -> Result<impl NDArrayRead<DType = To, Platform = Platform>> {
+        Ok(array.cast()?)
     }
 }
 
@@ -216,6 +222,7 @@ where
         } else {
             O::Output::ZERO
         };
+
         Ok(Self { source, op, zero })
     }
 }
@@ -373,30 +380,34 @@ where
     fn selection_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Selection<'_>> {
         Ok(expression::traversal::Selection::Source(
             &self.source,
             slice,
+            mapping,
         ))
     }
 
     fn ordered_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Ordered<'_>> {
         Ok(expression::traversal::Ordered::Sources(vec![(
             &self.source,
-            slice,
+            (slice, mapping),
         )]))
     }
 
     fn preferred_step<'a>(
         &'a self,
         shape: &'a [u64],
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Preferred<'a>> {
         Ok(expression::traversal::Preferred::Sources(vec![(
             &self.source,
-            shape,
+            (shape, mapping),
         )]))
     }
 }

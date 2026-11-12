@@ -1,6 +1,6 @@
 //! Lazy conditional selection over three expression sources.
 
-use ha_ndarray::{ArrayAccess, NDArrayWhere};
+use ha_ndarray::NDArrayWhere;
 
 use crate::expression::{self, Batch, Expression};
 use crate::request::BatchRequest;
@@ -150,13 +150,16 @@ where
     fn selection_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Selection<'_>> {
-        expression::traversal::ordered(self, slice).map(expression::traversal::Selection::Ready)
+        expression::traversal::ordered(self, slice, mapping)
+            .map(expression::traversal::Selection::Ready)
     }
 
     fn ordered_step(
         &self,
         slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Ordered<'_>> {
         if matches!(self.layout(), Layout::Dense) {
             return Ok(expression::traversal::Ordered::Ready(slice.stream()));
@@ -165,20 +168,21 @@ where
         let condition_slice = slice.clone();
         let then_slice = slice.clone();
         Ok(expression::traversal::Ordered::Sources(vec![
-            (&self.condition, condition_slice),
-            (&self.then, then_slice),
-            (&self.or_else, slice),
+            (&self.condition, (condition_slice, mapping.clone())),
+            (&self.then, (then_slice, mapping.clone())),
+            (&self.or_else, (slice, mapping)),
         ]))
     }
 
     fn preferred_step<'a>(
         &'a self,
         shape: &'a [u64],
+        mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<expression::traversal::Preferred<'a>> {
         Ok(expression::traversal::Preferred::Sources(vec![
-            (&self.condition, shape),
-            (&self.then, shape),
-            (&self.or_else, shape),
+            (&self.condition, (shape, mapping.clone())),
+            (&self.then, (shape, mapping.clone())),
+            (&self.or_else, (shape, mapping)),
         ]))
     }
 }
@@ -218,11 +222,11 @@ where
             let then = context.batch(&self.then, coords.clone()).await?;
             let or_else = context.batch(&self.or_else, coords).await?;
 
-            Batch::from_array(ArrayAccess::from(
+            Batch::from_array(
                 condition
                     .into_array()
                     .cond(then.into_array(), or_else.into_array())?,
-            ))
+            )
         })
     }
 }

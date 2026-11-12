@@ -27,10 +27,12 @@ fn poisoned_driver_rejects_polling_and_releases_pending_work() {
     };
     let waker = futures::task::noop_waker();
     let mut cx = TaskContext::from_waker(&waker);
-    assert!(matches!(
-        Pin::new(&mut driver).poll(&mut cx),
-        Poll::Ready(Err(Error::InvalidLayout(_)))
-    ));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Pin::new(&mut driver).poll(&mut cx)
+        }))
+        .is_err()
+    );
     assert!(retained.upgrade().is_some());
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {

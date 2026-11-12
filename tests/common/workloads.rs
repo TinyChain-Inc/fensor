@@ -1,4 +1,5 @@
 //! Workload selection is confined to the benchmark executable, not tensor execution.
+
 use super::{benchmark, common};
 
 #[path = "benchmark_source.rs"]
@@ -9,6 +10,9 @@ mod completion_cases;
 
 #[path = "copy_cases.rs"]
 mod copy_cases;
+
+#[path = "layout_cases.rs"]
+mod layout_cases;
 
 #[path = "pipeline_cases.rs"]
 mod pipeline_cases;
@@ -36,6 +40,7 @@ pub async fn run() {
         "reduction" => slice_cases::run().await,
         "completion" => completion_cases::run().await,
         "owned" => completion_cases::owned().await,
+        "layout" => layout_cases::run().await,
         "pipeline" => pipeline_cases::run().await,
         "copy" => copy_cases::run().await,
         "sparse" => sparse_cases::run().await,
@@ -52,6 +57,7 @@ pub async fn run() {
             slice_cases::run().await;
             completion_cases::run().await;
             completion_cases::owned().await;
+            layout_cases::run().await;
             pipeline_cases::run().await;
             copy_cases::run().await;
             sparse_cases::run().await;

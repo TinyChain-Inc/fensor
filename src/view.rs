@@ -230,36 +230,89 @@ where
             })
             .await
     }
+}
 
-    pub(crate) fn ordered_storage_requests(
-        &self,
-        slice: crate::slice::Slice,
-    ) -> Result<crate::slice::Requests<'static>> {
-        match self
+impl<S: TensorSource> crate::expression::traversal::Plan for TensorView<S>
+where
+    S::DType: TensorElement,
+{
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+        mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<crate::expression::traversal::Preferred<'a>> {
+        let mapping = if self
             .mapping
-            .storage_slice(self.tensor.shape(), self.tensor.strides())?
+            .is_identity(self.tensor.shape(), self.tensor.strides())
         {
-            Some(mapping) => crate::storage::ordered_requests(&self.tensor, slice, mapping),
-            None => Ok(slice.stream()),
-        }
+            mapping
+        } else {
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.tensor.shape(), self.tensor.strides())?
+            else {
+                return Ok(crate::expression::traversal::Preferred::Ready(None));
+            };
+            Some(local.compose(mapping)?)
+        };
+
+        crate::storage::preferred_requests(&self.tensor, shape, mapping)
+            .map(crate::expression::traversal::Preferred::Ready)
     }
 
-    pub(crate) fn slice_requests_for_storage(
+    fn selection_step(
         &self,
         slice: crate::slice::Slice,
-    ) -> Result<crate::slice::Requests<'_>> {
-        if slice.len() <= crate::expression::MAX_BATCH_ELEMENTS as u64
-            || matches!(self.layout(), Layout::Dense)
+        mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<crate::expression::traversal::Selection<'_>> {
+        if slice.len() <= crate::MAX_BATCH_ELEMENTS as u64 || matches!(self.layout(), Layout::Dense)
         {
-            return Ok(slice.stream());
+            return Ok(crate::expression::traversal::Selection::Ready(
+                slice.stream(),
+            ));
         }
 
-        match self
+        let mapping = if self
             .mapping
-            .storage_slice(self.tensor.shape(), self.tensor.strides())?
+            .is_identity(self.tensor.shape(), self.tensor.strides())
         {
-            Some(mapping) => crate::storage::slice_requests(&self.tensor, slice, Some(mapping)),
-            None => Ok(slice.stream()),
+            mapping
+        } else {
+            let local = self.mapping.storage_slice(self.tensor.shape(), self.tensor.strides())?
+                .ok_or_else(|| Error::Unsupported(
+                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
+                ))?;
+            Some(local.compose(mapping)?)
+        };
+
+        crate::storage::slice_requests(&self.tensor, slice, mapping)
+            .map(crate::expression::traversal::Selection::Ready)
+    }
+
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+        mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<crate::expression::traversal::Ordered<'_>> {
+        if slice.len() <= crate::MAX_BATCH_ELEMENTS as u64 || matches!(self.layout(), Layout::Dense)
+        {
+            return Ok(crate::expression::traversal::Ordered::Ready(slice.stream()));
         }
+
+        let mapping = if self
+            .mapping
+            .is_identity(self.tensor.shape(), self.tensor.strides())
+        {
+            mapping
+        } else {
+            let local = self.mapping.storage_slice(self.tensor.shape(), self.tensor.strides())?
+                .ok_or_else(|| Error::Unsupported(
+                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
+                ))?;
+            Some(local.compose(mapping)?)
+        };
+
+        crate::storage::ordered_requests(&self.tensor, slice, mapping)
+            .map(crate::expression::traversal::Ordered::Ready)
     }
 }

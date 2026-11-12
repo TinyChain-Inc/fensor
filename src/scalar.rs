@@ -23,7 +23,8 @@
 //! ```
 
 use ha_ndarray::{
-    ArrayAccess, Float, NDArrayBooleanScalar, NDArrayCompareScalar, NDArrayMathScalar, Real,
+    ArrayBuf, Buffer, Float, NDArrayBooleanScalar, NDArrayCompareScalar, NDArrayMathScalar,
+    NDArrayRead, Platform, Real,
 };
 
 use crate::expression::Expression;
@@ -48,9 +49,9 @@ macro_rules! scalar_op {
 
             fn apply(
                 &self,
-                array: ArrayAccess<'static, $ty>,
-            ) -> Result<ArrayAccess<'static, Self::Output>> {
-                Ok(ArrayAccess::from(array.$method(self.0)?))
+                array: ArrayBuf<$ty, Buffer<$ty>>,
+            ) -> Result<impl NDArrayRead<DType = Self::Output, Platform = Platform>> {
+                Ok(array.$method(self.0)?)
             }
         }
     };

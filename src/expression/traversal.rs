@@ -7,6 +7,7 @@ use collate::Collator;
 use futures::{StreamExt, TryStreamExt};
 
 use super::{Expression, MAX_BATCH_ELEMENTS, RequestIterator};
+use crate::mapping::StorageSlice;
 use crate::request::{BatchRequest, Cursor, decode_flat};
 use crate::schema::Coord;
 use crate::slice::{Requests, Slice};
@@ -14,20 +15,34 @@ use crate::{Error, Result, TensorElement};
 
 /// Address discovery is independent of the numerical dtype. Borrowed children
 /// let planning remain iterative before the evaluation trampoline starts.
+/// Selections stay in consumer coordinates; optional separable mappings compose
+/// on the way to native storage. Computed outputs end storage-plan delegation.
 pub trait Plan: Send + Sync {
     /// Describe one preferred-request step for the consumer's logical shape.
     /// None leaves request selection to another source or the consumer.
-    fn preferred_step<'a>(&'a self, _shape: &'a [u64]) -> Result<Preferred<'a>> {
+    fn preferred_step<'a>(
+        &'a self,
+        _shape: &'a [u64],
+        _mapping: Option<StorageSlice>,
+    ) -> Result<Preferred<'a>> {
         Ok(Preferred::Ready(None))
     }
 
     /// Describe ordered occupied-request candidates, independent of numerical values.
-    fn ordered_step(&self, slice: crate::slice::Slice) -> Result<Ordered<'_>> {
+    fn ordered_step(
+        &self,
+        slice: crate::slice::Slice,
+        _mapping: Option<StorageSlice>,
+    ) -> Result<Ordered<'_>> {
         Ok(Ordered::Ready(slice.stream()))
     }
 
     /// Describe one selection step; native readers may retain storage order.
-    fn selection_step(&self, slice: crate::slice::Slice) -> Result<Selection<'_>> {
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+        _mapping: Option<StorageSlice>,
+    ) -> Result<Selection<'_>> {
         Ok(Selection::Ready(slice.stream()))
     }
 }
@@ -37,12 +52,12 @@ pub enum Step<'a, I, T> {
     Sources(Vec<(&'a dyn Plan, I)>),
 }
 
-pub type Preferred<'a> = Step<'a, &'a [u64], Option<RequestIterator>>;
-pub type Ordered<'a> = Step<'a, Slice, Requests<'static>>;
+pub type Preferred<'a> = Step<'a, (&'a [u64], Option<StorageSlice>), Option<RequestIterator>>;
+pub type Ordered<'a> = Step<'a, (Slice, Option<StorageSlice>), Requests<'static>>;
 
 pub enum Selection<'a> {
     Ready(Requests<'a>),
-    Source(&'a dyn Plan, Slice),
+    Source(&'a dyn Plan, Slice, Option<StorageSlice>),
 }
 
 /// Runtime descriptions and candidate-planning work are bounded independently of batch width.
@@ -111,8 +126,8 @@ where
     E::DType: TensorElement,
 {
     walk(
-        source.preferred_step(shape)?,
-        |source, shape| source.preferred_step(shape),
+        source.preferred_step(shape, None)?,
+        |source, (shape, mapping)| source.preferred_step(shape, mapping),
         Ok,
     )
 }
@@ -121,7 +136,7 @@ pub fn selection<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Req
 where
     E::DType: TensorElement,
 {
-    let mut step = source.selection_step(slice)?;
+    let mut step = source.selection_step(slice, None)?;
     let mut visited = 0;
 
     loop {
@@ -129,20 +144,25 @@ where
 
         step = match step {
             Selection::Ready(requests) => return Ok(requests),
-            Selection::Source(source, slice) => source.selection_step(slice)?,
+            Selection::Source(source, slice, mapping) => source.selection_step(slice, mapping)?,
         };
     }
 }
 
-pub fn ordered<E: Expression + ?Sized>(source: &E, slice: Slice) -> Result<Requests<'static>>
+pub fn ordered<E: Expression + ?Sized>(
+    source: &E,
+    slice: Slice,
+    mapping: Option<StorageSlice>,
+) -> Result<Requests<'static>>
 where
     E::DType: TensorElement,
 {
+    let shape = slice.shape.clone();
     let mut streams = Vec::new();
 
     walk(
-        source.ordered_step(slice)?,
-        |source, slice| source.ordered_step(slice),
+        source.ordered_step(slice, mapping)?,
+        |source, (slice, mapping)| source.ordered_step(slice, mapping),
         |stream| {
             reserve(&mut streams, 1)?;
             streams.push(stream);
@@ -154,7 +174,7 @@ where
         return Ok(streams.pop().expect("one candidate stream"));
     }
 
-    Ok(merge(streams, source.shape().into()))
+    Ok(merge(streams, shape))
 }
 
 /// Adapt each compact request with reusable scratch; the union retains scalar heads.

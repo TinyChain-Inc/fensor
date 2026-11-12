@@ -1,13 +1,12 @@
 //! One storage constructor consumes base tensors and geometric views as readers.
 
+use common::{FsEntry, new_dir};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema,
     TensorSource, TensorTransform, TensorWrite,
 };
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType, UIntType};
-
-use common::{FsEntry, new_dir};
 
 mod common;
 
@@ -219,10 +218,22 @@ where
                 .load(out_root.to_path_buf())
                 .unwrap();
         let (other_root, other_dir) = new_dir("copy_concurrent_out").await;
-        let (copied, other) = futures::try_join!(
-            Tensor::copy_from(out_dir, &view, view.layout(), 128),
-            Tensor::copy_from(other_dir, &view, view.layout(), 7),
-        )
+        let (copied, other) = if matches!(layout, Layout::Sparse { .. }) {
+            let (_unsupported_root, unsupported_dir) = new_dir("copy_unsupported_order").await;
+            assert!(matches!(
+                Tensor::copy_from(unsupported_dir, &view, view.layout(), 128).await,
+                Err(Error::Unsupported(_))
+            ));
+            futures::try_join!(
+                Tensor::copy_from_values(out_dir, &view, view.layout(), 128),
+                Tensor::copy_from_values(other_dir, &view, view.layout(), 7),
+            )
+        } else {
+            futures::try_join!(
+                Tensor::copy_from(out_dir, &view, view.layout(), 128),
+                Tensor::copy_from(other_dir, &view, view.layout(), 7),
+            )
+        }
         .unwrap();
         copied.sync().await.unwrap();
         drop(copied);
@@ -455,5 +466,170 @@ async fn sparse_copy_consumes_once_releases_source_and_rejects_duplicates() {
             tensor.validate().await.unwrap();
         }
         common::cleanup(&root).await;
+    }
+}
+
+// Observe the full-value reader boundary independently of indexed sparse copying.
+struct ValueReader<'a> {
+    tensor: &'a Tensor<FsEntry, u8>,
+    blocks: Vec<std::result::Result<Vec<u8>, &'static str>>,
+    waiting: Option<std::sync::Arc<tokio::sync::Notify>>,
+    starts: std::sync::atomic::AtomicUsize,
+    lease: std::sync::Arc<()>,
+}
+
+impl TensorGeometry for ValueReader<'_> {
+    type DType = u8;
+
+    fn dtype(&self) -> NumberType {
+        self.tensor.dtype()
+    }
+
+    fn layout(&self) -> Layout {
+        self.tensor.layout()
+    }
+
+    fn shape(&self) -> &[u64] {
+        self.tensor.shape()
+    }
+}
+
+impl TensorRead for ValueReader<'_> {
+    fn read_value<'a>(&'a self, _: &'a [u64]) -> fensor::BoxFuture<'a, fensor::Result<u8>> {
+        Box::pin(async { panic!("full-value copy must consume read_blocks once") })
+    }
+
+    fn read_blocks(&self) -> fensor::Result<fensor::ValueBlockStream<'_, u8>> {
+        use std::task::Poll;
+
+        use futures::StreamExt;
+
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let lease = self.lease.clone();
+        let waiting = self.waiting.clone();
+        Ok(futures::stream::iter(self.blocks.clone())
+            .chain(futures::stream::poll_fn(move |_| {
+                if let Some(waiting) = &waiting {
+                    waiting.notify_one();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(None)
+                }
+            }))
+            .map(move |block| {
+                let _ = &lease;
+                block.map_err(|message| Error::InvalidLayout(message.into()))
+            })
+            .boxed())
+    }
+}
+
+#[tokio::test]
+async fn full_value_copy_validates_before_zero_filtering_and_releases_sources() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use futures::TryStreamExt;
+
+    for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
+        let (_root, dir) = new_dir("copy_values_source").await;
+        let source = Tensor::<FsEntry, u8>::create(
+            dir,
+            TensorSchema::new(NumberType::UInt(UIntType::U8), shape![2, 4]).unwrap(),
+            layout,
+            3,
+        )
+        .await
+        .unwrap();
+
+        for (blocks, expected_error) in [
+            (vec![], Some("reader returned fewer values than its shape")),
+            (
+                vec![Ok(vec![0; 7])],
+                Some("reader returned fewer values than its shape"),
+            ),
+            (
+                vec![Ok(vec![0; 9])],
+                Some("reader returned more values than its shape"),
+            ),
+            (
+                vec![Ok(vec![0; fensor::MAX_BATCH_ELEMENTS + 1])],
+                Some("copy block:"),
+            ),
+            (
+                vec![Ok(vec![0; 4]), Err("source failure")],
+                Some("source failure"),
+            ),
+            (vec![Ok(vec![0; 8])], None),
+            (
+                vec![Ok(vec![]), Ok(vec![0, 1, 2]), Ok(vec![3, 4, 5, 6, 7])],
+                None,
+            ),
+        ] {
+            let reader = ValueReader {
+                tensor: &source,
+                blocks: blocks.clone(),
+                waiting: None,
+                starts: 0.into(),
+                lease: Arc::new(()),
+            };
+            let (root, dir) = new_dir("copy_values_result").await;
+            let result =
+                Tensor::<FsEntry, u8>::copy_from_values(dir.clone(), &reader, layout, 2).await;
+            assert_eq!(reader.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&reader.lease), 1);
+
+            if let Some(message) = expected_error {
+                assert!(result.err().unwrap().to_string().contains(message));
+                assert!(Tensor::<FsEntry, u8>::load(dir).await.is_err());
+            } else {
+                let copy = result.unwrap();
+                let expected: Vec<_> = blocks.into_iter().flat_map(Result::unwrap).collect();
+                let values: Vec<_> = copy.read_blocks().unwrap().try_concat().await.unwrap();
+                assert_eq!(values, expected);
+                source.write_value(&[0, 0], 255).await.unwrap();
+                assert_eq!(copy.read_value(&[0, 0]).await.unwrap(), expected[0]);
+                copy.sync().await.unwrap();
+                drop(copy);
+                drop(dir);
+                let reopened = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reopened.read_blocks().unwrap().try_concat().await.unwrap(),
+                    expected
+                );
+            }
+        }
+
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let reader = ValueReader {
+            tensor: &source,
+            blocks: vec![Ok(vec![0; 4])],
+            waiting: Some(waiting.clone()),
+            starts: 0.into(),
+            lease: Arc::new(()),
+        };
+        let (_partial_root, dir) = new_dir("copy_values_cancel").await;
+        let mut pending = Box::pin(Tensor::<FsEntry, u8>::copy_from_values(
+            dir.clone(),
+            &reader,
+            layout,
+            2,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut pending => panic!("copy completed before cancellation: {}", result.is_ok()),
+                () = waiting.notified() => {}
+            }
+        }).await.unwrap();
+        assert_eq!(reader.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&reader.lease), 2);
+        drop(pending);
+        assert_eq!(Arc::strong_count(&reader.lease), 1);
+        assert!(Tensor::<FsEntry, u8>::load(dir).await.is_err());
+        source.write_value(&[1, 3], 127).await.unwrap();
+        assert_eq!(source.read_value(&[1, 3]).await.unwrap(), 127);
     }
 }

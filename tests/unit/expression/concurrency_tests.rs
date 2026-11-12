@@ -2,11 +2,13 @@
 
 use std::sync::Mutex;
 
-use futures::{TryStreamExt, channel::oneshot};
+use futures::TryStreamExt;
+use futures::channel::oneshot;
 use number_general::DType;
 
 use super::*;
-use crate::test_support::{self, FsEntry, counters::Counter};
+use crate::test_support::counters::Counter;
+use crate::test_support::{self, FsEntry};
 use crate::{Layout, TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
 
 struct Source<'a, T: TensorElement>
@@ -52,14 +54,22 @@ impl<T: TensorElement> crate::expression::traversal::Plan for Source<'_, T>
 where
     FsEntry: TensorFileEntry<T>,
 {
-    fn preferred_step<'a>(&'a self, shape: &'a [u64]) -> Result<traversal::Preferred<'a>> {
+    fn preferred_step<'a>(
+        &'a self,
+        shape: &'a [u64],
+        _mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<traversal::Preferred<'a>> {
         Ok(traversal::Preferred::Ready(Some(Box::new(
             crate::schema::row_major_coords(shape)?
                 .map(|coord| BatchRequest::explicit(vec![coord]).unwrap()),
         ))))
     }
 
-    fn selection_step(&self, slice: crate::slice::Slice) -> Result<traversal::Selection<'_>> {
+    fn selection_step(
+        &self,
+        slice: crate::slice::Slice,
+        _mapping: Option<crate::mapping::StorageSlice>,
+    ) -> Result<traversal::Selection<'_>> {
         // Test-only singleton batches preserve the validated slice selection.
         let requests = slice.requests().flat_map(|request| {
             request

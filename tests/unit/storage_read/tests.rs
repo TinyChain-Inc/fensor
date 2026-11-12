@@ -144,11 +144,16 @@ fn progressions_handle_arbitrary_signed_steps_and_carries() {
             }
 
             let map = affine(start, step, shape![len as usize as u64]);
-            compare(
-                &storage,
-                &map,
-                BatchRequest::linear(0, len as usize).unwrap(),
-            );
+            let request = BatchRequest::linear(0, len as usize).unwrap();
+            let mapped = request.mapped(&map, &shape, &strides).unwrap();
+            compare(&storage, &map, request);
+
+            let nested = CoordinateMap::identity(shape![3, 5, 7], &strides)
+                .transpose(Some(axes![2, 0, 1]))
+                .unwrap()
+                .flip(1)
+                .unwrap();
+            compare(&storage, &nested, mapped);
         }
     }
 }
@@ -179,23 +184,25 @@ async fn compact_runs_reduce_mapping_work_and_preserve_broadcasts() {
             8,
         ),
     ] {
-        crate::read_metrics::CURRENT
-            .scope(Default::default(), async {
-                let plan = storage
-                    .plan(
-                        &BatchRequest::linear(0, map.shape().iter().product::<u64>() as usize)
-                            .unwrap(),
-                        Some(&map),
-                    )
-                    .unwrap();
-                assert_eq!(plan.values().map(Vec::len).sum::<usize>(), expected_runs);
-                crate::read_metrics::CURRENT.with(|m| {
-                    let m = m.borrow();
-                    assert_eq!(m.coordinate_resolutions, 0);
-                    assert_eq!(m.boundary_decodes, 8);
-                });
-            })
-            .await;
+        let request =
+            BatchRequest::linear(0, map.shape().iter().product::<u64>() as usize).unwrap();
+        let strides = contiguous_strides(map.shape()).unwrap();
+        let identity = CoordinateMap::identity(map.shape().into(), &strides);
+        let mapped = request.mapped(&identity, map.shape(), &strides).unwrap();
+
+        for request in [&request, &mapped] {
+            crate::read_metrics::CURRENT
+                .scope(Default::default(), async {
+                    let plan = storage.plan(request, Some(&map)).unwrap();
+                    assert_eq!(plan.values().map(Vec::len).sum::<usize>(), expected_runs);
+                    crate::read_metrics::CURRENT.with(|m| {
+                        let m = m.borrow();
+                        assert_eq!(m.coordinate_resolutions, 0);
+                        assert_eq!(m.boundary_decodes, 8);
+                    });
+                })
+                .await;
+        }
     }
 
     let huge = StorageShape {

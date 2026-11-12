@@ -1356,10 +1356,8 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
 
 #[tokio::test]
 async fn update_stream_evaluates_once_and_owns_its_source() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::TryStreamExt;
 
@@ -1513,5 +1511,45 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
             });
         })
         .await;
+    // Preferred coordinate reads preserve physical order even when the same
+    // transform crosses an owned unary boundary.
+    use crate::TensorAbs;
+    for expression in [
+        TensorExpression::new(tensor.view().transpose(None).unwrap().abs().await.unwrap()).unwrap(),
+        TensorExpression::new(
+            TensorExpression::new(tensor.view())
+                .unwrap()
+                .abs()
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+        .transpose(None)
+        .unwrap(),
+    ] {
+        crate::read_metrics::CURRENT
+            .scope(Default::default(), async {
+                let mut requests =
+                    crate::expression::traversal::preferred(&expression, expression.shape())
+                        .unwrap()
+                        .unwrap();
+                let mut coordinates = std::collections::BTreeSet::new();
+                let mut block_ids = Vec::new();
+                for request in &mut requests {
+                    for coord in request.into_coordinates(expression.shape()).unwrap() {
+                        assert!(coordinates.insert(coord.clone()));
+                        let id = geometry.block_position(&[coord[1], coord[0]]).unwrap().0;
+                        if block_ids.last() != Some(&id) {
+                            block_ids.push(id);
+                        }
+                    }
+                }
+                assert_eq!(coordinates.len(), 3 * 4097);
+                assert_eq!(block_ids, (0..geometry.block_count()).collect::<Vec<_>>());
+                // Compatible column blocks form one region per physical row.
+                crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().block_bounds, 3));
+            })
+            .await;
+    }
     cleanup(&root).await;
 }

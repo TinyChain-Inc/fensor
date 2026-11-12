@@ -24,6 +24,7 @@ impl Run {
     pub fn validate(&self, block_len: usize, output_len: usize) -> Result<()> {
         let end = self.output.checked_add(self.len).ok_or_else(invalid)?;
         let last = self.offset as i128 + self.stride as i128 * self.len.saturating_sub(1) as i128;
+
         if self.len == 0
             || end > output_len
             || self.offset >= block_len
@@ -38,6 +39,7 @@ impl Run {
 
     pub fn scatter<T: Copy>(&self, block: &[T], output: &mut [T]) -> Result<()> {
         self.validate(block.len(), output.len())?;
+
         let out = &mut output[self.output..self.output + self.len];
         if self.stride == 1 {
             out.copy_from_slice(&block[self.offset..self.offset + self.len]);
@@ -127,10 +129,10 @@ impl StorageShape<'_> {
         let shape = mapping.map(|m| m.shape()).unwrap_or(self.shape);
         request.validate(shape)?;
 
-        let affine = if matches!(
-            request.kind(),
-            RequestKind::Explicit(_) | RequestKind::FlatRuns(_)
-        ) {
+        let affine = if matches!(request.kind(), RequestKind::Explicit(_))
+            || (matches!(request.kind(), RequestKind::FlatRuns(_))
+                && mapping.is_none_or(|m| m.is_identity(self.shape, self.strides)))
+        {
             None
         } else {
             match mapping {

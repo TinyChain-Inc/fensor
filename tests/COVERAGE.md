@@ -195,13 +195,13 @@ They cover rank, singleton dimensions, edge capacities, empty/zero dimensions,
 and overflow, retaining exact shape/stride and `InvalidSchema` assertions.
 
 Sparse owner locking is covered by
-`tensor::sparse_storage::validation_tests::table_guards_preserve_batch_reads_and_partial_updates`:
-a blocked payload read retains its table guard across consecutive and separated
+`tensor::sparse_storage::validation_tests::index_guards_preserve_batch_reads_and_partial_updates`:
+a blocked payload read retains its BTree guard across consecutive and separated
 ID groups, concurrent partial updates preserve both values, and quiesced sync
 reopens successfully after overlapping native operations. Raw corruption helpers
 live in `tests/unit/tensor/sparse_storage/corruption.rs`; production exposes no
-sparse table or directory handles. Existing cancellation and validation-order
-fixtures acquire native table guards directly.
+sparse BTree or directory handles. Existing cancellation and validation-order
+fixtures acquire native BTree guards directly.
 
 Dense construction belongs to `dense_storage::Construction`; construction tests
 retain their owning module. Storage benchmarks live in `common/storage_cases.rs`
@@ -211,9 +211,10 @@ and use the `storage` selector.
 batching. Malformed mapping and dense-file fixtures live in their owners' test
 support without adding production visibility.
 
-Read validation in `unit/storage/traversal_tests.rs` checks reuse of computed
-bounds during padding validation. Storage and sparse consumer fixtures cover
-invalid IDs, corruption, ordering, and absent rows.
+Read validation in `unit/storage/traversal_tests.rs` checks allocation-free full
+blocks, reuse of computed bounds during edge-padding validation, validation
+precedence, and `u64` boundary geometry. Storage and sparse consumer fixtures
+cover invalid IDs, corruption, ordering, and absent rows.
 
 Sequential-consumer fixtures check one active request, borrowed/owned cancellation,
 and source release. `sequential_errors_stop_before_later_evaluation` checks

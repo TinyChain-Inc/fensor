@@ -41,7 +41,7 @@ where
             ($m:ident, $source:ident) => {
                 fixture::blocks(
                     &$source.$m().await.unwrap(),
-                    &a.clone()
+                    &a.as_ref()
                         .$m()
                         .unwrap()
                         .buffer()
@@ -77,8 +77,8 @@ where
             ($m:ident, $s:ident, $binary_source:ident, $scalar_source:ident) => {
                 fixture::blocks(
                     &$binary_source.$m(&$binary_source).await.unwrap(),
-                    &a.clone()
-                        .$m(a.clone())
+                    &a.as_ref()
+                        .$m(a.as_ref())
                         .unwrap()
                         .buffer()
                         .unwrap()
@@ -90,7 +90,7 @@ where
                 .await;
                 fixture::blocks(
                     &$scalar_source.$s(T::ONE).await.unwrap(),
-                    &a.clone()
+                    &a.as_ref()
                         .$s(T::ONE)
                         .unwrap()
                         .buffer()
@@ -118,7 +118,7 @@ where
         let values_array = Array::new(Buffer::from(input.clone()), shape![input.len()]).unwrap();
         assert!(same(
             tensor.sum_all().await.unwrap(),
-            values_array.clone().sum_all().unwrap()
+            values_array.as_ref().sum_all().unwrap()
         ));
         assert!(same(
             tensor.product_all().await.unwrap(),
@@ -164,8 +164,8 @@ where
         .await;
         fixture::consumers(&v.diag().await.unwrap(), &[input[0], input[3]], same, same).await;
         let expected = a
-            .clone()
-            .matmul(a)
+            .as_ref()
+            .matmul(a.as_ref())
             .unwrap()
             .buffer()
             .unwrap()

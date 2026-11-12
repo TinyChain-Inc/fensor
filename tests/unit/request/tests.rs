@@ -40,6 +40,92 @@ fn flat_runs_validate_before_cursor_use() {
 }
 
 #[test]
+fn flat_runs_compose_affine_steps_across_coordinate_boundaries() {
+    let check = |shape: &[u64], strides: &[i128], run: Progression| {
+        let request = BatchRequest {
+            kind: RequestKind::FlatRuns(vec![run]),
+            len: run.len,
+        };
+        request.validate(shape).unwrap();
+        let expected: Vec<_> = request
+            .coordinates(shape)
+            .unwrap()
+            .iter()
+            .map(|coord| {
+                coord
+                    .iter()
+                    .zip(strides)
+                    .fold(0i128, |n, (&c, &s)| n + c as i128 * s)
+            })
+            .collect();
+        let mut actual = Vec::new();
+        progressions(&request, shape, 0, strides, |run| {
+            assert_eq!(run.output, actual.len());
+            actual.extend((0..run.len).map(|i| run.start + run.step * i as i128));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(actual, expected);
+    };
+
+    for start in 0..105 {
+        for step in -104..=104 {
+            let mut len = 1;
+            while len < 16 && (0..105).contains(&(start + len * step)) {
+                len += 1;
+            }
+
+            for strides in [[35, 7, 1], [1, 21, 3], [-35, 7, -1]] {
+                check(
+                    &[3, 5, 7],
+                    &strides,
+                    Progression {
+                        output: 0,
+                        start,
+                        step,
+                        len: len as usize,
+                    },
+                );
+            }
+        }
+    }
+
+    for (start, step, len) in [
+        (u64::MAX as i128 - 1, -1, 16),
+        (u64::MAX as i128 - 1, 1 - u64::MAX as i128, 2),
+        (u64::MAX as i128 - 1, 0, MAX_BATCH_ELEMENTS),
+        (u64::MAX as i128 - 1, i128::MIN, 1),
+    ] {
+        check(
+            &[1, u64::MAX, 1],
+            &[0, -1, 0],
+            Progression {
+                output: 0,
+                start,
+                step,
+                len,
+            },
+        );
+    }
+
+    let mut shape = vec![1; crate::PORTABLE_INLINE_RANK + 2];
+    shape[0] = 3;
+    let last = shape.len() - 1;
+    shape[last] = 5;
+    let strides = schema::contiguous_strides(&shape).unwrap();
+    check(
+        &shape,
+        &strides.iter().map(|&s| -(s as i128)).collect::<Vec<_>>(),
+        Progression {
+            output: 0,
+            start: 14,
+            step: -2,
+            len: 8,
+        },
+    );
+}
+
+#[test]
 fn shared_segments_preserve_order_bounds_and_exhaustion() {
     for axis in [
         Axis::range(8, 0),

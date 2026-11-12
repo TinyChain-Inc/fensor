@@ -148,7 +148,8 @@ pub use schema::{
 };
 pub use selection::WhereView;
 pub use sparse::{SparseCell, SparseNode};
-pub use storage::{BlockUpdates, StorageGeometry, StorageRead, TensorSource};
+pub use storage::{BlockUpdates, StorageGeometry, StorageRead, StorageReadPlan, TensorSource};
+pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 pub use traits::{
     BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray, TensorBoolean,
     TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar, TensorGeometry,
@@ -159,8 +160,6 @@ pub use traits::{
 };
 #[cfg(feature = "complex")]
 pub use traits::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};
-
-pub use tensor::{Tensor, TensorElement, TensorFileEntry};
 pub use unary::UnaryView;
 pub use validate::{
     broadcast_reduce_axes, broadcast_shape, matmul_broadcast_shapes, reduction_axes,

@@ -184,11 +184,24 @@ async fn affine_mapping_retains_runs_across_batch_boundaries() {
         .scope(Default::default(), async {
             for request in crate::request::linear_requests(&shape).unwrap() {
                 let mapped = request.mapped(&mapping, &shape, &strides).unwrap();
-                let crate::request::RequestKind::FlatRuns(runs) = mapped.kind() else {
-                    panic!("compact runs")
-                };
-                assert!(runs.len() <= request.len().div_ceil(4097) + 1);
-                assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), request.len());
+                let nested = mapped.mapped(&mapping, &shape, &strides).unwrap();
+
+                for mapped in [&mapped, &nested] {
+                    let crate::request::RequestKind::FlatRuns(runs) = mapped.kind() else {
+                        panic!("compact runs")
+                    };
+                    assert!(runs.len() <= request.len().div_ceil(4097) + 1);
+                    assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), request.len());
+                }
+                let mut expected = request.cursor(&shape).unwrap();
+                let mut actual = nested.cursor(&shape).unwrap();
+                let mut expected_coord = Coord::new();
+                let mut actual_coord = Coord::new();
+                while expected.next_into(&mut expected_coord) {
+                    assert!(actual.next_into(&mut actual_coord));
+                    assert_eq!(actual_coord, expected_coord);
+                }
+                assert!(!actual.next_into(&mut actual_coord));
             }
             crate::read_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
@@ -225,4 +238,72 @@ fn storage_slice_preserves_singleton_axis_identity() {
         );
         assert_eq!(slice.origins.as_slice(), vec![0; shape.len()]);
     }
+}
+
+#[test]
+fn storage_slices_compose_origins_steps_and_fixed_axes() {
+    let base = CoordinateMap::identity(smallvec::smallvec![7, 13, 5], &[65, 5, 1]);
+    let inner = base
+        .slice(smallvec::smallvec![
+            AxisRange::In(1, 7, 2),
+            AxisRange::In(2, 13, 3),
+            AxisRange::At(4)
+        ])
+        .unwrap()
+        .transpose(None)
+        .unwrap();
+    let inner_strides = schema::contiguous_strides(inner.shape()).unwrap();
+    let outer = CoordinateMap::identity(inner.shape().into(), &inner_strides)
+        .slice(smallvec::smallvec![
+            AxisRange::In(1, 4, 2),
+            AxisRange::At(2)
+        ])
+        .unwrap();
+    let composed = inner
+        .storage_slice(&[7, 13, 5], &[65, 5, 1])
+        .unwrap()
+        .unwrap()
+        .compose(outer.storage_slice(inner.shape(), &inner_strides).unwrap())
+        .unwrap();
+    assert_eq!(composed.origins.as_slice(), &[5, 5, 4]);
+    assert_eq!(composed.axes, [(1, 6)]);
+    for coordinate in schema::row_major_coords(outer.shape()).unwrap() {
+        let intermediate = outer
+            .resolve(&coordinate, inner.shape(), &inner_strides)
+            .unwrap();
+        let expected = inner
+            .resolve(&intermediate, &[7, 13, 5], &[65, 5, 1])
+            .unwrap();
+        let mut actual = composed.origins.clone();
+        for (&value, &(base, step)) in coordinate.iter().zip(&composed.axes) {
+            actual[base] += value * step;
+        }
+        assert_eq!(actual.as_slice(), expected);
+    }
+
+    let unchanged = StorageSlice::identity(&[3, 4]);
+    let axes = unchanged.axes.as_ptr();
+    assert_eq!(unchanged.compose(None).unwrap().axes.as_ptr(), axes);
+    assert!(
+        StorageSlice {
+            origins: vec![u64::MAX],
+            axes: vec![(0, 2)]
+        }
+        .compose(Some(StorageSlice {
+            origins: vec![1],
+            axes: vec![(0, 1)]
+        }))
+        .is_err()
+    );
+    assert!(
+        StorageSlice {
+            origins: vec![0],
+            axes: vec![(0, u64::MAX)]
+        }
+        .compose(Some(StorageSlice {
+            origins: vec![0],
+            axes: vec![(0, 2)]
+        }))
+        .is_err()
+    );
 }

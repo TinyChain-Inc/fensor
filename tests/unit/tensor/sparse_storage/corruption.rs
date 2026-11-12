@@ -1,6 +1,40 @@
 use crate::sparse::SparseCell;
 use crate::{Tensor, TensorElement, TensorFileEntry};
 
+pub(in crate::tensor) async fn sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
+    tensor: &Tensor<F, T>,
+    id: u64,
+) -> (freqfs::FileReadGuardOwned<F, crate::SparseNode<T>>, usize) {
+    let values = tensor
+        .directory
+        .read()
+        .await
+        .get_dir("values")
+        .cloned()
+        .unwrap();
+    let primary = values.read().await.get_dir("primary").cloned().unwrap();
+    let primary = primary.read().await;
+    for (_, entry) in primary.iter() {
+        let node = entry
+            .as_file()
+            .unwrap()
+            .clone()
+            .into_read::<crate::SparseNode<T>>()
+            .await
+            .unwrap();
+        let b_tree::Node::Leaf(rows) = &*node else {
+            continue;
+        };
+        if let Some(slot) = rows
+            .iter()
+            .position(|row| row.first() == Some(&SparseCell::Key(id)))
+        {
+            return (node, slot);
+        }
+    }
+    panic!("missing sparse fixture row {id}");
+}
+
 async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
     tensor: &Tensor<F, T>,
     id: u64,
@@ -22,7 +56,7 @@ async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
             .write::<crate::SparseNode<T>>()
             .await
             .unwrap();
-        if let b_table::Node::Leaf(rows) = &mut *node {
+        if let b_tree::Node::Leaf(rows) = &mut *node {
             for row in rows {
                 if row.first() == Some(&SparseCell::Key(id)) {
                     mutate(row);
@@ -56,7 +90,7 @@ pub(crate) async fn corrupt_sparse_payload<F: TensorFileEntry<T>, T: TensorEleme
     .await;
 }
 
-pub(in crate::tensor) fn block_table<F, T>(
+pub(in crate::tensor) fn block_index<F, T>(
     owner: &super::SparseStorage<F, T>,
 ) -> &super::Blocks<F, T> {
     &owner.blocks

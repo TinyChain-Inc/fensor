@@ -5,8 +5,7 @@ mod matrix_unary {
     use number_general::DType;
     use smallvec::smallvec;
 
-    use crate::test_support::cleanup;
-    use crate::test_support::{FsEntry, new_dir};
+    use crate::test_support::{FsEntry, cleanup, new_dir};
     use crate::{
         AxisRange, Error, Layout, Tensor, TensorMatrixUnary, TensorRead, TensorSchema, TensorWrite,
     };
@@ -51,7 +50,7 @@ mod matrix_unary {
             crate::tensor::corruption::corrupt_sparse_payload(&tensor, n * n - 1).await;
             assert!(matches!(
                 diag.read_value(&[n - 1]).await,
-                Err(Error::InvalidLayout(_))
+                Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
 
             assert!(diag.read_value(&[n - 1]).await.is_err());
@@ -150,8 +149,7 @@ mod storage_source {
     use futures::TryStreamExt;
     use number_general::FloatType;
 
-    use crate::test_support::cleanup;
-    use crate::test_support::{FsEntry, new_dir};
+    use crate::test_support::{FsEntry, cleanup, new_dir};
     use crate::{
         Layout, NumberType, SparseCell, SparseNode, Tensor, TensorRead, TensorSchema, TensorSource,
         TensorWrite,
@@ -240,7 +238,7 @@ mod storage_source {
                 .clone();
             {
                 let mut node = file.write::<SparseNode<f64>>().await.unwrap();
-                let b_table::Node::Leaf(rows) = &*node else {
+                let b_tree::Node::Leaf(rows) = &*node else {
                     panic!("single sparse page")
                 };
                 let mut rows = rows.clone();
@@ -248,7 +246,7 @@ mod storage_source {
                     SparseCell::Key(if invalid_key { 10 } else { 0 }),
                     SparseCell::Payload(vec![12.]),
                 ]);
-                let replacement = b_table::Node::Leaf(rows);
+                let replacement = b_tree::Node::Leaf(rows);
                 *node = replacement;
             }
             tensor.sync().await.unwrap();

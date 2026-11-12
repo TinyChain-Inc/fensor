@@ -32,8 +32,9 @@ or accumulators in the same process. They never persist computed intermediates.
 Nested expressions can recompute values, and source reads/cache spill can do I/O.
 
 `Tensor::copy_from(dir, &expression, destination_layout, max_capacity).await?`
-creates independent filesystem storage with caller-selected packing. Copying is
-never necessary between operations. The destination adapter can differ from the
+creates independent filesystem storage with caller-selected packing. Supported
+operations compose without copying; unsupported sparse traversal can be made
+explicit through `Tensor::copy_from_values`. The destination adapter can differ from the
 source adapter and must support the output dtype. `max_capacity` limits block
 capacity; it does not select an exact block shape. Sparse copying accepts a new
 sparse axis and omits final numerical zeros. A reader's reported layout describes
@@ -133,9 +134,12 @@ views, and reject other orders with `UnsupportedSparseIterationOrder`. They sort
 and deduplicate explicit selections for this reader only; geometric slicing retains
 selection order and duplicates. Compatible geometry traverses occupied logical blocks
 through paginated indexes. Eligible pointwise expressions delegate and merge these
-candidates incrementally. Other mappings and aggregate operations retain bounded
-logical evaluation; sparse storage alone does not guarantee work proportional to
-nonzero values. See [slice traversal](DESIGN.md#slices-and-reductions).
+candidates incrementally. Runtime-owned forward slices and permutations retain the same indexed planning.
+Unsupported mappings or ordering return a structured error for selections larger
+than one execution batch; use `Tensor::copy_from_values` to explicitly materialize
+them. Bounded point reads and row-major `read_blocks` remain available. Aggregate
+outputs retain their own logical evaluation; sparse storage alone does not guarantee
+work proportional to nonzero values. See [slice traversal](DESIGN.md#slices-and-reductions).
 
 ## Reductions and matrix operations
 
@@ -199,12 +203,12 @@ the full trailing shape into at most 4,096 elements each. `axis: None` selects
 scalar sparsity. Storage block capacity does not change the logical dense region.
 Loading validates the recorded geometry without retessellating it.
 
-Sparse storage blocks are dense typed vectors in a native `b-table`, keyed by logical
+Sparse storage blocks are dense typed vectors in a native `b-tree`, keyed by logical
 block ID. Rows share native pages. Missing blocks are zero; all-zero blocks have
 no row. Omission changes physical storage only: every logical coordinate still
 has its ordinary numerical value.
 
-Native table guards coordinate sparse reads and replacement. Synchronization
+Native BTree guards coordinate sparse reads and replacement. Synchronization
 releases operation guards before entering the directory hierarchy; callers quiesce
 mutations when they need a precise durable boundary. Validation is not a
 transaction snapshot across concurrent writes. After a failed or cancelled
@@ -224,7 +228,9 @@ responsible for limiting decoding allocations before fensor receives a payload.
 
 A successful complete coordinate stream visits every logical coordinate exactly
 once, including zeros. Its default adapter pairs row-major values with coordinates;
-built-in expressions can generate tiled requests. Request traversal is distinct
+built-in sources visit intersecting physical blocks, and matrix expressions can
+generate tiled requests. Transformed source planning retains consumer coordinates;
+absent sparse blocks still contribute their zero-valued coordinates. Request traversal is distinct
 from batch delivery order. Each stream is independent and live, not a snapshot.
 Concurrent source writes are not isolated. Dropping a stream cancels pending work.
 
@@ -274,8 +280,17 @@ Use `tensor.sync_all().await?` for delegated durable synchronization. Callers ow
 transaction and recovery policy.
 fensor provides no commit, rollback, or isolation semantics.
 
-Copying groups bounded destination updates and finishes each batch before requesting
-the next source batch. It adds no lookahead or background work. Validation and errors
+`Tensor::copy_from` retains indexed sparse copying and rejects unsupported ordered
+traversal. `Tensor::copy_from_values` is the explicit full-value alternative: it
+consumes logical row-major batches once, validates and counts each batch before
+omitting sparse zeros, and requires exact total cardinality before publication. It
+uses the same storage construction. It can be expensive for huge
+sparse shapes; neither operation retries through the other. Both retain the existing
+requirement to convert dense/sparse kinds explicitly before copying.
+
+Copying performs destination updates sequentially. Sparse construction may assemble
+a bounded batch of nonzeros from several input batches; it adds no speculative
+lookahead or background work. Validation and errors
 remain non-transactional: failures propagate and can leave partial output without
 loadable metadata or a guaranteed write prefix. Synchronization and cleanup remain
 caller responsibilities.
@@ -309,7 +324,7 @@ and releases its retained source handles without following expression depth on t
 worker stack. Physical payload and index mutation are private to the native owner.
 Storage itself is never erased.
 `replace_logical_block` coordinates native sparse
-payload/index changes and preserves other logical blocks sharing native table pages.
+payload/index changes and preserves other logical blocks sharing native BTree pages.
 
 `Tensor::load` is strict and non-mutating: missing metadata, blocks or indexes,
 wrong payload types, invalid lengths, duplicate logical keys, and inconsistent
@@ -333,3 +348,8 @@ streams with an input error convertible from `fensor::Error`. They require empty
 delegated storage and publish metadata only after successful construction; callers
 own cleanup after errors or cancellation. Published replacement requires existing,
 valid dense files and never creates or repairs missing payloads.
+
+Sparse block storage delegates directly to BTree, with the same `values/primary`
+layout and node encoding. Block-ID uniqueness, payload/padding validation, and
+native error classification remain fensor responsibilities. Borrowed native
+callbacks do not let page references escape into retained results.

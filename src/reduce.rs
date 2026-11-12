@@ -3,7 +3,6 @@
 use std::future::Future;
 
 use futures::TryStreamExt;
-
 use ha_ndarray::{NDArrayReduceAll, Number, Real};
 
 use crate::expression::{self, Batch, Expression};

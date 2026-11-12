@@ -8,7 +8,8 @@ mod delegation_tests;
 #[path = "../tests/unit/mapping/traversal_tests.rs"]
 mod traversal_tests;
 
-use std::{iter, sync::Arc};
+use std::iter;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -31,18 +32,48 @@ enum AxisContrib {
 }
 
 /// A separable forward slice: base coordinates are fixed or advance on one axis.
-/// This metadata is rank-sized; unsupported affine reshapes retain logical reads.
-pub(crate) struct StorageSlice {
-    pub(crate) origins: Coord,
+/// This metadata is rank-sized. Nonseparable mappings retain explicit logical
+/// reads, but cannot silently substitute them for large indexed sparse scans.
+#[derive(Clone)]
+pub struct StorageSlice {
+    // These descriptors travel in traversal steps; inline rank capacity would
+    // inflate every step, including unmapped delegation.
+    pub(crate) origins: Vec<u64>,
     pub(crate) axes: Vec<(usize, u64)>,
 }
 
 impl StorageSlice {
     pub(crate) fn identity(shape: &[u64]) -> Self {
         Self {
-            origins: Coord::from_elem(0, shape.len()),
+            origins: vec![0; shape.len()],
             axes: (0..shape.len()).map(|i| (i, 1)).collect(),
         }
+    }
+
+    /// Compose consumer-to-view addressing with this view-to-storage slice.
+    pub(crate) fn compose(mut self, consumer: Option<Self>) -> Result<Self> {
+        let Some(consumer) = consumer else {
+            return Ok(self);
+        };
+
+        for (axis, &(base, step)) in self.axes.iter().enumerate() {
+            self.origins[base] = consumer.origins[axis]
+                .checked_mul(step)
+                .and_then(|offset| self.origins[base].checked_add(offset))
+                .ok_or_else(|| Error::InvalidCoord("storage slice origin overflow".into()))?;
+        }
+
+        let mut axes = consumer.axes;
+        for (axis, step) in &mut axes {
+            let (base, source_step) = self.axes[*axis];
+            *step = source_step
+                .checked_mul(*step)
+                .ok_or_else(|| Error::InvalidCoord("storage slice step overflow".into()))?;
+            *axis = base;
+        }
+
+        self.axes = axes;
+        Ok(self)
     }
 
     pub(crate) fn bounds(&self, regions: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
@@ -200,7 +231,10 @@ impl CoordinateMap {
             axes.push((base, stride / strides[base]));
         }
 
-        Ok(Some(StorageSlice { origins, axes }))
+        Ok(Some(StorageSlice {
+            origins: origins.into_vec(),
+            axes,
+        }))
     }
 
     pub fn shape(&self) -> &[u64] {
@@ -849,6 +883,7 @@ macro_rules! transform_methods {
         $crate::mapping::transform_methods!(@owned transpose, permutation, Option<$crate::Axes>; $first $(, $rest)* $(; $preserve)?);
         $crate::mapping::transform_methods!(@owned squeeze, axes, $crate::Axes; $first $(, $rest)* $(; $preserve)?);
         $crate::mapping::transform_methods!(@owned unsqueeze, axes, $crate::Axes; $first $(, $rest)* $(; $preserve)?);
+
         fn flip(self, axis: usize) -> $crate::Result<Self> {
             let $first = self.$first.flip(axis)?;
             $(let $rest = self.$rest.flip(axis)?;)*
