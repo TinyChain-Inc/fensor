@@ -26,6 +26,7 @@ pub fn unique_tmp_dir(name: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+
     // Wall-clock timestamps alone can collide between concurrent tests.
     static NEXT_DIR: counters::Counter = counters::Counter::new();
     let sequence = NEXT_DIR.increment();
@@ -86,17 +87,19 @@ pub fn block_entries(
     geometry: &fensor::StorageGeometry,
     id: u64,
 ) -> impl Iterator<Item = (usize, Vec<u64>)> + '_ {
-    let bounds = geometry.block_bounds(id).unwrap();
-    let shape: Vec<_> = bounds.iter().map(|(start, end)| end - start).collect();
     geometry
-        .block_offsets(id)
+        .block_range(id)
         .unwrap()
-        .zip(iter_coords(&shape).map(move |mut coord| {
-            for (position, (start, _)) in coord.iter_mut().zip(&bounds) {
-                *position += start;
+        .enumerate()
+        .map(move |(offset, mut flat)| {
+            let mut coord = vec![0; geometry.schema().shape().len()];
+            for (i, &dim) in geometry.schema().shape().iter().enumerate().rev() {
+                coord[i] = flat % dim;
+                flat /= dim;
             }
-            coord
-        }))
+
+            (offset, coord)
+        })
 }
 
 pub fn iter_coords(shape: &[u64]) -> CoordIter {
@@ -116,6 +119,7 @@ impl CoordIter {
         } else {
             shape.iter().product()
         };
+
         Self {
             shape: shape.to_vec(),
             coord: vec![0u64; shape.len()],

@@ -23,6 +23,7 @@ mod matrix_unary {
             )
             .await
             .unwrap();
+
             tensor.write_value(&[n - 1, n - 1], 255).await.unwrap();
             tensor.write_value(&[0, 1], 127).await.unwrap();
             crate::tensor::corruption::corrupt_sparse_payload(&tensor, 1).await;
@@ -35,6 +36,7 @@ mod matrix_unary {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(entries, vec![(vec![n - 1], 255)]);
             assert!(diag.read_value(&[n]).await.is_err());
             assert!(
@@ -42,11 +44,13 @@ mod matrix_unary {
                     .await
                     .is_err()
             );
+
             assert!(
                 diag.read_sparse_elements_in_order(smallvec![AxisRange::At(0)], smallvec![1])
                     .await
                     .is_err()
             );
+
             crate::tensor::corruption::corrupt_sparse_payload(&tensor, n * n - 1).await;
             assert!(matches!(
                 diag.read_value(&[n - 1]).await,
@@ -83,6 +87,7 @@ mod math_unary {
         )
         .await
         .unwrap();
+
         tensor.write_value(&[0], 0.2).await.unwrap();
         tensor.write_value(&[3], 0.2).await.unwrap();
         tensor.write_value(&[4], 1.2).await.unwrap();
@@ -96,14 +101,17 @@ mod math_unary {
             .clone()
             .slice(range![AxisRange::Of(vec![4, 5, 0, 1, 4])])
             .unwrap();
+
         assert_eq!(
             selected.read_blocks().unwrap().try_concat().await.unwrap(),
             vec![1.2, 0., 0.2, 0., 1.2]
         );
+
         let dirty_group = view
             .clone()
             .slice(range![AxisRange::Of(vec![4, 5, 2, 3])])
             .unwrap();
+
         assert!(dirty_group.read_blocks().unwrap().try_next().await.is_err());
         let unary = TensorExpression::new(view.round().await.unwrap())
             .unwrap()
@@ -120,13 +128,16 @@ mod math_unary {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(rows.len(), 1);
             let mut corrupt = reader
                 .read_sparse_elements_in_order(range![AxisRange::At(7)], axes![0])
                 .await
                 .unwrap();
+
             assert!(corrupt.try_next().await.is_err());
         }
+
         check(&tensor).await;
         check(&view).await;
         let clean = unary.clone().slice(range![AxisRange::In(0, 1, 1)]).unwrap();
@@ -139,6 +150,7 @@ mod math_unary {
                 .unwrap(),
             [vec![1.]]
         );
+
         let dirty = unary.slice(range![AxisRange::In(7, 8, 1)]).unwrap();
         assert!(dirty.read_blocks().unwrap().try_next().await.is_err());
         common::cleanup(&root).await;
@@ -160,6 +172,7 @@ mod storage_source {
         let (root, dir) = new_dir("logical_sparse").await;
         let schema =
             TensorSchema::new(NumberType::Float(FloatType::F64), vec![2, 2].into()).unwrap();
+
         let tensor = Tensor::<FsEntry, f64>::create(
             dir.clone(),
             schema,
@@ -168,6 +181,7 @@ mod storage_source {
         )
         .await
         .unwrap();
+
         tensor.write_value(&[0, 0], 2.0).await.unwrap();
         assert_eq!(
             tensor
@@ -177,6 +191,7 @@ mod storage_source {
                 .unwrap(),
             [0]
         );
+
         tensor.write_value(&[1, 0], 2.0).await.unwrap();
         let values = dir.read().await.get_dir("values").cloned().unwrap();
         let primary = values.read().await.get_dir("primary").cloned().unwrap();
@@ -185,10 +200,12 @@ mod storage_source {
             1,
             "both rows share one native page"
         );
+
         tensor
             .replace_logical_block(0, vec![9.0, 0.0])
             .await
             .unwrap();
+
         assert_eq!(tensor.read_value(&[0, 0]).await.unwrap(), 9.0);
         assert_eq!(tensor.read_value(&[1, 0]).await.unwrap(), 2.0);
         tensor.validate().await.unwrap();
@@ -201,11 +218,57 @@ mod storage_source {
                 .unwrap(),
             [1]
         );
+
         assert_eq!(tensor.read_value(&[1, 0]).await.unwrap(), 2.0);
         tensor.sync().await.unwrap();
         let reopened = Tensor::<FsEntry, f64>::load(dir).await.unwrap();
         assert_eq!(reopened.read_value(&[1, 0]).await.unwrap(), 2.0);
         cleanup(&root).await;
+        use crate::{AxisRange, TensorTransform, TensorWriteBulk};
+        for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
+            let (root, dir) = new_dir("compact_borrowed_fragments").await;
+            let tensor = Tensor::<FsEntry, f64>::create(
+                dir,
+                TensorSchema::new(NumberType::Float(FloatType::F64), vec![3, 5].into()).unwrap(),
+                layout,
+                4,
+            )
+            .await
+            .unwrap();
+
+            tensor
+                .write_values(
+                    vec![AxisRange::In(0, 3, 1), AxisRange::In(0, 5, 1)].into(),
+                    (1..=15).map(f64::from).collect(),
+                )
+                .await
+                .unwrap();
+
+            let expected_blocks = tensor.storage_geometry().block_count();
+            let view = tensor.view().transpose(None).unwrap();
+            crate::read_metrics::CURRENT
+                .scope(Default::default(), async {
+                    let mut stream = view.read_coordinate_blocks().unwrap();
+                    let mut count = 0;
+                    while let Some((coords, values)) = stream.try_next().await.unwrap() {
+                        for (coord, value) in coords.into_iter().zip(values) {
+                            assert_eq!(value, (coord[1] * 5 + coord[0] + 1) as f64);
+                            count += 1;
+                        }
+                    }
+
+                    assert_eq!(count, 15);
+                    crate::read_metrics::CURRENT.with(|metrics| {
+                        assert_eq!(metrics.borrow().borrows as u64, expected_blocks);
+                        assert_eq!(metrics.borrow().borrowed, 15);
+                        assert_eq!(metrics.borrow().expanded_coordinates, 15);
+                        assert_eq!(metrics.borrow().coordinate_resolutions, 0);
+                    });
+                })
+                .await;
+
+            cleanup(&root).await;
+        }
     }
 
     #[tokio::test]
@@ -214,6 +277,7 @@ mod storage_source {
             let (root, dir) = new_dir("strict_sparse_rows").await;
             let schema =
                 TensorSchema::new(NumberType::Float(FloatType::F64), vec![2, 2].into()).unwrap();
+
             let tensor = Tensor::<FsEntry, f64>::create(
                 dir.clone(),
                 schema,
@@ -222,6 +286,7 @@ mod storage_source {
             )
             .await
             .unwrap();
+
             tensor.write_value(&[0, 0], 1.0).await.unwrap();
             tensor.sync().await.unwrap();
             let values = dir.read().await.get_dir("values").cloned().unwrap();
@@ -236,19 +301,23 @@ mod storage_source {
                 .as_file()
                 .unwrap()
                 .clone();
+
             {
                 let mut node = file.write::<SparseNode<f64>>().await.unwrap();
                 let b_tree::Node::Leaf(rows) = &*node else {
                     panic!("single sparse page")
                 };
+
                 let mut rows = rows.clone();
                 rows.push(vec![
                     SparseCell::Key(if invalid_key { 10 } else { 0 }),
                     SparseCell::Payload(vec![12.]),
                 ]);
+
                 let replacement = b_tree::Node::Leaf(rows);
                 *node = replacement;
             }
+
             tensor.sync().await.unwrap();
             assert!(Tensor::<FsEntry, f64>::load(dir).await.is_err());
             cleanup(&root).await;
@@ -279,6 +348,7 @@ mod matmul {
             )
             .await
             .unwrap();
+
             a.write_value(&[999_999_999, 1], 2.).await.unwrap();
             a.write_value(&[0, 0], 1.).await.unwrap();
             crate::tensor::corruption::corrupt_sparse_payload(&a, 0).await;
@@ -291,6 +361,7 @@ mod matmul {
                 [1f32, 2., 3., 4.],
             )
             .await;
+
             let view = a.view().matmul(&b.view()).await.unwrap();
             let entries: Vec<_> = view
                 .read_sparse_elements_in_order(
@@ -302,10 +373,12 @@ mod matmul {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(
                 entries,
                 vec![(vec![999_999_999, 0], 6.), (vec![999_999_999, 1], 8.)]
             );
+
             assert!(view.read_value(&[0, 0]).await.is_err());
             assert!(
                 view.read_sparse_elements_in_order(
@@ -315,6 +388,7 @@ mod matmul {
                 .await
                 .is_err()
             );
+
             // The same corrupt source on the right is only read for selected columns.
             let right = a.view().transpose(None).unwrap();
             let left = b.view().transpose(None).unwrap();
@@ -349,6 +423,7 @@ mod math_binary {
         )
         .await
         .unwrap();
+
         tensor.write_value(&[0], 0.2).await.unwrap();
         tensor.write_value(&[7], 0.2).await.unwrap();
         crate::tensor::corruption::corrupt_sparse_payload(&tensor, 7).await;
@@ -375,10 +450,12 @@ mod math_binary {
                 .exp()
                 .await
                 .unwrap();
+
             let clean = expression
                 .clone()
                 .slice(range![AxisRange::In(0, 1, 1)])
                 .unwrap();
+
             let values: Vec<_> = clean.read_blocks().unwrap().try_collect().await.unwrap();
 
             assert_eq!(values, vec![vec![0.2f32.exp()]]);
@@ -386,6 +463,7 @@ mod math_binary {
                 .clone()
                 .slice(range![AxisRange::In(7, 8, 1)])
                 .unwrap();
+
             let mut stream = dirty.read_blocks().unwrap();
 
             assert!(stream.try_next().await.is_err());
@@ -412,6 +490,7 @@ mod math_binary {
         )
         .await
         .unwrap();
+
         corrupt.write_value(&[0], 1).await.unwrap();
         corrupt.write_value(&[7], 1).await.unwrap();
         crate::tensor::corruption::corrupt_sparse_payload(&corrupt, 7).await;
@@ -428,6 +507,7 @@ mod math_binary {
         for position in 0..3 {
             let operands =
                 std::array::from_fn::<_, 3, _>(|i| if i == position { &corrupt } else { &empty });
+
             let expression = TensorExpression::new(
                 operands[0]
                     .view()
@@ -440,10 +520,12 @@ mod math_binary {
             .or_scalar(1)
             .await
             .unwrap();
+
             let clean = expression
                 .clone()
                 .slice(range![AxisRange::In(0, 1, 1)])
                 .unwrap();
+
             let values: Vec<_> = clean.read_blocks().unwrap().try_collect().await.unwrap();
             assert_eq!(values, vec![vec![1]]);
             assert!(expression.read_value(&[7]).await.is_err());
@@ -451,6 +533,7 @@ mod math_binary {
                 .clone()
                 .slice(range![AxisRange::In(7, 8, 1)])
                 .unwrap();
+
             let mut stream = dirty.read_blocks().unwrap();
             assert!(stream.try_next().await.is_err());
             assert!(
@@ -488,6 +571,7 @@ mod reduce {
             )
             .await
             .unwrap();
+
             tensor.write_value(&[499_999_999, 0], 2.).await.unwrap();
             tensor.write_value(&[0, 0], 1.).await.unwrap();
             crate::tensor::corruption::corrupt_sparse_payload(&tensor, 0).await;
@@ -502,6 +586,7 @@ mod reduce {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(entries, vec![(vec![499_999_999], 2.)]);
             assert!(view.read_value(&[0]).await.is_err());
             assert!(
@@ -509,6 +594,7 @@ mod reduce {
                     .await
                     .is_err()
             );
+
             assert!(
                 view.read_sparse_elements_in_order(range![AxisRange::At(1)], axes![1])
                     .await
@@ -530,6 +616,7 @@ mod reduce {
         )
         .await
         .unwrap();
+
         tensor.write_value(&[0], 0.2).await.unwrap();
         tensor.write_value(&[8192], 1.).await.unwrap();
         crate::tensor::corruption::corrupt_sparse_payload(&tensor, 8192).await;
@@ -542,6 +629,7 @@ mod reduce {
             .ge_scalar(0.)
             .await
             .unwrap();
+
         assert!(all_nonnegative.all().await.is_err());
         assert!(tensor.view().round().await.unwrap().any().await.is_err());
         assert!(tensor.sum_all().await.is_err());
@@ -564,15 +652,20 @@ mod bulk_mutation {
                 TensorSchema::new(<f64 as number_general::DType>::dtype(), vec![9, 129].into())
                     .unwrap(),
                 layout,
-                match layout {
-                    Layout::Dense => vec![4, 64].into(),
-                    Layout::Sparse { .. } => vec![1, 64].into(),
-                },
+                (match layout {
+                    Layout::Dense => vec![4, 64],
+                    Layout::Sparse { .. } => vec![1, 64],
+                })
+                .iter()
+                .copied()
+                .product::<u64>() as usize,
             )
             .unwrap();
+
             let tensor = Tensor::<FsEntry, f64>::create_with_geometry(dir, geometry.clone())
                 .await
                 .unwrap();
+
             CURRENT
                 .scope(Default::default(), async {
                     for value in [2., 0., f64::NAN] {
@@ -585,10 +678,11 @@ mod bulk_mutation {
 
                         for id in 0..geometry.block_count() {
                             let block = tensor.read_logical_block(id).await.unwrap();
-                            let mut valid = vec![false; geometry.block_len()];
+                            let mut valid = vec![false; geometry.block_capacity()];
                             let expected: Vec<_> =
                                 crate::test_support::block_entries(&geometry, id).collect();
-                            let offsets: Vec<_> = geometry.block_offsets(id).unwrap().collect();
+
+                            let offsets: Vec<_> = (0..geometry.block_len(id).unwrap()).collect();
                             assert_eq!(
                                 offsets,
                                 expected.iter().map(|(i, _)| *i).collect::<Vec<_>>()
@@ -601,6 +695,7 @@ mod bulk_mutation {
                                         || block[offset].is_nan() && value.is_nan()
                                 );
                             }
+
                             assert!(
                                 block
                                     .iter()
@@ -615,15 +710,30 @@ mod bulk_mutation {
                         AxisRange::Of(vec![128, 1, 128]),
                     ]
                     .into();
+
                     let before = CURRENT.with(|m| m.borrow().block_updates);
                     tensor
                         .write_values(range, (1..=9).map(f64::from).collect())
                         .await
                         .unwrap();
-                    assert_eq!(CURRENT.with(|m| m.borrow().block_updates) - before, 4);
+
+                    // Dense chunks cross rows: these four coordinates share two blocks.
+                    let expected = if matches!(layout, Layout::Dense) {
+                        2
+                    } else {
+                        4
+                    };
+
+                    assert_eq!(
+                        CURRENT.with(|m| m.borrow().block_updates) - before,
+                        expected
+                    );
+
                     assert_eq!(tensor.read_value(&[8, 128]).await.unwrap(), 9.);
                     assert_eq!(tensor.read_value(&[8, 1]).await.unwrap(), 8.);
                     assert_eq!(tensor.read_value(&[0, 128]).await.unwrap(), 6.);
+                    assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), 5.);
+                    assert!(tensor.read_value(&[0, 2]).await.unwrap().is_nan());
                     assert!(
                         tensor
                             .write_values(vec![AxisRange::At(0), AxisRange::At(0)].into(), vec![])
@@ -632,6 +742,7 @@ mod bulk_mutation {
                     );
                 })
                 .await;
+
             cleanup(&root).await;
         }
     }
@@ -647,11 +758,13 @@ mod bulk_mutation {
         )
         .await
         .unwrap();
+
         crate::tensor::corruption::files(&tensor.storage)
             .write()
             .await
             .delete("0")
             .await;
+
         assert!(tensor.write_value(&[0], 1.).await.is_err());
         assert!(
             tensor
@@ -659,6 +772,7 @@ mod bulk_mutation {
                 .await
                 .is_err()
         );
+
         assert!(tensor.fill(1.).await.is_err());
         assert!(
             crate::tensor::corruption::files(&tensor.storage)
@@ -667,15 +781,18 @@ mod bulk_mutation {
                 .get_file("0")
                 .is_none()
         );
+
         tensor
             .write_values(vec![AxisRange::In(4, 6, 1)].into(), vec![7., 8.])
             .await
             .unwrap();
+
         assert_eq!(tensor.read_value(&[5]).await.unwrap(), 8.);
         tensor
             .write_values(vec![AxisRange::Of(vec![])].into(), vec![])
             .await
             .unwrap();
+
         cleanup(&root).await;
     }
 }

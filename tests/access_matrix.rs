@@ -25,6 +25,7 @@ async fn create_dense(
     let tensor = Tensor::<FsEntry, f32>::create(dir, schema.clone(), Layout::Dense, max_capacity)
         .await
         .expect("create dense");
+
     (root, tensor, schema)
 }
 
@@ -40,6 +41,7 @@ async fn create_sparse(
         Tensor::<FsEntry, f32>::create(dir, schema.clone(), Layout::Sparse { axis }, max_capacity)
             .await
             .expect("create sparse");
+
     (root, tensor, schema)
 }
 
@@ -65,6 +67,7 @@ fn transpose_range(range: &Range, permutation: &[usize]) -> Range {
     for axis in permutation {
         remapped.push(range[*axis].clone());
     }
+
     remapped.into()
 }
 
@@ -143,10 +146,12 @@ mod section_a_access_parity {
             let v = dense.read_value(&[i]).await.expect("dense read");
             assert_eq!(v, i as f32 + 1.0, "dense coord [{}]", i);
         }
+
         cleanup(&dense_root).await;
 
         let (sparse_none_root, sparse_none, _) =
             create_sparse("a_rank_one_sn", shape![4], 2, None).await;
+
         for i in 0..4u64 {
             sparse_none
                 .write_value(&[i], i as f32 + 1.0)
@@ -159,8 +164,10 @@ mod section_a_access_parity {
                 .read_value(&[i])
                 .await
                 .expect("sparse_none read");
+
             assert_eq!(v, i as f32 + 1.0, "sparse_none coord [{}]", i);
         }
+
         cleanup(&sparse_none_root).await;
 
         let (sparse_root, sparse, _) = create_sparse("a_rank_one_s", shape![4], 2, Some(0)).await;
@@ -176,6 +183,7 @@ mod section_a_access_parity {
             let v = sparse.read_value(&[i]).await.expect("sparse read");
             assert_eq!(v, i as f32 + 1.0, "sparse coord [{}]", i);
         }
+
         cleanup(&sparse_root).await;
     }
 
@@ -187,6 +195,7 @@ mod section_a_access_parity {
             .write_value(&[0, 0, 0], 1.0)
             .await
             .expect("dense write min");
+
         assert_eq!(
             dense.read_value(&[0, 0, 0]).await.expect("dense read min"),
             1.0
@@ -196,6 +205,7 @@ mod section_a_access_parity {
             .write_value(&[1, 2, 3], 2.0)
             .await
             .expect("dense write max");
+
         assert_eq!(
             dense.read_value(&[1, 2, 3]).await.expect("dense read max"),
             2.0
@@ -205,14 +215,17 @@ mod section_a_access_parity {
             .read_value(&[2, 0, 0])
             .await
             .expect_err("oob read dense");
+
         assert!(
             matches!(oob_read, Error::InvalidCoord(_)),
             "got {oob_read:?}"
         );
+
         let oob_write = dense
             .write_value(&[2, 0, 0], 1.0)
             .await
             .expect_err("oob write dense");
+
         assert!(
             matches!(oob_write, Error::InvalidCoord(_)),
             "got {oob_write:?}"
@@ -227,6 +240,7 @@ mod section_a_access_parity {
             .write_value(&[0, 0, 0], 1.0)
             .await
             .expect("sparse write min");
+
         assert_eq!(
             sparse
                 .read_value(&[0, 0, 0])
@@ -239,6 +253,7 @@ mod section_a_access_parity {
             .write_value(&[1, 2, 3], 2.0)
             .await
             .expect("sparse write max");
+
         assert_eq!(
             sparse
                 .read_value(&[1, 2, 3])
@@ -251,14 +266,17 @@ mod section_a_access_parity {
             .read_value(&[2, 0, 0])
             .await
             .expect_err("oob read sparse");
+
         assert!(
             matches!(oob_read, Error::InvalidCoord(_)),
             "got {oob_read:?}"
         );
+
         let oob_write = sparse
             .write_value(&[2, 0, 0], 1.0)
             .await
             .expect_err("oob write sparse");
+
         assert!(
             matches!(oob_write, Error::InvalidCoord(_)),
             "got {oob_write:?}"
@@ -324,6 +342,7 @@ mod section_b_transforms {
                     .zip(step)
                     .map(|((&c, start), step)| start + c * step)
                     .collect();
+
                 let expected = tensor.read_value(&src).await.expect("read original");
                 let actual = sliced.read_value(&s_coord).await.expect("read sliced");
                 assert_eq!(actual, expected, "{case}: coord {:?}", s_coord);
@@ -468,6 +487,7 @@ mod section_b_transforms {
             AxisRange::In(0, 4, 2),
             AxisRange::In(0, 4, 1)
         ];
+
         let perm = axes![2, 0, 1];
         let s2: Range = range![
             AxisRange::In(0, 4, 2),
@@ -527,6 +547,7 @@ mod section_b_transforms {
                 AxisRange::In(0, 5, 1)
             ])
             .expect("slice At dense");
+
         assert_eq!(sliced.shape(), &[4, 5]);
 
         for coord in iter_coords(sliced.shape()) {
@@ -535,6 +556,7 @@ mod section_b_transforms {
             let actual = sliced.read_value(&coord).await.expect("sliced dense At");
             assert_eq!(actual, expected, "At dense coord {:?}", coord);
         }
+
         cleanup(&root).await;
 
         let (root, tensor, _) = create_sparse("b_at_sparse", shape![3, 4, 5], 5, Some(0)).await;
@@ -548,6 +570,7 @@ mod section_b_transforms {
                 AxisRange::In(0, 5, 1)
             ])
             .expect("slice At sparse");
+
         assert_eq!(sliced.shape(), &[4, 5]);
 
         for coord in iter_coords(sliced.shape()) {
@@ -556,6 +579,7 @@ mod section_b_transforms {
             let actual = sliced.read_value(&coord).await.expect("sliced sparse At");
             assert_eq!(actual, expected, "At sparse coord {:?}", coord);
         }
+
         cleanup(&root).await;
     }
 
@@ -572,6 +596,7 @@ mod section_b_transforms {
                 AxisRange::In(0, 8, 2)
             ])
             .expect("slice step=2 dense");
+
         assert_eq!(sliced.shape(), &[2, 3, 4]);
 
         for coord in iter_coords(sliced.shape()) {
@@ -580,6 +605,7 @@ mod section_b_transforms {
             let actual = sliced.read_value(&coord).await.expect("sliced dense step2");
             assert_eq!(actual, expected, "step2 dense coord {:?}", coord);
         }
+
         cleanup(&root).await;
 
         let (root, tensor, _) = create_sparse("b_step2_sparse", shape![4, 6, 8], 8, Some(1)).await;
@@ -593,6 +619,7 @@ mod section_b_transforms {
                 AxisRange::In(0, 8, 2)
             ])
             .expect("slice step=2 sparse");
+
         assert_eq!(sliced.shape(), &[2, 3, 4]);
 
         for coord in iter_coords(sliced.shape()) {
@@ -602,8 +629,10 @@ mod section_b_transforms {
                 .read_value(&coord)
                 .await
                 .expect("sliced sparse step2");
+
             assert_eq!(actual, expected, "step2 sparse coord {:?}", coord);
         }
+
         cleanup(&root).await;
     }
 
@@ -622,6 +651,7 @@ mod section_b_transforms {
                 AxisRange::In(0, 6, 1)
             ])
             .expect("slice Of dense");
+
         assert_eq!(sliced.shape(), &[3, 5, 6]);
 
         for coord in iter_coords(sliced.shape()) {
@@ -631,8 +661,10 @@ mod section_b_transforms {
                 .read_value(&coord)
                 .await
                 .expect("sliced dense gather");
+
             assert_eq!(actual, expected, "Of dense coord {:?}", coord);
         }
+
         cleanup(&root).await;
 
         let (root, tensor, _) = create_sparse("b_gather_sparse", shape![4, 5, 6], 6, Some(0)).await;
@@ -646,6 +678,7 @@ mod section_b_transforms {
                 AxisRange::In(0, 6, 1)
             ])
             .expect("slice Of sparse");
+
         assert_eq!(sliced.shape(), &[3, 5, 6]);
 
         for coord in iter_coords(sliced.shape()) {
@@ -655,8 +688,10 @@ mod section_b_transforms {
                 .read_value(&coord)
                 .await
                 .expect("sliced sparse gather");
+
             assert_eq!(actual, expected, "Of sparse coord {:?}", coord);
         }
+
         cleanup(&root).await;
     }
 
@@ -671,6 +706,7 @@ mod section_b_transforms {
             AxisRange::In(0, 5, 1),
             AxisRange::In(0, 6, 1)
         ]);
+
         assert!(result.is_err(), "zero-extent slice must fail, got Ok");
 
         cleanup(&root).await;
@@ -685,6 +721,7 @@ mod section_b_transforms {
             .view()
             .transpose(Some(axes![0, 1, 2]))
             .expect("identity tx");
+
         assert_eq!(transposed.shape(), tensor.shape());
 
         for coord in iter_coords(tensor.shape()) {
@@ -706,6 +743,7 @@ mod section_b_transforms {
             AxisRange::In(1, 3, 1),
             AxisRange::In(0, 4, 2)
         ];
+
         let perm = axes![2, 0, 1];
 
         // Two independent borrows of `tensor` held live at the same time.
@@ -778,6 +816,7 @@ mod section_c_new_transforms {
                         .read_value(&[a, b, c])
                         .await
                         .expect("broadcast read");
+
                     let expected = (b * 10 + c) as f32;
                     assert_eq!(v, expected, "broadcast [{a},{b},{c}]");
                 }
@@ -831,6 +870,7 @@ mod section_c_new_transforms {
                 values.clone(),
             )
             .await;
+
             let squeezed = tensor.view().squeeze(axes![0, 2]).expect(case);
             assert_eq!(squeezed.shape(), &[3, 4], "{case}");
             for (coord, expected) in iter_coords(squeezed.shape()).zip(values) {
@@ -840,6 +880,7 @@ mod section_c_new_transforms {
                     "{case}: {coord:?}"
                 );
             }
+
             cleanup(&root).await;
         }
     }
@@ -872,8 +913,10 @@ mod section_c_new_transforms {
                     }
                 })
                 .collect();
+
             let (root, tensor) =
                 common::fixture::source(case, shape, layout, 4, 1_000_000, values.clone()).await;
+
             let unsqueezed = tensor.view().unsqueeze(axes).expect(case);
             assert_eq!(unsqueezed.shape(), output.as_slice(), "{case}");
             for (coord, expected) in iter_coords(unsqueezed.shape()).zip(values) {
@@ -883,6 +926,7 @@ mod section_c_new_transforms {
                     "{case}: {coord:?}"
                 );
             }
+
             cleanup(&root).await;
         }
     }
@@ -895,10 +939,12 @@ mod section_c_new_transforms {
             .squeeze(axes![1])
             .err()
             .expect("must reject squeeze on size>1 axis");
+
         assert!(
             matches!(err, Error::InvalidLayout(_) | Error::Unsupported(_)),
             "got {err:?}"
         );
+
         cleanup(&root).await;
     }
 
@@ -910,6 +956,7 @@ mod section_c_new_transforms {
             .squeeze(axes![1, 1])
             .err()
             .expect("must reject duplicate axis");
+
         assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
         cleanup(&root).await;
     }
@@ -922,6 +969,7 @@ mod section_c_new_transforms {
             .squeeze(axes![5])
             .err()
             .expect("must reject out of bounds");
+
         assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
         cleanup(&root).await;
     }
@@ -934,6 +982,7 @@ mod section_c_new_transforms {
             .unsqueeze(axes![0, 0])
             .err()
             .expect("must reject duplicate axis");
+
         assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
         cleanup(&root).await;
     }
@@ -947,6 +996,7 @@ mod section_c_new_transforms {
             .unsqueeze(axes![2])
             .err()
             .expect("must reject axis 2");
+
         assert!(matches!(err2, Error::InvalidLayout(_)), "got {err2:?}");
 
         let err3 = tensor
@@ -954,6 +1004,7 @@ mod section_c_new_transforms {
             .unsqueeze(axes![3])
             .err()
             .expect("must reject axis 3");
+
         assert!(matches!(err3, Error::InvalidLayout(_)), "got {err3:?}");
         cleanup(&root).await;
     }
@@ -966,6 +1017,7 @@ mod section_c_new_transforms {
             .squeeze(axes![])
             .err()
             .expect("must reject empty axes");
+
         assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
         cleanup(&root).await;
     }
@@ -978,6 +1030,7 @@ mod section_c_new_transforms {
             .unsqueeze(axes![])
             .err()
             .expect("must reject empty axes");
+
         assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
         cleanup(&root).await;
     }
@@ -990,6 +1043,7 @@ mod section_c_new_transforms {
             .squeeze(axes![0, 1])
             .err()
             .expect("must reject squeezing all axes");
+
         assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
         cleanup(&root).await;
     }
@@ -1018,6 +1072,7 @@ mod section_c2_squeeze_unsqueeze_chains {
                 AxisRange::In(0, 4, 1)
             ])
             .expect("slice");
+
         let squeezed_a = sliced_a.squeeze(axes![1]).expect("squeeze");
 
         // Path (b): squeeze then slice
@@ -1037,6 +1092,7 @@ mod section_c2_squeeze_unsqueeze_chains {
             let v_b = sliced_b.read_value(&coord).await.expect("read b");
             assert_eq!(v_a, v_b, "coord {:?}", coord);
         }
+
         cleanup(&root).await;
     }
 
@@ -1053,6 +1109,7 @@ mod section_c2_squeeze_unsqueeze_chains {
         let transposed = unsqueezed
             .transpose(Some(axes![0, 3, 1, 2]))
             .expect("transpose");
+
         assert_eq!(transposed.shape(), &[2, 4, 1, 3]);
 
         // Verify reads: transposed[a,c,0,b] should equal original [a,b,c]
@@ -1065,6 +1122,7 @@ mod section_c2_squeeze_unsqueeze_chains {
                 }
             }
         }
+
         cleanup(&root).await;
     }
 
@@ -1084,6 +1142,7 @@ mod section_c2_squeeze_unsqueeze_chains {
             let v_flipped = flipped.read_value(&coord).await.expect("read flipped");
             assert_eq!(v_flipped, v_unflipped, "coord {:?}", coord);
         }
+
         cleanup(&root).await;
     }
 
@@ -1110,6 +1169,7 @@ mod section_c2_squeeze_unsqueeze_chains {
                 }
             }
         }
+
         cleanup(&root).await;
     }
 
@@ -1134,6 +1194,7 @@ mod section_c2_squeeze_unsqueeze_chains {
             let expected = encode_value(&[0, b, c]);
             assert_eq!(v, expected, "idx={}", idx);
         }
+
         cleanup(&root).await;
     }
 
@@ -1159,6 +1220,7 @@ mod section_c2_squeeze_unsqueeze_chains {
             let expected = encode_value(&[a, b, c]);
             assert_eq!(v, expected, "idx={}", idx);
         }
+
         cleanup(&root).await;
     }
 
@@ -1167,6 +1229,7 @@ mod section_c2_squeeze_unsqueeze_chains {
         // sparse shape [3,1,4], squeeze axis 1 then unsqueeze back
         let (root, tensor, _) =
             create_sparse("c2_squeeze_unsqueeze_sparse", shape![3, 1, 4], 1, Some(0)).await;
+
         seed_values(&tensor).await;
 
         let squeezed = tensor.view().squeeze(axes![1]).expect("squeeze");
@@ -1181,6 +1244,7 @@ mod section_c2_squeeze_unsqueeze_chains {
             let v_restored = restored.read_value(&coord).await.expect("read restored");
             assert_eq!(v_restored, v_orig, "coord {:?}", coord);
         }
+
         cleanup(&root).await;
     }
 }
@@ -1254,6 +1318,7 @@ mod section_d_bulk_io {
                 nonzero += 1;
             }
         }
+
         assert_eq!(nonzero, 2);
 
         cleanup(&root).await;
@@ -1273,6 +1338,7 @@ mod section_d_bulk_io {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+
         assert_eq!(values.len(), 24);
 
         for (idx, coord) in iter_coords(tensor.shape()).enumerate() {
@@ -1360,6 +1426,7 @@ mod section_d_bulk_io {
                 self.0.read_value(coord)
             }
         }
+
         let (sparse_root, dir) = new_dir("d_copy_sparse").await;
         let sparse = Tensor::copy_from(
             dir,
@@ -1406,6 +1473,7 @@ mod section_f_view_semantics {
                 AxisRange::In(0, 4, 1)
             ])
             .expect("slice");
+
         assert!(!sliced.is_base_tensor(), "sliced view is not the base");
 
         let transposed = tensor.view().transpose(Some(axes![2, 0, 1])).expect("tx");
@@ -1429,6 +1497,7 @@ mod section_f_view_semantics {
                 AxisRange::In(0, 4, 1)
             ])
             .expect("slice");
+
         assert!(sliced.supports_write_through());
 
         sliced
@@ -1457,6 +1526,7 @@ mod section_f_view_semantics {
             .write_value(&[1, 0, 0], 1.0)
             .await
             .expect_err("write must be rejected on broadcast view");
+
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
 
         cleanup(&root).await;
@@ -1483,6 +1553,7 @@ mod section_f_view_semantics {
             .write_value(&[0, 0, 0], 1.0)
             .await
             .expect_err("write must be rejected on gather-sliced view");
+
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
 
         cleanup(&root).await;
@@ -1505,6 +1576,7 @@ mod section_f_view_semantics {
                 AxisRange::In(0, 4, 1)
             ])
             .expect("slice");
+
         let err = sliced.reshape(shape![16]).err().expect("must reject");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
 
@@ -1539,6 +1611,7 @@ mod section_g_sparse_iteration {
             .try_collect()
             .await
             .expect("stream must not error");
+
         assert_eq!(partial, [(vec![1, 2, 3], 9.0)]);
 
         tensor.write_value(&[1, 0, 1], 4.0).await.expect("w");
@@ -1556,6 +1629,7 @@ mod section_g_sparse_iteration {
             .try_collect()
             .await
             .expect("stream must not error");
+
         assert_eq!(rows.len(), 3, "should yield exactly the written coords");
         assert_eq!(rows[0], (vec![0, 0, 0], 1.0));
 
@@ -1610,8 +1684,10 @@ mod section_g_sparse_iteration {
                     axes![0, 1, 2],
                 )
                 .await;
+
             assert!(matches!(result, Err(Error::InvalidLayout(_))), "{name}");
         }
+
         assert!(matches!(
             tensor
                 .read_sparse_elements_in_order(range![], axes![0, 1, 2])
@@ -1653,6 +1729,7 @@ mod section_g_sparse_iteration {
             Ok(stream) => {
                 let rows: Vec<(Vec<u64>, f32)> =
                     stream.try_collect().await.expect("stream must not error");
+
                 assert_eq!(rows.len(), 2);
             }
             Err(Error::UnsupportedSparseIterationOrder { hint, .. }) => {
@@ -1683,12 +1760,14 @@ mod section_h_persistence {
                 Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
                     .await
                     .expect("create");
+
             for coord in iter_coords(tensor.shape()) {
                 tensor
                     .write_value(&coord, encode_value(&coord))
                     .await
                     .expect("write");
             }
+
             dir.sync().await.expect("sync");
         }
 
@@ -1719,6 +1798,7 @@ mod section_h_persistence {
             )
             .await
             .expect("create");
+
             tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
             tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
             tensor.sync().await.expect("sync");
@@ -1757,6 +1837,7 @@ mod section_h_persistence {
             let _ = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
                 .await
                 .expect("create");
+
             dir.sync().await.expect("sync");
         }
 
@@ -1774,6 +1855,7 @@ mod section_h_persistence {
             .await
             .err()
             .expect("missing metadata must fail closed");
+
         assert!(
             matches!(err, Error::InvalidSchema(_) | Error::Io(_)),
             "got {err:?}"
@@ -1792,6 +1874,7 @@ mod section_h_persistence {
             let _ = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
                 .await
                 .expect("create");
+
             dir.sync().await.expect("sync");
         }
 
@@ -1805,6 +1888,7 @@ mod section_h_persistence {
             .await
             .err()
             .expect("tampered metadata must fail closed");
+
         assert!(
             matches!(err, Error::InvalidSchema(_) | Error::Io(_)),
             "got {err:?}"
@@ -1824,10 +1908,12 @@ mod section_h_persistence {
         )
         .await
         .expect("create");
+
         tensor
             .replace_logical_block(0, vec![5.; 512])
             .await
             .expect("write");
+
         let values = dir.read().await.get_dir("values").cloned().unwrap();
         let primary = values.read().await.get_dir("primary").cloned().unwrap();
         let name = primary.read().await.names().next().cloned().unwrap();
@@ -1839,6 +1925,7 @@ mod section_h_persistence {
             primary.read().await.is_empty(),
             "strict reads must not repair missing storage"
         );
+
         cleanup(&root).await;
     }
 
@@ -1855,12 +1942,14 @@ mod section_h_persistence {
         let tensor = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
             .await
             .expect("create dense");
+
         tensor.write_value(&[0, 1, 2], 5.0).await.expect("write");
 
         let blocks_dir = {
             let guard = dir.read().await;
             guard.get_dir("blocks").cloned().expect("blocks dir")
         };
+
         let block_id = {
             let blocks_guard = blocks_dir.read().await;
             blocks_guard
@@ -1869,10 +1958,12 @@ mod section_h_persistence {
                 .cloned()
                 .expect("at least one block file")
         };
+
         {
             let mut blocks_guard = blocks_dir.write().await;
             blocks_guard.delete(&block_id).await;
         }
+
         blocks_dir.sync().await.expect("sync deleted block");
 
         let mut saw_invalid_layout = false;
@@ -1884,9 +1975,11 @@ mod section_h_persistence {
                     matches!(err, Error::Io(ref error) if freqfs::IntegrityError::is_marked(error)),
                     "got {err:?}"
                 );
+
                 saw_invalid_layout = true;
             }
         }
+
         assert!(
             saw_invalid_layout,
             "deleting a block file must make at least one coordinate fail closed"
@@ -1896,7 +1989,7 @@ mod section_h_persistence {
     }
 
     // On a freshly created (unwritten) dense tensor, every block position
-    // implied by shape/block_shape must already have a block file on disk —
+    // implied by shape/block capacity must already have a block file on disk —
     // dense storage is fully materialized at `create`, not populated lazily
     // on first write.
     #[tokio::test]
@@ -1912,12 +2005,14 @@ mod section_h_persistence {
             Tensor::<FsEntry, f32>::create(dir.clone(), schema, Layout::Dense, max_capacity)
                 .await
                 .expect("create dense");
+
         dir.sync().await.expect("sync");
 
         let mut block_files = Vec::new();
         let mut rd = tokio::fs::read_dir(root.join("blocks"))
             .await
             .expect("read blocks dir");
+
         while let Some(entry) = rd.next_entry().await.expect("next entry") {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name != "metadata" {
@@ -1952,12 +2047,14 @@ mod section_h_persistence {
         )
         .await
         .expect("create sparse");
+
         dir.sync().await.expect("sync");
 
         let mut entries = Vec::new();
         let mut rd = tokio::fs::read_dir(root.join("blocks"))
             .await
             .expect("read blocks dir");
+
         while let Some(entry) = rd.next_entry().await.expect("next entry") {
             entries.push(entry.file_name().to_string_lossy().into_owned());
         }
@@ -1981,6 +2078,7 @@ mod section_h_persistence {
             let _ = Tensor::<FsEntry, f32>::create(dir.clone(), schema.clone(), Layout::Dense, 4)
                 .await
                 .expect("create");
+
             dir.sync().await.expect("sync");
         }
 
@@ -1994,6 +2092,7 @@ mod section_h_persistence {
             .await
             .err()
             .expect("unrecognized metadata must fail closed");
+
         assert!(
             matches!(err, Error::InvalidSchema(_) | Error::Io(_)),
             "got {err:?}"

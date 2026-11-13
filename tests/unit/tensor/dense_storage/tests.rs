@@ -34,6 +34,7 @@ async fn dense_reads_delegate_capacity_and_release_failed_work() {
                 .await
                 .unwrap()
                 .unwrap();
+
         assert_eq!(values, vec![0.; 2048]);
     }
 
@@ -43,18 +44,22 @@ async fn dense_reads_delegate_capacity_and_release_failed_work() {
     let tensor = Tensor::<FsEntry, f32>::load(cache.load(root.to_path_buf()).unwrap())
         .await
         .unwrap();
+
     let crate::tensor::Storage::Dense(owner) = tensor.storage.as_ref() else {
         unreachable!()
     };
+
     let held = owner.read::<f32>(0).await.unwrap();
     let request = BatchRequest::linear(512, 512).unwrap();
     let error = tokio::time::timeout(Duration::from_secs(5), tensor.read_batch(&request, None))
         .await
         .unwrap()
         .unwrap_err();
+
     assert!(
         matches!(error, crate::Error::Io(error) if error.kind() == std::io::ErrorKind::ResourceBusy)
     );
+
     drop(held);
 
     assert_eq!(
@@ -85,6 +90,54 @@ async fn buffered_reads_preserve_order_and_release_guards() {
     let crate::tensor::Storage::Dense(owner) = tensor.storage.as_ref() else {
         unreachable!()
     };
+
+    let directory_guard = owner.blocks.write().await;
+    for direct in [false, true] {
+        for (ids, oversized) in [
+            (vec![8], false),
+            (vec![0, 8], false),
+            (vec![1, 1], false),
+            (vec![1, 0], false),
+            (vec![8; crate::MAX_BATCH_ELEMENTS + 1], true),
+        ] {
+            let mut calls = 0;
+            let mut callback = |_: u64, _: &[f32]| {
+                calls += 1;
+                Ok(())
+            };
+
+            let result = if direct {
+                owner
+                    .visit_blocks::<f32, _>(&ids, &mut callback)
+                    .now_or_never()
+            } else {
+                tensor.visit_blocks(&ids, callback).now_or_never()
+            }
+            .expect("invalid IDs must not acquire native directory access");
+
+            assert!(if oversized {
+                matches!(result, Err(crate::Error::InvalidLayout(_)))
+            } else {
+                matches!(result, Err(crate::Error::InvalidCoord(_)))
+            });
+
+            assert_eq!(calls, 0);
+        }
+
+        let mut callback = |_, _: &[f32]| panic!("empty selection has no callbacks");
+        let result = if direct {
+            owner
+                .visit_blocks::<f32, _>(&[], &mut callback)
+                .now_or_never()
+        } else {
+            tensor.visit_blocks(&[], callback).now_or_never()
+        };
+
+        assert!(matches!(result, Some(Ok(()))));
+    }
+
+    drop(directory_guard);
+
     let first = super::required_file(&*owner.blocks.read().await, 0).unwrap();
     let second = super::required_file(&*owner.blocks.read().await, 1).unwrap();
     let request =
@@ -130,31 +183,37 @@ async fn dense_padding_is_validated_before_write_and_after_storage_reads() {
     let geometry = StorageGeometry::new(
         TensorSchema::new(f32::dtype(), shape![3]).unwrap(),
         Layout::Dense,
-        shape![4],
+        [4].iter().copied().product::<u64>() as usize,
     )
     .unwrap();
+
     let tensor = Tensor::<FsEntry, f32>::create_with_geometry(dir.clone(), geometry)
         .await
         .unwrap();
+
     assert!(
         tensor
             .replace_logical_block(0, vec![1., 2., 3., 9.])
             .await
             .is_err()
     );
+
     assert_eq!(tensor.read_value(&[0]).await.unwrap(), 0.);
     tensor
-        .replace_logical_block(0, vec![1., 2., 3., 0.])
+        .replace_logical_block(0, vec![1., 2., 3.])
         .await
         .unwrap();
+
     let crate::tensor::Storage::Dense(owner) = tensor.storage.as_ref() else {
         unreachable!()
     };
+
     let file = owner.blocks.read().await.get_file("0").unwrap().clone();
-    file.write::<Vec<f32>>().await.unwrap()[3] = 9.;
+    file.write::<Vec<f32>>().await.unwrap().push(9.);
     assert!(
         matches!(tensor.read_value(&[0]).await, Err(crate::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error))
     );
+
     assert!(tensor.validate().await.is_err());
     tensor.sync_all().await.unwrap();
     drop(file);

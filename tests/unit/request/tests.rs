@@ -19,6 +19,7 @@ fn flat_runs_validate_before_cursor_use() {
             }]),
             len: total,
         };
+
         assert!(request.cursor(&[3]).is_err());
     }
 
@@ -31,11 +32,13 @@ fn flat_runs_validate_before_cursor_use() {
         }]),
         len: 3,
     };
+
     assert_eq!(request.coordinates(&[1]).unwrap(), vec![vec![0]; 3]);
     let empty = BatchRequest {
         kind: RequestKind::FlatRuns(vec![]),
         len: 0,
     };
+
     assert!(empty.coordinates(&[1]).unwrap().is_empty());
 }
 
@@ -46,6 +49,7 @@ fn flat_runs_compose_affine_steps_across_coordinate_boundaries() {
             kind: RequestKind::FlatRuns(vec![run]),
             len: run.len,
         };
+
         request.validate(shape).unwrap();
         let expected: Vec<_> = request
             .coordinates(shape)
@@ -58,6 +62,7 @@ fn flat_runs_compose_affine_steps_across_coordinate_boundaries() {
                     .fold(0i128, |n, (&c, &s)| n + c as i128 * s)
             })
             .collect();
+
         let mut actual = Vec::new();
         progressions(&request, shape, 0, strides, |run| {
             assert_eq!(run.output, actual.len());
@@ -65,6 +70,7 @@ fn flat_runs_compose_affine_steps_across_coordinate_boundaries() {
             Ok(())
         })
         .unwrap();
+
         assert_eq!(actual, expected);
     };
 
@@ -130,9 +136,9 @@ fn shared_segments_preserve_order_bounds_and_exhaustion() {
     for axis in [
         Axis::range(8, 0),
         Axis::range(8, 7),
-        Axis::Selected(vec![]),
-        Axis::Selected(vec![9, 7, 5, 5, 5, 8, 2]),
-        Axis::Selected(vec![u64::MAX, 0, u64::MAX]),
+        Axis::selected(vec![]),
+        Axis::selected(vec![9, 7, 5, 5, 5, 8, 2]),
+        Axis::selected(vec![u64::MAX, 0, u64::MAX]),
     ] {
         let values: Vec<_> = axis
             .segments()
@@ -140,6 +146,7 @@ fn shared_segments_preserve_order_bounds_and_exhaustion() {
                 (0..len).map(move |i| (start as i128 + step * i as i128) as u64)
             })
             .collect();
+
         assert_eq!(
             values,
             (0..axis.len()).map(|i| axis.at(i)).collect::<Vec<_>>()
@@ -159,6 +166,7 @@ fn shared_segments_preserve_order_bounds_and_exhaustion() {
         huge.by_ref().take(3).collect::<Vec<_>>(),
         vec![(0, 0, 1), (1, 1, 1), (2, 2, 1)]
     );
+
     let mut empty = linear_segments(0, 0, 7).unwrap();
     assert_eq!(empty.next(), None);
     assert_eq!(empty.next(), None);
@@ -187,6 +195,7 @@ fn linear_batches_preserve_boundaries_and_validate_shape() {
             assert_eq!(batch.len(), (len - next).min(MAX_BATCH_ELEMENTS));
             next += batch.len();
         }
+
         assert_eq!(next, len);
     }
 
@@ -199,6 +208,7 @@ fn linear_batches_preserve_boundaries_and_validate_shape() {
         .unwrap()
         .take(2)
         .collect::<Vec<_>>();
+
     assert_eq!(prefix.len(), 2);
     assert!(prefix.iter().all(|batch| batch.len() == MAX_BATCH_ELEMENTS));
     assert!(matches!(
@@ -219,12 +229,14 @@ fn request_validation_and_cursor_reuse() {
             .validate(&[2, 3])
             .is_err()
     );
+
     assert!(Cartesian::new(vec![Axis::range(0, u64::MAX), Axis::range(0, 2)]).is_err());
     // Reject an unallocatable extent before narrowing it to a buffer length.
     assert!(matches!(
         Cartesian::new(vec![Axis::range(0, u64::MAX)]),
         Err(Error::InvalidLayout(_))
     ));
+
     let bad = BatchRequest::rectangles(vec![
         Cartesian::new(vec![Axis::Span {
             start: u64::MAX,
@@ -234,11 +246,12 @@ fn request_validation_and_cursor_reuse() {
         .unwrap(),
     ])
     .unwrap();
+
     assert!(bad.validate(&[10]).is_err());
     assert!(BatchRequest::point(&[0, 0]).validate(&[1]).is_err());
     let request = BatchRequest::rectangles(vec![
         Cartesian::new(vec![
-            Axis::Selected(vec![2, 0, 2]),
+            Axis::selected(vec![2, 0, 2]),
             Axis::Span {
                 start: 1,
                 step: 2,
@@ -248,6 +261,7 @@ fn request_validation_and_cursor_reuse() {
         .unwrap(),
     ])
     .unwrap();
+
     let expected = vec![
         vec![2, 1],
         vec![2, 3],
@@ -256,6 +270,7 @@ fn request_validation_and_cursor_reuse() {
         vec![2, 1],
         vec![2, 3],
     ];
+
     assert_eq!(request.coordinates(&[3, 4]).unwrap(), expected);
     let mut cursor = request.cursor(&[3, 4]).unwrap();
     let mut scratch = Coord::with_capacity(2);
@@ -266,6 +281,7 @@ fn request_validation_and_cursor_reuse() {
         assert_eq!(scratch.as_slice(), expected.as_slice());
         assert_eq!(scratch.as_ptr(), ptr);
     }
+
     assert!(!cursor.next_into(&mut scratch));
 }
 
@@ -287,6 +303,7 @@ fn spans_and_packed_tiles_preserve_coverage() {
             assert!(matches!(request.kind(), RequestKind::Rectangles(_)));
             all.extend(request.coordinates(&shape).unwrap());
         }
+
         all.sort();
         assert_eq!(
             all,
@@ -300,9 +317,11 @@ fn spans_and_packed_tiles_preserve_coverage() {
         .unwrap()
         .next()
         .unwrap();
+
     let RequestKind::Rectangles(rectangles) = first.kind() else {
         panic!("expected rectangles")
     };
+
     assert_eq!(rectangles.len(), 4);
     assert_eq!(first.len(), MAX_BATCH_ELEMENTS);
 }
@@ -314,16 +333,19 @@ fn range_requests_tile_without_expanding_coordinates() {
         .unwrap()
         .requests()
         .collect();
+
     assert!(
         requests
             .iter()
             .all(|request| request.len() <= MAX_BATCH_ELEMENTS)
     );
+
     let mut coordinates = Vec::new();
 
     for request in requests {
         coordinates.extend(request.coordinates(&[10, 10_000]).unwrap());
     }
+
     assert_eq!(coordinates.len(), 20_000);
     assert_eq!(coordinates.first(), Some(&vec![3, 0]));
     assert_eq!(coordinates.last(), Some(&vec![4, 9_999]));

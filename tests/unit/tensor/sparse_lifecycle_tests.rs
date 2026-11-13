@@ -18,6 +18,7 @@ async fn create_sparse(
     let tensor = Tensor::<TestFE, f32>::create(dir, schema, Layout::Sparse { axis }, max_capacity)
         .await
         .expect("create sparse");
+
     (root, tensor)
 }
 
@@ -43,14 +44,20 @@ async fn persisted_sparse(
 ) -> (Directory, Tensor<TestFE, f32>) {
     let (root, dir) = new_dir(name).await;
     let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape.clone()).unwrap();
-    let storage =
-        StorageSchema::from_block_shape(&shape, Layout::Sparse { axis }, block_shape).unwrap();
+    let storage = StorageSchema::new(
+        &shape,
+        Layout::Sparse { axis },
+        block_shape.iter().product::<u64>() as usize,
+    )
+    .unwrap();
+
     let tensor = Tensor::<TestFE, f32>::create_with_geometry(
         dir.clone(),
         crate::StorageGeometry { schema, storage },
     )
     .await
     .unwrap();
+
     tensor.sync().await.unwrap();
     drop(tensor);
     drop(dir);
@@ -76,6 +83,7 @@ async fn clearing_one_value_preserves_the_rest_of_its_sparse_key() {
         .visit_blocks(&[id], |_, _| panic!("absent sparse block"))
         .await
         .unwrap();
+
     assert!(
         tensor
             .occupied_blocks(0..tensor.storage_geometry().block_count())
@@ -84,6 +92,7 @@ async fn clearing_one_value_preserves_the_rest_of_its_sparse_key() {
             .unwrap()
             .is_none()
     );
+
     cleanup(&root).await;
 }
 
@@ -102,6 +111,7 @@ async fn zero_writes_respect_persisted_regions_edges_and_shared_pages() {
             axis,
         )
         .await;
+
         let first = [0, 0, 0];
         let neighbor = [0, 0, 1];
         tensor.write_value(&first, 2.).await.unwrap();
@@ -112,6 +122,7 @@ async fn zero_writes_respect_persisted_regions_edges_and_shared_pages() {
             .block_position(&neighbor)
             .unwrap()
             .0;
+
         assert_eq!(neighbor_id, expected);
         tensor.write_value(&first, -0.).await.unwrap();
         assert!(tensor.read_value(&neighbor).await.unwrap().is_nan());
@@ -139,6 +150,7 @@ async fn zero_writes_respect_persisted_regions_edges_and_shared_pages() {
         } else {
             block.push(11.);
         }
+
         assert!(tensor.replace_logical_block(edge_id, block).await.is_err());
         assert_eq!(tensor.read_value(&edge).await.unwrap(), 9.);
         tensor.write_value(&edge, 0.).await.unwrap();
@@ -148,7 +160,12 @@ async fn zero_writes_respect_persisted_regions_edges_and_shared_pages() {
         let loaded = Tensor::<TestFE, f32>::load(open_dir(&root).unwrap())
             .await
             .unwrap();
-        assert_eq!(loaded.block_shape(), block_shape.as_slice());
+
+        assert_eq!(
+            loaded.storage_geometry().block_capacity(),
+            block_shape.iter().product::<u64>() as usize
+        );
+
         assert_eq!(loaded.read_value(&edge).await.unwrap(), 0.);
         cleanup(&root).await;
     }
@@ -164,10 +181,12 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
             Some(0),
         )
         .await;
+
         tensor
             .replace_logical_block(0, vec![1.; len as usize])
             .await
             .unwrap();
+
         let clone = tensor.clone();
         let owner = tensor.storage.sparse().unwrap();
         {
@@ -179,29 +198,35 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
                     .now_or_never(),
                 Some(Err(Error::InvalidCoord(_)))
             ));
+
             assert!(matches!(
                 tensor.replace_logical_block(0, vec![]).now_or_never(),
                 Some(Err(Error::InvalidLayout(_)))
             ));
+
             drop(held);
             assert_eq!(
                 tensor.read_logical_block(0).await.unwrap(),
                 vec![1.; len as usize]
             );
         }
+
         // Cancellation while waiting for native table access leaves no held guards.
         let guard = crate::tensor::corruption::block_index(owner).write().await;
         {
             let mut replacement =
                 std::pin::pin!(tensor.replace_logical_block(0, vec![2.; len as usize]));
+
             assert!(futures::poll!(replacement.as_mut()).is_pending());
         }
+
         drop(guard);
         assert!(
             crate::tensor::corruption::block_index(owner)
                 .try_write()
                 .is_ok()
         );
+
         // This fixture stopped before any table mutation. Inspect native data
         // directly, then follow the caller contract by discarding both handles.
         assert_eq!(
@@ -214,6 +239,7 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
                 .unwrap()[1],
             crate::SparseCell::Payload(vec![1.; len as usize])
         );
+
         drop(clone);
         drop(tensor);
         cleanup(&root).await;
@@ -231,19 +257,22 @@ async fn sparse_capacity_spans_grids_without_axis_padding() {
                 axis,
             )
             .await;
-            assert_eq!(tensor.block_shape()[axis.unwrap_or(0)], 1);
-            assert!(tensor.block_len() <= capacity);
+
+            assert_eq!(tensor.layout(), Layout::Sparse { axis });
+            assert!(crate::TensorSource::storage_geometry(&tensor).block_capacity() <= capacity);
 
             for (coord, value) in [([0, 0, 0], 1.), ([2, 4, MAX_BLOCK_CAPACITY as u64], 2.)] {
                 tensor.write_value(&coord, value).await.unwrap();
                 assert_eq!(tensor.read_value(&coord).await.unwrap(), value);
             }
+
             tensor.sync().await.unwrap();
             drop(tensor);
             let loaded = Tensor::<TestFE, f32>::load(open_dir(&root).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(loaded.block_shape()[axis.unwrap_or(0)], 1);
+
+            assert_eq!(loaded.layout(), Layout::Sparse { axis });
             assert_eq!(
                 loaded
                     .read_value(&[2, 4, MAX_BLOCK_CAPACITY as u64])
@@ -251,6 +280,7 @@ async fn sparse_capacity_spans_grids_without_axis_padding() {
                     .unwrap(),
                 2.
             );
+
             cleanup(&root).await;
         }
     }
@@ -277,6 +307,7 @@ async fn occupied_block_pages_resume_after_delivered_ids() {
             .occupied_page(first.last().copied().unwrap() + 1..entries as u64)
             .await
             .unwrap();
+
         assert_eq!(second.len(), 1);
         assert!(first.last().unwrap() < second.first().unwrap());
         assert!(
@@ -286,6 +317,7 @@ async fn occupied_block_pages_resume_after_delivered_ids() {
                 .unwrap()
                 .is_empty()
         );
+
         assert_eq!(tensor.sum_all().await.unwrap(), entries as f32);
         cleanup(&root).await;
     }
@@ -309,6 +341,7 @@ async fn sparse_point_mutation_lifecycle() {
             value
         );
     }
+
     drop(tensor);
     cleanup(&root).await;
 }
@@ -332,6 +365,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
         let tensor = Tensor::<TestFE, f32>::create(dir, schema, layout, 4)
             .await
             .unwrap();
+
         tensor.write_value(&[0, 0], 2.).await.unwrap();
         tensor.write_value(&[0, 3], 3.).await.unwrap();
         tensor.write_value(&[1, 1], 4.).await.unwrap();
@@ -340,12 +374,9 @@ async fn storage_batches_group_blocks_and_preserve_order() {
         let request = BatchRequest::explicit(coords.clone()).unwrap();
         let geometry = tensor.storage_geometry();
         let storage = crate::storage_read::StorageShape {
-            shape: tensor.shape(),
-            strides: tensor.strides(),
-            block_shape: tensor.block_shape(),
-            block_strides: tensor.block_strides(),
-            grid_strides: tensor.grid_strides(),
+            geometry: &tensor.storage_geometry(),
         };
+
         let groups: BTreeMap<_, _> = storage.plan(&request, None).unwrap();
         let plan = crate::StorageRead {
             request: &request,
@@ -353,6 +384,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
         }
         .plan(&geometry)
         .unwrap();
+
         assert_eq!(plan.len(), coords.len());
         assert!(!plan.is_empty());
         assert_eq!(plan.block_ids().collect::<Vec<_>>(), vec![0, 1]);
@@ -365,6 +397,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
             })
             .await
             .unwrap();
+
         assert_eq!(visited, [0, 1]);
         assert_eq!(values, [4., 3., 2., 3.]);
         if matches!(layout, Layout::Sparse { .. }) {
@@ -372,9 +405,11 @@ async fn storage_batches_group_blocks_and_preserve_order() {
             let b_tree::Node::Leaf(rows) = &*node else {
                 panic!("expected sparse leaf")
             };
+
             let crate::sparse::SparseCell::Payload(stored) = &rows[slot][1] else {
                 panic!("expected sparse payload")
             };
+
             for ids in [vec![0], vec![0, 1]] {
                 let mut observed = false;
                 tensor
@@ -383,13 +418,16 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                             assert!(std::ptr::eq(block, stored.as_slice()));
                             observed = true;
                         }
+
                         Ok(())
                     })
                     .await
                     .unwrap();
+
                 assert!(observed);
             }
         }
+
         for (id, block, len) in [
             (0, vec![0.; 3], 4),
             (0, vec![0.; 4], 3),
@@ -399,6 +437,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
             assert!(plan.scatter(id, &block, &mut output).is_err());
             assert_eq!(output, vec![-1.; len]);
         }
+
         for ids in [vec![0], vec![0, 1]] {
             visited.clear();
             let error = tensor
@@ -408,22 +447,27 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 })
                 .await
                 .unwrap_err();
+
             assert!(
                 matches!(error, Error::Unsupported(message) if message == "stopped consumption")
             );
+
             assert_eq!(visited, [0]);
             // Consumer errors release all native guards, including buffered reads.
             tensor.write_value(&[0, 0], 2.).await.unwrap();
         }
+
         tensor
             .visit_blocks(&[], |_, _| panic!("empty block selection"))
             .await
             .unwrap();
+
         assert_eq!(groups.len(), 2);
         assert_eq!(
             groups.values().flatten().map(|run| run.len).sum::<usize>(),
             coords.len()
         );
+
         assert!(groups.values().any(|positions| {
             positions
                 .iter()
@@ -438,6 +482,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 .collect::<Vec<_>>()
                 == vec![(1, 3), (2, 0), (3, 3)]
         }));
+
         assert_eq!(
             tensor
                 .read_batch(&BatchRequest::explicit(coords.clone()).unwrap(), None)
@@ -445,12 +490,14 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 .unwrap(),
             vec![4., 3., 2., 3.]
         );
+
         assert!(
             tensor
                 .read_batch(&BatchRequest::point(&[2, 0]), None)
                 .await
                 .is_err()
         );
+
         assert!(
             BatchRequest::explicit(vec![vec![0, 0]; crate::expression::MAX_BATCH_ELEMENTS + 1])
                 .is_err()
@@ -465,16 +512,19 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 .get_file(&id.to_string())
                 .unwrap()
                 .clone();
+
             file.write::<Vec<f32>>().await.unwrap().pop();
         } else {
             crate::tensor::corruption::corrupt_sparse_payload(&tensor, id).await;
         }
+
         assert!(matches!(
             tensor
                 .read_batch(&BatchRequest::explicit(coords.clone()).unwrap(), None)
                 .await,
             Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
         ));
+
         // Validate every ID before accessing the corrupted first payload.
         for ids in [vec![0, 2], vec![0, 0], vec![1, 0]] {
             assert!(matches!(
@@ -484,6 +534,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 Err(Error::InvalidCoord(_))
             ));
         }
+
         let oversized = vec![0; crate::expression::MAX_BATCH_ELEMENTS + 1];
         assert!(matches!(
             tensor
@@ -491,6 +542,7 @@ async fn storage_batches_group_blocks_and_preserve_order() {
                 .await,
             Err(Error::InvalidLayout(_))
         ));
+
         drop(tensor);
         cleanup(&root).await;
     }
@@ -506,10 +558,12 @@ async fn sparse_singleton_rejects_ambiguity_before_borrowing_payload() {
         .visit_blocks(&[0], |_, _| panic!("ambiguous row reached consumer"))
         .await
         .unwrap_err();
+
     assert!(error.to_string().contains("ambiguous semantic key"));
     let Error::Io(error) = error else {
         panic!("native sparse storage error")
     };
+
     assert!(freqfs::IntegrityError::is_marked(&error));
     drop(tensor);
     cleanup(&root).await;
@@ -528,12 +582,14 @@ async fn invalid_affine_requests_fail_before_storage_io() {
                     .await,
                 Err(Error::InvalidCoord(_))
             ));
+
             crate::read_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
                 assert_eq!((m.logical_payload_reads, m.borrows), (0, 0));
             });
         })
         .await;
+
     cleanup(&root).await;
 }
 
@@ -544,15 +600,18 @@ async fn storage_batch_groups_logical_blocks_across_sparse_regions() {
     tensor.write_value(&[2, 1], 3.).await.unwrap();
     let request =
         BatchRequest::explicit(vec![vec![0, 0], vec![1, 0], vec![2, 1], vec![0, 0]]).unwrap();
+
     assert_eq!(
         tensor.read_batch(&request, None).await.unwrap(),
         vec![2., 0., 3., 2.]
     );
+
     tensor.write_value(&[0, 0], 0.).await.unwrap();
     assert_eq!(
         tensor.read_batch(&request, None).await.unwrap(),
         vec![0., 0., 3., 0.]
     );
+
     tensor.validate().await.unwrap();
     cleanup(&root).await;
 }
@@ -569,6 +628,7 @@ async fn dense_sparse_matrix_products_include_zero_values() {
     )
     .await
     .unwrap();
+
     let (sparse_root, sparse) = create_sparse("sparse_matrix_support", shape![2, 2], 2, None).await;
     let left = dense.view().matmul(&sparse.view()).await.unwrap();
     let right = sparse
@@ -576,6 +636,7 @@ async fn dense_sparse_matrix_products_include_zero_values() {
         .matmul(&dense.view().transpose(None).unwrap())
         .await
         .unwrap();
+
     for values in [
         crate::expression::evaluate_batch(&left, &BatchRequest::point(&[0, 0]))
             .await
@@ -588,6 +649,7 @@ async fn dense_sparse_matrix_products_include_zero_values() {
     ] {
         assert_eq!(values, vec![0.]);
     }
+
     cleanup(&root).await;
     cleanup(&sparse_root).await;
 }
@@ -624,6 +686,7 @@ impl crate::expression::Expression for CompactSource<'_> {
                 request.kind(),
                 crate::request::RequestKind::Rectangles(_)
             ));
+
             self.0.build(context, request).await
         })
     }
@@ -646,6 +709,7 @@ async fn compact_requests_survive_elementwise_composition() {
         .unwrap(),
     ])
     .unwrap();
+
     assert_eq!(
         crate::expression::evaluate_batch(&selected, &request)
             .await
@@ -661,6 +725,7 @@ async fn compact_requests_survive_elementwise_composition() {
         tensor.read_batch(&request, Some(&mapping)).await,
         Err(Error::InvalidCoord(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -676,6 +741,7 @@ async fn copy_batches_group_logical_blocks() {
     )
     .await
     .unwrap();
+
     let output = dense_storage::Construction(tensor);
     let coords = vec![vec![1, 3], vec![0, 2], vec![1, 1], vec![0, 0]];
     let expected = 1;
@@ -690,6 +756,7 @@ async fn copy_batches_group_logical_blocks() {
                     .await
                     .unwrap();
             }
+
             copy_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
                 assert_eq!(m.groups, 2 * expected);
@@ -697,17 +764,20 @@ async fn copy_batches_group_logical_blocks() {
             });
         })
         .await;
+
     let tensor = output.finish().await.unwrap();
 
     for (coord, value) in coords.iter().zip([3., 2., 1., 4.]) {
         assert_eq!(tensor.read_value(coord).await.unwrap(), value);
     }
+
     tensor.sync().await.unwrap();
     drop(tensor);
     drop(dir);
     let loaded = Tensor::<TestFE, f32>::load(open_dir(&root).unwrap())
         .await
         .unwrap();
+
     assert_eq!(loaded.read_value(&[1, 3]).await.unwrap(), 3.);
     cleanup(&root).await;
 }
@@ -719,7 +789,10 @@ async fn copy_batches_coalesce_existing_logical_blocks() {
 
     for id in 0..source.storage_geometry().block_count() {
         source
-            .replace_logical_block(id, vec![1.; source.block_len()])
+            .replace_logical_block(
+                id,
+                vec![1.; crate::TensorSource::storage_geometry(&source).block_capacity()],
+            )
             .await
             .unwrap();
     }
@@ -730,6 +803,7 @@ async fn copy_batches_coalesce_existing_logical_blocks() {
             let output = Tensor::<TestFE, f32>::copy_from(dir, &source, source.layout(), 4096)
                 .await
                 .unwrap();
+
             copy_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
                 assert_eq!(m.block_updates, 0);
@@ -737,18 +811,22 @@ async fn copy_batches_coalesce_existing_logical_blocks() {
                     m.constructed_blocks,
                     output.storage_geometry().block_count() as usize
                 );
+
                 assert_eq!(m.staged_elements, 65 * 33);
                 assert!(m.max_staging_batch <= crate::expression::MAX_BATCH_ELEMENTS);
             });
+
             output
         })
         .await;
+
     for id in 0..output.storage_geometry().block_count() {
         assert_eq!(
             output.read_logical_block(id).await.unwrap(),
-            vec![1.; output.block_len()]
+            vec![1.; crate::TensorSource::storage_geometry(&output).block_capacity()]
         );
     }
+
     output.validate().await.unwrap();
     cleanup(&root).await;
     cleanup(&out_root).await;
@@ -784,11 +862,20 @@ async fn update_planning_rejects_invalid_input_and_corrupt_blocks() {
                 ))
                 .is_err()
         );
+
         assert_eq!(tensor.read_value(&[0]).await.unwrap(), 0.);
     }
 
     let mut block = vec![0.; 4];
-    assert!(apply_block_updates(&mut block, tensor.block_len(), &[(0, 1.), (4, 2.)]).is_err());
+    assert!(
+        apply_block_updates(
+            &mut block,
+            crate::TensorSource::storage_geometry(&tensor).block_capacity(),
+            &[(0, 1.), (4, 2.)]
+        )
+        .is_err()
+    );
+
     assert_eq!(block, vec![0.; 4]);
     let blocks = dir.read().await.get_dir(BLOCKS).unwrap().clone();
     let file = blocks.read().await.get_file("0").unwrap().clone();
@@ -809,6 +896,7 @@ async fn sparse_copy_zeros_do_not_create_storage() {
     )
     .await
     .unwrap();
+
     let tensor = copy_metrics::CURRENT
         .scope(Default::default(), async {
             let mut builder = sparse_storage::Construction::new(tensor);
@@ -816,13 +904,16 @@ async fn sparse_copy_zeros_do_not_create_storage() {
                 .stage(&[vec![0, 0], vec![1, 1]], vec![0., -0.])
                 .await
                 .unwrap();
+
             copy_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
                 assert_eq!((m.groups, m.block_updates, m.constructed_blocks), (0, 0, 0));
             });
+
             builder.finish().await.unwrap()
         })
         .await;
+
     assert!(
         tensor
             .occupied_blocks(0..tensor.storage_geometry().block_count())
@@ -831,6 +922,7 @@ async fn sparse_copy_zeros_do_not_create_storage() {
             .unwrap()
             .is_none()
     );
+
     assert_eq!(
         crate::tensor::corruption::files(&tensor.storage)
             .read()
@@ -839,6 +931,7 @@ async fn sparse_copy_zeros_do_not_create_storage() {
             .count(),
         1
     ); // metadata only
+
     cleanup(&root).await;
 }
 
@@ -848,6 +941,7 @@ async fn ordered_sparse_consumers_visit_candidate_blocks_with_intermediate_zeros
     let (root, tensor) = create_sparse("ordered_support", shape![1_000_000, 4], 4, None).await;
     let (baseline_root, baseline) =
         create_sparse("ordered_baseline", shape![1_000_000, 4], 4, None).await;
+
     tensor.write_value(&[12, 3], 2.0).await.unwrap();
     tensor.write_value(&[999_999, 1], 4.0).await.unwrap();
     baseline.write_value(&[12, 3], 2.0).await.unwrap();
@@ -862,6 +956,7 @@ async fn ordered_sparse_consumers_visit_candidate_blocks_with_intermediate_zeros
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(entries, [(vec![999_999, 1], 2.0)]);
             let count = 4_000_000.;
             assert_eq!(shifted.mean_all().await.unwrap(), 2. / count);
@@ -876,6 +971,7 @@ async fn ordered_sparse_consumers_visit_candidate_blocks_with_intermediate_zeros
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(entries, [(vec![999_999, 1], 4.0)]);
             crate::read_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
@@ -884,6 +980,7 @@ async fn ordered_sparse_consumers_visit_candidate_blocks_with_intermediate_zeros
             });
         })
         .await;
+
     cleanup(&root).await;
     cleanup(&baseline_root).await;
 }
@@ -901,6 +998,7 @@ async fn reordered_sparse_stream_preserves_row_major_values() {
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0], (vec![0, 1], f32::INFINITY));
     assert_eq!(entries[1].0, vec![2, 0]);
@@ -920,6 +1018,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
         )
         .await
         .unwrap();
+
         let probe = tensor.clone();
         let owner = probe.storage.sparse().unwrap();
         let mut builder = sparse_storage::Construction::new(tensor);
@@ -929,12 +1028,14 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
             let held = crate::tensor::corruption::files(&probe.storage)
                 .write()
                 .await;
+
             let mut future = builder.finish();
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(10), &mut future)
                     .await
                     .is_err()
             );
+
             // Completion has persisted its row before waiting for metadata. This
             // exercises cancellation after mutation, independently of table locks.
             assert!(
@@ -946,6 +1047,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
                     .unwrap()
                     .is_some()
             );
+
             drop(future);
             drop(held);
         } else {
@@ -957,6 +1059,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
                     .await
                     .is_err()
             );
+
             drop(future);
             drop(held);
             drop(builder);
@@ -967,6 +1070,7 @@ async fn interrupted_construction_never_reopens_and_releases_guards() {
                 .try_write()
                 .is_ok()
         );
+
         // The caller discards every handle after cancellation. Metadata was
         // withheld, so incomplete construction cannot be reopened.
         drop(probe);
@@ -980,12 +1084,17 @@ async fn construction_preserves_interleaved_blocks_across_batches() {
     let (root, dir) = new_dir("interleaved_construction").await;
     let shape = shape![1, 129, 65];
     let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape.clone()).unwrap();
-    let geometry =
-        crate::StorageGeometry::new(schema, Layout::Sparse { axis: Some(0) }, shape![1, 2, 16])
-            .unwrap();
+    let geometry = crate::StorageGeometry::new(
+        schema,
+        Layout::Sparse { axis: Some(0) },
+        [1, 2, 16].iter().copied().product::<u64>() as usize,
+    )
+    .unwrap();
+
     let tensor = Tensor::<TestFE, f32>::unpublished_with_geometry(dir, geometry.clone())
         .await
         .unwrap();
+
     let mut builder = sparse_storage::Construction::new(tensor);
     let mut input = crate::row_major_coords(&shape).unwrap();
     let tensor = copy_metrics::CURRENT
@@ -995,12 +1104,15 @@ async fn construction_preserves_interleaved_blocks_across_batches() {
                     .by_ref()
                     .take(crate::expression::MAX_BATCH_ELEMENTS)
                     .collect();
+
                 if coords.is_empty() {
                     break;
                 }
+
                 let len = coords.len();
                 builder.stage(&coords, vec![1.; len]).await.unwrap();
             }
+
             let tensor = builder.finish().await.unwrap();
             copy_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
@@ -1010,22 +1122,23 @@ async fn construction_preserves_interleaved_blocks_across_batches() {
                 assert_eq!(m.block_updates, 0);
                 assert_eq!(m.replaced_blocks, 0);
             });
+
             tensor
         })
         .await;
+
     for id in 0..geometry.block_count() {
-        let mut expected = vec![0.; geometry.block_len()];
-        for offset in geometry.block_offsets(id).unwrap() {
-            expected[offset] = 1.;
-        }
+        let expected = vec![1.; geometry.block_len(id).unwrap()];
         assert_eq!(tensor.read_logical_block(id).await.unwrap(), expected);
     }
+
     tensor.validate().await.unwrap();
     tensor.sync().await.unwrap();
     drop(tensor);
     let tensor = Tensor::<TestFE, f32>::load(open_dir(&root).unwrap())
         .await
         .unwrap();
+
     assert_eq!(tensor.read_value(&[0, 128, 64]).await.unwrap(), 1.);
     cleanup(&root).await;
 }
@@ -1046,6 +1159,7 @@ async fn replace_payload_bits<T: crate::TensorElement>(
     )
     .await
     .unwrap();
+
     let mut expected = Vec::new();
     for values in cases {
         expected = values.iter().copied().map(&bits).collect::<Vec<_>>();
@@ -1060,6 +1174,7 @@ async fn replace_payload_bits<T: crate::TensorElement>(
     let tensor = Tensor::<TestFE, T>::load(open_dir(&root).unwrap())
         .await
         .unwrap();
+
     let actual = tensor.read_logical_block(0).await.unwrap();
     assert_eq!(actual.into_iter().map(bits).collect::<Vec<_>>(), expected);
     drop(tensor);
@@ -1081,14 +1196,17 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
             )
             .is_lt()
     );
+
     assert_eq!(
         SparseCell::Payload(vec![0.]),
         SparseCell::Payload(vec![-0.])
     );
+
     assert_eq!(
         SparseCell::Payload(vec![f64::NAN]),
         SparseCell::Payload(vec![-f64::NAN])
     );
+
     let (root, _) = new_dir("sparse_bits").await;
     let dir = freqfs::Cache::new(
         4 * crate::schema::SPARSE_NODE_MEMORY,
@@ -1098,6 +1216,7 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
     )
     .load(root.to_path_buf())
     .unwrap();
+
     let tensor = Tensor::<TestFE, f64>::create(
         dir,
         TensorSchema::new(NumberType::Float(FloatType::F64), shape![257]).unwrap(),
@@ -1106,18 +1225,21 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
     )
     .await
     .unwrap();
+
     let values = [
         f64::from_bits(0x7ff8000000000123),
         f64::INFINITY,
         f64::NEG_INFINITY,
         3.,
     ];
+
     for id in 0..257 {
         tensor
             .replace_logical_block(id, vec![values[id as usize % 4]])
             .await
             .unwrap();
     }
+
     assert_eq!(
         crate::tensor::corruption::files(&tensor.storage)
             .read()
@@ -1125,6 +1247,7 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
             .len(),
         1
     );
+
     let values_dir = tensor
         .directory
         .read()
@@ -1132,11 +1255,13 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
         .get_dir("values")
         .cloned()
         .unwrap();
+
     let primary = values_dir.read().await.get_dir("primary").cloned().unwrap();
     assert!(
         primary.read().await.len() < 257,
         "logical blocks must share native pages"
     );
+
     tensor.validate().await.unwrap();
     tensor.replace_logical_block(63, vec![0.]).await.unwrap();
     tensor.replace_logical_block(64, vec![7.]).await.unwrap();
@@ -1146,17 +1271,20 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
     let tensor = Tensor::<TestFE, f64>::load(open_dir(&root).unwrap())
         .await
         .unwrap();
+
     for id in 0..257 {
         let expected = match id {
             63 => 0.,
             64 => 7.,
             _ => values[id as usize % 4],
         };
+
         assert_eq!(
             tensor.read_logical_block(id).await.unwrap()[0].to_bits(),
             expected.to_bits()
         );
     }
+
     drop(tensor);
     cleanup(&root).await;
 
@@ -1195,6 +1323,7 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
         ]
         .into_iter()
         .map(|(re, im)| vec![Complex64::new(re, im), Complex64::new(1., 0.)]);
+
         replace_payload_bits(cases, |v: Complex64| [v.re.to_bits(), v.im.to_bits()]).await;
     }
 }
@@ -1206,40 +1335,30 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
         let geometry = crate::StorageGeometry::new(
             TensorSchema::new(NumberType::Float(FloatType::F32), shape![1, 3]).unwrap(),
             Layout::Sparse { axis: Some(0) },
-            shape![1, 2],
+            [1, 2].iter().copied().product::<u64>() as usize,
         )
         .unwrap();
+
         let tensor = Tensor::<TestFE, f32>::create_with_geometry(dir.clone(), geometry)
             .await
             .unwrap();
+
         tensor.write_value(&[0, 2], 1.).await.unwrap();
         tensor.sync().await.unwrap();
-        let owner = tensor.storage.sparse().unwrap();
 
         match fault {
             0 => crate::tensor::corruption::corrupt_sparse_payload(&tensor, 1).await,
             1 | 2 => {
                 let values = if fault == 1 {
-                    vec![0.; 2]
+                    vec![0.; 1]
                 } else {
                     vec![1., 2.]
                 };
-                let mut index = crate::tensor::corruption::block_index(owner).write().await;
-                let previous = index
-                    .get(&[crate::SparseCell::Key(1)])
-                    .await
-                    .unwrap()
-                    .unwrap();
-                index
-                    .replace(
-                        &previous,
-                        vec![
-                            crate::SparseCell::Key(1),
-                            crate::SparseCell::Payload(values),
-                        ],
-                    )
-                    .await
-                    .unwrap();
+
+                crate::tensor::corruption::corrupt_sparse_row(&tensor, 1, |row| {
+                    row[1] = crate::SparseCell::Payload(values);
+                })
+                .await;
             }
             3 => {
                 dir.write().await.delete("values").await;
@@ -1263,12 +1382,14 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
 
         if fault < 3 {
             assert!(tensor.read_logical_block(1).await.is_err());
-            assert!(tensor.replace_logical_block(1, vec![0.; 2]).await.is_err());
+            assert!(tensor.replace_logical_block(1, vec![0.; 1]).await.is_err());
         }
+
         assert!(
             Tensor::<TestFE, f32>::load(dir).await.is_err(),
             "fault {fault}"
         );
+
         cleanup(&root).await;
     }
 }

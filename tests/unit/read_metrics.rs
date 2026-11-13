@@ -5,7 +5,7 @@ use std::cell::RefCell;
 #[derive(Default, Debug)]
 pub(crate) struct Metrics {
     pub block_bounds: usize,
-    pub padding_walks: usize,
+    pub selection_comparisons: usize,
     pub mapped_runs: usize,
     pub slice_requests: usize,
     pub index_entries: usize,

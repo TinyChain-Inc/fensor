@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use crate::mapping::CoordinateMap;
-use crate::request::{BatchRequest, Progression, RequestKind, decode_flat, progressions};
-use crate::schema::{BlockPosition, Coord};
+use crate::request::{BatchRequest, Progression, RequestKind, progressions};
+use crate::schema::Coord;
 use crate::{Error, Result};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,40 +57,7 @@ impl Run {
 pub(crate) type LogicalGroups = BTreeMap<u64, Vec<Run>>;
 
 pub(crate) struct StorageShape<'a> {
-    pub shape: &'a [u64],
-    pub strides: &'a [u64],
-    pub block_shape: &'a [u64],
-    pub block_strides: &'a [u64],
-    pub grid_strides: &'a [u64],
-}
-
-// Two rank-sized buffers, reused across all progression boundaries in a request.
-struct Scratch {
-    coord: Coord,
-    delta: Coord,
-}
-
-// Shared address arithmetic for read planning and scalar/copy writes. Coordinates
-// and schema cardinality are validated by callers. The block offset is below the
-// validated MAX_BLOCK_CAPACITY, so only that offset narrows to usize.
-pub(crate) fn block_position(
-    coord: impl Iterator<Item = u64>,
-    block_shape: &[u64],
-    block_strides: &[u64],
-    grid_strides: &[u64],
-) -> BlockPosition {
-    let mut block_id = 0;
-    let mut offset_in_block = 0;
-
-    for (i, c) in coord.enumerate() {
-        block_id += (c / block_shape[i]) * grid_strides[i];
-        offset_in_block += (c % block_shape[i]) * block_strides[i];
-    }
-
-    BlockPosition {
-        block_id,
-        offset_in_block: offset_in_block as usize,
-    }
+    pub geometry: &'a crate::StorageGeometry,
 }
 
 fn invalid() -> Error {
@@ -126,50 +93,66 @@ impl StorageShape<'_> {
         request: &BatchRequest,
         mapping: Option<&CoordinateMap>,
     ) -> Result<LogicalGroups> {
-        let shape = mapping.map(|m| m.shape()).unwrap_or(self.shape);
+        let shape = mapping
+            .map(|m| m.shape())
+            .unwrap_or(self.geometry.schema().shape());
+
         request.validate(shape)?;
 
         let affine = if matches!(request.kind(), RequestKind::Explicit(_))
             || (matches!(request.kind(), RequestKind::FlatRuns(_))
-                && mapping.is_none_or(|m| m.is_identity(self.shape, self.strides)))
-        {
+                && mapping.is_none_or(|m| {
+                    m.is_identity(
+                        self.geometry.schema().shape(),
+                        self.geometry.schema().strides(),
+                    )
+                })) {
             None
         } else {
             match mapping {
                 Some(mapping) => mapping.affine()?,
-                None => Some((0, self.strides.iter().map(|s| *s as i128).collect())),
+                None => Some((
+                    0,
+                    self.geometry
+                        .schema()
+                        .strides()
+                        .iter()
+                        .map(|s| *s as i128)
+                        .collect(),
+                )),
             }
         };
 
         let mut groups = LogicalGroups::new();
-        let block_len = self.block_shape.iter().product::<u64>() as usize;
+
         let mut end = 0;
         let mut emit = |key, run: Run| {
-            run.validate(block_len, request.len())?;
+            run.validate(self.geometry.block_len(key)?, request.len())?;
             if run.output != end {
                 return Err(invalid());
             }
+
             end += run.len;
             push_run(groups.entry(key).or_default(), run);
             Ok(())
         };
-        // Rank-sized scratch is reused at progression/block boundaries.
-        let mut scratch = Scratch {
-            coord: Coord::from_elem(0, self.shape.len()),
-            delta: Coord::from_elem(0, self.shape.len()),
-        };
 
         match (request.kind(), affine) {
             (RequestKind::FlatRuns(runs), _)
-                if mapping.is_none_or(|m| m.is_identity(self.shape, self.strides)) =>
+                if mapping.is_none_or(|m| {
+                    m.is_identity(
+                        self.geometry.schema().shape(),
+                        self.geometry.schema().strides(),
+                    )
+                }) =>
             {
                 for run in runs {
-                    self.split(&mut emit, &mut scratch, *run)?;
+                    self.split(&mut emit, *run)?;
                 }
             }
             (_, Some((offset, strides))) => {
                 progressions(request, shape, offset, &strides, |progression| {
-                    self.split(&mut emit, &mut scratch, progression)
+                    self.split(&mut emit, progression)
                 })?;
             }
             _ => {
@@ -181,8 +164,15 @@ impl StorageShape<'_> {
                 while cursor.next_into(&mut coord) {
                     #[cfg(test)]
                     crate::read_metrics::record(|m| m.coordinate_resolutions += 1);
+
                     let coord = if let Some(mapping) = mapping {
-                        mapping.resolve_into(&coord, self.shape, self.strides, &mut mapped)?;
+                        mapping.resolve_into(
+                            &coord,
+                            self.geometry.schema().shape(),
+                            self.geometry.schema().strides(),
+                            &mut mapped,
+                        )?;
+
                         &mapped
                     } else {
                         &coord
@@ -198,6 +188,7 @@ impl StorageShape<'_> {
                             len: 1,
                         },
                     )?;
+
                     output += 1;
                 }
             }
@@ -212,106 +203,37 @@ impl StorageShape<'_> {
             m.runs += groups.values().map(Vec::len).sum::<usize>();
             m.requested += request.len();
         });
+
         Ok(groups)
     }
 
     fn position(&self, coord: &[u64]) -> (u64, usize) {
-        let position = block_position(
-            coord.iter().copied(),
-            self.block_shape,
-            self.block_strides,
-            self.grid_strides,
-        );
-        (position.block_id, position.offset_in_block)
+        self.geometry
+            .block_position(coord)
+            .expect("validated source coordinates")
     }
 
     fn split(
         &self,
         emit: &mut impl FnMut(u64, Run) -> Result<()>,
-        scratch: &mut Scratch,
         progression: Progression,
     ) -> Result<()> {
-        let Progression {
-            output,
-            start,
-            step,
-            len,
-        } = progression;
-        let Scratch { coord, delta } = scratch;
-        if len == 0 {
-            return Ok(());
-        }
-
-        let last = step
-            .checked_mul((len - 1) as i128)
-            .and_then(|d| start.checked_add(d))
-            .ok_or_else(invalid)?;
-        let size = self
-            .shape
-            .iter()
-            .try_fold(1i128, |n, d| n.checked_mul(*d as i128))
-            .ok_or_else(invalid)?;
-        if start.min(last) < 0 || start.max(last) >= size {
-            return Err(Error::InvalidCoord(
-                "mapped progression out of bounds".into(),
-            ));
-        }
-
-        let magnitude = if len == 1 {
-            0
-        } else {
-            u64::try_from(step.checked_abs().ok_or_else(invalid)?).map_err(|_| invalid())?
-        };
-        // Mixed-radix step digits are constant until a carry/borrow. The block
-        // boundary limits also prevent coordinate carries inside an emitted run.
-        for ((delta, stride), dim) in delta.iter_mut().zip(self.strides).zip(self.shape) {
-            *delta = (magnitude / stride) % dim;
-        }
-
-        let mut done = 0;
-
-        while done < len {
-            // Endpoints were checked in widened arithmetic. All intermediate
-            // offsets lie between them; native division is safe at boundaries.
-            let flat = u64::try_from(start + done as i128 * step).map_err(|_| invalid())?;
-
-            #[cfg(test)]
-            crate::read_metrics::record(|m| m.boundary_decodes += 1);
-            let mut count = len - done;
-            let mut stride = 0i128;
-
-            decode_flat(flat, self.shape, coord)?;
-
-            for (i, c) in coord.iter().enumerate() {
-                let low = *c / self.block_shape[i] * self.block_shape[i];
-                let high = low + (self.block_shape[i] - 1).min(self.shape[i] - 1 - low);
-                let room = if step < 0 { *c - low } else { high - *c };
-                if let Some(steps) = room.checked_div(delta[i]) {
-                    count = (count as u64).min(steps.saturating_add(1)) as usize;
-                }
-
-                stride += delta[i] as i128 * self.block_strides[i] as i128 * step.signum();
-            }
-
-            let (block, offset) = self.position(coord);
-            let stride = if count == 1 {
-                0
-            } else {
-                i64::try_from(stride).map_err(|_| invalid())?
-            };
-            emit(
-                block,
-                Run {
-                    output: output + done,
-                    offset,
-                    stride,
-                    len: count,
-                },
-            )?;
-            done += count;
-        }
-
-        Ok(())
+        self.geometry.storage.blocks.split(
+            progression.start,
+            progression.step,
+            progression.len,
+            |id, offset, stride, len, done| {
+                emit(
+                    id,
+                    Run {
+                        output: progression.output + done,
+                        offset,
+                        stride,
+                        len,
+                    },
+                )
+            },
+        )
     }
 }
 

@@ -26,12 +26,20 @@ fn compare(storage: &StorageShape<'_>, map: &CoordinateMap, request: BatchReques
         .unwrap()
         .iter()
         .map(|coord| {
-            let base = map.resolve(coord, storage.shape, storage.strides).unwrap();
+            let base = map
+                .resolve(
+                    coord,
+                    storage.geometry.schema().shape(),
+                    storage.geometry.schema().strides(),
+                )
+                .unwrap();
+
             let base: Vec<_> = base.into_iter().collect();
             let (id, offset) = storage.position(&base);
             (id, offset)
         })
         .collect();
+
     assert_eq!(actual, expected);
 }
 
@@ -82,20 +90,19 @@ fn affine_plans_match_scalar_mapping_across_blocks() {
     ];
 
     for block_shape in [vec![1, 1, 1], vec![2, 3, 4], vec![3, 5, 7]] {
-        let block_strides = contiguous_strides(&block_shape).unwrap();
-        let grid: Vec<_> = shape
-            .iter()
-            .zip(&block_shape)
-            .map(|(d, b)| d.div_ceil(*b))
-            .collect();
-        let grid_strides = contiguous_strides(&grid).unwrap();
+        let geometry = crate::StorageGeometry::new(
+            crate::TensorSchema::new(
+                number_general::NumberType::Float(number_general::FloatType::F64),
+                shape.to_vec().into(),
+            )
+            .unwrap(),
+            crate::Layout::Dense,
+            block_shape.iter().copied().product::<u64>() as usize,
+        )
+        .unwrap();
 
         let storage = StorageShape {
-            shape: &shape,
-            strides: &strides,
-            block_shape: &block_shape,
-            block_strides: &block_strides,
-            grid_strides: &grid_strides,
+            geometry: &geometry,
         };
 
         for map in &maps {
@@ -112,8 +119,9 @@ fn affine_plans_match_scalar_mapping_across_blocks() {
             let axes = map
                 .shape()
                 .iter()
-                .map(|d| Axis::Selected(vec![(*d - 1), 0, 0]))
+                .map(|d| Axis::selected(vec![(*d - 1), 0, 0]))
                 .collect();
+
             compare(
                 &storage,
                 map,
@@ -127,12 +135,19 @@ fn affine_plans_match_scalar_mapping_across_blocks() {
 fn progressions_handle_arbitrary_signed_steps_and_carries() {
     let shape = [3, 5, 7];
     let strides = [35, 7, 1];
+    let geometry = crate::StorageGeometry::new(
+        crate::TensorSchema::new(
+            number_general::NumberType::Float(number_general::FloatType::F64),
+            shape.to_vec().into(),
+        )
+        .unwrap(),
+        crate::Layout::Dense,
+        [2, 3, 4].iter().copied().product::<u64>() as usize,
+    )
+    .unwrap();
+
     let storage = StorageShape {
-        shape: &shape,
-        strides: &strides,
-        block_shape: &[2, 3, 4],
-        block_strides: &[12, 4, 1],
-        grid_strides: &[4, 2, 1],
+        geometry: &geometry,
     };
 
     for start in 0..105 {
@@ -153,6 +168,7 @@ fn progressions_handle_arbitrary_signed_steps_and_carries() {
                 .unwrap()
                 .flip(1)
                 .unwrap();
+
             compare(&storage, &nested, mapped);
         }
     }
@@ -160,12 +176,19 @@ fn progressions_handle_arbitrary_signed_steps_and_carries() {
 
 #[tokio::test]
 async fn compact_runs_reduce_mapping_work_and_preserve_broadcasts() {
+    let geometry = crate::StorageGeometry::new(
+        crate::TensorSchema::new(
+            number_general::NumberType::Float(number_general::FloatType::F64),
+            [8, 8].to_vec().into(),
+        )
+        .unwrap(),
+        crate::Layout::Dense,
+        [8, 8].iter().copied().product::<u64>() as usize,
+    )
+    .unwrap();
+
     let storage = StorageShape {
-        shape: &[8, 8],
-        strides: &[8, 1],
-        block_shape: &[8, 8],
-        block_strides: &[8, 1],
-        grid_strides: &[1, 1],
+        geometry: &geometry,
     };
 
     let identity = CoordinateMap::identity(shape![8, 8], &[8, 1]);
@@ -186,6 +209,7 @@ async fn compact_runs_reduce_mapping_work_and_preserve_broadcasts() {
     ] {
         let request =
             BatchRequest::linear(0, map.shape().iter().product::<u64>() as usize).unwrap();
+
         let strides = contiguous_strides(map.shape()).unwrap();
         let identity = CoordinateMap::identity(map.shape().into(), &strides);
         let mapped = request.mapped(&identity, map.shape(), &strides).unwrap();
@@ -198,7 +222,7 @@ async fn compact_runs_reduce_mapping_work_and_preserve_broadcasts() {
                     crate::read_metrics::CURRENT.with(|m| {
                         let m = m.borrow();
                         assert_eq!(m.coordinate_resolutions, 0);
-                        assert_eq!(m.boundary_decodes, 8);
+                        assert_eq!(m.boundary_decodes, 0);
                     });
                 })
                 .await;
@@ -206,14 +230,19 @@ async fn compact_runs_reduce_mapping_work_and_preserve_broadcasts() {
     }
 
     let huge = StorageShape {
-        shape: &[1_000_000_000, 1_000_000_000],
-        strides: &[1_000_000_000, 1],
-        block_shape: &[1, crate::schema::MAX_BLOCK_CAPACITY as u64],
-        block_strides: &[crate::schema::MAX_BLOCK_CAPACITY as u64, 1],
-        grid_strides: &[
-            1_000_000_000u64.div_ceil(crate::schema::MAX_BLOCK_CAPACITY as u64),
-            1,
-        ],
+        geometry: &crate::StorageGeometry::new(
+            crate::TensorSchema::new(
+                number_general::NumberType::Float(number_general::FloatType::F64),
+                [1_000_000_000, 1_000_000_000].to_vec().into(),
+            )
+            .unwrap(),
+            crate::Layout::Dense,
+            [1, crate::schema::MAX_BLOCK_CAPACITY as u64]
+                .iter()
+                .copied()
+                .product::<u64>() as usize,
+        )
+        .unwrap(),
     };
 
     let request = BatchRequest::linear(999_999_999_999_999_968, 32).unwrap();
@@ -225,12 +254,19 @@ async fn singleton_axes_do_not_expand_narrow_requests() {
     let batch_len = crate::expression::MAX_BATCH_ELEMENTS;
     let block_len = 128; // Deliberately narrower than one execution batch.
     let expected_runs = batch_len.div_ceil(block_len);
+    let geometry = crate::StorageGeometry::new(
+        crate::TensorSchema::new(
+            number_general::NumberType::Float(number_general::FloatType::F64),
+            [batch_len as u64 + 1, 1].to_vec().into(),
+        )
+        .unwrap(),
+        crate::Layout::Dense,
+        [block_len as u64, 1].iter().copied().product::<u64>() as usize,
+    )
+    .unwrap();
+
     let storage = StorageShape {
-        shape: &[batch_len as u64 + 1, 1],
-        strides: &[1, 1],
-        block_shape: &[block_len as u64, 1],
-        block_strides: &[1, 1],
-        grid_strides: &[1, 1],
+        geometry: &geometry,
     };
 
     for request in [
@@ -238,7 +274,7 @@ async fn singleton_axes_do_not_expand_narrow_requests() {
         BatchRequest::rectangles(vec![
             Cartesian::new(vec![
                 Axis::range(0, batch_len as u64),
-                Axis::Selected(vec![0]),
+                Axis::selected(vec![0]),
             ])
             .unwrap(),
         ])
@@ -248,8 +284,7 @@ async fn singleton_axes_do_not_expand_narrow_requests() {
             .scope(Default::default(), async {
                 let runs = storage.plan(&request, None).unwrap();
                 assert_eq!(runs.len(), expected_runs);
-                crate::read_metrics::CURRENT
-                    .with(|m| assert_eq!(m.borrow().boundary_decodes, expected_runs));
+                crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().boundary_decodes, 0));
             })
             .await;
     }
@@ -257,12 +292,19 @@ async fn singleton_axes_do_not_expand_narrow_requests() {
 
 #[test]
 fn malformed_progressions_and_runs_fail_closed() {
+    let geometry = crate::StorageGeometry::new(
+        crate::TensorSchema::new(
+            number_general::NumberType::Float(number_general::FloatType::F64),
+            [8, 8].to_vec().into(),
+        )
+        .unwrap(),
+        crate::Layout::Dense,
+        [8, 8].iter().copied().product::<u64>() as usize,
+    )
+    .unwrap();
+
     let storage = StorageShape {
-        shape: &[8, 8],
-        strides: &[8, 1],
-        block_shape: &[8, 8],
-        block_strides: &[8, 1],
-        grid_strides: &[1, 1],
+        geometry: &geometry,
     };
 
     for (offset, stride) in [(64, 1), (-1, 1), (1, -1), (i128::MAX, i128::MAX)] {
@@ -273,6 +315,7 @@ fn malformed_progressions_and_runs_fail_closed() {
                 .is_err()
         );
     }
+
     assert!(
         storage
             .plan(&BatchRequest::linear(63, 2).unwrap(), None)

@@ -116,6 +116,7 @@ fn plan_tiles(
             .entry(coord)
             .or_default()
             .push((position, row, column));
+
         Ok(())
     })?;
 
@@ -157,8 +158,10 @@ fn plan_rectangles(requests: Vec<(usize, u64, u64)>) -> Vec<Rectangle> {
         for (row, columns) in by_row {
             groups.entry(columns).or_default().push(row);
         }
+
         groups.into_iter().collect()
     };
+
     groups
         .into_iter()
         .map(|(columns, rows)| {
@@ -170,6 +173,7 @@ fn plan_rectangles(requests: Vec<(usize, u64, u64)>) -> Vec<Rectangle> {
                     scatter.push((position, i * columns.len() + j));
                 }
             }
+
             Rectangle {
                 rows,
                 columns,
@@ -243,6 +247,7 @@ fn axis_tiles(axis: &Axis) -> AxisTiles {
             .or_default()
             .push((position as usize, value));
     }
+
     tiles
 }
 
@@ -259,6 +264,7 @@ fn selected_axis(positions: &[(usize, u64)]) -> (Vec<u64>, Vec<(usize, usize)>) 
             )
         })
         .collect();
+
     (values, scatter)
 }
 
@@ -271,6 +277,7 @@ fn cartesian_plans(rectangles: &[Cartesian], shape: &[u64]) -> Result<Vec<Matrix
         let axes = rect.axes();
         let prefix_request =
             BatchRequest::rectangles(vec![Cartesian::new(axes[..rank - 2].to_vec())?])?;
+
         let mut prefixes = prefix_request.cursor(&shape[..rank - 2])?;
         let row_tiles = axis_tiles(&axes[rank - 2]);
         let column_tiles = axis_tiles(&axes[rank - 1]);
@@ -297,6 +304,7 @@ fn cartesian_plans(rectangles: &[Cartesian], shape: &[u64]) -> Result<Vec<Matrix
                     });
                 }
             }
+
             start += (axes[rank - 2].len() * axes[rank - 1].len()) as usize;
         }
     }
@@ -326,6 +334,7 @@ fn linear_plans(start: u64, len: usize, shape: &[u64]) -> Result<Vec<MatrixPlan>
                 .entry(key)
                 .or_default()
                 .push((output + done, row, column, count));
+
             done += count;
         }
     }
@@ -348,10 +357,12 @@ fn linear_plans(start: u64, len: usize, shape: &[u64]) -> Result<Vec<MatrixPlan>
                 .filter(|i| row_mask & (1 << i) != 0)
                 .map(|i| row_origin + i as u64)
                 .collect();
+
             let columns: Vec<_> = (0..TILE_SIDE)
                 .filter(|i| column_mask & (1 << i) != 0)
                 .map(|i| column_origin + i as u64)
                 .collect();
+
             let spans = segments
                 .into_iter()
                 .map(|(position, row, column, len)| {
@@ -363,6 +374,7 @@ fn linear_plans(start: u64, len: usize, shape: &[u64]) -> Result<Vec<MatrixPlan>
                     )
                 })
                 .collect();
+
             MatrixPlan {
                 prefix,
                 rectangle: Rectangle {
@@ -413,13 +425,14 @@ fn operand_request(
     left: bool,
 ) -> Result<BatchRequest> {
     let mut axes: Vec<_> = prefix.iter().map(|v| Axis::range(*v, 1)).collect();
-    let selection = Axis::Selected(fixed.to_vec());
+    let selection = Axis::selected(fixed.to_vec());
     let contraction = Axis::range(start, count as u64);
     if left {
         axes.extend([selection, contraction]);
     } else {
         axes.extend([contraction, selection]);
     }
+
     BatchRequest::rectangles(vec![crate::slice::Slice::new(shape, axes)?.rectangle()?])
 }
 
@@ -528,6 +541,7 @@ where
                     let count = (inner - start).min(step as u64) as usize;
                     let left_coords =
                         operand_request(self.left.shape(), &key, &rows, start, count, true)?;
+
                     let right_coords =
                         operand_request(self.right.shape(), &key, &columns, start, count, false)?;
 
@@ -535,14 +549,17 @@ where
                     let left = context
                         .evaluate(&self.left, std::sync::Arc::new(left_coords))
                         .await?;
+
                     let right = context
                         .evaluate(&self.right, std::sync::Arc::new(right_coords))
                         .await?;
 
                     let left = expression::batch_array(left.values)?
                         .reshape(ha_ndarray::shape![rows.len(), count])?;
+
                     let right = expression::batch_array(right.values)?
                         .reshape(ha_ndarray::shape![count, columns.len()])?;
+
                     let partial = left.matmul(right)?.buffer()?.to_slice()?.into_vec();
 
                     #[cfg(test)]

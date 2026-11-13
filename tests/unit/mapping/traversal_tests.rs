@@ -10,10 +10,11 @@ fn mapped_visits_preserve_request_order_and_reset_scratch() {
         .unwrap()
         .flip(0)
         .unwrap();
+
     let requests = [
         BatchRequest::linear(0, 6).unwrap(),
         BatchRequest::rectangles(vec![
-            Cartesian::new(vec![Axis::Selected(vec![2, 0, 2]), Axis::range(0, 2)]).unwrap(),
+            Cartesian::new(vec![Axis::selected(vec![2, 0, 2]), Axis::range(0, 2)]).unwrap(),
         ])
         .unwrap(),
         BatchRequest::explicit(vec![vec![1, 0], vec![0, 1], vec![1, 0]]).unwrap(),
@@ -29,6 +30,7 @@ fn mapped_visits_preserve_request_order_and_reset_scratch() {
             .iter()
             .map(|coord| mapping.resolve(coord, &shape, &strides).unwrap())
             .collect();
+
         let mut actual = Vec::new();
         mapping
             .visit_mapped(&request, &shape, &strides, |position, coord| {
@@ -39,6 +41,7 @@ fn mapped_visits_preserve_request_order_and_reset_scratch() {
                 Ok(())
             })
             .unwrap();
+
         assert_eq!(actual, expected);
     }
 }
@@ -65,6 +68,7 @@ fn mapped_visits_validate_first_and_stop_on_errors() {
             Ok(())
         }
     });
+
     assert!(matches!(error, Err(Error::Unsupported(message)) if message == "callback"));
     assert_eq!(visited, [0, 1]);
 
@@ -73,6 +77,7 @@ fn mapped_visits_validate_first_and_stop_on_errors() {
         visited.push(position);
         Ok(())
     });
+
     assert!(matches!(error, Err(Error::InvalidCoord(_))));
     assert_eq!(visited, [0]);
 }
@@ -98,6 +103,7 @@ fn mapped_visits_reuse_rank_sized_scratch_beyond_inline_capacity() {
             Ok(())
         })
         .unwrap();
+
     assert_eq!(count, request.len());
 }
 
@@ -138,7 +144,7 @@ fn compact_mapped_requests_match_coordinate_reference() {
                     mapping
                         .shape
                         .iter()
-                        .map(|&d| Axis::Selected(vec![d - 1, 0, d - 1]))
+                        .map(|&d| Axis::selected(vec![d - 1, 0, d - 1]))
                         .collect(),
                 )
                 .unwrap(),
@@ -153,6 +159,7 @@ fn compact_mapped_requests_match_coordinate_reference() {
                 .iter()
                 .map(|coord| mapping.resolve(coord, &shape, &strides).unwrap())
                 .collect();
+
             let mapped = request.mapped(&mapping, &shape, &strides).unwrap();
             assert_eq!(mapped.coordinates(&shape).unwrap(), expected);
             // A nested wrapper consumes runs without allocating an explicit request.
@@ -164,6 +171,7 @@ fn compact_mapped_requests_match_coordinate_reference() {
                 crate::request::RequestKind::FlatRuns(_)
             ));
         }
+
         assert!(
             BatchRequest::linear(total, 1)
                 .unwrap()
@@ -180,6 +188,7 @@ async fn affine_mapping_retains_runs_across_batch_boundaries() {
     let mapping = CoordinateMap::identity(shape.clone(), &strides)
         .flip(1)
         .unwrap();
+
     crate::read_metrics::CURRENT
         .scope(Default::default(), async {
             for request in crate::request::linear_requests(&shape).unwrap() {
@@ -190,9 +199,11 @@ async fn affine_mapping_retains_runs_across_batch_boundaries() {
                     let crate::request::RequestKind::FlatRuns(runs) = mapped.kind() else {
                         panic!("compact runs")
                     };
+
                     assert!(runs.len() <= request.len().div_ceil(4097) + 1);
                     assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), request.len());
                 }
+
                 let mut expected = request.cursor(&shape).unwrap();
                 let mut actual = nested.cursor(&shape).unwrap();
                 let mut expected_coord = Coord::new();
@@ -201,8 +212,10 @@ async fn affine_mapping_retains_runs_across_batch_boundaries() {
                     assert!(actual.next_into(&mut actual_coord));
                     assert_eq!(actual_coord, expected_coord);
                 }
+
                 assert!(!actual.next_into(&mut actual_coord));
             }
+
             crate::read_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
                 assert_eq!(m.expanded_coordinates, 0);
@@ -236,6 +249,7 @@ fn storage_slice_preserves_singleton_axis_identity() {
             slice.axes,
             (0..shape.len()).map(|axis| (axis, 1)).collect::<Vec<_>>()
         );
+
         assert_eq!(slice.origins.as_slice(), vec![0; shape.len()]);
     }
 }
@@ -252,6 +266,7 @@ fn storage_slices_compose_origins_steps_and_fixed_axes() {
         .unwrap()
         .transpose(None)
         .unwrap();
+
     let inner_strides = schema::contiguous_strides(inner.shape()).unwrap();
     let outer = CoordinateMap::identity(inner.shape().into(), &inner_strides)
         .slice(smallvec::smallvec![
@@ -259,25 +274,30 @@ fn storage_slices_compose_origins_steps_and_fixed_axes() {
             AxisRange::At(2)
         ])
         .unwrap();
+
     let composed = inner
         .storage_slice(&[7, 13, 5], &[65, 5, 1])
         .unwrap()
         .unwrap()
         .compose(outer.storage_slice(inner.shape(), &inner_strides).unwrap())
         .unwrap();
+
     assert_eq!(composed.origins.as_slice(), &[5, 5, 4]);
     assert_eq!(composed.axes, [(1, 6)]);
     for coordinate in schema::row_major_coords(outer.shape()).unwrap() {
         let intermediate = outer
             .resolve(&coordinate, inner.shape(), &inner_strides)
             .unwrap();
+
         let expected = inner
             .resolve(&intermediate, &[7, 13, 5], &[65, 5, 1])
             .unwrap();
+
         let mut actual = composed.origins.clone();
         for (&value, &(base, step)) in coordinate.iter().zip(&composed.axes) {
             actual[base] += value * step;
         }
+
         assert_eq!(actual.as_slice(), expected);
     }
 
@@ -295,6 +315,7 @@ fn storage_slices_compose_origins_steps_and_fixed_axes() {
         }))
         .is_err()
     );
+
     assert!(
         StorageSlice {
             origins: vec![0],

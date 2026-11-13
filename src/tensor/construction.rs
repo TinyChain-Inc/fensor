@@ -29,14 +29,17 @@ where
                 break;
             };
 
-            if previous.as_ref().is_some_and(|last| last >= &coord) {
+            if coords
+                .last()
+                .or(previous.as_ref())
+                .is_some_and(|last| last >= &coord)
+            {
                 return Err(Error::InvalidCoord(
                     "sparse entries must be ordered and unique".into(),
                 )
                 .into());
             }
 
-            previous = Some(coord.clone());
             coords.push(coord);
             values.push(value);
         }
@@ -46,6 +49,7 @@ where
         }
 
         output.stage(&coords, values).await?;
+        previous = coords.pop();
     }
 
     Ok(output.finish().await?)

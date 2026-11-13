@@ -37,45 +37,10 @@ fn contiguous_strides_reject_invalid_shapes() {
 }
 
 #[test]
-fn greedy_block_shape_valid_capacities() {
-    let cases: &[(&str, &[u64], usize, &[u64])] = &[
-        ("capacity_covers_whole_tensor", &[4, 5, 6], 1000, &[4, 5, 6]),
-        ("capacity_equals_total", &[2, 3], 6, &[2, 3]),
-        // Fill trailing axes first: 50 / 6 / 5 leaves room for one outer element.
-        ("partial_fit_limits_outer_axis", &[4, 5, 6], 50, &[1, 5, 6]),
-        ("rank_two_partial", &[3, 7], 5, &[1, 5]),
-        // Capacity need not evenly divide the axis.
-        ("single_dim", &[10], 3, &[3]),
-        ("capacity_one", &[4, 5, 6], 1, &[1, 1, 1]),
-    ];
-
-    for &(name, shape, capacity, expected) in cases {
-        assert_eq!(
-            greedy_block_shape(shape, capacity).expect(name).as_slice(),
-            expected,
-            "{name}"
-        );
-    }
-}
-
-#[test]
-fn greedy_block_shape_reject_invalid_inputs() {
-    let cases: &[(&str, &[u64], usize)] = &[
-        ("zero_capacity", &[4, 5, 6], 0),
-        ("empty_shape", &[], 10),
-        ("zero_dim", &[3, 0, 4], 10),
-    ];
-
-    for &(name, shape, capacity) in cases {
-        let err = greedy_block_shape(shape, capacity).expect_err(name);
-        assert!(matches!(err, Error::InvalidSchema(_)), "{name}: {err}");
-    }
-}
-
-#[test]
 fn tensor_schema_new_computes_strides() {
     let schema = TensorSchema::new(NumberType::Float(FloatType::F32), vec![4u64, 5, 6].into())
         .expect("schema");
+
     assert_eq!(schema.shape().as_slice(), &[4, 5, 6]);
     assert_eq!(schema.strides().as_slice(), &[30, 6, 1]);
 }
@@ -84,92 +49,197 @@ fn tensor_schema_new_computes_strides() {
 fn tensor_schema_new_rejects_empty_shape() {
     let err = TensorSchema::new(NumberType::Float(FloatType::F32), Shape::new())
         .expect_err("empty shape rejected");
+
     assert!(matches!(err, crate::Error::InvalidSchema(_)));
 }
 
 #[test]
-fn block_schema_new_covers_whole_tensor() {
-    let block = BlockSchema::new(&[4, 5, 6], 1000).expect("block schema");
-    assert_eq!(block.shape.as_slice(), &[4, 5, 6]);
-    assert_eq!(block.strides.as_slice(), &[30, 6, 1]);
-}
-
-#[test]
 fn storage_schema_new_evenly_dividing() {
-    // tensor [4, 6], capacity large enough for block [4, 6] -> grid [1, 1]
-    let storage = StorageSchema::new(&[4, 6], Layout::Dense, 1000).expect("storage schema");
-    assert_eq!(storage.shape.as_slice(), &[1, 1]);
-    assert_eq!(storage.block_schema.shape.as_slice(), &[4, 6]);
+    let storage = StorageSchema::new(&[4, 6], Layout::Dense, 1000).unwrap();
+    assert_eq!(storage.blocks.capacity, 24);
+    assert_eq!(storage.blocks.count(), 1);
 }
 
 #[test]
 fn storage_schema_new_ceiling_remainder() {
-    // tensor [10], capacity 3 -> block [3], grid ceil(10/3) = 4
-    let storage = StorageSchema::new(&[10], Layout::Dense, 3).expect("storage schema");
-    assert_eq!(storage.block_schema.shape.as_slice(), &[3]);
-    assert_eq!(storage.shape.as_slice(), &[4]);
-    assert_eq!(storage.strides.as_slice(), &[1]);
-}
-
-#[test]
-fn storage_schema_from_block_shape_matches_new() {
-    let via_new = StorageSchema::new(&[10], Layout::Dense, 3).expect("via new");
-    let via_block_shape = StorageSchema::from_block_shape(&[10], Layout::Dense, vec![3u64].into())
-        .expect("via from_block_shape");
-    assert_eq!(via_new, via_block_shape);
+    let storage = StorageSchema::new(&[10], Layout::Dense, 3).unwrap();
+    assert_eq!(storage.blocks.count(), 4);
+    assert_eq!(storage.blocks.range(3).unwrap(), 9..10);
 }
 
 #[test]
 fn sparse_storage_has_scalar_or_dense_suffix_payloads() {
     let shape = [3, 5, 7];
+    for (axis, length) in [(None, 1), (Some(0), 35), (Some(1), 7), (Some(2), 1)] {
+        let storage =
+            StorageSchema::new(&shape, Layout::Sparse { axis }, MAX_BLOCK_CAPACITY).unwrap();
 
-    for (axis, capacity, expected) in [
-        (None, MAX_BLOCK_CAPACITY, [1, 1, 1]),
-        (Some(0), MAX_BLOCK_CAPACITY, [1, 5, 7]),
-        (Some(1), MAX_BLOCK_CAPACITY, [1, 1, 7]),
-        (Some(2), MAX_BLOCK_CAPACITY, [1, 1, 1]),
-        (Some(0), 4, [1, 1, 4]),
-        (Some(1), 4, [1, 1, 4]),
-    ] {
-        let layout = Layout::Sparse { axis };
-        let storage = StorageSchema::new(&shape, layout, capacity).unwrap();
-        assert_eq!(storage.block_schema.shape.as_slice(), expected);
-        assert_eq!(
-            StorageSchema::from_block_shape(&shape, layout, expected.to_vec().into()).unwrap(),
-            storage
-        );
-
-        for prefix in 0..axis.map_or(shape.len(), |axis| axis + 1) {
-            let mut invalid = expected;
-            invalid[prefix] = 2;
-            assert!(matches!(
-                StorageSchema::from_block_shape(&shape, layout, invalid.to_vec().into()),
-                Err(Error::InvalidLayout(_))
-            ));
+        assert_eq!(storage.blocks.region_len, length);
+        assert_eq!(storage.blocks.capacity as u64, length);
+        for id in 0..storage.blocks.count() {
+            assert_eq!(
+                storage.blocks.range(id).unwrap().end - storage.blocks.range(id).unwrap().start,
+                length
+            );
         }
     }
 
     for axis in [shape.len(), usize::MAX] {
-        let layout = Layout::Sparse { axis: Some(axis) };
-        assert!(matches!(
-            StorageSchema::new(&shape, layout, MAX_BLOCK_CAPACITY),
-            Err(Error::InvalidSchema(_))
-        ));
-        assert!(matches!(
-            StorageSchema::from_block_shape(&shape, layout, vec![1, 1, 1].into()),
-            Err(Error::InvalidSchema(_))
-        ));
+        assert!(StorageSchema::new(&shape, Layout::Sparse { axis: Some(axis) }, 4).is_err());
     }
 }
 
 #[test]
 fn storage_schema_new_rejects_zero_capacity() {
     let err = StorageSchema::new(&[4, 5, 6], Layout::Dense, 0).expect_err("zero capacity rejected");
-    assert!(matches!(err, crate::Error::InvalidSchema(_)));
+    assert!(matches!(err, crate::Error::InvalidLayout(_)));
 }
 
 #[test]
 fn storage_schema_new_rejects_empty_shape() {
     let err = StorageSchema::new(&[], Layout::Dense, 10).expect_err("empty shape rejected");
     assert!(matches!(err, crate::Error::InvalidSchema(_)));
+}
+
+#[test]
+fn compact_linear_blocks_cover_regions_and_progressions() {
+    use crate::schema::LinearBlocks;
+    for shape in [vec![1], vec![3, 5], vec![5, 7, 11], vec![2, 3, 4]] {
+        for prefix in 0..=shape.len() {
+            let layout = if prefix == 0 {
+                crate::Layout::Dense
+            } else {
+                crate::Layout::Sparse {
+                    axis: Some(prefix - 1),
+                }
+            };
+
+            for capacity in [1, 2, 3, 4, 7, 32, 4096] {
+                let blocks = LinearBlocks::new(&shape, layout, capacity).unwrap();
+                let size: u64 = shape.iter().product();
+                // Independent oracle: chunk each dense suffix separately.
+                let region_len: u64 = shape[prefix..].iter().product();
+                let mut expected_ranges = Vec::new();
+                for region in (0..size).step_by(region_len as usize) {
+                    let positions: Vec<_> = (region..region + region_len).collect();
+                    for chunk in positions.chunks(capacity) {
+                        expected_ranges.push(chunk[0]..chunk[chunk.len() - 1] + 1);
+                    }
+                }
+
+                assert_eq!(blocks.count() as usize, expected_ranges.len());
+                for (id, expected) in expected_ranges.iter().enumerate() {
+                    assert_eq!(&blocks.range(id as u64).unwrap(), expected);
+                }
+
+                let mut expected_start = 0;
+                for id in 0..blocks.count() {
+                    let range = blocks.range(id).unwrap();
+                    assert_eq!(range.start, expected_start);
+                    assert!(!range.is_empty());
+                    assert!(range.end - range.start <= capacity as u64);
+                    for flat in range.clone() {
+                        let actual = blocks.position(flat);
+                        assert_eq!(actual.block_id, id);
+                        assert_eq!(actual.offset_in_block as u64, flat - range.start);
+                    }
+
+                    expected_start = range.end;
+                }
+
+                assert_eq!(expected_start, size);
+                assert!(blocks.range(blocks.count()).is_err());
+                for step in [-7_i128, -1, 0, 1, 7] {
+                    for start in 0..size {
+                        let len = if step == 0 {
+                            17
+                        } else if step < 0 {
+                            (start as i128 / -step + 1) as usize
+                        } else {
+                            ((size - 1 - start) as i128 / step + 1) as usize
+                        };
+
+                        let mut output = 0;
+                        blocks
+                            .split(
+                                start as i128,
+                                step,
+                                len,
+                                |id, offset, stride, count, done| {
+                                    assert_eq!(done, output);
+                                    let range = blocks.range(id).unwrap();
+                                    for i in 0..count {
+                                        assert_eq!(
+                                            range.start as i128
+                                                + offset as i128
+                                                + i as i128 * stride as i128,
+                                            start as i128 + (done + i) as i128 * step
+                                        );
+                                    }
+
+                                    output += count;
+                                    Ok(())
+                                },
+                            )
+                            .unwrap();
+
+                        assert_eq!(output, len);
+                    }
+                }
+            }
+        }
+    }
+
+    for capacity in [0, 4097] {
+        assert!(LinearBlocks::new(&[3, 5], crate::Layout::Dense, capacity).is_err());
+    }
+
+    assert!(LinearBlocks::new(&[u64::MAX, 2], crate::Layout::Dense, 4096).is_err());
+}
+
+#[test]
+fn compact_flat_rectangles_preserve_exact_coverage() {
+    use crate::schema::flat_rectangles;
+    for shape in [vec![1], vec![3, 5], vec![2, 3, 4], vec![3, 2, 4, 2]] {
+        let size: u64 = shape.iter().product();
+        let strides = crate::schema::contiguous_strides(&shape).unwrap();
+        let schema =
+            TensorSchema::new(NumberType::Float(FloatType::F64), shape.clone().into()).unwrap();
+
+        for start in 0..=size {
+            for end in start..=size {
+                let mut next = start;
+                let mut count = 0;
+                for bounds in flat_rectangles(&schema, start..end).unwrap() {
+                    count += 1;
+                    let lengths: Vec<_> = bounds.iter().map(|&(lo, hi)| hi - lo).collect();
+                    let mut local = vec![0; shape.len()];
+                    for _ in 0..lengths.iter().product::<u64>() {
+                        let flat: u64 = local
+                            .iter()
+                            .zip(&bounds)
+                            .zip(&strides)
+                            .map(|((&c, &(lo, _)), &stride)| (lo + c) * stride)
+                            .sum();
+
+                        assert_eq!(flat, next);
+                        next += 1;
+                        for axis in (0..local.len()).rev() {
+                            local[axis] += 1;
+                            if local[axis] < lengths[axis] {
+                                break;
+                            }
+
+                            local[axis] = 0;
+                        }
+                    }
+                }
+
+                assert_eq!(next, end);
+                assert!(count < 2 * shape.len());
+            }
+        }
+
+        assert!(flat_rectangles(&schema, 0..size + 1).is_err());
+    }
 }

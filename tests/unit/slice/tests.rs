@@ -14,7 +14,7 @@ fn ordered_coverage_and_permanent_exhaustion() {
     let slice = Slice::new(
         &[3, 6000],
         vec![
-            Axis::Selected(vec![2, 0, 2]),
+            Axis::selected(vec![2, 0, 2]),
             Axis::Span {
                 start: 1,
                 step: 2,
@@ -23,6 +23,7 @@ fn ordered_coverage_and_permanent_exhaustion() {
         ],
     )
     .unwrap();
+
     let mut requests = slice.requests();
     let mut actual = Vec::new();
 
@@ -35,6 +36,7 @@ fn ordered_coverage_and_permanent_exhaustion() {
         .into_iter()
         .flat_map(|row| (0..2999).map(move |i| vec![row, 1 + i * 2]))
         .collect();
+
     assert_eq!(actual, expected);
     assert!(requests.next().is_none());
     assert!(requests.next().is_none());
@@ -45,25 +47,28 @@ fn ordered_coverage_and_permanent_exhaustion() {
             .next()
             .is_none()
     );
+
     assert!(Slice::full(&[]).is_err());
     let mut scalar = Slice::new(&[], vec![]).unwrap().requests();
     assert_eq!(scalar.next().unwrap().len(), 1);
     assert!(scalar.next().is_none());
 
-    let slice = Slice::new(&[4], vec![Axis::Selected(vec![3, 1, 3])]).unwrap();
+    let slice = Slice::new(&[4], vec![Axis::selected(vec![3, 1, 3])]).unwrap();
     let axes = slice.axes.as_ptr();
     let Axis::Selected(values) = &slice.axes[0] else {
         panic!("explicit selection");
     };
-    let selection = values.as_ptr();
+
+    let selection = values.as_slice().as_ptr();
     let mut requests = slice.requests();
     let rectangle = requests.next_rectangle().unwrap();
     assert_eq!(rectangle.axes().as_ptr(), axes);
     let Axis::Selected(values) = &rectangle.axes()[0] else {
         panic!("explicit selection");
     };
-    assert_eq!(values.as_ptr(), selection);
-    assert_eq!(values, &[3, 1, 3]);
+
+    assert_eq!(values.as_slice().as_ptr(), selection);
+    assert_eq!(values.as_slice(), &[3, 1, 3]);
     assert!(requests.next_rectangle().is_none());
 }
 
@@ -84,6 +89,7 @@ fn validation_and_huge_bounded_prefix() {
         )
         .is_err()
     );
+
     assert!(
         Slice::new(
             &[u64::MAX],
@@ -95,7 +101,71 @@ fn validation_and_huge_bounded_prefix() {
         )
         .is_err()
     );
-    assert!(Slice::new(&[3], vec![Axis::Selected(vec![3])]).is_err());
+
+    assert!(Slice::new(&[3], vec![Axis::selected(vec![3])]).is_err());
+
+    for values in [
+        vec![],
+        vec![0, 1, 1, 5, 9],
+        vec![9, 5, 1, 1, 0],
+        vec![4, 0, 4, 2],
+        vec![3; 8],
+        vec![u64::MAX - 1, 0, u64::MAX - 1],
+    ] {
+        let slice = Slice::new(&[u64::MAX], vec![Axis::selected(values.clone())]).unwrap();
+        for (lo, hi) in [
+            (0, 0),
+            (0, 1),
+            (1, 5),
+            (5, 10),
+            (10, u64::MAX),
+            (u64::MAX - 1, u64::MAX),
+        ] {
+            let expected: Vec<_> = values
+                .iter()
+                .copied()
+                .filter(|&v| lo <= v && v < hi)
+                .map(|v| vec![v])
+                .collect();
+
+            let clipped = slice.intersect(&[(lo, hi)]).unwrap();
+            let actual: Vec<_> = clipped
+                .requests()
+                .flat_map(|r| r.into_coordinates(&[u64::MAX]).unwrap())
+                .collect();
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    let len = 8192_u64;
+    let sorted = Slice::new(
+        &[len],
+        vec![Axis::selected((0..len).map(|v| v / 2).collect())],
+    )
+    .unwrap();
+
+    crate::read_metrics::CURRENT.sync_scope(Default::default(), || {
+        let queries = 128;
+        for query in 0..queries {
+            let lo = query as u64 * 31;
+            let clipped = sorted.intersect(&[(lo, lo + 1)]).unwrap();
+            let actual: Vec<_> = clipped
+                .requests()
+                .flat_map(|r| r.into_coordinates(&[len]).unwrap())
+                .collect();
+
+            assert_eq!(actual, [vec![lo], vec![lo]]);
+        }
+
+        let comparisons = crate::read_metrics::CURRENT.with(|m| m.borrow().selection_comparisons);
+        let logarithmic_bound = queries * (2 * (len.ilog2() as usize + 2) + 2);
+        assert!(
+            comparisons > 0 && comparisons <= logarithmic_bound,
+            "{comparisons} comparisons exceed {logarithmic_bound}"
+        );
+    });
+
     assert!(Slice::full(&[u64::MAX, 2]).is_err());
     let slice = Slice::full(&[1_000_000_000, 1_000_000_000]).unwrap();
     let request = slice.requests().next().unwrap();
@@ -117,6 +187,7 @@ async fn huge_sparse_slices_keep_zero_candidates_and_release_guards() {
     )
     .await
     .unwrap();
+
     tensor.write_value(&[0, 999_999_998], 0.2).await.unwrap();
     tensor.write_value(&[1, 3], 2.).await.unwrap();
     crate::read_metrics::CURRENT
@@ -129,6 +200,7 @@ async fn huge_sparse_slices_keep_zero_candidates_and_release_guards() {
                 .view()
                 .slice(vec![AxisRange::At(0), AxisRange::In(2, 1_000_000_000, 2)].into())
                 .unwrap();
+
             assert_eq!(slice.sum_all().await.unwrap(), 0.2);
             crate::read_metrics::CURRENT.with(|m| {
                 assert!(m.borrow().index_entries <= 4);
@@ -136,9 +208,11 @@ async fn huge_sparse_slices_keep_zero_candidates_and_release_guards() {
             });
         })
         .await;
+
     let mut requests =
         crate::expression::traversal::selection(&tensor, Slice::full(&[2, 1_000_000_000]).unwrap())
             .unwrap();
+
     assert!(requests.try_next().await.unwrap().is_some());
     tensor.write_value(&[1, 4], 3.).await.unwrap();
     drop(requests);
@@ -169,10 +243,12 @@ async fn packed_dense_groups_share_one_block() {
             let batch = crate::expression::evaluate_batch(&reduced, &request)
                 .await
                 .unwrap();
+
             assert_eq!(batch.values, (0..64).map(|i| i as f32).collect::<Vec<_>>());
             crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().borrows, 1));
         })
         .await;
+
     crate::test_support::cleanup(&root).await;
 }
 
@@ -187,6 +263,7 @@ async fn sparse_regions_filter_corruption_and_validate_grid_keys() {
     )
     .await
     .unwrap();
+
     tensor.write_value(&[0, 0], 1.).await.unwrap();
     tensor.write_value(&[0, 9_999], 2.).await.unwrap();
     crate::tensor::corruption::corrupt_sparse_payload(&tensor, 0).await;
@@ -194,6 +271,7 @@ async fn sparse_regions_filter_corruption_and_validate_grid_keys() {
         .view()
         .slice(vec![AxisRange::At(0), AxisRange::In(5000, 10000, 1)].into())
         .unwrap();
+
     assert_eq!(slice.sum_all().await.unwrap(), 2.);
     assert!(tensor.sum_all().await.is_err());
     crate::tensor::corruption::corrupt_sparse_key(&tensor, 0, 9_999).await;
@@ -204,6 +282,7 @@ async fn sparse_regions_filter_corruption_and_validate_grid_keys() {
             .await,
         Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
     ));
+
     assert!(tensor.validate().await.is_err());
     crate::test_support::cleanup(&root).await;
 }
@@ -219,6 +298,7 @@ async fn occupied_slices_respect_shared_pages_and_live_sources() {
     )
     .await
     .unwrap();
+
     tensor.write_value(&[0, 0], 2.).await.unwrap();
     tensor.write_value(&[0, 1], 3.).await.unwrap();
     tensor.write_value(&[1, 0], 2.).await.unwrap();

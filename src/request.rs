@@ -20,6 +20,7 @@ pub(crate) fn decode_flat(mut flat: u64, shape: &[u64], out: &mut Coord) -> Resu
                 "zero dimension in coordinate decoding".into(),
             ));
         }
+
         *value = flat % dim;
         flat /= dim;
     }
@@ -60,10 +61,68 @@ pub(crate) fn linear_segments(
 #[derive(Clone, Debug)]
 pub(crate) enum Axis {
     Span { start: u64, step: u64, len: u64 },
-    Selected(Vec<u64>),
+    Selected(SelectedIndices),
+}
+
+/// Explicit indices with immutable ordering metadata.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedIndices {
+    values: Vec<u64>,
+    nondecreasing: bool,
+}
+
+impl SelectedIndices {
+    pub(crate) fn as_slice(&self) -> &[u64] {
+        &self.values
+    }
+
+    pub(crate) fn clipped(&self, lo: u64, hi: u64) -> Vec<u64> {
+        if self.nondecreasing {
+            let first = self.values.partition_point(|&value| {
+                #[cfg(test)]
+                crate::read_metrics::record(|m| m.selection_comparisons += 1);
+
+                value < lo
+            });
+
+            let end = self.values.partition_point(|&value| {
+                #[cfg(test)]
+                crate::read_metrics::record(|m| m.selection_comparisons += 1);
+
+                value < hi
+            });
+
+            self.values[first..end].to_vec()
+        } else {
+            self.values
+                .iter()
+                .copied()
+                .filter(|&value| {
+                    #[cfg(test)]
+                    crate::read_metrics::record(|m| m.selection_comparisons += 1);
+
+                    value >= lo && value < hi
+                })
+                .collect()
+        }
+    }
 }
 
 impl Axis {
+    pub(crate) fn selected(values: Vec<u64>) -> Self {
+        let nondecreasing = values.windows(2).all(|pair| {
+            #[cfg(test)]
+            crate::read_metrics::record(|m| m.selection_comparisons += 1);
+
+            pair[0] <= pair[1]
+        });
+
+        Self::Selected(SelectedIndices {
+            values,
+            nondecreasing,
+        })
+    }
+
     pub(crate) fn range(start: u64, len: u64) -> Self {
         Self::Span {
             start,
@@ -75,14 +134,14 @@ impl Axis {
     pub(crate) fn len(&self) -> u64 {
         match self {
             Self::Span { len, .. } => *len,
-            Self::Selected(values) => values.len() as u64,
+            Self::Selected(values) => values.as_slice().len() as u64,
         }
     }
 
     pub(crate) fn at(&self, index: u64) -> u64 {
         match self {
             Self::Span { start, step, .. } => start + step * index,
-            Self::Selected(values) => values[index as usize],
+            Self::Selected(values) => values.as_slice()[index as usize],
         }
     }
 
@@ -100,9 +159,11 @@ impl Axis {
                 Self::Span { step, len, .. } => (*step as i128, *len),
                 Self::Selected(values) => {
                     let step = values
+                        .as_slice()
                         .get(i as usize + 1)
                         .map(|v| *v as i128 - start as i128)
                         .unwrap_or(0);
+
                     let mut end = i + 1;
 
                     while end < self.len()
@@ -110,6 +171,7 @@ impl Axis {
                     {
                         end += 1;
                     }
+
                     (step, end)
                 }
             };
@@ -132,13 +194,14 @@ impl Axis {
                         .checked_mul(len - 1)
                         .and_then(|n| start.checked_add(n))
                         .ok_or_else(|| Error::InvalidCoord("request axis overflow".into()))?;
+
                     if last >= dim {
                         return Err(Error::InvalidCoord("request axis out of bounds".into()));
                     }
                 }
             }
             Self::Selected(values) => {
-                if values.iter().any(|v| *v >= dim) {
+                if values.as_slice().iter().any(|v| *v >= dim) {
                     return Err(Error::InvalidCoord(
                         "request selection out of bounds".into(),
                     ));
@@ -161,7 +224,7 @@ impl Cartesian {
     pub(crate) fn new(axes: Vec<Axis>) -> Result<Self> {
         for axis in &axes {
             if let Axis::Selected(values) = axis {
-                bound(values.len())?;
+                bound(values.as_slice().len())?;
             }
         }
 
@@ -175,6 +238,7 @@ impl Cartesian {
 
         let len = usize::try_from(len)
             .map_err(|_| Error::InvalidLayout("request cardinality exceeds usize".into()))?;
+
         bound(len)?;
         Ok(Self { axes, len })
     }
@@ -248,6 +312,7 @@ fn push_progression(runs: &mut Vec<Progression>, next: Progression) {
             return;
         }
     }
+
     runs.push(next);
 }
 
@@ -284,6 +349,7 @@ impl BatchRequest {
         start
             .checked_add(len as u64)
             .ok_or_else(|| Error::InvalidLayout("request span overflow".into()))?;
+
         Ok(Self {
             kind: RequestKind::Linear { start },
             len,
@@ -297,6 +363,7 @@ impl BatchRequest {
             .iter()
             .try_fold(0usize, |n, r| n.checked_add(r.len()))
             .ok_or_else(|| Error::InvalidLayout("request cardinality overflow".into()))?;
+
         bound(len)?;
         Ok(Self {
             kind: RequestKind::Rectangles(rectangles),
@@ -358,6 +425,7 @@ impl BatchRequest {
                             .and_then(|v| n.checked_add(v))
                             .ok_or_else(invalid)
                     })?;
+
                 push_progression(
                     &mut runs,
                     Progression {
@@ -367,6 +435,7 @@ impl BatchRequest {
                         len: 1,
                     },
                 );
+
                 Ok(())
             })?;
         }
@@ -375,6 +444,7 @@ impl BatchRequest {
             kind: RequestKind::FlatRuns(runs),
             len: self.len,
         };
+
         mapped.validate(base_shape)?;
         #[cfg(test)]
         if let RequestKind::FlatRuns(runs) = &mapped.kind {
@@ -412,6 +482,7 @@ impl BatchRequest {
                         .checked_mul((run.len - 1) as i128)
                         .and_then(|n| run.start.checked_add(n))
                         .ok_or_else(invalid)?;
+
                     end = end.checked_add(run.len).ok_or_else(invalid)?;
                     if end > self.len {
                         return Err(invalid());
@@ -464,6 +535,7 @@ impl BatchRequest {
         let mut cursor = self.cursor(shape)?;
         #[cfg(test)]
         crate::read_metrics::record(|m| m.expanded_coordinates += self.len);
+
         let mut scratch = Coord::new();
         let mut out = Vec::with_capacity(self.len);
 
@@ -512,6 +584,7 @@ impl<R: Borrow<BatchRequest>, S: AsRef<[u64]>> Cursor<R, S> {
                     self.rectangle += 1;
                     self.local = 0;
                 }
+
                 rectangles[self.rectangle].coordinate(self.local, out);
                 self.local += 1;
             }
@@ -585,10 +658,12 @@ pub(crate) fn tiled_requests(
                     Axis::range(start, (shape[i] - start).min(side))
                 })
                 .collect();
+
             let rect = Cartesian::new(axes).expect("bounded spatial tile");
             if size + rect.len() > MAX_BATCH_ELEMENTS {
                 break;
             }
+
             size += rect.len();
             rectangles.push(rect);
             tiles.next();
@@ -687,6 +762,7 @@ pub(crate) fn progressions(
                             step: step.checked_mul(strides[varying]).ok_or_else(invalid)?,
                             len,
                         })?;
+
                         output += len;
                     }
                 }
@@ -702,6 +778,7 @@ pub(crate) fn progressions(
                     u64::try_from(run.step.checked_abs().ok_or_else(invalid)?)
                         .map_err(|_| invalid())?
                 };
+
                 decode_flat(magnitude, shape, &mut delta)?;
                 let mut done = 0;
 
@@ -712,6 +789,7 @@ pub(crate) fn progressions(
                         shape,
                         &mut coord,
                     )?;
+
                     let mut len = run.len - done;
 
                     // A flat step has constant mixed-radix digits until a carry
@@ -733,12 +811,14 @@ pub(crate) fn progressions(
                                 .ok_or_else(invalid)
                         })?
                     };
+
                     emit(Progression {
                         output: run.output + done,
                         start: flat(&coord)?,
                         step,
                         len,
                     })?;
+
                     done += len;
                 }
             }

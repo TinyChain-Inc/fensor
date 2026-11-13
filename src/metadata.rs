@@ -4,7 +4,7 @@ use destream::{de, en};
 use get_size::GetSize;
 
 use crate::schema::{StorageSchema, TensorSchema};
-use crate::{Error, Layout, Result, Shape, TensorElement};
+use crate::{Layout, Result, Shape, TensorElement};
 
 /// Typed filesystem metadata, independent of the byte codec used by the file adapter.
 ///
@@ -16,29 +16,20 @@ use crate::{Error, Layout, Result, Shape, TensorElement};
 pub struct TensorMetadata<T> {
     shape: Shape,
     layout: Layout,
-    block_shape: Shape,
+    block_capacity: usize,
     dtype: PhantomData<T>,
 }
 
 impl<T: TensorElement> TensorMetadata<T> {
-    pub fn new(shape: Shape, layout: Layout, block_shape: Shape) -> Result<Self> {
+    pub fn new(shape: Shape, layout: Layout, block_capacity: usize) -> Result<Self> {
         TensorSchema::new(T::dtype(), shape.clone())?;
 
-        if shape.len() != block_shape.len() {
-            return Err(Error::InvalidSchema(
-                "block shape rank differs from tensor rank".into(),
-            ));
-        }
-
-        let capacity = crate::schema::checked_product(&block_shape)?;
-        if capacity == 0 || capacity > crate::schema::MAX_BLOCK_CAPACITY as u64 {
-            return Err(Error::InvalidSchema("invalid block capacity".into()));
-        }
-        StorageSchema::from_block_shape(&shape, layout, block_shape.clone())?;
+        let storage = StorageSchema::new(&shape, layout, block_capacity)?;
+        let block_capacity = storage.blocks.capacity;
         Ok(Self {
             shape,
             layout,
-            block_shape,
+            block_capacity,
             dtype: PhantomData,
         })
     }
@@ -51,25 +42,25 @@ impl<T: TensorElement> TensorMetadata<T> {
         self.layout
     }
 
-    pub fn block_shape(&self) -> &Shape {
-        &self.block_shape
+    pub fn block_capacity(&self) -> usize {
+        self.block_capacity
     }
 
     pub(crate) fn schemas(&self) -> Result<(TensorSchema, StorageSchema)> {
         Ok((
             TensorSchema::new(T::dtype(), self.shape.clone())?,
-            StorageSchema::from_block_shape(&self.shape, self.layout, self.block_shape.clone())?,
+            StorageSchema::new(&self.shape, self.layout, self.block_capacity)?,
         ))
     }
 }
 
 impl<T> GetSize for TensorMetadata<T> {
     fn get_heap_size(&self) -> usize {
-        [&self.shape, &self.block_shape]
-            .into_iter()
-            .filter(|shape| shape.spilled())
-            .map(|shape| shape.capacity() * std::mem::size_of::<u64>())
-            .sum()
+        if self.shape.spilled() {
+            self.shape.capacity() * std::mem::size_of::<u64>()
+        } else {
+            0
+        }
     }
 }
 
@@ -126,7 +117,9 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
         decoder.finish_child(&mut sequence).await?;
 
         require_field::<D::Error>(&sequence)?;
-        let block_shape = decode_shape(limit, decoder).await?;
+        let block_capacity =
+            usize::try_from(u64::from_stream((), decoder).await?).map_err(de::Error::custom)?;
+
         decoder.finish_child(&mut sequence).await?;
 
         let layout = if sparse {
@@ -146,7 +139,7 @@ impl<T: TensorElement> de::FromStream for TensorMetadata<T> {
             return Err(de::Error::custom("unexpected metadata field"));
         }
 
-        TensorMetadata::new(shape, layout, block_shape).map_err(de::Error::custom)
+        TensorMetadata::new(shape, layout, block_capacity).map_err(de::Error::custom)
     }
 }
 
@@ -170,7 +163,7 @@ impl<'en, T: TensorElement> en::ToStream<'en> for TensorMetadata<T> {
                 self.shape.as_slice(),
                 sparse,
                 axis,
-                self.block_shape.as_slice(),
+                self.block_capacity as u64,
             ),
             encoder,
         )

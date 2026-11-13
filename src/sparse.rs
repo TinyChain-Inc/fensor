@@ -129,14 +129,14 @@ pub type SparseNode<T> = b_tree::Node<Vec<Vec<SparseCell<T>>>>;
 // Sparse blocks use one native index keyed by their logical block ID.
 #[derive(Clone, Debug)]
 pub(crate) struct PayloadSchema<T> {
-    block_len: usize,
+    geometry: crate::StorageGeometry,
     dtype: PhantomData<T>,
 }
 
 impl<T> PayloadSchema<T> {
-    pub(crate) fn new(block_len: usize) -> Self {
+    pub(crate) fn new(geometry: crate::StorageGeometry) -> Self {
         Self {
-            block_len,
+            geometry,
             dtype: PhantomData,
         }
     }
@@ -144,7 +144,7 @@ impl<T> PayloadSchema<T> {
 
 impl<T> PartialEq for PayloadSchema<T> {
     fn eq(&self, b: &Self) -> bool {
-        self.block_len == b.block_len
+        self.geometry == b.geometry
     }
 }
 
@@ -170,7 +170,7 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
         let header = std::mem::size_of::<b_tree::Node<Vec<Vec<SparseCell<T>>>>>();
         let row = std::mem::size_of::<Vec<SparseCell<T>>>()
             + 2 * std::mem::size_of::<SparseCell<T>>()
-            + self.block_len * std::mem::size_of::<T>()
+            + self.geometry.block_capacity() * std::mem::size_of::<T>()
             + 16;
 
         // Packing policy: choose an even order of at least four for sparse pages.
@@ -179,10 +179,11 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
 
     fn validate_prefix(&self, prefix: &[Self::Value]) -> io::Result<()> {
         match prefix {
-            [SparseCell::Key(_)] => Ok(()),
-            [SparseCell::Key(_), SparseCell::Payload(values)] if values.len() == self.block_len => {
-                Ok(())
-            }
+            [SparseCell::Key(id)] => self.geometry.validate_id(*id).map_err(io::Error::other),
+            [SparseCell::Key(id), SparseCell::Payload(values)] => self
+                .geometry
+                .validate_block(*id, values)
+                .map_err(io::Error::other),
             _ => Err(invalid()),
         }
     }
@@ -191,6 +192,7 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
         if row.len() != 2 {
             return Err(invalid());
         }
+
         self.validate_prefix(&row)?;
 
         Ok(row)

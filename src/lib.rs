@@ -149,7 +149,7 @@ pub use schema::{
 pub use selection::WhereView;
 pub use sparse::{SparseCell, SparseNode};
 pub use storage::{BlockUpdates, StorageGeometry, StorageRead, StorageReadPlan, TensorSource};
-pub use tensor::{Tensor, TensorElement, TensorFileEntry};
+pub use tensor::{SparseBlocks, Tensor, TensorElement, TensorFileEntry};
 pub use traits::{
     BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray, TensorBoolean,
     TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar, TensorGeometry,

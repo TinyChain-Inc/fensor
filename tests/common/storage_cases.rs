@@ -19,6 +19,7 @@ pub async fn storage() {
         if smoke && shape[0] == 4096 {
             shape[0] = 16;
         }
+
         common::counters::reset_traffic();
         let (root, dir) = common::new_dir(name).await;
         let t = Tensor::<common::FsEntry, f64>::create(
@@ -29,17 +30,20 @@ pub async fn storage() {
         )
         .await
         .unwrap();
+
         let g = t.storage_geometry();
         let start = Instant::now();
         for id in 0..g.block_count() {
-            let mut values = vec![0.; g.block_len()];
+            let mut values = vec![0.; g.block_len(id).unwrap()];
             if full {
                 values.fill(1.);
             } else {
                 values[0] = 1.;
             }
+
             t.replace_logical_block(id, values).await.unwrap();
         }
+
         let write_only = start.elapsed();
         t.sync().await.unwrap();
         let write = start.elapsed();
@@ -48,19 +52,17 @@ pub async fn storage() {
         for id in 0..g.block_count() {
             t.read_logical_block(id).await.unwrap();
         }
+
         let scan = start.elapsed();
         let start = Instant::now();
         for _ in 0..workload_repetitions(1) {
             for id in 0..g.block_count() {
-                let coord: Vec<_> = g
-                    .block_bounds(id)
-                    .unwrap()
-                    .into_iter()
-                    .map(|(start, _)| start)
-                    .collect();
+                let (_, coord) = common::block_entries(&g, id).next().unwrap();
+
                 t.write_value(&coord, 2.).await.unwrap();
             }
         }
+
         t.sync().await.unwrap();
         let point = start.elapsed();
         let (copy_root, copy_dir) = common::new_dir("storage_copy").await;
@@ -68,6 +70,7 @@ pub async fn storage() {
         let copy = Tensor::<common::FsEntry, f64>::copy_from(copy_dir, &t, t.layout(), 4096)
             .await
             .unwrap();
+
         let construct_time = start.elapsed();
         copy.sync().await.unwrap();
         let sync_time = start.elapsed() - construct_time;
@@ -75,31 +78,30 @@ pub async fn storage() {
         benchmark::storage(name, "copy", &copy_root).await;
         let copy_geometry = copy.storage_geometry();
         for id in 0..g.block_count() {
-            let coord: Vec<_> = g
-                .block_bounds(id)
-                .unwrap()
-                .into_iter()
-                .map(|(start, _)| start)
-                .collect();
+            let (_, coord) = common::block_entries(&g, id).next().unwrap();
+
             assert_eq!(
                 copy.read_value(&coord).await.unwrap(),
                 t.read_value(&coord).await.unwrap()
             );
         }
+
         for (metric, value) in [
             ("blocks", copy_geometry.block_count() as u128),
-            ("block_elements", copy_geometry.block_len() as u128),
+            ("block_elements", copy_geometry.block_capacity() as u128),
         ] {
             benchmark::record(name, "storage", "copy", metric, "count", value);
         }
+
         common::cleanup(&copy_root).await;
         benchmark::storage(name, "populated", &root).await;
         let start = Instant::now();
         for id in 0..g.block_count() {
-            t.replace_logical_block(id, vec![0.; g.block_len()])
+            t.replace_logical_block(id, vec![0.; g.block_len(id).unwrap()])
                 .await
                 .unwrap();
         }
+
         t.sync().await.unwrap();
         let deletion = start.elapsed();
         let traffic = common::counters::snapshot_traffic();
@@ -116,38 +118,42 @@ pub async fn storage() {
         ] {
             benchmark::record(name, operation, "first", "wall", "ns", elapsed.as_nanos());
         }
+
         for (metric, value) in [
             ("blocks", g.block_count() as u128),
-            ("block_elements", g.block_len() as u128),
+            ("block_elements", g.block_capacity() as u128),
             ("cache_budget", 1_000_000),
             ("loads", traffic.loads as u128),
             ("saves", traffic.saves as u128),
         ] {
             benchmark::record(name, "storage", "populated", metric, "count", value);
         }
+
         common::cleanup(&root).await;
     }
 }
 
 pub async fn mutation() {
     use fensor::{StorageGeometry, TensorWriteBulk};
-    for (layout, shapes) in [
-        (Layout::Dense, [vec![4, 16], vec![16, 16]]),
-        (Layout::Sparse { axis: Some(0) }, [vec![1, 16], vec![1, 64]]),
+    for (layout, capacities) in [
+        (Layout::Dense, [64, 256]),
+        (Layout::Sparse { axis: Some(0) }, [16, 64]),
     ] {
-        for block_shape in shapes {
+        for capacity in capacities {
             for scalar in [true, false] {
                 common::counters::reset_traffic();
                 let (root, dir) = common::new_dir("bulk_mutation").await;
                 let geometry = StorageGeometry::new(
                     TensorSchema::new(f64::dtype(), vec![16, 64].into()).unwrap(),
                     layout,
-                    block_shape.clone().into(),
+                    capacity,
                 )
                 .unwrap();
+
                 let tensor = Tensor::<common::FsEntry, f64>::create_with_geometry(dir, geometry)
                     .await
                     .unwrap();
+
                 let start = Instant::now();
                 for value in [1., 0., 2.] {
                     if scalar {
@@ -158,6 +164,7 @@ pub async fn mutation() {
                         tensor.fill(value).await.unwrap();
                     }
                 }
+
                 let mutation = start.elapsed();
                 tensor.sync().await.unwrap();
                 let elapsed = start.elapsed();
@@ -165,11 +172,10 @@ pub async fn mutation() {
                 assert_eq!(tensor.read_value(&[15, 63]).await.unwrap(), 2.);
                 let traffic = common::counters::snapshot_traffic();
                 let name = format!(
-                    "mutation_{}_{}x{}_scalar{scalar}",
-                    layout_name(layout),
-                    block_shape[0],
-                    block_shape[1]
+                    "mutation_{}_cap{capacity}_scalar{scalar}",
+                    layout_name(layout)
                 );
+
                 for (operation, duration) in [
                     ("mutate", mutation),
                     ("sync", sync),
@@ -177,6 +183,7 @@ pub async fn mutation() {
                 ] {
                     benchmark::record(&name, operation, "first", "wall", "ns", duration.as_nanos());
                 }
+
                 for (metric, value) in [("loads", traffic.loads), ("saves", traffic.saves)] {
                     benchmark::record(
                         &name,
@@ -187,6 +194,7 @@ pub async fn mutation() {
                         value as u128,
                     );
                 }
+
                 common::cleanup(&root).await;
             }
         }
@@ -203,6 +211,7 @@ pub async fn replacement() {
     )
     .await
     .unwrap();
+
     common::counters::reset_traffic();
     let start = Instant::now();
     for _ in 0..workload_repetitions(64) {
@@ -213,6 +222,7 @@ pub async fn replacement() {
                 .unwrap();
         }
     }
+
     let replace = start.elapsed();
     tensor.sync().await.unwrap();
     let traffic = common::counters::snapshot_traffic();
@@ -224,6 +234,7 @@ pub async fn replacement() {
         "ns",
         replace.as_nanos(),
     );
+
     for (metric, value) in [("loads", traffic.loads), ("saves", traffic.saves)] {
         benchmark::record(
             "dense_replacement",
@@ -234,6 +245,7 @@ pub async fn replacement() {
             value as u128,
         );
     }
+
     common::cleanup(&root).await;
 }
 
@@ -255,11 +267,12 @@ pub async fn traversal() {
         )
         .await
         .unwrap();
+
         let g = tensor.storage_geometry();
         let mut expected_occupied = 0;
 
         for id in 0..g.block_count() {
-            let mut values = vec![0.; g.block_len()];
+            let mut values = vec![0.; g.block_len(id).unwrap()];
             for (offset, coord) in common::block_entries(&g, id) {
                 values[offset] = if coord[1] % 4 == 0 { 2. } else { 0. };
             }
@@ -270,12 +283,14 @@ pub async fn traversal() {
 
             tensor.replace_logical_block(id, values).await.unwrap();
         }
+
         let start = Instant::now();
         for _ in 0..repeats.div_ceil(4) {
             for i in 0..128 {
                 assert_eq!(tensor.read_value(&[i, 0]).await.unwrap(), 2.);
             }
         }
+
         let point = start.elapsed();
         let start = Instant::now();
         for _ in 0..repeats {
@@ -290,11 +305,13 @@ pub async fn traversal() {
                 128 * 129
             );
         }
+
         let scan = start.elapsed();
         let start = Instant::now();
         for _ in 0..repeats {
             assert_eq!(tensor.sum_all().await.unwrap(), 128. * 33. * 2.);
         }
+
         let reduction = start.elapsed();
         let start = Instant::now();
         for _ in 0..repeats {
@@ -304,6 +321,7 @@ pub async fn traversal() {
                 .unwrap()
                 .flip(0)
                 .unwrap();
+
             assert_eq!(
                 value
                     .into_blocks()
@@ -315,6 +333,7 @@ pub async fn traversal() {
                 128 * 129
             );
         }
+
         let transformed = start.elapsed();
         let name = format!("traversal_{}", layout_name(layout));
         for (operation, elapsed) in [
@@ -325,6 +344,7 @@ pub async fn traversal() {
         ] {
             benchmark::record(&name, operation, "warm", "wall", "ns", elapsed.as_nanos());
         }
+
         benchmark::record(
             &name,
             "traversal",
@@ -361,6 +381,7 @@ pub async fn traversal() {
 
         common::cleanup(&root).await;
     }
+
     Box::pin(sparse_output()).await;
     Box::pin(sparse_selections()).await;
     Box::pin(sparse_union()).await;
@@ -383,6 +404,7 @@ async fn sparse_output() {
             (0..32768).map(|offset| if offset % 1024 == 0 { 2f64 } else { 0. }),
         )
         .await;
+
         let expression = TensorExpression::new(tensor).unwrap();
         benchmark::measure(
             &format!("sparse_output_rank{rank}"),
@@ -400,9 +422,11 @@ async fn sparse_output() {
                         assert_eq!(value, 2.);
                         emitted += 1;
                     }
+
                     assert_eq!(emitted, 32);
                     count += emitted as usize;
                 }
+
                 count
             },
         )
@@ -429,6 +453,7 @@ async fn sparse_union() {
                         .sum()
                 })
                 .collect();
+
             let mut roots = Vec::new();
             let mut expression: Option<TensorExpression<f64>> = None;
 
@@ -450,6 +475,7 @@ async fn sparse_union() {
                     }),
                 )
                 .await;
+
                 roots.push(root);
                 let operand = TensorExpression::new(tensor).unwrap();
                 expression = Some(match expression {
@@ -475,6 +501,7 @@ async fn sparse_union() {
                             .flat_map(|(row, value)| {
                                 (0..257).step_by(8).map(move |column| (row, column, *value))
                             });
+
                         let mut stream = expression.clone().into_sparse_elements().unwrap();
                         while let Some((coord, value)) = stream.try_next().await.unwrap() {
                             let (row, column, expected_value) = expected.next().unwrap();
@@ -485,12 +512,15 @@ async fn sparse_union() {
                             assert_eq!(value, expected_value);
                             count += 1;
                         }
+
                         assert!(expected.next().is_none());
                     }
+
                     count
                 },
             )
             .await;
+
             drop(expression);
             drop(roots);
         }
@@ -511,7 +541,8 @@ async fn sparse_selections() {
         std::iter::repeat_n(1f64, 65536),
     )
     .await;
-    assert_eq!(tensor.storage_geometry().block_len(), 4096);
+
+    assert_eq!(tensor.storage_geometry().block_capacity(), 4096);
     let expression = TensorExpression::new(tensor).unwrap();
     // Each selected physical chunk contains 32 KiB of dense numerical values.
     // Visit every block repeatedly while consuming only a point or eight values.
@@ -524,6 +555,7 @@ async fn sparse_selections() {
                     .unwrap()
             })
             .collect();
+
         benchmark::measure(
             &format!("sparse_dense_selection{width}"),
             "read",
@@ -542,11 +574,13 @@ async fn sparse_selections() {
                                 assert!(values.iter().all(|&value| value == 1.));
                                 selected += values.len();
                             }
+
                             assert_eq!(selected, width as usize);
                             count += selected;
                         }
                     }
                 }
+
                 count
             },
         )
@@ -558,10 +592,12 @@ fn workload_repetitions(default: usize) -> usize {
     if std::env::var_os("FENSOR_BENCH_SMOKE").is_some() {
         return 1;
     }
+
     let count = std::env::var("FENSOR_WORKLOAD_REPEATS")
         .ok()
         .map(|value| value.parse().expect("positive repeat count"))
         .unwrap_or(default);
+
     assert!(count > 0);
     count
 }
@@ -577,14 +613,14 @@ pub async fn reopen() {
         )
         .await
         .unwrap();
+
         let geometry = tensor.storage_geometry();
         for id in 0..geometry.block_count() {
-            let mut values = vec![0.; geometry.block_len()];
-            for offset in geometry.block_offsets(id).unwrap() {
-                values[offset] = 1.;
-            }
+            let values = vec![1.; geometry.block_len(id).unwrap()];
+
             tensor.replace_logical_block(id, values).await.unwrap();
         }
+
         tensor.sync_all().await.unwrap();
         drop(tensor);
         let start = Instant::now();
@@ -592,11 +628,13 @@ pub async fn reopen() {
             let loaded = Tensor::<common::FsEntry, f64>::load(common::open_dir(&root).unwrap())
                 .await
                 .unwrap();
+
             let reopened = loaded.storage_geometry();
             assert_eq!(reopened.schema(), geometry.schema());
             assert_eq!(reopened.layout(), geometry.layout());
-            assert_eq!(reopened.block_shape(), geometry.block_shape());
+            assert_eq!(reopened.block_capacity(), geometry.block_capacity());
         }
+
         benchmark::record(
             &format!("reopen_axis{axis}"),
             "reopen",
@@ -605,6 +643,7 @@ pub async fn reopen() {
             "ns",
             start.elapsed().as_nanos(),
         );
+
         common::cleanup(&root).await;
     }
 }

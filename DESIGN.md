@@ -26,7 +26,7 @@ expression depth. Reductions, matrix products, and Fourier transforms use the
 same process. None may create temporary tensor files or persist computed
 intermediates. Persistence requires an explicit write or `Tensor::copy_from`.
 The copy caller selects destination layout; reader layout never selects allocation
-implicitly. Geometry validates block IDs, lengths, and padding for native storage
+implicitly. Geometry validates block IDs and exact lengths for native storage
 and caller-owned logical-block replacements; storage owners retain payload and
 mutation validation.
 
@@ -207,8 +207,7 @@ without sorting or removing duplicates. Checked widened arithmetic validates
 endpoints before I/O. Invalid mappings fail; only unsupported optimization geometry
 selects bounded coordinate mapping.
 
-Storage leaves split progressions at base-coordinate carries, block boundaries, or
-sparse-key changes. Each storage run holds destination start, source-block offset,
+Storage leaves split flat progressions at contiguous block boundaries. Each storage run holds destination start, source-block offset,
 signed stride, and count. At most one run per requested element is retained.
 Nested affine `FlatRuns` compose directly, splitting at mixed-radix carries and
 borrows while retaining signed and zero strides. Gather mappings and explicit
@@ -216,7 +215,7 @@ requests emit/coalesce singleton runs using the same
 mapping logic and rank-sized scratch, without collecting mapped base coordinates.
 
 Request cursors, affine leaves, and matrix rows share checked logical decoding and
-lazy segment iteration. Storage owns block/carry splitting; matrix products own
+lazy segment iteration. Storage owns linear block splitting; matrix products own
 tile intersection and scattering. Consumers obtain these behaviors through ordinary
 expression delegation, without selecting a planning strategy.
 
@@ -230,15 +229,23 @@ paths use the same consumer for native reads and caller-owned visibility layers.
 Each BTree or file guard is released before entering another domain. Unit-stride
 runs copy slices; negative, zero, and other strides use the shared scatter loop.
 Missing sparse storage blocks yield zero; malformed stored blocks fail closed.
-Payload validation checks padding gaps between valid offsets without a validity
-mask. Full blocks need neither bounds allocation nor padding traversal.
+Payload validation checks each block's exact expected length; there are no padding slots.
+Block visits validate the complete bounded, increasing ID selection before native
+access or callbacks. Rectangle decomposition borrows validated shape/stride metadata.
+Explicit selections retain their input order and duplicates; their immutable ordering
+metadata allows binary-search clipping when nondecreasing, with a linear filter otherwise.
+Sparse candidate discovery consumes Tokio's cooperative budget before requesting
+another occupied ID, including when every candidate is rejected by the selection.
+It yields without retaining native page guards. Sparse construction borrows the
+current batch's last coordinate for ordering and moves its final coordinate into
+the predecessor slot after staging; it does not clone every input coordinate.
 
 Native shape helpers describe broadcasting and normalize reduction axes without
 narrowing logical dimensions. Callers choose automatic versus explicit broadcasting
 and scalar versus tensor results.
 
-`StorageGeometry` owns one rank-sized block cursor. `block_offsets` exposes valid
-offsets, skipping padding and preserving logical order.
+`StorageGeometry` derives each block's flat range and exact length. Dense values
+form one region; sparse prefixes select independent dense suffix regions.
 
 Matrix diagonal projection maps each bounded output request to correlated source
 coordinates using reusable rank-sized scratch and one explicit request. It calls
@@ -341,7 +348,7 @@ strict reopening fail. Callers continue owning cleanup and durability.
 Dense copying and native value-buffer writes share request-to-block planning.
 Published writes retain their read-modify-write corruption checks. Value-buffer writes validate cardinality before mutation and group at
 most one execution batch by logical block, preserving repeated-offset input order.
-Native fills validate and replace one block at a time, retaining zero edge padding.
+Native fills validate and replace one compact block at a time.
 Sparse adapters encode complete block/payload leaf rows and typed routing prefixes,
 including block-only separators. Recreate storage containing old copied-minimum
 internal nodes; loading does not migrate it.
@@ -475,9 +482,9 @@ consumption use one evaluator and one sequential request stream.
 
 The [public layout model](README.md#layout-and-geometric-views) defines sparse-axis
 regions independently of block capacity. `StorageGeometry` validates the selected
-layout and block shape; `create_with_geometry` accepts that geometry, while normal
+layout and block capacity; `create_with_geometry` accepts that geometry, while normal
 creation chooses it and delegates. Metadata records shape, layout, sparse axis,
-and block shape. Loading validates these fields without retessellating storage.
+and block capacity. Loading validates these fields without retessellating storage.
 
 Each sparse BTree row stores a logical block ID and dense typed vector.
 One private BTree schema validates the key and payload fields; geometry validation
@@ -492,7 +499,7 @@ payload tags, and bounded decoding allocations. Rows share native BTree pages;
 there is no separate descriptor, occupancy table, or payload-file representation.
 
 An absent storage block is all-zero. Removing a block's last nonzero value
-removes its row. Invalid padding, malformed lengths, empty stored blocks, and
+removes its row. Malformed lengths, empty stored blocks, and
 incorrect block IDs are errors. Batch reads borrow native rows for synchronous
 payload validation and consumption, sharing a BTree range for consecutive requested
 block IDs. Exact singleton reads resolve semantic uniqueness before the callback.
@@ -584,11 +591,11 @@ Occupied scans retain cursors and bounded native page lookahead until consumed o
 dropped. Expression consumers retain the scan across output batches. Native pages
 validate ordered block IDs before returning keys; consumers need no second
 membership lookup. Payload reads validate the selected dense blocks. Dense and sparse
-validation borrow required payloads without cloning them. Native fills visit valid offsets while retaining old-value
-validation and zero padding.
+validation borrow required payloads without cloning them. Native fills retain
+old-value validation and fill every element in the compact block.
 
 Geometry owns address validation; storage owns payload validation and file access.
-Reuse computed block bounds for padding traversal. Buffered dense reads retain at
+Buffered dense reads retain at
 most the CPU-derived window of payload guards.
 Each consumed guard is released after scatter. Insufficient pinned capacity returns
 freqfs's bounded admission error; error or cancellation drops the stream and its
@@ -607,3 +614,6 @@ ha-ndarray. Fourier extraction also consumes its completed result. Sequential re
 and borrow it during evaluation, without cloning that owner per request. Shared
 expression operands and iterative destruction still preserve independently
 retained sources and stack safety.
+
+See [the native-storage migration guidance](README.md#native-storage-migration)
+for removed tile APIs and the capacity-based metadata format.

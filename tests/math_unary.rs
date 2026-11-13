@@ -19,6 +19,7 @@ async fn dense_single_block_round_matches_expected_values() {
     let (_out_root, out_dir) = new_dir("dense_round_single_block_out").await;
     let values: [((u64, u64), f32); 4] =
         [((0, 0), 1.4), ((0, 1), 1.6), ((1, 0), -1.5), ((1, 1), 2.5)];
+
     let (_root, tensor) = common::fixture::source(
         "dense_round_single_block",
         shape![2, 2],
@@ -47,7 +48,7 @@ async fn dense_single_block_round_matches_expected_values() {
 
 #[tokio::test]
 async fn dense_multi_block_exp_and_ln_stream_correctly() {
-    // shape [10] with max_capacity 3 -> block_shape [3], grid ceil(10/3) = 4
+    // shape [10] with capacity 3 -> four linear blocks, with a one-element tail
     // blocks, forcing the block-level copy path to walk multiple blocks.
     let (_exp_root, exp_dir) = new_dir("dense_multi_block_exp_ln_exp_out").await;
     let (_ln_root, ln_dir) = new_dir("dense_multi_block_exp_ln_ln_out").await;
@@ -70,6 +71,7 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
     )
     .await
     .expect("copy exp");
+
     let lnd = Tensor::copy_from(
         ln_dir,
         &tensor.view().ln().await.expect("ln should succeed"),
@@ -87,6 +89,7 @@ async fn dense_multi_block_exp_and_ln_stream_correctly() {
             expd.read_value(&coord).await.expect("read exp"),
             expected_exp
         );
+
         let actual_ln = lnd.read_value(&coord).await.expect("read ln");
         if expected_ln.is_nan() {
             assert!(actual_ln.is_nan());
@@ -102,6 +105,7 @@ async fn chain_is_lazy_until_copy() {
     let (out_root, out_dir) = new_dir("lazy_chain_out").await;
     let schema =
         TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 2]).expect("schema");
+
     let tensor = create_dense_tensor::<f32>(dir, schema).await;
     tensor.write_value(&[0, 0], 1.0).await.expect("write");
 
@@ -122,12 +126,14 @@ async fn chain_is_lazy_until_copy() {
     let copied = Tensor::copy_from(out_dir.clone(), &chain, chain.layout(), 1000)
         .await
         .expect("copy should succeed");
+
     copied.sync().await.expect("sync");
 
     assert!(
         out_root.join("blocks").exists(),
         "copy must create the blocks directory"
     );
+
     assert_eq!(
         copied.read_value(&[0, 0]).await.expect("read"),
         1.0f32.exp().ln()
@@ -291,13 +297,16 @@ async fn transformed_sparse_unary_view_copies() {
         .exp()
         .await
         .expect("exp should succeed lazily");
+
     let result = Tensor::copy_from(out_dir, &chain, chain.layout(), 2)
         .await
         .expect("copy transformed sparse");
+
     assert_eq!(
         result.read_value(&[0, 1, 2]).await.expect("populated"),
         1.6f32.exp()
     );
+
     assert_eq!(
         result
             .read_value(&[0, 0, 0])
@@ -358,6 +367,7 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
         (0..10).map(|i| i as f64 / 4.),
     )
     .await;
+
     let expression: UnaryView<UnaryView<TensorView<fensor::Tensor<FsEntry, f64>>, Round>, Exp> =
         tensor
             .view()
@@ -369,6 +379,7 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
             .exp()
             .await
             .unwrap();
+
     assert!(!expression.is_base_tensor());
     assert!(!expression.supports_write_through());
     let (first, second): (Vec<Vec<f64>>, Vec<Vec<f64>>) = futures::try_join!(
@@ -376,6 +387,7 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
         expression.read_blocks().unwrap().try_collect(),
     )
     .unwrap();
+
     assert_eq!(first, second);
     assert_eq!(first.iter().map(Vec::len).collect::<Vec<_>>(), vec![10]);
     let values: Vec<_> = first.into_iter().flatten().collect();
@@ -383,12 +395,14 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
     let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
         .await
         .unwrap();
+
     for (i, coord) in iter_coords(&[5, 2]).enumerate() {
         let expected = (((coord[1] * 5 + coord[0]) as f64 / 4.0).round()).exp();
         assert_eq!(values[i], expected);
         assert_eq!(expression.read_value(&coord).await.unwrap(), expected);
         assert_eq!(output.read_value(&coord).await.unwrap(), expected);
     }
+
     assert_eq!(tensor.read_value(&[0, 0]).await.unwrap(), 0.0);
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
@@ -403,6 +417,7 @@ async fn sparse_chain_keeps_intermediate_zeros_through_transforms() {
         Some(1),
     )
     .await;
+
     tensor.write_value(&[1, 2], -0.2).await.unwrap();
     let expression = tensor
         .view()
@@ -414,6 +429,7 @@ async fn sparse_chain_keeps_intermediate_zeros_through_transforms() {
         .unwrap()
         .transpose(Some(axes![1, 0]))
         .unwrap();
+
     assert_eq!(expression.read_value(&[2, 1]).await.unwrap(), 0.0);
     assert_eq!(expression.read_value(&[0, 0]).await.unwrap(), 0.0);
     let rows: Vec<_> = expression
@@ -426,17 +442,20 @@ async fn sparse_chain_keeps_intermediate_zeros_through_transforms() {
         .try_collect()
         .await
         .unwrap();
+
     assert!(rows.is_empty());
     let (out_root, out_dir) = new_dir("sparse_chain_support_out").await;
     let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
         .await
         .unwrap();
+
     for coord in iter_coords(&[3, 2]) {
         assert_eq!(
             output.read_value(&coord).await.unwrap(),
             expression.read_value(&coord).await.unwrap()
         );
     }
+
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
 }
@@ -452,6 +471,7 @@ async fn stream_is_demand_driven_and_errors_on_corrupt_tail() {
     )
     .await
     .unwrap();
+
     let expression = tensor.view().exp().await.unwrap();
     let mut stream = expression.read_blocks().unwrap();
     // Constructing the stream must not read or retain the data it will consume.
@@ -485,12 +505,14 @@ async fn copying_spills_beyond_cache_budget_and_reloads() {
         )
         .await
         .unwrap();
+
         // A zero-filled tensor larger than cache capacity must spill during creation.
         let mut files = tokio::fs::read_dir(root.join("blocks")).await.unwrap();
         let mut count = 0;
         while files.next_entry().await.unwrap().is_some() {
             count += 1;
         }
+
         assert!(count > 1, "blocks must spill before explicit sync");
         tensor.write_value(&[1023], 2.0).await.unwrap();
         tensor.sync().await.unwrap();
@@ -504,6 +526,7 @@ async fn copying_spills_beyond_cache_budget_and_reloads() {
         let (out_root, _) = new_dir("unary_small_cache_out").await;
         let out_cache =
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
+
         let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
         let expression = tensor.view().exp().await.unwrap();
         let output = Tensor::copy_from(out_dir.clone(), &expression, expression.layout(), 16)
@@ -517,6 +540,7 @@ async fn copying_spills_beyond_cache_budget_and_reloads() {
         let reloaded = Tensor::<FsEntry, f32>::load(common::open_dir(&out_root).unwrap())
             .await
             .unwrap();
+
         assert_eq!(reloaded.read_value(&[0]).await.unwrap(), 1.0);
         assert_eq!(reloaded.read_value(&[1023]).await.unwrap(), 2.0f32.exp());
         common::cleanup(&root).await;
@@ -538,9 +562,11 @@ async fn block_larger_than_cache_is_a_recoverable_error() {
         1024,
     )
     .await;
+
     assert!(
         matches!(result, Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::OutOfMemory)
     );
+
     common::cleanup(&root).await;
 }
 
@@ -554,11 +580,13 @@ async fn large_sparse_shape_constructs_streams_without_expanding_axes() {
         None,
     )
     .await;
+
     let expression = tensor.view().round().await.unwrap();
     let sparse = expression
         .read_sparse_elements_in_order(range![AxisRange::In(0, length, 1)], axes![0])
         .await
         .unwrap();
+
     drop(sparse);
     let mut blocks = expression.read_blocks().unwrap();
     assert_eq!(blocks.try_next().await.unwrap().unwrap(), vec![0.0; 4096]);
@@ -574,6 +602,7 @@ async fn scalar_view_streaming_is_explicitly_unsupported() {
         TensorSchema::new(NumberType::Float(FloatType::F32), shape![2]).unwrap(),
     )
     .await;
+
     let scalar = tensor
         .view()
         .exp()
@@ -581,6 +610,7 @@ async fn scalar_view_streaming_is_explicitly_unsupported() {
         .unwrap()
         .slice(range![AxisRange::At(1)])
         .unwrap();
+
     assert!(matches!(scalar.read_blocks(), Err(Error::InvalidSchema(_))));
     common::cleanup(&root).await;
 }
@@ -600,6 +630,7 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
             (0..6).map(|i| i as f32 + 0.25),
         )
         .await;
+
         let expression = TensorExpression::new(tensor.view())
             .unwrap()
             .into_dense()
@@ -638,18 +669,21 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
             .ln()
             .await
             .unwrap();
+
         let blocks: Vec<Vec<f32>> = expression
             .read_blocks()
             .unwrap()
             .try_collect()
             .await
             .unwrap();
+
         let values: Vec<_> = blocks.into_iter().flatten().collect();
         assert_eq!(values.len(), 6);
         let (out_root, out_dir) = new_dir(&format!("{name}_out")).await;
         let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
             .await
             .unwrap();
+
         if matches!(layout, Layout::Sparse { .. }) {
             let rows: Vec<_> = expression
                 .read_coordinate_blocks()
@@ -663,6 +697,7 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(
                 rows,
                 iter_coords(&[3, 2])
@@ -670,6 +705,7 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
                     .collect::<Vec<_>>()
             );
         }
+
         for (i, coord) in iter_coords(&[3, 2]).enumerate() {
             // Row 1 of the original tensor, reversed along its final axis;
             // the two output columns both select the broadcast singleton.
@@ -678,6 +714,7 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
             assert_eq!(expression.read_value(&coord).await.unwrap(), expected);
             assert_eq!(output.read_value(&coord).await.unwrap(), expected);
         }
+
         common::cleanup(&root).await;
         common::cleanup(&out_root).await;
     }
@@ -694,9 +731,11 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             None,
         )
         .await;
+
         for offset in [1, 3, 5] {
             tensor.write_value(&[(length - offset)], 1.2).await.unwrap();
         }
+
         let view = tensor.view();
         let unary = view.round().await.unwrap().sin().await.unwrap();
         let selection = range![AxisRange::Of(vec![
@@ -705,6 +744,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             length - 1,
             length - 3
         ])];
+
         let expected_coords = vec![vec![(length - 5)], vec![(length - 3)], vec![(length - 1)]];
 
         async fn check(
@@ -720,12 +760,14 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(
                 rows.iter()
                     .map(|(coord, _)| coord.clone())
                     .collect::<Vec<_>>(),
                 expected_coords
             );
+
             let stepped: Vec<_> = reader
                 .read_sparse_elements_in_order(
                     range![AxisRange::In(length - 5, length, 2)],
@@ -736,6 +778,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(rows, stepped);
             let empty: Vec<_> = reader
                 .read_sparse_elements_in_order(range![AxisRange::In(length, length, 1)], axes![0])
@@ -744,6 +787,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert!(empty.is_empty());
             assert!(
                 reader
@@ -751,6 +795,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
                     .await
                     .is_err()
             );
+
             assert!(matches!(
                 reader
                     .read_sparse_elements_in_order(selection.clone(), axes![1])
@@ -758,6 +803,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
                 Err(Error::UnsupportedSparseIterationOrder { .. })
             ));
         }
+
         check(&tensor, length, selection.clone(), &expected_coords).await;
         check(&view, length, selection.clone(), &expected_coords).await;
         check(&unary, length, selection.clone(), &expected_coords).await;
@@ -768,6 +814,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             .try_collect()
             .await
             .unwrap();
+
         assert!(rows.iter().all(|(_, value)| *value == 1.0f32.sin()));
         common::cleanup(&root).await;
     })
@@ -786,32 +833,38 @@ async fn sparse_unary_batches_filter_zeros_and_preserve_independent_consumption(
         (0..4100).map(|i| if i % 2 == 0 { 0.2f32 } else { 1.2 }),
     )
     .await;
+
     let expression = tensor.view().abs().await.unwrap();
     let range = range![AxisRange::At(0), AxisRange::In(0, 4100, 1)];
     let mut dropped = expression
         .read_sparse_elements_in_order(range.clone(), axes![0, 1])
         .await
         .unwrap();
+
     assert_eq!(dropped.try_next().await.unwrap(), Some((vec![0, 0], 0.2)));
     drop(dropped);
     let first = expression
         .read_sparse_elements_in_order(range.clone(), axes![0, 1])
         .await
         .unwrap();
+
     let second = expression
         .read_sparse_elements_in_order(range.clone(), axes![0, 1])
         .await
         .unwrap();
+
     let (first, second) = futures::try_join!(
         first.try_collect::<Vec<_>>(),
         second.try_collect::<Vec<_>>()
     )
     .unwrap();
+
     assert_eq!(first, second);
     assert_eq!(first.len(), 4100);
     for (coord, value) in &first {
         assert_eq!(*value, expression.read_value(coord).await.unwrap());
     }
+
     let final_zeros = expression.round().await.unwrap();
     let rows: Vec<_> = final_zeros
         .read_sparse_elements_in_order(range, axes![0, 1])
@@ -820,11 +873,13 @@ async fn sparse_unary_batches_filter_zeros_and_preserve_independent_consumption(
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(rows.len(), 2050);
     assert!(
         rows.iter()
             .all(|(coord, value)| coord[1] % 2 == 1 && *value != 0.0)
     );
+
     common::cleanup(&root).await;
 }
 
@@ -839,6 +894,7 @@ async fn dense_scalar_write_rejects_malformed_existing_block() {
     )
     .await
     .unwrap();
+
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     let file = blocks.read().await.get_file("0").unwrap().clone();
     file.write::<Vec<f32>>().await.unwrap().truncate(1);
@@ -846,6 +902,7 @@ async fn dense_scalar_write_rejects_malformed_existing_block() {
         tensor.write_value(&[0], 2.0).await,
         Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
     ));
+
     assert_eq!(*file.read::<Vec<f32>>().await.unwrap(), vec![0.0]);
     common::cleanup(&root).await;
 }
