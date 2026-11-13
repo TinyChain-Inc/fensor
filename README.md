@@ -34,8 +34,8 @@ Nested expressions can recompute values, and source reads/cache spill can do I/O
 creates independent filesystem storage with caller-selected packing. Supported
 operations compose without copying; unsupported sparse traversal can be made
 explicit through `Tensor::copy_from_values`. The destination adapter can differ from the
-source adapter and must support the output dtype. `max_capacity` limits block
-capacity; it does not select an exact block shape. Sparse copying accepts a new
+source adapter and must support the output dtype. `max_capacity` bounds the
+values per chunk; each region can end with a shorter chunk. Sparse copying accepts a new
 sparse axis and omits final numerical zeros. A reader's reported layout describes
 its values and supplies a hint; it does not choose destination allocation.
 Dense/sparse kind mismatches return a structured error. Use `into_dense()` before
@@ -294,7 +294,7 @@ Filesystem adapters implement `freqfs::FileLoad`/`FileSave` and expose `Vec<T>`,
 destream but prescribes no byte codec or whole-tensor transfer format. JSON and
 TBON adapters are exercised in tests; applications own their format choices.
 
-Metadata encodes shape, layout, sparse axis, and block shape. The adapter must preserve the Rust payload type
+Metadata encodes shape, layout, sparse axis, and block capacity. The adapter must preserve the Rust payload type
 across reloads, for example with distinct tagged block/metadata variants per dtype.
 Decoding untagged metadata as whichever dtype was requested violates this contract.
 The [native storage contract](DESIGN.md#native-storage-and-sources) defines these native structures.
@@ -340,7 +340,7 @@ and interpretation](BENCHMARKS.md).
 
 `TensorSource` connects typed native or caller-provided logical blocks to the
 same geometric views and expression evaluator. `StorageGeometry` describes bounded
-logical tiles, and occupied-block streams use logical grid IDs. Views own their
+linear chunks, and occupied-block streams use canonical block IDs. Views own their
 source handles; `TensorExpression<T>` owns dynamically composed read-only values.
 Borrowed reads and owned consuming streams share one bounded evaluator. Runtime
 expression descriptions and evaluation frames have checked limits; each numerical
@@ -376,3 +376,12 @@ streams with an input error convertible from `fensor::Error`. They require empty
 delegated storage and publish metadata only after successful construction; callers
 own cleanup after errors or cancellation. Published replacement requires existing,
 valid dense files and never creates or repairs missing payloads.
+
+## Native storage migration
+
+Native block metadata now stores capacity instead of a rectangular tile shape.
+Old native stores are rejected and must be recreated; no automatic migration or
+compatibility reader is provided. Tensor wire values and semantic hashes are
+unchanged. `StorageGeometry::new` takes a capacity, `block_len(id)` returns an
+exact length, and `block_range(id)` returns a flat row-major range. Arbitrary tile
+shapes, padded blocks, and valid-offset iterators are no longer supported.

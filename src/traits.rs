@@ -88,6 +88,7 @@ pub trait TensorRead: TensorGeometry {
                             "reader returned fewer values than its shape".into(),
                         ));
                     }
+
                     return Ok(None);
                 };
 
@@ -132,9 +133,11 @@ pub trait TensorRead: TensorGeometry {
                             elements.push((coord, value));
                         }
                     }
+
                     Ok::<_, Error>(futures::stream::iter(elements.into_iter().map(Ok)))
                 })
                 .try_flatten();
+
             Ok(elements.boxed())
         })
     }
@@ -779,6 +782,7 @@ fn coordinate_batches(
             .by_ref()
             .take(crate::expression::MAX_BATCH_ELEMENTS)
             .collect();
+
         (!batch.is_empty()).then_some(batch)
     })
 }
@@ -805,9 +809,10 @@ pub(crate) fn sparse_slice<V: TensorGeometry + ?Sized>(
         .map(|(axis, len)| match axis {
             crate::AxisRange::At(at) => crate::request::Axis::range(at, 1),
             crate::AxisRange::In(start, _, step) => crate::request::Axis::Span { start, step, len },
-            crate::AxisRange::Of(values) => crate::request::Axis::Selected(values),
+            crate::AxisRange::Of(values) => crate::request::Axis::selected(values),
         })
         .collect();
+
     crate::slice::Slice::new(tensor.shape(), axes)
 }
 

@@ -1,6 +1,7 @@
 mod construction;
 mod dense_storage;
 mod sparse_storage;
+pub use sparse_storage::SparseBlocks;
 
 #[cfg(test)]
 #[path = "../tests/unit/tensor/physical_tests.rs"]
@@ -89,11 +90,11 @@ where
 #[allow(clippy::large_enum_variant)]
 enum Storage<FE, T> {
     Dense(DenseStorage<FE>),
-    Sparse(sparse_storage::SparseStorage<FE, T>),
+    Sparse(sparse_storage::SparseBlocks<FE, T>),
 }
 
 impl<FE, T> Storage<FE, T> {
-    fn sparse(&self) -> Option<&sparse_storage::SparseStorage<FE, T>> {
+    fn sparse(&self) -> Option<&sparse_storage::SparseBlocks<FE, T>> {
         match self {
             Self::Sparse(s) => Some(s),
             Self::Dense(_) => None,
@@ -169,6 +170,7 @@ where
                 "max block capacity must be non-zero and at most {MAX_BLOCK_CAPACITY}, got {max_capacity}"
             )));
         }
+
         validate_tensor_dtype::<T>(schema.dtype())?;
         let storage = StorageSchema::new(schema.shape().as_slice(), layout, max_capacity)?;
         Self::unpublished_with_geometry(dir, crate::StorageGeometry { schema, storage }).await
@@ -197,6 +199,7 @@ where
                     "tensor creation requires empty storage".into(),
                 ));
             }
+
             guard.create_dir(BLOCKS.to_string())?
         };
 
@@ -204,7 +207,7 @@ where
         let storage = match geometry.layout() {
             Layout::Dense => Storage::Dense(DenseStorage::new(blocks, geometry)),
             Layout::Sparse { .. } => Storage::Sparse(
-                sparse_storage::SparseStorage::create(&dir, blocks, geometry).await?,
+                sparse_storage::SparseBlocks::create_canonical(&dir, blocks, geometry).await?,
             ),
         };
 
@@ -246,6 +249,7 @@ where
                 if received + batch.len() as u64 >= expected {
                     return Err(Error::InvalidLayout("too many Tensor values".into()).into());
                 }
+
                 batch.push(value);
             }
 
@@ -316,6 +320,7 @@ where
     {
         let schema =
             TensorSchema::new(<T as number_general::DType>::dtype(), source.shape().into())?;
+
         if matches!(source.layout(), Layout::Dense) != matches!(destination_layout, Layout::Dense) {
             return Err(Error::Unsupported(
                 "copy requires matching dense/sparse kinds; convert the source explicitly first"
@@ -331,6 +336,7 @@ where
                     (0..source.ndim()).collect(),
                 )
                 .await?;
+
             return construction::sparse(output, entries).await;
         }
 
@@ -349,12 +355,14 @@ where
                     values.len()
                 )));
             }
+
             received = received
                 .checked_add(values.len() as u64)
                 .filter(|n| *n <= expected)
                 .ok_or_else(|| {
                     Error::InvalidLayout("reader returned more values than its shape".into())
                 })?;
+
             output
                 .stage(BatchRequest::explicit(coords)?, values)
                 .await?;
@@ -391,6 +399,7 @@ where
     {
         let schema =
             TensorSchema::new(<T as number_general::DType>::dtype(), source.shape().into())?;
+
         if matches!(source.layout(), Layout::Dense) != matches!(destination_layout, Layout::Dense) {
             return Err(Error::Unsupported(
                 "copy requires matching dense/sparse kinds; convert the source explicitly first"
@@ -421,12 +430,14 @@ where
                         values.len()
                     )));
                 }
+
                 let end = received
                     .checked_add(values.len() as u64)
                     .filter(|n| *n <= expected)
                     .ok_or_else(|| {
                         Error::InvalidLayout("reader returned more values than its shape".into())
                     })?;
+
                 Ok(Some(((received, values), (blocks, end))))
             },
         )
@@ -448,11 +459,13 @@ where
                                     shape,
                                     &mut coord,
                                 )?;
+
                                 Ok((coord.to_vec(), value))
                             }),
                     )
                 })
                 .try_flatten();
+
             return construction::sparse(output, entries).await;
         }
 
@@ -476,6 +489,7 @@ where
             .get_dir(BLOCKS)
             .cloned()
             .ok_or_else(|| Error::InvalidSchema("tensor missing blocks directory".into()))?;
+
         let geometry = load_metadata_file::<FE, T>(&blocks).await?;
         validate_tensor_dtype::<T>(geometry.schema.dtype())?;
         let schema = geometry.schema.clone();
@@ -486,10 +500,11 @@ where
                         "dense tensor contains a sparse index".into(),
                     ));
                 }
+
                 Storage::Dense(DenseStorage::new(blocks, geometry))
             }
             Layout::Sparse { .. } => {
-                Storage::Sparse(sparse_storage::SparseStorage::load(&dir, blocks, geometry)?)
+                Storage::Sparse(sparse_storage::SparseBlocks::load(&dir, blocks, geometry)?)
             }
         };
 
@@ -498,6 +513,7 @@ where
             storage: Arc::new(storage),
             schema,
         };
+
         tensor.validate().await?;
         Ok(tensor)
     }
@@ -533,33 +549,13 @@ where
     }
 
     pub(crate) fn block_position_from_base_coord(&self, base_coord: &[u64]) -> BlockPosition {
-        crate::storage_read::block_position(
-            base_coord.iter().copied(),
-            self.block_shape(),
-            self.block_strides(),
-            self.grid_strides(),
-        )
-    }
+        let flat = base_coord
+            .iter()
+            .zip(self.schema.strides())
+            .map(|(&c, &s)| c * s)
+            .sum();
 
-    pub(crate) fn block_shape(&self) -> &[u64] {
-        &self.storage.storage_schema().block_schema.shape
-    }
-
-    pub(crate) fn block_strides(&self) -> &[u64] {
-        &self.storage.storage_schema().block_schema.strides
-    }
-
-    pub(crate) fn grid_strides(&self) -> &[u64] {
-        &self.storage.storage_schema().strides
-    }
-
-    pub(crate) fn block_len(&self) -> usize {
-        self.block_shape().iter().product::<u64>() as usize
-    }
-
-    // One validated storage block, independent of tensor size.
-    fn default_block(&self) -> Vec<T> {
-        vec![T::default(); self.block_len()]
+        self.storage.storage_schema().blocks.position(flat)
     }
 
     async fn initialize_dense_blocks(&self) -> Result<()> {
@@ -578,6 +574,7 @@ where
 
         #[cfg(test)]
         copy_metrics::record(|m| m.block_updates += 1);
+
         Ok(())
     }
 
@@ -586,8 +583,9 @@ where
         let metadata = TensorMetadata::<T>::new(
             self.schema.shape().clone(),
             self.layout(),
-            self.storage.storage_schema().block_schema.shape.clone(),
+            self.storage.storage_schema().blocks.capacity,
         )?;
+
         match self.storage.as_ref() {
             Storage::Dense(dense) => dense.publish_metadata(metadata).await,
             Storage::Sparse(sparse) => sparse.publish_metadata(metadata).await,
@@ -607,27 +605,6 @@ where
         C: FnMut(u64, &[T]) -> Result<()> + Send + 'a,
     {
         Box::pin(async move {
-            if ids.len() > crate::expression::MAX_BATCH_ELEMENTS {
-                return Err(Error::InvalidLayout(
-                    "too many logical blocks in read batch".into(),
-                ));
-            }
-            if ids.is_empty() {
-                return Ok(());
-            }
-
-            let count = self.storage.storage_schema().shape.iter().product::<u64>();
-            for (index, &id) in ids.iter().enumerate() {
-                if id >= count {
-                    return Err(Error::InvalidCoord("logical block out of bounds".into()));
-                }
-                if index != 0 && ids[index - 1] >= id {
-                    return Err(Error::InvalidCoord(
-                        "logical block IDs must be sorted and unique".into(),
-                    ));
-                }
-            }
-
             match self.storage.as_ref() {
                 Storage::Dense(dense) => dense.visit_blocks(ids, &mut consume).await,
                 Storage::Sparse(sparse) => sparse.visit_blocks(ids, &mut consume).await,
@@ -727,6 +704,7 @@ where
                 block_id,
                 offset_in_block,
             } = self.block_position_from_base_coord(coord);
+
             self.write_block_updates(block_id, &[(offset_in_block, value)])
                 .await
         })
@@ -772,6 +750,7 @@ where
                     .by_ref()
                     .take(crate::expression::MAX_BATCH_ELEMENTS)
                     .collect();
+
                 if batch.is_empty() {
                     break;
                 }
@@ -781,6 +760,7 @@ where
                 for (id, updates) in view.plan_updates(&geometry, start, batch)? {
                     self.write_block_updates(id, &updates).await?;
                 }
+
                 start += len;
             }
 
@@ -796,11 +776,7 @@ where
             for id in 0..geometry.block_count() {
                 // Validate the selected stored block before overwriting it, as scalar writes do.
                 let mut values = self.read_logical_block(id).await?;
-                values.fill(T::ZERO);
-
-                for offset in geometry.block_offsets(id)? {
-                    values[offset] = value;
-                }
+                values.fill(value);
 
                 self.replace_logical_block(id, values).await?;
             }
@@ -850,6 +826,7 @@ async fn create_metadata_file<FE: TensorFileEntry<T>, T: TensorElement>(
         .await
         .create_file(METADATA.to_string(), metadata)
         .await?;
+
     Ok(())
 }
 
@@ -864,6 +841,7 @@ where
         .get_file(METADATA)
         .cloned()
         .ok_or_else(|| Error::InvalidSchema("missing tensor metadata file".into()))?;
+
     let (schema, storage) = file.read::<TensorMetadata<T>>().await?.schemas()?;
     Ok(crate::StorageGeometry { schema, storage })
 }
@@ -924,6 +902,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
                 .ok_or_else(|| Error::InvalidLayout("dense storage has no occupancy".into()))?
                 .occupied_page(range.clone())
                 .await?;
+
             let Some(&last) = keys.last() else {
                 return Ok::<_, Error>(None);
             };
@@ -949,7 +928,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
 
 impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
     /// Replace one complete logical block. Callers exclude related native writes.
-    /// Sparse replacement serializes payload and index changes under one native table write guard.
+    /// Sparse replacement serializes payload changes under one native BTree write guard.
     /// After failed or cancelled mutation, callers must discard all handles to the
     /// affected storage and coordinate recovery before reuse.
     /// Failure may leave partial changes; this method supplies no transaction policy.
@@ -961,6 +940,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
 
         #[cfg(test)]
         copy_metrics::record(|m| m.block_updates += 1);
+
         Ok(())
     }
 }

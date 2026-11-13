@@ -21,7 +21,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Matrix, diagonal, and Fourier sparse consumer delegation | `sparse_consumers`: transformed outputs, cross-batch selections, zeros, nonfinite values, empty sparse storage |
 | Sparse output order, duplicates, final zeros, NaN and lengths | Expression unit `sparse_output_*` |
 | Request/affine/irregular planning bounds and block grouping | Request, storage-read, matrix and tensor unit cases; mapping compact-run/reference parity and view owned-consumption counters |
-| Valid block offset order, shared payload validation, edge padding, high-rank scratch reuse | Storage geometry traversal tests; sparse replacement lock/validation precedence fixture; collection canonical-delta padding fixture |
+| Compact block ranges, exact payload lengths, region tails, high-rank scratch reuse | Storage geometry traversal tests; sparse replacement lock/validation precedence fixture; Collection stored-length and materialization-handoff fixtures |
 | Ordinary implicit zeros, dense-equivalent statistics, explicit dense conversion and bounded groups | `dense_sparse_rows`; `sparse_semantics`; reduction zero-gap integration/unit cases |
 | Expression zero signs during indexed gap aggregation | Reduction unit `zero_gap_products_preserve_expression_signed_zeros` |
 | Corruption, boolean decision boundaries, cache pressure, cancellation and live reads | Native `tensor::physical_tests` and `tensor::dtype_storage`; dedicated copy cases |
@@ -33,7 +33,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Tiled propagation, reduction boundaries and transformed current-shape coverage | Matrix `coordinate_traversal_propagates_and_preserves_coverage` |
 | Full-shape linear batches and invalid shapes | Request unit `linear_batches_preserve_boundaries_and_validate_shape`; reduction tests retain boolean error boundaries |
 | Request-to-update parity, affine allocation bounds, owned source consumption and release | View unit `update_planning_matches_coordinates_without_affine_expansion`, `update_stream_evaluates_once_and_owns_its_source` |
-| Bulk block publication counts, edge padding, duplicate writes, NaN, and missing-block mutation rejection | `tensor::physical_tests::bulk_mutation` |
+| Bulk block publication counts, compact tails, duplicate writes, NaN, and missing-block mutation rejection | `tensor::physical_tests::bulk_mutation` |
 | Sequential copy backpressure, drop/error cancellation | `copy_pipeline` with a held filesystem block guard |
 | Sequential batch backpressure and ordered delivery | Expression unit `sequential_batches_are_ordered_and_cancelled_by_drop` for borrowed and owned handles |
 | Request pairing, backpressure, independent consumers and cancellation | Expression unit `sequential_consumption_preserves_pairs_and_backpressure` |
@@ -62,7 +62,7 @@ checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
 ## Concrete dtype coverage
 
 - The `tensor::sparse_lifecycle_tests` module in the Tensor test directory owns same-key zero writes, persisted block geometry,
-  edge padding, shared pages, interrupted publication, and capacity/axis
+  compact region tails, shared pages, interrupted publication, and capacity/axis
   allocation. `tensor::dtype_storage` checks geometric and bulk zero writes for every
   supported dtype. Existing storage/planner tests retain logical block grouping coverage
   with explicitly persisted layouts.
@@ -134,7 +134,7 @@ bounded requests and execution with the structural suites listed above.
 |---|---|
 | Absent-zero, insertion, replacement, deletion, reinsertion, block presence and stable logical addressing | `sparse_point_mutation_lifecycle`; shared-page, edge and interrupted-publication fixtures remain separate |
 | Every dtype/layout, borrowed non-Unpin input, schema/type checks, write-through, original mutation/reopen, transformed copy/reopen and malformed payloads | `tensor::dtype_storage`; full block comparisons, exhaustive sparse point/entry checks, dense point probes at special values, every block boundary and the modified final element |
-| Dense trailing regions, scalar sparsity, omitted zero blocks, edge padding, exact nonfinite bits, capacity-independent values and reopening | `dense_sparse_rows` parameterized cases |
+| Dense trailing regions, scalar sparsity, omitted zero blocks, compact tails, exact nonfinite bits, capacity-independent values and reopening | `dense_sparse_rows` parameterized cases |
 | Lazy dense conversion, unchanged operand clones, transformed layout and implicit zeros across batch boundaries | `dense_sparse_rows::lazy_dense_conversion_includes_implicit_zeros_across_batches` and companion geometry case |
 | Copy batch boundaries, explicit destination layout, pre-consumption rejection, independent geometry and exceptional values | `tensor_copy`; collection copy policy fixture retains axis hints; specialized errors and cancellation remain separate |
 | Typed source errors, cardinality, coordinate bounds/order/duplicates, cancellation, incomplete metadata and strict rejection | `tensor::construction::tests`; interrupted staging, publication and completion release guards |
@@ -194,9 +194,10 @@ Existing unit-test module names and targeted test commands are unchanged; see [t
 
 `unit/schema/tests.rs` owns the named valid/invalid cases in
 `contiguous_strides_valid_shapes`, `contiguous_strides_reject_invalid_shapes`,
-`greedy_block_shape_valid_capacities`, and `greedy_block_shape_reject_invalid_inputs`.
+`compact_linear_blocks_cover_regions_and_progressions`, and
+`compact_flat_rectangles_preserve_exact_coverage`.
 They cover rank, singleton dimensions, edge capacities, empty/zero dimensions,
-and overflow, retaining exact shape/stride and `InvalidSchema` assertions.
+and overflow, retaining exact range/stride and structured-error assertions.
 
 Sparse owner locking is covered by
 `tensor::sparse_storage::validation_tests::index_guards_preserve_batch_reads_and_partial_updates`:
@@ -215,9 +216,8 @@ and use the `storage` selector.
 batching. Malformed mapping and dense-file fixtures live in their owners' test
 support without adding production visibility.
 
-Read validation in `unit/storage/traversal_tests.rs` checks allocation-free full
-blocks, reuse of computed bounds during edge-padding validation, validation
-precedence, and `u64` boundary geometry. Storage and sparse consumer fixtures
+Read validation in `unit/storage/traversal_tests.rs` checks exact block lengths,
+region tails, validation precedence, and `u64` boundary geometry. Storage and sparse consumer fixtures
 cover invalid IDs, corruption, ordering, and absent rows.
 
 Sequential-consumer fixtures check one active request, borrowed/owned cancellation,
@@ -241,3 +241,48 @@ assertions. Constrained-cache behavior is owned by the dense-reader capacity fix
 
 Complex exceptional-value and Fourier parity fixtures use adequate source-read
 capacity for both layouts; all existing numerical and copy assertions remain.
+
+## Compact-block assertion migration
+
+`compact_linear_blocks_cover_regions_and_progressions` replaces the tile-only
+`greedy_block_shape_valid_capacities`, `greedy_block_shape_reject_invalid_inputs`,
+`block_schema_new_covers_whole_tensor`, and
+`storage_schema_from_block_shape_matches_new` fixtures. It checks independent
+per-region chunking, address inversion, and signed progressions;
+`compact_flat_rectangles_preserve_exact_coverage` checks the traversal bridge.
+Arbitrary rectangular tile selection is intentionally removed.
+
+Existing corruption and bulk-write fixture names are retained. Their former
+padding assertions now check exact per-ID lengths and compact tails. Valid
+nonfinite values remain supported; extra or missing stored elements are corruption.
+Metadata fixtures reject the former shape field rather than interpreting it as a
+capacity. Borrowed-read counters check that decomposing a chunk into rectangles
+still visits each native payload once per bounded request.
+
+## Prepared selection and visit boundaries
+
+`slice::tests::validation_and_huge_bounded_prefix` compares explicit clipping with
+an independent linear oracle and bounds comparison work for repeated narrow clips
+of a prepared sorted selection. `ordered_coverage_and_permanent_exhaustion`
+retains ordering, duplicate, exhaustion, and moved-vector observations.
+
+`replacement_validation_preserves_lock_precedence` and
+`buffered_reads_preserve_order_and_release_guards` cover invalid and empty block
+selections through both native owners and Tensor dispatch while native guards
+are held. Invalid suffixes invoke no callbacks. Sparse callback errors remain
+unmarked; the existing corruption and borrowed-read fixtures retain native-error
+classification and release coverage. The rectangle oracle now borrows a validated
+schema while retaining independently enumerated coverage expectations.
+
+## Filtered candidates and constructor ordering
+
+`preferred_regions_skip_gaps_and_include_sparse_zeros` includes an always-ready
+candidate source: filtered runs must yield and wake before exhaustion, retain
+partial request coverage when resumed, preserve source errors, and release the
+source after completion, cancellation, or unpolled drop. It requires no payload
+reads or source-holder clones.
+
+`invalid_or_interrupted_inputs_withhold_metadata` covers duplicate and descending
+coordinates across construction-batch boundaries, including zero values and
+input errors. `sparse_stream_uses_bounded_single_pass_construction` retains
+successful single-pass coverage and adds an exact-batch completion control.

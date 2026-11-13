@@ -72,7 +72,12 @@ async fn sparse_axis_selects_dense_suffix_and_scalar_payloads() {
         )
         .await
         .unwrap();
-        assert_eq!(tensor.storage_geometry().block_shape(), block);
+
+        assert_eq!(
+            tensor.storage_geometry().block_capacity(),
+            block.iter().product::<u64>() as usize
+        );
+
         tensor.write_value(&[1, 2, 4], 7.).await.unwrap();
         tensor.sync().await.unwrap();
         drop(tensor);
@@ -80,7 +85,12 @@ async fn sparse_axis_selects_dense_suffix_and_scalar_payloads() {
         let tensor = Tensor::<FsEntry, f64>::load(open_dir(&root).unwrap())
             .await
             .unwrap();
-        assert_eq!(tensor.storage_geometry().block_shape(), block);
+
+        assert_eq!(
+            tensor.storage_geometry().block_capacity(),
+            block.iter().product::<u64>() as usize
+        );
+
         assert_eq!(tensor.read_value(&[1, 2, 4]).await.unwrap(), 7.);
         assert_eq!(tensor.read_value(&[0, 0, 0]).await.unwrap(), 0.);
     }
@@ -97,11 +107,13 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
     )
     .await
     .unwrap();
-    assert_eq!(tensor.storage_geometry().block_shape(), [1, 4]);
+
+    assert_eq!(tensor.storage_geometry().block_capacity(), 4);
     tensor
         .replace_logical_block(0, vec![0., 2., 0., -0.])
         .await
         .unwrap();
+
     assert_eq!(
         tensor
             .occupied_blocks(0..tensor.storage_geometry().block_count())
@@ -122,16 +134,19 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
                 .is_none()
         );
     }
+
     for range in [count..0, 0..count + 1] {
         assert!(tensor.occupied_blocks(range).try_next().await.is_err());
     }
-    assert_eq!(tensor.read_logical_block(1).await.unwrap(), vec![0.; 4]);
+
+    assert_eq!(tensor.read_logical_block(1).await.unwrap(), vec![0.; 1]);
 
     let native = TensorExpression::new(tensor.clone()).unwrap();
     assert!(matches!(
         native.exp().await,
         Err(fensor::Error::WouldDensify { operation: "exp" })
     ));
+
     let dense = native.clone().into_dense();
     assert_eq!(dense.layout(), Layout::Dense);
     assert_eq!(native.layout(), Layout::Sparse { axis: Some(0) });
@@ -141,6 +156,7 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
         transposed.transpose(None).unwrap().layout(),
         Layout::Sparse { axis: Some(0) }
     );
+
     let expected = [1., 2.0_f64.exp(), 1., 1., 1., 1., 1., 1., 1., 1.];
     fixture::reads(&dense.exp().await.unwrap(), &expected, |a, b| a == b).await;
     let view = TensorView::new(Source(tensor.clone()));
@@ -148,6 +164,7 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
         view.exp().await,
         Err(fensor::Error::WouldDensify { operation: "exp" })
     ));
+
     let expected = [0., 2.0_f64.sin(), 0., 0., 0., 0., 0., 0., 0., 0.];
     fixture::reads(&native.sin().await.unwrap(), &expected, |a, b| a == b).await;
     fixture::reads(&view.sin().await.unwrap(), &expected, |a, b| a == b).await;
@@ -156,6 +173,7 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
         view.mean_all().await.unwrap(),
         dense.mean_all().await.unwrap()
     );
+
     drop(view);
     drop(native);
     drop(dense);
@@ -169,6 +187,7 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
             .unwrap()
             .is_none()
     );
+
     fixture::blocks(&tensor.view().sin().await.unwrap(), &[0.; 10], |a, b| {
         a == b
     })
@@ -179,16 +198,11 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
         .replace_logical_block(0, vec![0., nan, f64::INFINITY, f64::NEG_INFINITY])
         .await
         .unwrap();
-    tensor
-        .replace_logical_block(1, vec![3., 0., 0., 0.])
-        .await
-        .unwrap();
-    assert!(
-        tensor
-            .replace_logical_block(1, vec![3., 0., 9., 0.])
-            .await
-            .is_err()
-    );
+
+    tensor.replace_logical_block(1, vec![3.]).await.unwrap();
+
+    assert!(tensor.replace_logical_block(1, vec![3., 9.]).await.is_err());
+
     assert_eq!(tensor.read_value(&[0, 4]).await.unwrap(), 3.);
     let mut detached = tensor.read_logical_block(0).await.unwrap();
     detached[1] = 9.;
@@ -212,6 +226,7 @@ async fn dense_sparse_payloads_preserve_values_padding_and_reopening() {
     let loaded = Tensor::<FsEntry, f64>::load(open_dir(&root).unwrap())
         .await
         .unwrap();
+
     fixture::blocks(
         &loaded,
         &[
@@ -254,10 +269,12 @@ async fn dense_sparse_values_are_independent_of_chunk_capacity() {
         )
         .await
         .unwrap();
+
         let mut coordinate = vec![0; shape.len()];
         for prefix in 0..=axis {
             coordinate[prefix] = shape[prefix] - 1;
         }
+
         coordinate[axis + 1] = 1;
         tensor.write_value(&coordinate, 2.).await.unwrap();
         let expected: Vec<_> = common::iter_coords(&shape)
@@ -269,11 +286,13 @@ async fn dense_sparse_values_are_independent_of_chunk_capacity() {
                 }
             })
             .collect();
+
         let occupied = tensor
             .occupied_blocks(0..tensor.storage_geometry().block_count())
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+
         let geometry = tensor.storage_geometry();
         let first = geometry.block_position(&coordinate).unwrap().0;
         assert_eq!(occupied, [first]);
@@ -288,6 +307,7 @@ async fn dense_sparse_values_are_independent_of_chunk_capacity() {
                     .all(|&value| value == 0.)
             );
         }
+
         fixture::reads(
             &TensorExpression::new(TensorView::new(Source(tensor.clone())))
                 .unwrap()
@@ -299,12 +319,14 @@ async fn dense_sparse_values_are_independent_of_chunk_capacity() {
             |a, b| a == b,
         )
         .await;
+
         tensor.sync().await.unwrap();
         drop(tensor);
 
         let tensor = Tensor::<FsEntry, f64>::load(open_dir(&root).unwrap())
             .await
             .unwrap();
+
         assert_eq!(
             tensor
                 .occupied_blocks(0..tensor.storage_geometry().block_count())
@@ -313,6 +335,7 @@ async fn dense_sparse_values_are_independent_of_chunk_capacity() {
                 .unwrap(),
             occupied
         );
+
         fixture::reads(
             &TensorExpression::new(tensor.clone())
                 .unwrap()
@@ -324,6 +347,7 @@ async fn dense_sparse_values_are_independent_of_chunk_capacity() {
             |a, b| a == b,
         )
         .await;
+
         tensor.write_value(&coordinate, 0.).await.unwrap();
         assert!(
             tensor
@@ -333,17 +357,20 @@ async fn dense_sparse_values_are_independent_of_chunk_capacity() {
                 .unwrap()
                 .is_none()
         );
+
         fixture::blocks(
             &tensor.view().sin().await.unwrap(),
             &vec![0.; expected.len()],
             |a, b| a == b,
         )
         .await;
+
         tensor.sync().await.unwrap();
         drop(tensor);
         let tensor = Tensor::<FsEntry, f64>::load(open_dir(&root).unwrap())
             .await
             .unwrap();
+
         assert!(
             tensor
                 .occupied_blocks(0..tensor.storage_geometry().block_count())
@@ -366,6 +393,7 @@ async fn lazy_dense_conversion_includes_implicit_zeros_across_batches() {
     )
     .await
     .unwrap();
+
     tensor.write_value(&[0, 0], 2.).await.unwrap();
     let sparse = TensorExpression::new(tensor).unwrap();
     let dense = sparse.clone().into_dense();
@@ -375,6 +403,7 @@ async fn lazy_dense_conversion_includes_implicit_zeros_across_batches() {
         sparse.exp().await,
         Err(fensor::Error::WouldDensify { operation: "exp" })
     ));
+
     let output = TensorExpression::new(dense.exp().await.unwrap()).unwrap();
     let mut entries = output.into_sparse_elements().unwrap();
     for coordinate in common::iter_coords(&[2, 4097]) {
@@ -389,5 +418,6 @@ async fn lazy_dense_conversion_includes_implicit_zeros_across_batches() {
             }
         );
     }
+
     assert!(entries.try_next().await.unwrap().is_none());
 }

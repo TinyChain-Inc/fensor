@@ -99,6 +99,7 @@ async fn request_providers_delegate_once_in_order_and_propagate_errors() {
             calls: &calls[i],
             provide: providers[i],
         });
+
         // Consumer shape is forwarded unchanged, rather than replaced by a leaf shape.
         let selected = a.cond(&b, &c).await.unwrap().not().await.unwrap();
         let result = traversal::preferred(&selected, &[7, 3]);
@@ -108,6 +109,7 @@ async fn request_providers_delegate_once_in_order_and_propagate_errors() {
             assert_eq!(requests.next().unwrap().len(), 21);
             assert!(requests.next().is_none());
         }
+
         assert_eq!(calls.each_ref().map(|n| n.read()), expected);
 
         for call in &calls {
@@ -123,6 +125,7 @@ async fn request_providers_delegate_once_in_order_and_propagate_errors() {
             [expected[0], expected[1], 0]
         );
     }
+
     crate::test_support::cleanup(&root).await;
 }
 
@@ -167,6 +170,7 @@ async fn ordered_providers_visit_operands_left_to_right() {
             calls: &calls[i],
             provide: providers[i],
         });
+
         let selected = condition
             .cond(&left, &right)
             .await
@@ -174,8 +178,10 @@ async fn ordered_providers_visit_operands_left_to_right() {
             .abs()
             .await
             .unwrap();
+
         let requests =
             traversal::ordered(&selected, crate::slice::Slice::full(&[6]).unwrap(), None);
+
         assert_eq!(requests.is_err(), fails);
         assert_eq!(calls.each_ref().map(|n| n.read()), expected);
         if let Ok(mut requests) = requests {
@@ -185,6 +191,7 @@ async fn ordered_providers_visit_operands_left_to_right() {
                 assert!(request.len() <= MAX_BATCH_ELEMENTS);
                 coordinates.extend(request.into_coordinates(&[6]).unwrap());
             }
+
             assert_eq!(coordinates, (0..6).map(|i| vec![i]).collect::<Vec<_>>());
         }
     }
@@ -196,6 +203,7 @@ async fn ordered_providers_visit_operands_left_to_right() {
             calls: &calls[i],
             provide: providers[i],
         });
+
         assert!(
             traversal::ordered(
                 &left.add(&right).await.unwrap(),
@@ -204,8 +212,10 @@ async fn ordered_providers_visit_operands_left_to_right() {
             )
             .is_err()
         );
+
         assert_eq!(calls.each_ref().map(|n| n.read()), expected);
     }
+
     crate::test_support::cleanup(&root).await;
 }
 
@@ -219,6 +229,7 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
         .unwrap()
         .flip(0)
         .unwrap();
+
     let mut high_rank = vec![1; crate::PORTABLE_INLINE_RANK + 2];
     *high_rank.last_mut().unwrap() = 7;
     let pattern = [
@@ -230,6 +241,7 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
         f32::INFINITY,
         f32::NEG_INFINITY,
     ];
+
     let cases = [
         (
             "explicit",
@@ -247,8 +259,8 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
             "rectangular duplicates",
             BatchRequest::rectangles(vec![
                 Cartesian::new(vec![
-                    Axis::Selected(vec![2, 0, 2]),
-                    Axis::Selected(vec![1, 3]),
+                    Axis::selected(vec![2, 0, 2]),
+                    Axis::selected(vec![1, 3]),
                 ])
                 .unwrap(),
             ])
@@ -299,6 +311,7 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
         let values: Vec<_> = (0..request.len())
             .map(|i| pattern[i % pattern.len()])
             .collect();
+
         let expected: Vec<_> = expected_coords
             .iter()
             .zip(&values)
@@ -306,12 +319,14 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
             .filter(|(_, (_, value))| **value != 0.)
             .map(|(i, (coord, value))| (i, coord.clone(), value.to_bits()))
             .collect();
+
         crate::read_metrics::CURRENT
             .scope(Default::default(), async {
                 let output = sparse_elements(request, EvaluatedBatch { values }, &shape).unwrap();
                 crate::read_metrics::CURRENT.with(|m| {
                     assert_eq!(m.borrow().expanded_coordinates, 0, "{name}");
                 });
+
                 let output = output.collect::<Result<Vec<_>>>().unwrap();
                 assert_eq!(output.len(), expected.len(), "{name}");
 
@@ -322,6 +337,7 @@ async fn sparse_output_preserves_order_duplicates_and_nan() {
                         assert_eq!(coord.as_ptr(), pointers[*i], "{name}");
                     }
                 }
+
                 crate::read_metrics::CURRENT.with(|m| {
                     assert_eq!(
                         m.borrow().expanded_coordinates,
@@ -339,6 +355,7 @@ fn sparse_output_rejects_mismatched_values_and_invalid_requests() {
     let batch = EvaluatedBatch {
         values: vec![1u8, 2],
     };
+
     assert!(matches!(
         sparse_elements(BatchRequest::point(&[0]), batch, &[1]),
         Err(Error::InvalidLayout(_))
@@ -355,6 +372,7 @@ fn sparse_output_rejects_mismatched_values_and_invalid_requests() {
         let batch = EvaluatedBatch {
             values: vec![0u8; request.len()],
         };
+
         assert!(matches!(
             sparse_elements(request, batch, &[1]),
             Err(Error::InvalidCoord(_))
@@ -375,6 +393,7 @@ fn tiled_requests_retain_only_a_bounded_prefix() {
             .unwrap()
             .flat_map(|request| request.coordinates(&shape).unwrap())
             .collect();
+
         tiled.sort();
         assert_eq!(
             tiled,
@@ -394,6 +413,7 @@ fn malformed_batches_fail_closed() {
         ha_ndarray::shape![MAX_BATCH_ELEMENTS + 1],
     )
     .unwrap();
+
     assert!(Batch::from_array(oversized).is_err());
     // A malformed batch must be rejected before reading or realizing its source.
     let unread = Array::new(UnreadBatch, ha_ndarray::shape![MAX_BATCH_ELEMENTS + 1]).unwrap();
@@ -405,6 +425,7 @@ fn malformed_batches_fail_closed() {
     let evaluated = EvaluatedBatch {
         values: vec![0u8; MAX_BATCH_ELEMENTS + 1],
     };
+
     assert!(evaluated.validate(MAX_BATCH_ELEMENTS + 1).is_err());
 }
 
@@ -442,6 +463,7 @@ impl Expression for StreamSource {
             if self.pending {
                 std::future::pending::<()>().await;
             }
+
             if request.len() != 1 {
                 return Err(Error::InvalidLayout("injected evaluation error".into()));
             }
@@ -459,12 +481,14 @@ async fn request_stream_moves_nonclone_source_and_preserves_error_items() {
         _lease: lease,
         pending: false,
     });
+
     let requests = futures::stream::iter([
         Ok(BatchRequest::point(&[0])),
         Err(Error::InvalidLayout("injected request error".into())),
         Ok(BatchRequest::linear(0, 2).unwrap()),
         Ok(BatchRequest::point(&[1])),
     ]);
+
     let mut stream = evaluate_requests(source, requests);
     assert!(observed.upgrade().is_some());
     assert_eq!(stream.next().await.unwrap().unwrap().1.values, vec![7.0]);
@@ -472,6 +496,7 @@ async fn request_stream_moves_nonclone_source_and_preserves_error_items() {
         let error = stream.next().await.unwrap().err().unwrap();
         assert!(error.to_string().contains(expected));
     }
+
     assert_eq!(stream.next().await.unwrap().unwrap().1.values, vec![7.0]);
     assert!(stream.next().await.is_none());
     assert!(observed.upgrade().is_none());
@@ -486,13 +511,16 @@ async fn request_stream_releases_unpolled_and_pending_sources() {
             _lease: lease,
             pending: true,
         });
+
         let mut stream = evaluate_requests(
             source,
             futures::stream::iter([Ok(BatchRequest::point(&[0]))]),
         );
+
         if poll {
             assert!(futures::poll!(stream.next()).is_pending());
         }
+
         assert!(observed.upgrade().is_some());
         drop(stream);
         assert!(observed.upgrade().is_none());
@@ -507,6 +535,7 @@ fn completed_host_batches_transfer_their_buffer() {
         .unwrap()
         .into_evaluated()
         .unwrap();
+
     assert_eq!(evaluated.values.as_ptr(), pointer);
     assert_eq!(evaluated.values, vec![3.5; MAX_BATCH_ELEMENTS]);
     let values = vec![2.5; MAX_BATCH_ELEMENTS];
@@ -520,6 +549,7 @@ fn completed_host_batches_transfer_their_buffer() {
         .unwrap()
         .as_ref()
         .as_ptr();
+
     assert_eq!(completed_pointer, pointer);
     let evaluated = batch.into_evaluated().unwrap();
     assert_eq!(evaluated.values.as_ptr(), pointer);

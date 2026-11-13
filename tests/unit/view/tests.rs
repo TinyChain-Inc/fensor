@@ -17,6 +17,7 @@ async fn create_dense(
     let tensor = Tensor::<TestFE, f32>::create(dir, schema, Layout::Dense, max_capacity)
         .await
         .expect("create dense");
+
     (root, tensor)
 }
 
@@ -36,6 +37,7 @@ async fn flat_offset_reshape_rank_reducing() {
     // [2,3,4]→[6,4]: new strides [4,1], coord [3,2] → k = 3*4 + 2*1 = 14
     let (root, tensor) =
         create_dense("flat_offset_reshape_rank_reducing", shape![2, 3, 4], 1000).await;
+
     let view = tensor.view();
     let reshaped = view.reshape(shape![6, 4]).expect("reshape");
     assert_eq!(reshaped.mapping.flat_offset(&[3, 2]).expect("offset"), 14);
@@ -47,12 +49,14 @@ async fn flat_offset_reshape_rank_increasing() {
     // [6,4]→[2,3,4]: new strides [12,4,1], coord [1,0,2] → k = 1*12 + 0*4 + 2*1 = 14
     let (root, tensor) =
         create_dense("flat_offset_reshape_rank_increasing", shape![6, 4], 1000).await;
+
     let view = tensor.view();
     let reshaped = view.reshape(shape![2, 3, 4]).expect("reshape");
     assert_eq!(
         reshaped.mapping.flat_offset(&[1, 0, 2]).expect("offset"),
         14
     );
+
     cleanup(&root).await;
 }
 
@@ -82,6 +86,7 @@ async fn slice_then_resolve() {
         AxisRange::In(1, 5, 2),
         AxisRange::Of(vec![0, 3, 4])
     ];
+
     let sliced = view.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 3]);
     assert_eq!(sliced.mapping.flat_offset(&[1, 2]).expect("offset"), 82);
@@ -94,12 +99,14 @@ async fn transpose_arbitrary_permutation() {
     // flat_offset([1,2,3]) = 1*1 + 2*20 + 3*5 = 56
     let (root, tensor) =
         create_dense("transpose_arbitrary_permutation", shape![3, 4, 5], 1000).await;
+
     let view = tensor.view();
     let transposed = view.transpose(Some(axes![2, 0, 1])).expect("transpose");
     assert_eq!(
         transposed.mapping.flat_offset(&[1, 2, 3]).expect("offset"),
         56
     );
+
     cleanup(&root).await;
 }
 
@@ -119,6 +126,7 @@ async fn compose_transpose_and_slice() {
         AxisRange::At(2),
         AxisRange::In(0, 4, 2)
     ];
+
     let sliced = transposed.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 2]);
     assert_eq!(sliced.mapping.flat_offset(&[1, 1]).expect("offset"), 53);
@@ -137,6 +145,7 @@ async fn transpose_then_reshape_rejected() {
         transposed.reshape(shape![12]),
         Err(Error::Unsupported(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -145,6 +154,7 @@ async fn strided_slice_then_reshape_rejected() {
     // In(0,6,2) on axis 0 of [6,4]: axes=[Stride(8),Stride(1)]; contiguous_strides([3,4])=[4,1]; 8≠4
     let (root, tensor) =
         create_dense("strided_slice_then_reshape_rejected", shape![6, 4], 1000).await;
+
     let view = tensor.view();
     let r = range![AxisRange::In(0, 6, 2), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
@@ -152,6 +162,7 @@ async fn strided_slice_then_reshape_rejected() {
         sliced.reshape(shape![12]),
         Err(Error::Unsupported(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -160,6 +171,7 @@ async fn gather_slice_then_reshape_rejected() {
     // Of([0,2,4]) on axis 0: Gather axis present → rejected
     let (root, tensor) =
         create_dense("gather_slice_then_reshape_rejected", shape![6, 4], 1000).await;
+
     let view = tensor.view();
     let r = range![AxisRange::Of(vec![0, 2, 4]), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
@@ -167,6 +179,7 @@ async fn gather_slice_then_reshape_rejected() {
         sliced.reshape(shape![12]),
         Err(Error::Unsupported(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -179,6 +192,7 @@ async fn at_slice_non_first_axis_then_reshape_rejected() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let r = range![AxisRange::In(0, 3, 1), AxisRange::At(0)];
     let sliced = view.slice(r).expect("slice");
@@ -186,6 +200,7 @@ async fn at_slice_non_first_axis_then_reshape_rejected() {
         sliced.reshape(shape![3]),
         Err(Error::Unsupported(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -232,6 +247,7 @@ async fn reshape_then_slice_flat_offset() {
         AxisRange::In(0, 2, 1),
         AxisRange::In(0, 4, 1)
     ];
+
     let sliced = reshaped.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 2, 4]);
     assert_eq!(sliced.mapping.flat_offset(&[1, 1, 2]).expect("offset"), 18);
@@ -251,18 +267,22 @@ async fn flat_offset_broadcast_rank_preserving() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let broadcasted = view
         .broadcast(shape![2, 3, 4])
         .expect("broadcast must be supported");
+
     assert_eq!(
         broadcasted.mapping.flat_offset(&[0, 2, 3]).expect("offset"),
         11
     );
+
     assert_eq!(
         broadcasted.mapping.flat_offset(&[1, 2, 3]).expect("offset"),
         11
     );
+
     cleanup(&root).await;
 }
 
@@ -273,18 +293,22 @@ async fn flat_offset_broadcast_rank_expanding() {
     // flat_offset([a,2,3]) = 4*2 + 1*3 = 11, for any a
     let (root, tensor) =
         create_dense("flat_offset_broadcast_rank_expanding", shape![3, 4], 1000).await;
+
     let view = tensor.view();
     let broadcasted = view
         .broadcast(shape![2, 3, 4])
         .expect("broadcast must be supported");
+
     assert_eq!(
         broadcasted.mapping.flat_offset(&[0, 2, 3]).expect("offset"),
         11
     );
+
     assert_eq!(
         broadcasted.mapping.flat_offset(&[1, 2, 3]).expect("offset"),
         11
     );
+
     cleanup(&root).await;
 }
 
@@ -299,6 +323,7 @@ async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
         1000,
     )
     .await;
+
     tensor.write_value(&[3, 2, 4], 77.0).await.expect("seed");
     let view = tensor.view();
     let r = range![
@@ -306,15 +331,18 @@ async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
         AxisRange::In(0, 5, 1),
         AxisRange::In(0, 6, 1)
     ];
+
     let sliced = view.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[1, 5, 6]);
     let broadcasted = sliced
         .broadcast(shape![7, 5, 6])
         .expect("broadcast must be supported");
+
     assert_eq!(
         broadcasted.mapping.flat_offset(&[0, 2, 4]).expect("offset"),
         106
     );
+
     assert_eq!(
         broadcasted.mapping.flat_offset(&[6, 2, 4]).expect("offset"),
         106
@@ -325,8 +353,10 @@ async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
             .read_value(&[k, 2, 4])
             .await
             .expect("broadcast read");
+
         assert_eq!(v, 77.0, "k={k}");
     }
+
     cleanup(&root).await;
 }
 
@@ -334,11 +364,13 @@ async fn broadcast_preserves_offset_of_gathered_size_one_axis() {
 async fn broadcast_rejects_lower_rank_target() {
     let (root, tensor) =
         create_dense("broadcast_rejects_lower_rank_target", shape![2, 3], 1000).await;
+
     let view = tensor.view();
     assert!(matches!(
         view.broadcast(shape![3]),
         Err(Error::InvalidLayout(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -346,11 +378,13 @@ async fn broadcast_rejects_lower_rank_target() {
 async fn broadcast_rejects_incompatible_dim() {
     let (root, tensor) =
         create_dense("broadcast_rejects_incompatible_dim", shape![2, 3], 1000).await;
+
     let view = tensor.view();
     assert!(matches!(
         view.broadcast(shape![2, 5]),
         Err(Error::InvalidLayout(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -363,15 +397,18 @@ async fn broadcast_noop_same_shape_preserves_write_through() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let broadcasted = view
         .broadcast(shape![2, 3])
         .expect("no-op broadcast must be supported");
+
     assert!(broadcasted.supports_write_through());
     broadcasted
         .write_value(&[1, 2], 5.0)
         .await
         .expect("write through no-op broadcast");
+
     assert_eq!(tensor.read_value(&[1, 2]).await.expect("base read"), 5.0);
     cleanup(&root).await;
 }
@@ -384,10 +421,12 @@ async fn broadcast_then_reshape_rejected() {
     let broadcasted = view
         .broadcast(shape![3, 4])
         .expect("broadcast must be supported");
+
     assert!(matches!(
         broadcasted.reshape(shape![12]),
         Err(Error::Unsupported(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -403,11 +442,13 @@ async fn broadcast_expands_middle_or_trailing_axis_with_rank_increase() {
         1000,
     )
     .await;
+
     tensor.write_value(&[2, 0, 2], 55.0).await.expect("seed");
     let view = tensor.view();
     let broadcasted = view
         .broadcast(shape![2, 3, 5, 4])
         .expect("broadcast must be supported");
+
     assert_eq!(broadcasted.shape(), &[2, 3, 5, 4]);
     assert_eq!(
         broadcasted
@@ -416,6 +457,7 @@ async fn broadcast_expands_middle_or_trailing_axis_with_rank_increase() {
             .expect("offset"),
         10
     );
+
     assert_eq!(
         broadcasted
             .mapping
@@ -430,6 +472,7 @@ async fn broadcast_expands_middle_or_trailing_axis_with_rank_increase() {
             assert_eq!(v, 55.0, "i={i} k={k}");
         }
     }
+
     cleanup(&root).await;
 }
 
@@ -460,9 +503,11 @@ async fn broadcast_twice_passes_through_existing_broadcast_axis() {
     let once = sliced
         .broadcast(shape![5, 4])
         .expect("first broadcast must be supported");
+
     let twice = once
         .broadcast(shape![2, 5, 4])
         .expect("second broadcast must be supported");
+
     assert_eq!(twice.shape(), &[2, 5, 4]);
 
     for i in 0..2u64 {
@@ -473,11 +518,13 @@ async fn broadcast_twice_passes_through_existing_broadcast_axis() {
                     12 + k as i128,
                     "i={i} j={j} k={k}"
                 );
+
                 let v = twice.read_value(&[i, j, k]).await.expect("read");
                 assert_eq!(v, k as f32 * 1.5, "i={i} j={j} k={k}");
             }
         }
     }
+
     cleanup(&root).await;
 }
 
@@ -492,12 +539,14 @@ async fn broadcast_then_transpose_preserves_constant() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let r = range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)];
     let sliced = view.slice(r).expect("slice");
     let broadcasted = sliced
         .broadcast(shape![5, 4])
         .expect("broadcast must be supported");
+
     let transposed = broadcasted.transpose(Some(axes![1, 0])).expect("transpose");
     assert_eq!(transposed.shape(), &[4, 5]);
 
@@ -510,6 +559,7 @@ async fn broadcast_then_transpose_preserves_constant() {
             );
         }
     }
+
     cleanup(&root).await;
 }
 
@@ -524,10 +574,12 @@ async fn slice_of_after_broadcast_preserves_constant() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let broadcasted = view
         .broadcast(shape![3, 4])
         .expect("broadcast must be supported");
+
     let r = range![AxisRange::Of(vec![0, 2]), AxisRange::In(0, 4, 1)];
     let sliced = broadcasted.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[2, 4]);
@@ -541,6 +593,7 @@ async fn slice_of_after_broadcast_preserves_constant() {
             );
         }
     }
+
     cleanup(&root).await;
 }
 
@@ -552,6 +605,7 @@ async fn flip_stride_axis_reverses_offset() {
     // flat_offset([0,0,0]) = 5 + 0*(-1) = 5; flat_offset([0,0,5]) = 5 + 5*(-1) = 0
     let (root, tensor) =
         create_dense("flip_stride_axis_reverses_offset", shape![4, 5, 6], 1000).await;
+
     let view = tensor.view();
     let flipped = view.flip(2).expect("flip");
     assert_eq!(flipped.mapping.flat_offset(&[0, 0, 0]).expect("offset"), 5);
@@ -571,6 +625,7 @@ async fn flip_then_flip_is_identity() {
         .expect("flip")
         .flip(2)
         .expect("flip again");
+
     let coords = row_major_coords(&shape).expect("coords for shape");
 
     for c in coords {
@@ -580,6 +635,7 @@ async fn flip_then_flip_is_identity() {
             "{c:?}"
         );
     }
+
     cleanup(&root).await;
 }
 
@@ -591,13 +647,16 @@ async fn flip_on_broadcast_axis_is_noop() {
     let broadcasted = view
         .broadcast(shape![3, 4])
         .expect("broadcast must be supported");
+
     let before: Vec<i128> = (0..3u64)
         .map(|x| broadcasted.mapping.flat_offset(&[x, 2]).expect("offset"))
         .collect();
+
     let flipped = broadcasted.flip(0).expect("flip");
     let after: Vec<i128> = (0..3u64)
         .map(|x| flipped.mapping.flat_offset(&[x, 2]).expect("offset"))
         .collect();
+
     assert_eq!(before, after);
     cleanup(&root).await;
 }
@@ -608,17 +667,21 @@ async fn flip_on_gather_axis_reverses_table() {
     // flip axis 0 reverses the table -> Gather([12,4])
     let (root, tensor) =
         create_dense("flip_on_gather_axis_reverses_table", shape![4, 4], 1000).await;
+
     let view = tensor.view();
     let gathered = view
         .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
+
     let before: Vec<i128> = (0..2u64)
         .map(|a| gathered.mapping.flat_offset(&[a, 0]).expect("offset"))
         .collect();
+
     let flipped = gathered.flip(0).expect("flip");
     let after: Vec<i128> = (0..2u64)
         .map(|a| flipped.mapping.flat_offset(&[a, 0]).expect("offset"))
         .collect();
+
     let expected: Vec<i128> = before.into_iter().rev().collect();
     assert_eq!(after, expected);
     cleanup(&root).await;
@@ -628,6 +691,7 @@ async fn flip_on_gather_axis_reverses_table() {
 async fn flip_invalid_axis_out_of_bounds() {
     let (root, tensor) =
         create_dense("flip_invalid_axis_out_of_bounds", shape![3, 4, 5], 1000).await;
+
     let view = tensor.view();
     assert!(matches!(view.flip(3), Err(Error::InvalidLayout(_))));
     cleanup(&root).await;
@@ -643,6 +707,7 @@ async fn flip_then_reshape_rejected() {
         flipped.reshape(shape![12]),
         Err(Error::Unsupported(_))
     ));
+
     cleanup(&root).await;
 }
 
@@ -656,6 +721,7 @@ async fn flip_write_through_roundtrip() {
         .write_value(&[1, 1], 9.0)
         .await
         .expect("write through flipped");
+
     assert_eq!(tensor.read_value(&[1, 2]).await.expect("base read"), 9.0);
     cleanup(&root).await;
 }
@@ -680,6 +746,7 @@ async fn at_slice_on_broadcast_axis() {
     let broadcasted = view
         .broadcast(shape![3, 4])
         .expect("broadcast must be supported");
+
     let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
     let sliced = broadcasted.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[4]);
@@ -689,6 +756,7 @@ async fn at_slice_on_broadcast_axis() {
         let v = sliced.read_value(&[y]).await.expect("read");
         assert_eq!(v, y as f32 * 2.0, "y={y}");
     }
+
     cleanup(&root).await;
 }
 
@@ -709,6 +777,7 @@ async fn in_slice_on_broadcast_axis() {
     let broadcasted = view
         .broadcast(shape![5, 4])
         .expect("broadcast must be supported");
+
     let r = range![AxisRange::In(1, 4, 1), AxisRange::In(0, 4, 1)];
     let sliced = broadcasted.slice(r).expect("slice");
     assert_eq!(sliced.shape(), &[3, 4]);
@@ -720,10 +789,12 @@ async fn in_slice_on_broadcast_axis() {
                 y as i128,
                 "a={a} y={y}"
             );
+
             let v = sliced.read_value(&[a, y]).await.expect("read");
             assert_eq!(v, y as f32 * 2.0, "a={a} y={y}");
         }
     }
+
     cleanup(&root).await;
 }
 
@@ -745,6 +816,7 @@ async fn at_slice_on_gather_axis() {
     let gathered = view
         .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
+
     assert_eq!(gathered.shape(), &[2, 4]);
     let r = range![AxisRange::At(1), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice At on gather axis");
@@ -756,9 +828,11 @@ async fn at_slice_on_gather_axis() {
             12 + y as i128,
             "y={y}"
         );
+
         let v = sliced.read_value(&[y]).await.expect("read");
         assert_eq!(v, y as f32 * 3.0, "y={y}");
     }
+
     cleanup(&root).await;
 }
 
@@ -780,6 +854,7 @@ async fn in_slice_on_gather_axis() {
     let gathered = view
         .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
+
     let r = range![AxisRange::In(1, 2, 1), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice In on gather axis");
     assert_eq!(sliced.shape(), &[1, 4]);
@@ -790,9 +865,11 @@ async fn in_slice_on_gather_axis() {
             12 + y as i128,
             "y={y}"
         );
+
         let v = sliced.read_value(&[0, y]).await.expect("read");
         assert_eq!(v, y as f32 * 3.0, "y={y}");
     }
+
     cleanup(&root).await;
 }
 
@@ -808,6 +885,7 @@ async fn of_slice_on_gather_axis() {
             .write_value(&[1, y], y as f32 * 5.0)
             .await
             .expect("seed row1");
+
         tensor
             .write_value(&[3, y], y as f32 * 3.0)
             .await
@@ -818,6 +896,7 @@ async fn of_slice_on_gather_axis() {
     let gathered = view
         .slice(range![AxisRange::Of(vec![1, 3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
+
     let r = range![AxisRange::Of(vec![1, 0]), AxisRange::In(0, 4, 1)];
     let sliced = gathered.slice(r).expect("slice Of on gather axis");
     assert_eq!(sliced.shape(), &[2, 4]);
@@ -828,22 +907,26 @@ async fn of_slice_on_gather_axis() {
             12 + y as i128,
             "y={y}"
         );
+
         assert_eq!(
             sliced.mapping.flat_offset(&[1, y]).expect("offset"),
             4 + y as i128,
             "y={y}"
         );
+
         assert_eq!(
             sliced.read_value(&[0, y]).await.expect("read"),
             y as f32 * 3.0,
             "y={y}"
         );
+
         assert_eq!(
             sliced.read_value(&[1, y]).await.expect("read"),
             y as f32 * 5.0,
             "y={y}"
         );
     }
+
     cleanup(&root).await;
 }
 
@@ -880,6 +963,7 @@ async fn in_slice_step_zero_rejected() {
 async fn in_slice_start_after_stop_rejected() {
     let (root, tensor) =
         create_dense("in_slice_start_after_stop_rejected", shape![3, 4], 1000).await;
+
     let view = tensor.view();
     let r = range![AxisRange::In(2, 1, 1), AxisRange::In(0, 4, 1)];
     assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
@@ -890,6 +974,7 @@ async fn in_slice_start_after_stop_rejected() {
 async fn in_slice_stop_exceeds_dim_rejected() {
     let (root, tensor) =
         create_dense("in_slice_stop_exceeds_dim_rejected", shape![3, 4], 1000).await;
+
     let view = tensor.view();
     let r = range![AxisRange::In(0, 5, 1), AxisRange::In(0, 4, 1)];
     assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
@@ -918,11 +1003,13 @@ async fn squeeze_stride_axis_folds_zero_offset() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let squeezed = view
         .clone()
         .squeeze(axes![1])
         .expect("squeeze must be supported");
+
     assert_eq!(squeezed.shape(), &[3, 4]);
 
     // For a stride axis with dim=1, index 0 contributes 0 to the offset
@@ -934,9 +1021,11 @@ async fn squeeze_stride_axis_folds_zero_offset() {
                 .mapping
                 .flat_offset(&[x, z])
                 .expect("squeeze offset");
+
             assert_eq!(orig_offset, squeeze_offset, "x={}, z={}", x, z);
         }
     }
+
     cleanup(&root).await;
 }
 
@@ -947,6 +1036,7 @@ async fn squeeze_gather_singleton_folds_offset() {
     // flat_offset([y]) = 12 + y
     let (root, tensor) =
         create_dense("squeeze_gather_singleton_folds_offset", shape![4, 4], 1000).await;
+
     for y in 0..4u64 {
         tensor
             .write_value(&[3, y], y as f32 * 2.0)
@@ -958,10 +1048,12 @@ async fn squeeze_gather_singleton_folds_offset() {
     let gathered = view
         .slice(range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
+
     assert_eq!(gathered.shape(), &[1, 4]);
     let squeezed = gathered
         .squeeze(axes![0])
         .expect("squeeze must be supported");
+
     assert_eq!(squeezed.shape(), &[4]);
 
     for y in 0..4u64 {
@@ -971,9 +1063,11 @@ async fn squeeze_gather_singleton_folds_offset() {
             "y={}",
             y
         );
+
         let v = squeezed.read_value(&[y]).await.expect("read");
         assert_eq!(v, y as f32 * 2.0, "y={}", y);
     }
+
     cleanup(&root).await;
 }
 
@@ -991,6 +1085,7 @@ async fn squeeze_broadcast_axis_folds_constant() {
         1000,
     )
     .await;
+
     tensor.write_value(&[3, 2, 4], 77.0).await.expect("seed");
     let view = tensor.view();
     let gathered = view
@@ -1000,6 +1095,7 @@ async fn squeeze_broadcast_axis_folds_constant() {
             AxisRange::In(0, 6, 1)
         ])
         .expect("slice Of");
+
     assert_eq!(gathered.shape(), &[1, 5, 6]);
 
     let broadcasted = gathered
@@ -1009,6 +1105,7 @@ async fn squeeze_broadcast_axis_folds_constant() {
     let squeezed = broadcasted
         .squeeze(axes![0])
         .expect("squeeze must be supported");
+
     assert_eq!(squeezed.shape(), &[5, 6]);
 
     for y in 0..5u64 {
@@ -1037,10 +1134,12 @@ async fn squeeze_removes_gather_axis_restores_write_through() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let gathered = view
         .slice(range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
+
     assert!(
         !gathered.supports_write_through(),
         "gathered should have Gather axis"
@@ -1049,6 +1148,7 @@ async fn squeeze_removes_gather_axis_restores_write_through() {
     let squeezed = gathered
         .squeeze(axes![0])
         .expect("squeeze must be supported");
+
     assert!(
         squeezed.supports_write_through(),
         "squeezed should support write_through"
@@ -1071,10 +1171,12 @@ async fn unsqueeze_uses_contiguous_stride_at_insertion_point() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let unsqueezed = view
         .unsqueeze(axes![0, 1])
         .expect("unsqueeze must be supported");
+
     assert_eq!(unsqueezed.shape(), &[1, 3, 1, 4]);
 
     // Verify expected strides via flat_offset calculations
@@ -1087,6 +1189,7 @@ async fn unsqueeze_uses_contiguous_stride_at_insertion_point() {
         6,
         "flat_offset([0,1,0,2])"
     );
+
     assert_eq!(
         unsqueezed
             .mapping
@@ -1095,6 +1198,7 @@ async fn unsqueeze_uses_contiguous_stride_at_insertion_point() {
         2 * 4 + 3,
         "flat_offset([0,2,0,3])"
     );
+
     cleanup(&root).await;
 }
 
@@ -1108,16 +1212,19 @@ async fn unsqueeze_then_reshape_preserves_contiguity() {
         1000,
     )
     .await;
+
     let view = tensor.view();
     let unsqueezed = view
         .unsqueeze(axes![0])
         .expect("unsqueeze must be supported");
+
     assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
 
     // This should succeed, proving contiguity is preserved
     let reshaped = unsqueezed
         .reshape(shape![12])
         .expect("reshape after unsqueeze must succeed");
+
     assert_eq!(reshaped.shape(), &[12]);
     cleanup(&root).await;
 }
@@ -1131,6 +1238,7 @@ async fn unsqueeze_before_first_middle_and_last_original_axis() {
         1000,
     )
     .await;
+
     let view = tensor.view();
 
     let unsqueeze_first = view.clone().unsqueeze(axes![0]).expect("unsqueeze at 0");
@@ -1151,16 +1259,19 @@ async fn unsqueeze_write_through_roundtrip() {
     // write_value at [0,1,2] should write to [1,2] on base tensor
     let (root, tensor) =
         create_dense("unsqueeze_write_through_roundtrip", shape![3, 4], 1000).await;
+
     let view = tensor.view();
     let unsqueezed = view
         .unsqueeze(axes![0])
         .expect("unsqueeze must be supported");
+
     assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
 
     unsqueezed
         .write_value(&[0, 1, 2], 9.0)
         .await
         .expect("write");
+
     let v = tensor.read_value(&[1, 2]).await.expect("read from base");
     assert_eq!(v, 9.0);
     cleanup(&root).await;
@@ -1174,16 +1285,19 @@ async fn squeeze_then_unsqueeze_round_trip() {
     let shape = shape![3, 1, 4];
     let (root, tensor) =
         create_dense("squeeze_then_unsqueeze_round_trip", shape.clone(), 1000).await;
+
     let view = tensor.view();
     let squeezed = view
         .clone()
         .squeeze(axes![1])
         .expect("squeeze must be supported");
+
     assert_eq!(squeezed.shape(), &[3, 4]);
 
     let restored = squeezed
         .unsqueeze(axes![1])
         .expect("unsqueeze must be supported");
+
     assert_eq!(restored.shape(), &[3, 1, 4]);
 
     // Verify flat_offset matches for all coordinates
@@ -1197,6 +1311,7 @@ async fn squeeze_then_unsqueeze_round_trip() {
             c
         );
     }
+
     cleanup(&root).await;
 }
 
@@ -1208,16 +1323,19 @@ async fn unsqueeze_then_squeeze_round_trip() {
     let shape = shape![3, 4];
     let (root, tensor) =
         create_dense("unsqueeze_then_squeeze_round_trip", shape.clone(), 1000).await;
+
     let view = tensor.view();
     let unsqueezed = view
         .clone()
         .unsqueeze(axes![0])
         .expect("unsqueeze must be supported");
+
     assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
 
     let restored = unsqueezed
         .squeeze(axes![0])
         .expect("squeeze must be supported");
+
     assert_eq!(restored.shape(), &[3, 4]);
 
     // Verify flat_offset matches for all coordinates
@@ -1231,6 +1349,7 @@ async fn unsqueeze_then_squeeze_round_trip() {
             c
         );
     }
+
     cleanup(&root).await;
 }
 
@@ -1249,6 +1368,7 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
         view.plan_updates(&geometry, 0, vec![1.; limit + 1]),
         Err(Error::InvalidLayout(_))
     ));
+
     for id in 0..geometry.block_count() {
         assert!(
             tensor
@@ -1259,24 +1379,24 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
                 .all(|v| *v == 0.)
         );
     }
+
     cleanup(&root).await;
 
     for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
         for block_shape in [shape![2, 3], shape![4, 64]] {
+            let block_shape: crate::Shape = block_shape;
             let (root, dir) = new_dir("update_plans").await;
             let geometry = crate::StorageGeometry::new(
                 TensorSchema::new(NumberType::Float(FloatType::F32), shape![5, 131]).unwrap(),
                 layout,
-                if matches!(layout, Layout::Dense) {
-                    block_shape
-                } else {
-                    shape![1, block_shape[1]]
-                },
+                block_shape.iter().copied().product::<u64>() as usize,
             )
             .unwrap();
+
             let tensor = Tensor::<TestFE, f32>::create_with_geometry(dir, geometry.clone())
                 .await
                 .unwrap();
+
             let base = tensor.view();
             let views = [
                 base.clone(),
@@ -1304,12 +1424,14 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
                         let (id, offset) = geometry.block_position(&mapped).unwrap();
                         expected.entry(id).or_default().push((offset, *value));
                     }
+
                     crate::read_metrics::CURRENT
                         .scope(Default::default(), async {
                             assert_eq!(
                                 view.plan_updates(&geometry, start as u64, values).unwrap(),
                                 expected
                             );
+
                             crate::read_metrics::CURRENT.with(|m| {
                                 assert_eq!(m.borrow().expanded_coordinates, 0);
                                 if index < 4 {
@@ -1319,11 +1441,13 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
                         })
                         .await;
                 }
+
                 assert!(
                     view.plan_updates(&geometry, view.size().unwrap(), vec![])
                         .unwrap()
                         .is_empty()
                 );
+
                 assert!(
                     view.plan_updates(&geometry, view.size().unwrap(), vec![1.])
                         .is_err()
@@ -1337,18 +1461,16 @@ async fn update_planning_matches_coordinates_without_affine_expansion() {
                 } else {
                     Layout::Dense
                 },
-                if matches!(layout, Layout::Dense) {
-                    shape![1, geometry.block_shape()[1]]
-                } else {
-                    geometry.block_shape().into()
-                },
+                geometry.block_capacity(),
             )
             .unwrap();
+
             assert!(base.plan_updates(&wrong, 0, vec![1.]).is_err());
             assert_eq!(
-                tensor.storage_geometry().block_shape(),
-                geometry.block_shape()
+                crate::TensorSource::storage_geometry(&tensor).block_capacity(),
+                geometry.block_capacity()
             );
+
             cleanup(&root).await;
         }
     }
@@ -1412,10 +1534,12 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
             fail,
         })
         .unwrap();
+
         let mut stream = tensor
             .view()
             .updates_from(&tensor.storage_geometry(), source)
             .unwrap();
+
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         if fail {
             assert!(stream.try_next().await.is_err());
@@ -1427,9 +1551,11 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
                 assert!(n <= crate::expression::MAX_BATCH_ELEMENTS);
                 count += n;
             }
+
             assert_eq!(count, 8193);
             assert_eq!(calls.load(Ordering::Relaxed), 3);
         }
+
         drop(stream);
         assert_eq!(Arc::strong_count(&calls), 1);
         let source = TensorExpression::new(Counted {
@@ -1437,13 +1563,16 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
             fail,
         })
         .unwrap();
+
         let stream = tensor
             .view()
             .updates_from(&tensor.storage_geometry(), source)
             .unwrap();
+
         drop(stream);
         assert_eq!(Arc::strong_count(&calls), 1);
     }
+
     cleanup(&root).await;
 }
 
@@ -1456,11 +1585,12 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
     let geometry = tensor.storage_geometry();
 
     for id in 0..geometry.block_count() {
-        let mut values = vec![0.; geometry.block_len()];
+        let mut values = vec![0.; geometry.block_len(id).unwrap()];
 
         for (offset, coord) in crate::test_support::block_entries(&geometry, id) {
             values[offset] = (coord[0] * 4097 + coord[1]) as f32;
         }
+
         tensor.replace_logical_block(id, values).await.unwrap();
     }
 
@@ -1475,6 +1605,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
         .try_concat()
         .await
         .unwrap();
+
     crate::read_metrics::CURRENT
         .scope(Default::default(), async {
             let value = TensorExpression::new(tensor.view())
@@ -1483,6 +1614,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
                 .unwrap()
                 .flip(0)
                 .unwrap();
+
             let actual = value
                 .clone()
                 .into_blocks()
@@ -1490,6 +1622,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
                 .try_concat()
                 .await
                 .unwrap();
+
             assert_eq!(actual, expected);
             // Force a second nonidentity owned mapping over the first.
             let nested = TensorExpression::new(value).unwrap().flip(0).unwrap();
@@ -1503,6 +1636,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
                 .try_concat()
                 .await
                 .unwrap();
+
             assert_eq!(actual, expected);
             crate::read_metrics::CURRENT.with(|m| {
                 let m = m.borrow();
@@ -1511,6 +1645,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
             });
         })
         .await;
+
     // Preferred coordinate reads preserve physical order even when the same
     // transform crosses an owned unary boundary.
     use crate::TensorAbs;
@@ -1533,6 +1668,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
                     crate::expression::traversal::preferred(&expression, expression.shape())
                         .unwrap()
                         .unwrap();
+
                 let mut coordinates = std::collections::BTreeSet::new();
                 let mut block_ids = Vec::new();
                 for request in &mut requests {
@@ -1544,12 +1680,14 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
                         }
                     }
                 }
+
                 assert_eq!(coordinates.len(), 3 * 4097);
                 assert_eq!(block_ids, (0..geometry.block_count()).collect::<Vec<_>>());
-                // Compatible column blocks form one region per physical row.
-                crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().block_bounds, 3));
+                // Flat block planning does not reconstruct rectangular tile bounds.
+                crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().block_bounds, 0));
             })
             .await;
     }
+
     cleanup(&root).await;
 }

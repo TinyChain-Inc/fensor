@@ -66,6 +66,7 @@ impl Slice {
             *chunk = axis.len().min(MAX_BATCH_ELEMENTS as u64 / capacity);
             capacity *= (*chunk).max(1);
         }
+
         SliceRequests {
             origins: Coord::from_elem(0, self.axes.len()),
             chunks,
@@ -105,15 +106,10 @@ impl Slice {
                         len: count,
                     }
                 }
-                Axis::Selected(indices) => Axis::Selected(
-                    indices
-                        .iter()
-                        .copied()
-                        .filter(|&i| i >= lo && i < hi)
-                        .collect(),
-                ),
+                Axis::Selected(indices) => Axis::selected(indices.clipped(lo, hi)),
             })
             .collect();
+
         Self::new(&self.shape, axes)
     }
 }
@@ -151,12 +147,13 @@ impl SliceRequests {
                         step: *step,
                         len,
                     },
-                    Axis::Selected(values) => {
-                        Axis::Selected(values[origin as usize..(origin + len) as usize].to_vec())
-                    }
+                    Axis::Selected(values) => Axis::selected(
+                        values.as_slice()[origin as usize..(origin + len) as usize].to_vec(),
+                    ),
                 }
             })
             .collect();
+
         // Constructor validation proves endpoints, cardinality, and every advance.
         let rectangle = Cartesian::new(axes).expect("validated slice chunk");
         self.done = true;

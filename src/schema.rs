@@ -84,109 +84,187 @@ impl TensorSchema {
     }
 }
 
+/// Contiguous chunks within independently indexed dense regions.
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub(crate) struct BlockSchema {
-    pub(crate) shape: Shape,
-    pub(crate) strides: Strides,
+pub(crate) struct LinearBlocks {
+    pub size: u64,
+    pub region_len: u64,
+    pub capacity: usize,
+    pub chunks: u64,
 }
 
-impl BlockSchema {
-    pub(crate) fn new(tensor_shape: &[u64], max_capacity: usize) -> FResult<Self> {
-        let shape = greedy_block_shape(tensor_shape, max_capacity)?;
-        let strides = contiguous_strides(shape.as_slice())?;
-        Ok(Self { shape, strides })
-    }
-}
+impl LinearBlocks {
+    pub fn new(shape: &[u64], layout: Layout, capacity: usize) -> FResult<Self> {
+        validate_shape_dims(shape)?;
+        let size = checked_product(shape)?;
+        if capacity == 0 || capacity > MAX_BLOCK_CAPACITY {
+            return Err(Error::InvalidLayout("invalid block capacity".into()));
+        }
 
-/// Storage block grid and payload geometry.
-/// `shape`/`strides` are the block-grid dimensions/strides (ceil(tensor_dim /
-/// block_dim) per axis), precomputed once at construction -- never recomputed
-/// per call.
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub(crate) struct StorageSchema {
-    pub(crate) shape: Shape,
-    pub(crate) layout: Layout,
-    pub(crate) strides: Strides,
-    pub(crate) block_schema: BlockSchema,
-}
-
-impl StorageSchema {
-    /// Creation path: run the greedy algorithm to pick a block shape.
-    pub(crate) fn new(tensor_shape: &[u64], layout: Layout, max_capacity: usize) -> FResult<Self> {
-        validate_shape_dims(tensor_shape)?;
-        // Sparse coordinates identify a dense suffix. Without a sparse axis,
-        // each stored payload is one scalar.
-        let block_schema = if let Layout::Sparse { axis } = layout {
-            let mut region = Shape::from_slice(tensor_shape);
-            if let Some(axis) = axis {
-                region
-                    .get_mut(..=axis)
-                    .ok_or_else(|| Error::InvalidSchema("sparse axis out of bounds".into()))?
-                    .fill(1);
-            } else {
-                region.fill(1);
+        let prefix = match layout {
+            Layout::Dense => 0,
+            Layout::Sparse { axis: None } => shape.len(),
+            Layout::Sparse { axis: Some(axis) } if axis < shape.len() => axis + 1,
+            Layout::Sparse { .. } => {
+                return Err(Error::InvalidSchema("sparse axis out of bounds".into()));
             }
-
-            BlockSchema::new(&region, max_capacity)?
-        } else {
-            BlockSchema::new(tensor_shape, max_capacity)?
         };
-        Self::from_block_schema(tensor_shape, layout, block_schema)
+
+        let region_len = checked_product(&shape[prefix..])?;
+        let capacity = (capacity as u64).min(region_len) as usize;
+        let chunks = region_len.div_ceil(capacity as u64);
+        Ok(Self {
+            size,
+            region_len,
+            capacity,
+            chunks,
+        })
     }
 
-    /// Load path: block shape already known (persisted) -- no greedy run needed.
-    pub(crate) fn from_block_shape(
-        tensor_shape: &[u64],
-        layout: Layout,
-        block_shape: Shape,
-    ) -> FResult<Self> {
-        let strides = contiguous_strides(block_shape.as_slice())?;
-        Self::from_block_schema(
-            tensor_shape,
-            layout,
-            BlockSchema {
-                shape: block_shape,
-                strides,
-            },
-        )
+    pub fn count(&self) -> u64 {
+        (self.size / self.region_len) * self.chunks
     }
 
-    fn from_block_schema(
-        tensor_shape: &[u64],
-        layout: Layout,
-        block_schema: BlockSchema,
-    ) -> FResult<Self> {
-        if let Layout::Sparse { axis } = layout {
-            let prefix = match axis {
-                Some(axis) if axis < tensor_shape.len() => axis + 1,
-                Some(_) => {
-                    return Err(Error::InvalidSchema("sparse axis out of bounds".into()));
-                }
-                None => tensor_shape.len(),
+    pub fn position(&self, flat: u64) -> BlockPosition {
+        debug_assert!(flat < self.size);
+        let region = flat / self.region_len;
+        let local = flat % self.region_len;
+        BlockPosition {
+            block_id: region * self.chunks + local / self.capacity as u64,
+            offset_in_block: (local % self.capacity as u64) as usize,
+        }
+    }
+
+    pub fn range(&self, id: u64) -> FResult<std::ops::Range<u64>> {
+        if id >= self.count() {
+            return Err(Error::InvalidCoord("logical block out of bounds".into()));
+        }
+
+        let local = (id % self.chunks) * self.capacity as u64;
+        let start = (id / self.chunks) * self.region_len + local;
+        let len = (self.region_len - local).min(self.capacity as u64);
+        Ok(start..start + len)
+    }
+
+    pub fn split(
+        &self,
+        start: i128,
+        step: i128,
+        len: usize,
+        mut emit: impl FnMut(u64, usize, i64, usize, usize) -> FResult<()>,
+    ) -> FResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let last = step
+            .checked_mul((len - 1) as i128)
+            .and_then(|n| start.checked_add(n))
+            .ok_or_else(|| Error::InvalidCoord("mapped progression overflow".into()))?;
+
+        if start.min(last) < 0 || start.max(last) >= self.size as i128 {
+            return Err(Error::InvalidCoord(
+                "mapped progression out of bounds".into(),
+            ));
+        }
+
+        let mut done = 0;
+        while done < len {
+            let flat = (start + done as i128 * step) as u64;
+            let position = self.position(flat);
+            let range = self.range(position.block_id)?;
+            let room = if step < 0 {
+                flat - range.start
+            } else {
+                range.end - 1 - flat
             };
 
-            if block_schema
-                .shape
-                .get(..prefix)
-                .is_none_or(|prefix| prefix.iter().any(|&extent| extent != 1))
-            {
-                return Err(Error::InvalidLayout(
-                    "sparse block spans multiple sparse coordinates".into(),
-                ));
+            let count = if len - done == 1 {
+                1
+            } else if step == 0 {
+                len - done
+            } else {
+                ((room as i128 / step.abs()) + 1).min((len - done) as i128) as usize
+            };
+
+            let stride = if count == 1 {
+                0
+            } else {
+                i64::try_from(step)
+                    .map_err(|_| Error::InvalidCoord("storage stride exceeds i64".into()))?
+            };
+
+            emit(
+                position.block_id,
+                position.offset_in_block,
+                stride,
+                count,
+                done,
+            )?;
+
+            done += count;
+        }
+
+        Ok(())
+    }
+}
+
+/// Lazily cover a flat interval with disjoint row-major rectangles.
+/// Retains rank-sized coordinates; no map of storage blocks is built.
+pub(crate) fn flat_rectangles(
+    schema: &TensorSchema,
+    range: std::ops::Range<u64>,
+) -> FResult<impl Iterator<Item = Vec<(u64, u64)>> + '_> {
+    let shape = schema.shape();
+    let strides = schema.strides();
+    // TensorSchema validates a nonempty shape and its complete product.
+    let size = shape[0] * strides[0];
+    if range.start > range.end || range.end > size {
+        return Err(Error::InvalidCoord("flat interval out of bounds".into()));
+    }
+
+    let mut start = range.start;
+    let end = range.end;
+    let mut coord = Coord::from_elem(0, shape.len());
+    Ok(std::iter::from_fn(move || {
+        if start == end {
+            return None;
+        }
+
+        for ((value, stride), dim) in coord.iter_mut().zip(strides).zip(shape) {
+            *value = (start / stride) % dim;
+        }
+
+        for (axis, &width) in strides.iter().enumerate() {
+            if start.is_multiple_of(width) && end - start >= width {
+                let count = (shape[axis] - coord[axis]).min((end - start) / width);
+                let mut bounds: Vec<_> = coord.iter().map(|&c| (c, c + 1)).collect();
+                bounds[axis].1 = coord[axis] + count;
+                for trailing in axis + 1..shape.len() {
+                    bounds[trailing] = (0, shape[trailing]);
+                }
+
+                start += count * width;
+                return Some(bounds);
             }
         }
 
-        let shape: Shape = tensor_shape
-            .iter()
-            .zip(block_schema.shape.iter())
-            .map(|(dim, block_dim)| dim.div_ceil(*block_dim))
-            .collect();
-        let strides = contiguous_strides(shape.as_slice())?;
+        unreachable!("last axis has unit stride")
+    }))
+}
+
+/// Canonical row-major chunks; sparse prefixes never share a chunk.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub(crate) struct StorageSchema {
+    pub(crate) layout: Layout,
+    pub(crate) blocks: LinearBlocks,
+}
+
+impl StorageSchema {
+    pub(crate) fn new(shape: &[u64], layout: Layout, capacity: usize) -> FResult<Self> {
         Ok(Self {
-            shape,
             layout,
-            strides,
-            block_schema,
+            blocks: LinearBlocks::new(shape, layout, capacity)?,
         })
     }
 }
@@ -241,28 +319,6 @@ pub fn contiguous_strides(shape: &[u64]) -> FResult<Strides> {
     Ok(strides)
 }
 
-fn greedy_block_shape(shape: &[u64], max_capacity: usize) -> FResult<Shape> {
-    validate_shape_dims(shape)?;
-
-    if max_capacity == 0 {
-        return Err(Error::InvalidSchema(
-            "max block capacity must be non-zero".to_string(),
-        ));
-    }
-
-    let ndim = shape.len();
-    let mut block_shape = Shape::from_elem(1, ndim);
-    let mut remaining = max_capacity as u64;
-
-    for i in (0..ndim).rev() {
-        let take = shape[i].min(remaining);
-        block_shape[i] = take;
-        remaining /= take;
-    }
-
-    Ok(block_shape)
-}
-
 pub(crate) fn checked_product(shape: &[u64]) -> FResult<u64> {
     shape
         .iter()
@@ -314,6 +370,7 @@ impl Iterator for RowMajorCoords {
                 if axis == 0 {
                     break;
                 }
+
                 axis -= 1;
             }
         }

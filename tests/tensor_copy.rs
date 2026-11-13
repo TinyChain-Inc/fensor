@@ -22,11 +22,13 @@ async fn copy_base_and_geometric_readers_into_independent_storage() {
         )
         .await
         .unwrap();
+
         source.write_value(&[1, 2], 255).await.unwrap();
         let (base_root, base_dir) = new_dir("copy_base").await;
         let copied = Tensor::copy_from(base_dir, &source, source.layout(), 3)
             .await
             .unwrap();
+
         assert_eq!(copied.schema(), source.schema());
         assert_eq!(copied.layout(), layout);
         let view = source.view().transpose(Some(axes![1, 0])).unwrap();
@@ -35,12 +37,14 @@ async fn copy_base_and_geometric_readers_into_independent_storage() {
             Layout::Dense => Layout::Dense,
             Layout::Sparse { .. } => Layout::Sparse { axis: Some(0) },
         };
+
         let transposed = Tensor::copy_from(view_dir, &view, destination_layout, 2)
             .await
             .unwrap();
+
         assert_eq!(transposed.shape(), &[3, 2]);
         assert_eq!(transposed.layout(), destination_layout);
-        assert_eq!(transposed.storage_geometry().block_len(), 2);
+        assert_eq!(transposed.storage_geometry().block_capacity(), 2);
 
         for coord in common::iter_coords(&[3, 2]) {
             assert_eq!(
@@ -48,6 +52,7 @@ async fn copy_base_and_geometric_readers_into_independent_storage() {
                 view.read_value(&coord).await.unwrap()
             );
         }
+
         source.write_value(&[1, 2], 7).await.unwrap();
         assert_eq!(copied.read_value(&[1, 2]).await.unwrap(), 255);
         assert_eq!(transposed.read_value(&[2, 1]).await.unwrap(), 255);
@@ -71,21 +76,25 @@ async fn copy_propagates_source_and_destination_errors() {
     )
     .await
     .unwrap();
+
     let (out_root, out_dir) = new_dir("copy_errors_out").await;
     assert!(matches!(
         Tensor::copy_from(out_dir.clone(), &source, Layout::Sparse { axis: None }, 2).await,
         Err(Error::Unsupported(_))
     ));
+
     assert!(out_dir.try_read().unwrap().is_empty());
     assert!(matches!(
         Tensor::copy_from(out_dir.clone(), &source, source.layout(), 0).await,
         Err(Error::InvalidSchema(_))
     ));
+
     let scalar = source.view().slice(range![AxisRange::At(0)]).unwrap();
     assert!(matches!(
         Tensor::copy_from(out_dir.clone(), &scalar, scalar.layout(), 2).await,
         Err(Error::InvalidSchema(_))
     ));
+
     assert!(!out_root.join("blocks").exists());
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
     blocks.write().await.delete("0").await;
@@ -94,6 +103,7 @@ async fn copy_propagates_source_and_destination_errors() {
             .await
             .is_err()
     );
+
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
 }
@@ -179,6 +189,7 @@ async fn coordinate_copy_validates_blocks_and_accepts_unordered_coverage() {
     )
     .await
     .unwrap();
+
     assert_eq!(copy.read_value(&[0]).await.unwrap(), 2);
     assert_eq!(copy.read_value(&[1]).await.unwrap(), 3);
 }
@@ -217,6 +228,7 @@ where
             freqfs::Cache::<FsEntry>::new(65_536, None, 0, std::time::Duration::from_secs(1))
                 .load(out_root.to_path_buf())
                 .unwrap();
+
         let (other_root, other_dir) = new_dir("copy_concurrent_out").await;
         let (copied, other) = if matches!(layout, Layout::Sparse { .. }) {
             let (_unsupported_root, unsupported_dir) = new_dir("copy_unsupported_order").await;
@@ -224,6 +236,7 @@ where
                 Tensor::copy_from(unsupported_dir, &view, view.layout(), 128).await,
                 Err(Error::Unsupported(_))
             ));
+
             futures::try_join!(
                 Tensor::copy_from_values(out_dir, &view, view.layout(), 128),
                 Tensor::copy_from_values(other_dir, &view, view.layout(), 7),
@@ -235,11 +248,13 @@ where
             )
         }
         .unwrap();
+
         copied.sync().await.unwrap();
         drop(copied);
         let dir = freqfs::Cache::<FsEntry>::new(65_536, None, 0, std::time::Duration::from_secs(1))
             .load(out_root.to_path_buf())
             .unwrap();
+
         let copied = Tensor::<FsEntry, T>::load(dir).await.unwrap();
         let mut blocks = copied.read_blocks().unwrap();
         let mut i = 0;
@@ -252,10 +267,12 @@ where
                 } else {
                     expected
                 };
+
                 assert!(equal(value, expected), "copy mismatch at {i}");
                 i += 1;
             }
         }
+
         assert_eq!(i, 4097);
         assert!(equal(
             other.read_value(&[240, 16]).await.unwrap(),
@@ -276,6 +293,7 @@ async fn grouped_copy_preserves_float_special_values_and_u8_boundaries() {
         |a, b| (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits(),
     )
     .await;
+
     copy_boundary_values(
         &[0f64, -0., f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.],
         |a, b| (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits(),
@@ -328,6 +346,7 @@ async fn dropped_copy_releases_guards_and_allows_source_reuse() {
     )
     .await
     .unwrap();
+
     source.write_value(&[1], 255).await.unwrap();
     let paused = PausedReader(&source);
     let (partial_root, partial_dir) = new_dir("copy_cancel_partial").await;
@@ -339,6 +358,7 @@ async fn dropped_copy_releases_guards_and_allows_source_reuse() {
     let output = Tensor::copy_from(out_dir, &source, source.layout(), 2)
         .await
         .unwrap();
+
     assert_eq!(output.read_value(&[0]).await.unwrap(), 127);
     assert_eq!(output.read_value(&[1]).await.unwrap(), 255);
 
@@ -391,6 +411,7 @@ impl TensorRead for SparseOnce {
                     self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
+
             let lease = Lease(&self.drops);
             let malformed = self.malformed;
             Ok(futures::stream::iter([
@@ -429,6 +450,7 @@ async fn sparse_copy_consumes_once_releases_source_and_rejects_duplicates() {
             Layout::Dense => assert!(matches!(result, Err(Error::Unsupported(_)))),
             _ => assert!(matches!(result, Err(Error::InvalidSchema(_)))),
         }
+
         assert!(dir.try_read().unwrap().is_empty());
         assert_eq!(source.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(source.drops.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -446,6 +468,7 @@ async fn sparse_copy_consumes_once_releases_source_and_rejects_duplicates() {
             drops: 0.into(),
             malformed,
         };
+
         let (root, dir) = new_dir("copy_once").await;
         let result = Tensor::<FsEntry, f64>::copy_from(dir.clone(), &source, layout, 4096).await;
         assert_eq!(source.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -457,14 +480,16 @@ async fn sparse_copy_consumes_once_releases_source_and_rejects_duplicates() {
             let tensor = result.unwrap();
             assert_eq!(tensor.layout(), layout);
             assert_eq!(
-                tensor.storage_geometry().block_len(),
+                tensor.storage_geometry().block_capacity(),
                 if axis == Some(0) { 4096 } else { 1 }
             );
+
             assert!(tensor.read_value(&[0, 0]).await.unwrap().is_nan());
             assert_eq!(tensor.read_value(&[0, 4096]).await.unwrap(), f64::INFINITY);
             assert_eq!(tensor.read_value(&[1, 8192]).await.unwrap(), 2.);
             tensor.validate().await.unwrap();
         }
+
         common::cleanup(&root).await;
     }
 }
@@ -506,6 +531,7 @@ impl TensorRead for ValueReader<'_> {
 
         self.starts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         let lease = self.lease.clone();
         let waiting = self.waiting.clone();
         Ok(futures::stream::iter(self.blocks.clone())
@@ -574,9 +600,11 @@ async fn full_value_copy_validates_before_zero_filtering_and_releases_sources() 
                 starts: 0.into(),
                 lease: Arc::new(()),
             };
+
             let (root, dir) = new_dir("copy_values_result").await;
             let result =
                 Tensor::<FsEntry, u8>::copy_from_values(dir.clone(), &reader, layout, 2).await;
+
             assert_eq!(reader.starts.load(Ordering::SeqCst), 1);
             assert_eq!(Arc::strong_count(&reader.lease), 1);
 
@@ -596,6 +624,7 @@ async fn full_value_copy_validates_before_zero_filtering_and_releases_sources() 
                 let reopened = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
                     .await
                     .unwrap();
+
                 assert_eq!(
                     reopened.read_blocks().unwrap().try_concat().await.unwrap(),
                     expected
@@ -611,6 +640,7 @@ async fn full_value_copy_validates_before_zero_filtering_and_releases_sources() 
             starts: 0.into(),
             lease: Arc::new(()),
         };
+
         let (_partial_root, dir) = new_dir("copy_values_cancel").await;
         let mut pending = Box::pin(Tensor::<FsEntry, u8>::copy_from_values(
             dir.clone(),
@@ -618,12 +648,14 @@ async fn full_value_copy_validates_before_zero_filtering_and_releases_sources() 
             layout,
             2,
         ));
+
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut pending => panic!("copy completed before cancellation: {}", result.is_ok()),
                 () = waiting.notified() => {}
             }
         }).await.unwrap();
+
         assert_eq!(reader.starts.load(Ordering::SeqCst), 1);
         assert_eq!(Arc::strong_count(&reader.lease), 2);
         drop(pending);

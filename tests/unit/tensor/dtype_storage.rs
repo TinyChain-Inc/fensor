@@ -26,6 +26,7 @@ where
         let mut expected: Vec<T> = (0..len)
             .map(|i| if i % 3 == 0 { T::ZERO } else { T::ONE })
             .collect();
+
         if let Some(samples) = samples {
             expected[2..4].copy_from_slice(&samples);
         }
@@ -36,6 +37,7 @@ where
         let dir = freqfs::Cache::<FsEntry>::new(cache, None, 0, std::time::Duration::from_secs(1))
             .load(root.to_path_buf())
             .unwrap();
+
         let schema = TensorSchema::new(T::dtype(), shape![len as u64]).unwrap();
         // Borrow the expected values through a non-Unpin stream. Construction
         // must not require Clone adapters, owned inputs, or a static decoder.
@@ -43,6 +45,7 @@ where
             let values = futures::stream::unfold(expected.iter(), |mut iter| async move {
                 iter.next().map(|&v| (Ok::<_, Error>(v), iter))
             });
+
             Tensor::from_values(dir, schema, 31, values).await.unwrap()
         } else {
             let entries = futures::stream::iter(
@@ -51,10 +54,12 @@ where
                     .enumerate()
                     .map(|(i, &v)| Ok::<_, Error>((vec![i as u64], v))),
             );
+
             Tensor::from_sparse_elements(dir, schema, layout, 31, entries)
                 .await
                 .unwrap()
         };
+
         assert_eq!(tensor.dtype(), T::dtype());
         assert_eq!(tensor.view().dtype(), T::dtype());
         assert_eq!(tensor.schema().dtype(), T::dtype());
@@ -66,12 +71,13 @@ where
             .write_value(&[0], T::ONE)
             .await
             .unwrap();
+
         expected[len - 1] = T::ONE;
         if matches!(layout, Layout::Dense) {
             fixture::blocks(&tensor.view(), &expected, same).await;
             // Sample point access independently of the complete stream comparison.
             // Cover special values, every block boundary, and the write-through value.
-            let block_len = tensor.block_len();
+            let block_len = crate::TensorSource::storage_geometry(&tensor).block_capacity();
 
             for (i, &value) in expected.iter().enumerate() {
                 if i < 4 || i + 1 == len || i % block_len <= 1 || i % block_len + 1 == block_len {
@@ -81,6 +87,7 @@ where
         } else {
             fixture::reads(&tensor.view(), &expected, same).await;
         }
+
         tensor.write_value(&[1], T::ZERO).await.unwrap();
         expected[1] = T::ZERO;
         tensor.sync().await.unwrap();
@@ -98,6 +105,7 @@ where
             tensor.schema(),
             &TensorSchema::new(T::dtype(), shape![len as u64]).unwrap()
         );
+
         fixture::blocks(&tensor, &expected, same).await;
         let (copy_root, copy_dir) = common::new_dir("dtype_copy").await;
         let copied = Tensor::<FsEntry, T>::copy_from(
@@ -108,6 +116,7 @@ where
         )
         .await
         .unwrap();
+
         let reversed: Vec<_> = expected.iter().copied().rev().collect();
         fixture::blocks(&copied, &reversed, same).await;
         copied.sync().await.unwrap();
@@ -116,6 +125,7 @@ where
         let copied = Tensor::<FsEntry, T>::load(common::open_dir(&copy_root).unwrap())
             .await
             .unwrap();
+
         fixture::blocks(&copied, &reversed, same).await;
         drop(copied);
         cleanup(&copy_root).await;
@@ -140,6 +150,7 @@ where
                 tensor.read_value(&[2]).await,
                 Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
+
             assert!(matches!(
                 tensor.write_value(&[2], T::ONE).await,
                 Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
@@ -151,12 +162,15 @@ where
                 tensor.read_value(&[2]).await,
                 Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
+
             assert!(matches!(
                 tensor.write_value(&[2], T::ONE).await,
                 Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
             ));
+
             assert!(file.read::<Vec<T>>().await.unwrap().is_empty());
         }
+
         drop(tensor);
         drop(dir);
         cleanup(&root).await;
@@ -177,6 +191,7 @@ where
             [T::ONE, T::ONE, T::ZERO, T::ZERO],
         )
         .await;
+
         let tensor = if matches!(layout, Layout::Sparse { axis: Some(0) }) {
             // Scalar sparse persistence is covered above. Reopen one small dense
             // suffix payload for each dtype.
@@ -188,6 +203,7 @@ where
         } else {
             tensor
         };
+
         tensor
             .view()
             .transpose(None)
@@ -195,6 +211,7 @@ where
             .write_value(&[0, 0], T::ZERO)
             .await
             .unwrap();
+
         assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), T::ONE);
         tensor
             .write_values(
@@ -203,6 +220,7 @@ where
             )
             .await
             .unwrap();
+
         assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), T::ZERO);
         cleanup(&root).await;
     }
@@ -261,6 +279,7 @@ async fn malformed_complex_components_are_rejected_by_adapter() {
                 .await
                 .is_err()
         );
+
         let excess = (tag, vec![(1f64, 2f64, 3f64)]);
         assert!(
             tbon::de::try_decode::<_, _, FsEntry>((), tbon::en::encode(&excess).unwrap())

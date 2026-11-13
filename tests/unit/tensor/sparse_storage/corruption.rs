@@ -12,6 +12,7 @@ pub(in crate::tensor) async fn sparse_row<F: TensorFileEntry<T>, T: TensorElemen
         .get_dir("values")
         .cloned()
         .unwrap();
+
     let primary = values.read().await.get_dir("primary").cloned().unwrap();
     let primary = primary.read().await;
     for (_, entry) in primary.iter() {
@@ -22,9 +23,11 @@ pub(in crate::tensor) async fn sparse_row<F: TensorFileEntry<T>, T: TensorElemen
             .into_read::<crate::SparseNode<T>>()
             .await
             .unwrap();
+
         let b_tree::Node::Leaf(rows) = &*node else {
             continue;
         };
+
         if let Some(slot) = rows
             .iter()
             .position(|row| row.first() == Some(&SparseCell::Key(id)))
@@ -32,10 +35,11 @@ pub(in crate::tensor) async fn sparse_row<F: TensorFileEntry<T>, T: TensorElemen
             return (node, slot);
         }
     }
+
     panic!("missing sparse fixture row {id}");
 }
 
-async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
+pub(in crate::tensor) async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
     tensor: &Tensor<F, T>,
     id: u64,
     mutate: impl FnOnce(&mut Vec<SparseCell<T>>),
@@ -47,6 +51,7 @@ async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
         .get_dir("values")
         .cloned()
         .unwrap();
+
     let primary = values.read().await.get_dir("primary").cloned().unwrap();
     let primary = primary.read().await;
     for (_, entry) in primary.iter() {
@@ -56,6 +61,7 @@ async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
             .write::<crate::SparseNode<T>>()
             .await
             .unwrap();
+
         if let b_tree::Node::Leaf(rows) = &mut *node {
             for row in rows {
                 if row.first() == Some(&SparseCell::Key(id)) {
@@ -65,6 +71,7 @@ async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
             }
         }
     }
+
     panic!("missing sparse corruption fixture row {id}");
 }
 
@@ -85,15 +92,16 @@ pub(crate) async fn corrupt_sparse_payload<F: TensorFileEntry<T>, T: TensorEleme
         let SparseCell::Payload(values) = &mut row[1] else {
             panic!("native sparse payload")
         };
+
         values.clear();
     })
     .await;
 }
 
 pub(in crate::tensor) fn block_index<F, T>(
-    owner: &super::SparseStorage<F, T>,
+    owner: &super::SparseBlocks<F, T>,
 ) -> &super::Blocks<F, T> {
-    &owner.blocks
+    &owner.inner.blocks
 }
 
 pub(in crate::tensor) fn files<F, T>(
@@ -103,6 +111,6 @@ pub(in crate::tensor) fn files<F, T>(
         crate::tensor::Storage::Dense(dense) => {
             crate::tensor::dense_storage::test_support::files(dense)
         }
-        crate::tensor::Storage::Sparse(sparse) => &sparse.metadata_dir,
+        crate::tensor::Storage::Sparse(sparse) => &sparse.inner.metadata_dir,
     }
 }

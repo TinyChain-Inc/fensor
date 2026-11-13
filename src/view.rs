@@ -104,21 +104,9 @@ where
             return Ok(0..0);
         };
 
-        let mut lower = Vec::with_capacity(self.tensor.shape().len());
-        let mut upper = Vec::with_capacity(self.tensor.shape().len());
-
-        for (&len, &stride) in self.tensor.shape().iter().zip(self.tensor.strides()) {
-            let (start, end) = (lo / stride, hi / stride);
-            if start / len == end / len {
-                lower.push(start % len);
-                upper.push(end % len);
-            } else {
-                lower.push(0);
-                upper.push(len - 1);
-            }
-        }
-
-        Ok(geometry.block_position(&lower)?.0..geometry.block_position(&upper)?.0 + 1)
+        let lower = geometry.storage.blocks.position(lo).block_id;
+        let upper = geometry.storage.blocks.position(hi).block_id;
+        Ok(lower..upper + 1)
     }
 
     pub fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
@@ -253,6 +241,7 @@ where
             else {
                 return Ok(crate::expression::traversal::Preferred::Ready(None));
             };
+
             Some(local.compose(mapping)?)
         };
 
@@ -282,6 +271,7 @@ where
                 .ok_or_else(|| Error::Unsupported(
                     "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
                 ))?;
+
             Some(local.compose(mapping)?)
         };
 
@@ -309,6 +299,7 @@ where
                 .ok_or_else(|| Error::Unsupported(
                     "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
                 ))?;
+
             Some(local.compose(mapping)?)
         };
 

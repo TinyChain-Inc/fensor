@@ -16,6 +16,7 @@ fn tile_planning_is_bounded_and_preserves_requests() {
     let coords: Vec<_> = (0..64 * 64)
         .map(|i| vec![1, (i / 64) as u64, (i % 64) as u64])
         .collect();
+
     let tiles = plan_tiles(
         &mapping,
         &shape,
@@ -23,6 +24,7 @@ fn tile_planning_is_bounded_and_preserves_requests() {
         &BatchRequest::explicit(coords).unwrap(),
     )
     .unwrap();
+
     assert_eq!(tiles.len(), 4);
     assert_eq!(tiles.values().map(Vec::len).sum::<usize>(), 64 * 64);
 
@@ -33,14 +35,17 @@ fn tile_planning_is_bounded_and_preserves_requests() {
             rows.len() * contraction_step(rows.len(), columns.len())
                 <= expression::MAX_BATCH_ELEMENTS
         );
+
         assert!(
             columns.len() * contraction_step(rows.len(), columns.len())
                 <= expression::MAX_BATCH_ELEMENTS
         );
     }
+
     assert!(
         BatchRequest::explicit(vec![vec![0, 0, 0]; expression::MAX_BATCH_ELEMENTS + 1]).is_err()
     );
+
     let requests = plan_tiles(
         &mapping,
         &shape,
@@ -48,6 +53,7 @@ fn tile_planning_is_bounded_and_preserves_requests() {
         &BatchRequest::explicit(vec![vec![0, 1, 2], vec![0, 1, 2]]).unwrap(),
     )
     .unwrap();
+
     assert_eq!(
         requests.values().next().unwrap(),
         &vec![(0, 1, 2), (1, 1, 2)]
@@ -67,6 +73,7 @@ fn irregular_rectangles_bound_arithmetic_and_retain_duplicates() {
     ] {
         let unique: std::collections::BTreeSet<_> =
             requests.iter().map(|(_, r, c)| (*r, *c)).collect();
+
         let rectangles = plan_rectangles(requests.clone());
         assert!(
             rectangles
@@ -75,6 +82,7 @@ fn irregular_rectangles_bound_arithmetic_and_retain_duplicates() {
                 .sum::<usize>()
                 <= MAX_RECTANGLE_AMPLIFICATION * unique.len()
         );
+
         let mut seen = vec![false; requests.len()];
 
         for rect in rectangles {
@@ -90,12 +98,15 @@ fn irregular_rectangles_bound_arithmetic_and_retain_duplicates() {
                 );
             });
         }
+
         assert!(seen.into_iter().all(|v| v));
     }
+
     assert_eq!(
         contraction_step(TILE_SIDE, TILE_SIDE),
         expression::MAX_BATCH_ELEMENTS / TILE_SIDE
     );
+
     assert_eq!(contraction_step(1, 1), expression::MAX_BATCH_ELEMENTS);
     assert_eq!(contraction_step(2, 1), expression::MAX_BATCH_ELEMENTS / 2);
     assert!(combine_partial(&mut Some(vec![1u8]), vec![2, 3], 1).is_err());
@@ -137,9 +148,11 @@ fn planner_work_counts() {
                     });
                 }
             }
+
             totals.push((operands, calls));
             println!("PLAN,{name},{revised},{operands},{calls}");
         }
+
         assert!(totals[1].0 <= totals[0].0);
         assert!(totals[1].1 <= totals[0].1);
     }
@@ -157,9 +170,11 @@ fn planned_coordinates(plans: &[MatrixPlan], len: usize) -> Vec<Vec<u64>> {
                 rect.rows[offset / rect.columns.len()],
                 rect.columns[offset % rect.columns.len()],
             ]);
+
             coords[position] = coord;
         });
     }
+
     coords
 }
 
@@ -174,9 +189,9 @@ fn compact_and_explicit_plans_agree() {
         BatchRequest::linear(2000, 2690).unwrap(),
         BatchRequest::rectangles(vec![
             Cartesian::new(vec![
-                Axis::Selected(vec![1, 0, 1]),
-                Axis::Selected(vec![34, 0, 34, 1]),
-                Axis::Selected(vec![66, 0, 31, 32]),
+                Axis::selected(vec![1, 0, 1]),
+                Axis::selected(vec![34, 0, 34, 1]),
+                Axis::selected(vec![66, 0, 31, 32]),
             ])
             .unwrap(),
         ])
@@ -191,6 +206,7 @@ fn compact_and_explicit_plans_agree() {
                 .iter()
                 .all(|p| !matches!(p.rectangle.scatter, Scatter::Explicit(_)))
         );
+
         let explicit = plan_request(
             &mapping,
             &shape,
@@ -198,6 +214,7 @@ fn compact_and_explicit_plans_agree() {
             &BatchRequest::explicit(expected.clone()).unwrap(),
         )
         .unwrap();
+
         assert_eq!(planned_coordinates(&direct, request.len()), expected);
         assert_eq!(planned_coordinates(&explicit, request.len()), expected);
     }
@@ -210,12 +227,14 @@ fn compact_and_explicit_plans_agree() {
         .iter()
         .map(|c| flipped.resolve(c, &shape, &strides).unwrap())
         .collect();
+
     let plans = plan_request(&flipped, &shape, &strides, &request).unwrap();
     assert!(
         plans
             .iter()
             .all(|p| matches!(p.rectangle.scatter, Scatter::Explicit(_)))
     );
+
     assert_eq!(planned_coordinates(&plans, request.len()), expected);
 }
 
@@ -233,6 +252,7 @@ fn compact_planning_representation_counts() {
         let RequestKind::Rectangles(rectangles) = request.kind() else {
             panic!("expanded regular traversal")
         };
+
         descriptors += rectangles.len();
         logical += request.len();
 
@@ -240,6 +260,7 @@ fn compact_planning_representation_counts() {
             let Scatter::Cartesian { rows, columns, .. } = &plan.rectangle.scatter else {
                 panic!("expanded regular scatter")
             };
+
             scatter_slots += rows.len() + columns.len();
             calls += 17usize.div_ceil(contraction_step(
                 plan.rectangle.rows.len(),
@@ -247,10 +268,12 @@ fn compact_planning_representation_counts() {
             ));
         }
     }
+
     assert_eq!(
         (logical, descriptors, scatter_slots, calls),
         (131104, 129, 8225, 129)
     );
+
     println!(
         "COMPACT,wide,logical={logical},rectangles={descriptors},scatter_axis_slots={scatter_slots},matmul_calls={calls},pre_evaluation_coordinate_payloads=0"
     );

@@ -16,9 +16,10 @@ fn validated_layout_selects_its_axis() {
             )
             .unwrap(),
             layout,
-            vec![1, 1, 1].into(),
+            [1, 1, 1].iter().copied().product::<u64>() as usize,
         )
         .unwrap();
+
         assert_eq!(geometry.sparse_axis().unwrap_or(0), expected);
     }
 }
