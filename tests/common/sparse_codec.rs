@@ -1,9 +1,11 @@
 //! Adapter-owned, bounded typed sparse payload serialization.
 
 use destream::{de, en};
+
 use fensor::{SparseCell, SparseNode, TensorElement};
 
 pub(super) const MAX_NODE_ENTRIES: usize = 1024;
+
 pub(super) const MAX_NODE_VALUES: usize = 4 * fensor::MAX_BLOCK_CAPACITY;
 
 pub trait Bits: TensorElement {
@@ -91,6 +93,7 @@ impl<'en, T: Bits> en::IntoStream<'en> for EncodedPayload<'en, T> {
         if self.0.is_empty() || self.0.len() > fensor::MAX_BLOCK_CAPACITY {
             return Err(en::Error::custom("invalid sparse payload length"));
         }
+
         let width = std::mem::size_of::<T>();
         let mut bytes = Vec::with_capacity(std::mem::size_of_val(self.0));
         for value in self.0 {
@@ -100,6 +103,7 @@ impl<'en, T: Bits> en::IntoStream<'en> for EncodedPayload<'en, T> {
                 bytes.extend_from_slice(&b.to_le_bytes()[..T::COMPONENT_BYTES]);
             }
         }
+
         encoder.encode_array_u8(futures::stream::iter([bytes]))
     }
 }
@@ -126,6 +130,7 @@ impl<'en, T: Bits> en::IntoStream<'en> for Encoded<'en, T> {
             b_tree::Node::Leaf(rows) => (true, rows, &[][..]),
             b_tree::Node::Index(rows, children) => (false, rows, children.as_slice()),
         };
+
         if !leaf && (rows.is_empty() || children.len() != rows.len() + 1) {
             return Err(en::Error::custom("invalid sparse separator count"));
         }
@@ -135,8 +140,10 @@ impl<'en, T: Bits> en::IntoStream<'en> for Encoded<'en, T> {
             if leaf && row.len() != 2 {
                 return Err(en::Error::custom("incomplete sparse payload row"));
             }
+
             encoded.push(EncodedRow(row));
         }
+
         (leaf, encoded, children).into_stream(encoder)
     }
 }
@@ -165,11 +172,14 @@ impl<T: de::FromStream<Context = ()> + Send> de::FromStream for Limited<T> {
                     if values.len() == MAX_NODE_ENTRIES {
                         return Err(de::Error::custom("oversized sparse node"));
                     }
+
                     values.push(v);
                 }
+
                 Ok(Limited(values))
             }
         }
+
         decoder.decode_seq(Visitor(std::marker::PhantomData)).await
     }
 }
@@ -203,15 +213,19 @@ impl<T: Bits> de::FromStream for Payload<T> {
                         if filled != 0 {
                             return Err(de::Error::custom("incomplete sparse scalar bytes"));
                         }
+
                         break;
                     }
+
                     filled += read;
                     if filled != width {
                         continue;
                     }
+
                     if values.len() == fensor::MAX_BLOCK_CAPACITY {
                         return Err(de::Error::custom("oversized sparse payload"));
                     }
+
                     let mut a = [0; 8];
                     let mut b = [0; 8];
                     a[..T::COMPONENT_BYTES].copy_from_slice(&scratch[..T::COMPONENT_BYTES]);
@@ -219,15 +233,19 @@ impl<T: Bits> de::FromStream for Payload<T> {
                         b[..T::COMPONENT_BYTES]
                             .copy_from_slice(&scratch[T::COMPONENT_BYTES..width]);
                     }
+
                     let value = T::from_bits(u64::from_le_bytes(a), u64::from_le_bytes(b))
                         .ok_or_else(|| de::Error::custom("invalid sparse scalar bits"))?;
+
                     values.try_reserve(1).map_err(de::Error::custom)?;
                     values.push(value);
                     filled = 0;
                 }
+
                 if values.is_empty() {
                     return Err(de::Error::custom("empty sparse payload"));
                 }
+
                 Ok(Payload(values))
             }
         }
@@ -305,6 +323,7 @@ impl<T: Bits> de::FromStream for Rows<T> {
                     if rows.len() == MAX_NODE_ENTRIES {
                         return Err(de::Error::custom("oversized sparse node"));
                     }
+
                     if let Some(SparseCell::Payload(values)) = row.get(1) {
                         count += values.len();
                         if count > MAX_NODE_VALUES {
@@ -315,9 +334,11 @@ impl<T: Bits> de::FromStream for Rows<T> {
                     rows.try_reserve(1).map_err(de::Error::custom)?;
                     rows.push(row);
                 }
+
                 Ok(Rows(rows))
             }
         }
+
         decoder
             .decode_seq(Visitor(leaf, std::marker::PhantomData))
             .await
@@ -354,11 +375,13 @@ impl<T: Bits> de::FromStream for Decoded<T> {
                     if !children.is_empty() {
                         return Err(de::Error::custom("leaf has children"));
                     }
+
                     Ok(Decoded(b_tree::Node::Leaf(rows)))
                 } else {
                     if rows.is_empty() || children.len() != rows.len() + 1 {
                         return Err(de::Error::custom("invalid sparse separator count"));
                     }
+
                     Ok(Decoded(b_tree::Node::Index(rows, children)))
                 }
             }

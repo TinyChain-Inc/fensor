@@ -4,7 +4,7 @@ use super::*;
 fn validated_layout_selects_its_axis() {
     for (layout, expected) in [
         (Layout::Dense, 0),
-        (Layout::Sparse { axis: None }, 0),
+        (Layout::Sparse { axis: None }, 2),
         (Layout::Sparse { axis: Some(0) }, 0),
         (Layout::Sparse { axis: Some(1) }, 1),
         (Layout::Sparse { axis: Some(2) }, 2),

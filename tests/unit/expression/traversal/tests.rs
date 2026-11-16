@@ -29,6 +29,7 @@ async fn wide_sparse_candidates_retain_compact_requests_and_release_sources() {
                 .boxed()
             })
             .collect();
+
         drop(lease);
         CURRENT
             .scope(RefCell::new(Metrics::default()), async {
@@ -46,6 +47,7 @@ async fn wide_sparse_candidates_retain_compact_requests_and_release_sources() {
                         count += 1;
                     }
                 }
+
                 assert_eq!(count, MAX_BATCH_ELEMENTS as u64 + 1);
                 assert_eq!(reads.load(Ordering::Relaxed), leaves * 3);
                 assert_eq!(CURRENT.with(|m| m.borrow().expanded_coordinates), 0);
@@ -76,15 +78,18 @@ async fn ready_sparse_candidates_can_be_cancelled_and_errors_release_sources() {
                 .boxed()
             })
             .collect();
+
         drop(lease);
         let mut stream = merge(
             streams,
             crate::Shape::from_slice(&[MAX_BATCH_ELEMENTS as u64]),
         );
+
         if fail {
             assert!(
                 matches!(stream.try_next().await, Err(Error::InvalidLayout(message)) if message == "candidate source failure")
             );
+
             assert!(weak.upgrade().is_none());
         } else {
             {
@@ -92,6 +97,7 @@ async fn ready_sparse_candidates_can_be_cancelled_and_errors_release_sources() {
                 assert!(matches!(futures::poll!(next.as_mut()), Poll::Pending));
                 assert!(weak.upgrade().is_some());
             }
+
             drop(stream);
             assert!(weak.upgrade().is_none());
         }
@@ -112,6 +118,7 @@ async fn candidate_errors_discard_partial_batches_and_empty_inputs_yield() {
                 item
             })
             .boxed();
+
         let mut stream = merge(vec![source], crate::Shape::from_slice(&[2]));
         assert!(stream.try_next().await.is_err());
         assert!(weak.upgrade().is_none());
@@ -125,6 +132,7 @@ async fn candidate_errors_discard_partial_batches_and_empty_inputs_yield() {
         Ok(BatchRequest::linear(0, 0).unwrap())
     })
     .boxed();
+
     let mut stream = merge(vec![source], crate::Shape::from_slice(&[2]));
     assert!(matches!(futures::poll!(stream.try_next()), Poll::Pending));
     assert!(weak.upgrade().is_some());

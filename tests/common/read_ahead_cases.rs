@@ -1,10 +1,10 @@
 //! Resident-cache and cache-pressure reads; OS page-cache state is uncontrolled.
 
-use fensor::{AxisRange, TensorGeometry, TensorRead, TensorReduceAll, TensorTransform};
 use futures::TryStreamExt;
 use ha_ndarray::range;
 
 use super::{benchmark, benchmark_source};
+use fensor::{AxisRange, TensorGeometry, TensorRead, TensorReduceAll, TensorTransform};
 
 pub async fn run() {
     let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();
@@ -16,12 +16,14 @@ pub async fn run() {
         for cache in [32768, 1_000_000] {
             let (root, tensor) =
                 benchmark_source::source(rows, columns, false, capacity, 1, cache).await;
+
             let name = format!("read_blocks_{capacity}_cache{cache}");
             let temperature = if cache == 1_000_000 {
                 "resident"
             } else {
                 "streaming"
             };
+
             let transposed = tensor.view().transpose(None).unwrap();
             let selected = tensor
                 .view()
@@ -47,9 +49,11 @@ pub async fn run() {
                                 _ => unreachable!(),
                             };
                         }
+
                         Ok::<_, fensor::Error>(count)
                     }
                     .await;
+
                     let (admitted, count) = match result {
                         Ok(count) => (true, count),
                         Err(fensor::Error::Io(error))
@@ -68,6 +72,7 @@ pub async fn run() {
                         "count",
                         u128::from(admitted),
                     );
+
                     benchmark::record(
                         &name,
                         operation,
@@ -76,6 +81,7 @@ pub async fn run() {
                         "count",
                         u128::from(!admitted),
                     );
+
                     count
                 })
                 .await;
@@ -88,6 +94,7 @@ pub async fn run() {
                 for _ in 0..repeats {
                     std::hint::black_box(tensor.read_value(&[0, 0]).await.unwrap());
                 }
+
                 repeats
             })
             .await;

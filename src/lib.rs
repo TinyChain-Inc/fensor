@@ -39,7 +39,7 @@
 //! ```no_run
 //! use fensor::{
 //!     Result, Tensor, TensorExpression, TensorFileEntry, TensorMatMul, TensorMathScalar, TensorRead,
-//!     TensorUnary,
+//!     TensorUnary, TensorGeometry,
 //! };
 //! use futures::TryStreamExt;
 //!
@@ -55,7 +55,8 @@
 //!
 //!     let mut batches = result.read_coordinate_blocks()?;
 //!
-//!     while let Some((coordinates, values)) = batches.try_next().await? {
+//!     while let Some(batch) = batches.try_next().await? {
+//!         let (coordinates, values) = batch.into_coordinates(result.shape())?;
 //!         // Batch delivery order is unspecified; coordinates stay paired.
 //!         for (coordinate, value) in coordinates.iter().zip(values) {
 //!             visit(coordinate, value);
@@ -128,18 +129,19 @@ mod validate;
 
 mod view;
 
+pub use ha_ndarray::Axes;
+#[cfg(feature = "complex")]
+pub use ha_ndarray::complex;
+pub use number_general::NumberType;
+
 pub use binary::BinaryView;
 pub use error::{Error, Result};
 pub use expression::MAX_BATCH_ELEMENTS;
 #[cfg(feature = "complex")]
 pub use fft::FourierView;
-pub use ha_ndarray::Axes;
-#[cfg(feature = "complex")]
-pub use ha_ndarray::complex;
 pub use matmul::MatMulView;
 pub use matrix::DiagView;
 pub use metadata::TensorMetadata;
-pub use number_general::NumberType;
 pub use owned::TensorExpression;
 pub use reduce::{ReduceView, StatisticsElement, TensorStatistics};
 pub use schema::{
@@ -151,12 +153,12 @@ pub use sparse::{SparseCell, SparseNode};
 pub use storage::{BlockUpdates, StorageGeometry, StorageRead, StorageReadPlan, TensorSource};
 pub use tensor::{SparseBlocks, Tensor, TensorElement, TensorFileEntry};
 pub use traits::{
-    BoxFuture, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray, TensorBoolean,
-    TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar, TensorGeometry,
-    TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric, TensorRead,
-    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig, TensorUnary,
-    TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite, TensorWriteBulk,
-    ValueBlockStream,
+    BoxFuture, CoordinateBatch, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray,
+    TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric,
+    TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig,
+    TensorUnary, TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite,
+    TensorWriteBulk, ValueBlockStream,
 };
 #[cfg(feature = "complex")]
 pub use traits::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};

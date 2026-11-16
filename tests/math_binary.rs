@@ -1,10 +1,4 @@
 //! Filesystem-backed binary expression parity and implicit-zero regressions.
-use fensor::{
-    AxisRange, Layout, Tensor, TensorArray, TensorBoolean, TensorBooleanScalar, TensorCast,
-    TensorCompare, TensorCompareScalar, TensorElement, TensorExpression, TensorFileEntry,
-    TensorGeometry, TensorMath, TensorMathScalar, TensorNumeric, TensorRead, TensorSchema,
-    TensorTransform, TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite,
-};
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{
     Array, ArrayAccess, Buffer, NDArrayBoolean, NDArrayBooleanScalar, NDArrayCompare,
@@ -13,7 +7,14 @@ use ha_ndarray::{
 };
 use number_general::DType;
 
-use common::{FsEntry, new_dir, numbers::same};
+use common::numbers::same;
+use common::{FsEntry, new_dir};
+use fensor::{
+    AxisRange, Layout, Tensor, TensorArray, TensorBoolean, TensorBooleanScalar, TensorCast,
+    TensorCompare, TensorCompareScalar, TensorElement, TensorExpression, TensorFileEntry,
+    TensorGeometry, TensorMath, TensorMathScalar, TensorNumeric, TensorRead, TensorSchema,
+    TensorTransform, TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite,
+};
 
 mod common;
 
@@ -143,6 +144,7 @@ matrix!(
     vec![0., 2., 2., -2., 3., 0., 1., 2., 0.],
     [add, sub, mul, div, pow, log, rem]
 );
+
 matrix!(
     f64_matrix,
     f64,
@@ -160,6 +162,7 @@ matrix!(
     vec![0., 2., 2., -2., 3., 0., 1., 2., 0.],
     [add, sub, mul, div, pow, log, rem]
 );
+
 matrix!(
     u8_matrix,
     u8,
@@ -191,10 +194,12 @@ async fn sparse_zero_intermediates_match_materialized_values() {
         zero.exp().await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     assert!(matches!(
         zero.div(&zero).await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     let dense_zero = TensorExpression::new(zero.clone()).unwrap().into_dense();
     check(dense_zero.exp().await.unwrap(), vec![1.; 4]).await;
     check(
@@ -202,31 +207,38 @@ async fn sparse_zero_intermediates_match_materialized_values() {
         vec![f32::NAN; 4],
     )
     .await;
+
     let rounded = TensorExpression::new(a.view().round().await.unwrap())
         .unwrap()
         .into_dense();
+
     check(
         rounded.exp().await.unwrap().add(&b.view()).await.unwrap(),
         vec![1., 4., 2f32.exp() + 2., 1.],
     )
     .await;
+
     let difference = TensorExpression::new(a.view().sub(&b.view()).await.unwrap())
         .unwrap()
         .into_dense();
+
     check(
         difference.exp().await.unwrap(),
         vec![0.2f32.exp(), (-3f32).exp(), 1., 1.],
     )
     .await;
+
     let (_dir_root, dir) = new_dir("binary_zero_copy").await;
     let copied: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &zero, zero.layout(), 2)
         .await
         .unwrap();
+
     check(copied.view(), vec![0.; 4]).await;
     assert!(matches!(
         copied.view().exp().await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     let copied = TensorExpression::new(copied).unwrap().into_dense();
     check(copied.exp().await.unwrap(), vec![1.; 4]).await;
 }
@@ -253,6 +265,7 @@ async fn nested_transforms_casts_predicates_and_explicit_broadcast() {
     .not()
     .await
     .unwrap();
+
     check(expression, vec![1u8; 4]).await;
     let transformed = a
         .view()
@@ -263,6 +276,7 @@ async fn nested_transforms_casts_predicates_and_explicit_broadcast() {
         .unwrap()
         .transpose(Some(axes![1, 0]))
         .unwrap();
+
     check(transformed, vec![3., 4., 2., 6.]).await;
     let (_scalar_root, scalar) = source(&[2f32], Layout::Dense, 1).await;
 
@@ -290,6 +304,7 @@ async fn bounded_batches_independent_consumption_and_live_sources() {
         expression.read_blocks().unwrap().try_collect::<Vec<_>>(),
         expression.read_blocks().unwrap().try_collect::<Vec<_>>()
     );
+
     let first = first.unwrap();
 
     assert_eq!(first, second.unwrap());
@@ -316,11 +331,13 @@ async fn far_end_sparse_range_is_bounded_and_ordered() {
     )
     .await
     .unwrap();
+
     let (_dir_root, dir) = new_dir("binary_far_right").await;
     let b =
         Tensor::<FsEntry, f32>::create(dir, a.schema().clone(), Layout::Sparse { axis: None }, 99)
             .await
             .unwrap();
+
     a.write_value(&[999_999_998], 2.).await.unwrap();
     b.write_value(&[999_999_999], 3.).await.unwrap();
     let expression = a
@@ -331,6 +348,7 @@ async fn far_end_sparse_range_is_bounded_and_ordered() {
         .mul_scalar(2.)
         .await
         .unwrap();
+
     let run = async {
         expression
             .read_sparse_elements_in_order(
@@ -395,6 +413,7 @@ async fn binary_copy_under_cache_pressure_reloads() {
         )
         .await
         .unwrap();
+
         a.write_value(&[1023], 255).await.unwrap();
         a.sync().await.unwrap();
         drop(a);
@@ -408,6 +427,7 @@ async fn binary_copy_under_cache_pressure_reloads() {
         let (out_root, _) = new_dir("binary_cache_copy").await;
         let out_cache =
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
+
         let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
         let expression = a.view().add(&b.view()).await.unwrap();
         let output: Tensor<FsEntry, u8> =
@@ -450,6 +470,7 @@ async fn sparse_batch_boundaries_preserve_zero_intermediates_and_order() {
         .sub(&b.view())
         .await
         .unwrap();
+
     let read = || async {
         expression
             .read_sparse_elements_in_order(range![AxisRange::In(0, 4101, 1)], axes![0])
@@ -507,6 +528,7 @@ async fn binary_tree_transforms_preserve_operand_order_and_scalar_limits() {
         .unwrap()
         .squeeze(axes![0])
         .unwrap();
+
     check(tree, vec![-9., -5., -9.]).await;
     let scalar = sum.slice(range![AxisRange::At(0)]).unwrap();
 
@@ -526,6 +548,7 @@ fn backend<T: TensorElement>(values: &[T], sparse: bool) -> ArrayAccess<'static,
         .iter()
         .map(|v| if sparse && *v == T::ZERO { T::ZERO } else { *v })
         .collect();
+
     let len = values.len();
 
     ArrayAccess::from(Array::new(Buffer::from(values), shape![len]).unwrap())
@@ -564,6 +587,7 @@ macro_rules! scalar_cases {
         }
     };
 }
+
 scalar_cases!(
     f32_scalar_math,
     f32,
@@ -583,6 +607,7 @@ scalar_cases!(
         add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, rem_scalar, log_scalar
     ]
 );
+
 scalar_cases!(
     f32_scalar_predicates,
     f32,
@@ -603,6 +628,7 @@ scalar_cases!(
         xor_scalar
     ]
 );
+
 scalar_cases!(
     f64_scalar_math,
     f64,
@@ -622,6 +648,7 @@ scalar_cases!(
         add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, rem_scalar, log_scalar
     ]
 );
+
 scalar_cases!(
     f64_scalar_predicates,
     f64,
@@ -642,6 +669,7 @@ scalar_cases!(
         xor_scalar
     ]
 );
+
 scalar_cases!(
     u8_scalar_math,
     u8,
@@ -651,6 +679,7 @@ scalar_cases!(
         add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, rem_scalar
     ]
 );
+
 scalar_cases!(
     u8_scalar_predicates,
     u8,
@@ -661,6 +690,7 @@ scalar_cases!(
         xor_scalar
     ]
 );
+
 matrix!(
     f32_comparisons_and_booleans,
     f32,
@@ -688,6 +718,7 @@ matrix!(
     ],
     [eq, ne, gt, ge, lt, le, and, or, xor]
 );
+
 matrix!(
     f64_comparisons_and_booleans,
     f64,
@@ -715,6 +746,7 @@ matrix!(
     ],
     [eq, ne, gt, ge, lt, le, and, or, xor]
 );
+
 matrix!(
     u8_comparisons_and_booleans,
     u8,
@@ -731,16 +763,19 @@ async fn scalar_independent_arithmetic_and_truth_tables() {
         vec![1, 2, 128, 0],
     )
     .await;
+
     check(
         tensor.view().sub_scalar(1).await.unwrap(),
         vec![255, 0, 126, 254],
     )
     .await;
+
     check(
         tensor.view().mul_scalar(2).await.unwrap(),
         vec![0, 2, 254, 254],
     )
     .await;
+
     check(tensor.view().pow_scalar(2).await.unwrap(), vec![0, 1, 1, 1]).await;
     check(tensor.view().div_scalar(0).await.unwrap(), vec![0; 4]).await;
     check(tensor.view().rem_scalar(0).await.unwrap(), vec![0; 4]).await;
@@ -749,11 +784,13 @@ async fn scalar_independent_arithmetic_and_truth_tables() {
         vec![0, 1, 1, 1],
     )
     .await;
+
     check(
         tensor.view().xor_scalar(255).await.unwrap(),
         vec![1, 0, 0, 0],
     )
     .await;
+
     check(
         tensor.view().gt_scalar(127).await.unwrap(),
         vec![0, 0, 0, 1],
@@ -766,16 +803,19 @@ async fn scalar_independent_arithmetic_and_truth_tables() {
         2,
     )
     .await;
+
     check(
         floats.view().eq_scalar(0.).await.unwrap(),
         vec![1, 1, 0, 0, 0],
     )
     .await;
+
     check(
         floats.view().ne_scalar(0.).await.unwrap(),
         vec![0, 0, 1, 1, 1],
     )
     .await;
+
     check(
         floats.view().and_scalar(1.).await.unwrap(),
         vec![0, 0, 1, 1, 1],
@@ -839,18 +879,21 @@ macro_rules! selection_cases {
         }
     };
 }
+
 selection_cases!(
     f32_selection,
     f32,
     vec![0., -0., f32::NAN, f32::INFINITY, 2., 0.],
     vec![-0., f32::NAN, 1., 0., f32::NEG_INFINITY, 0.]
 );
+
 selection_cases!(
     f64_selection,
     f64,
     vec![0., -0., f64::NAN, f64::INFINITY, 2., 0.],
     vec![-0., f64::NAN, 1., 0., f64::NEG_INFINITY, 0.]
 );
+
 selection_cases!(
     u8_selection,
     u8,
@@ -871,6 +914,7 @@ async fn sparse_scalar_comparison_and_selection_use_ordinary_zeros() {
     ] {
         assert!(matches!(result, Err(fensor::Error::WouldDensify { .. })));
     }
+
     check(a.view().ne(&b.view()).await.unwrap(), vec![0, 1, 1, 0]).await;
     let dense = TensorExpression::new(a.clone()).unwrap().into_dense();
     check(dense.add_scalar(1.).await.unwrap(), vec![1., 3., 1., 1.]).await;
@@ -882,10 +926,12 @@ async fn sparse_scalar_comparison_and_selection_use_ordinary_zeros() {
         selected.eq_scalar(0.).await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     let (_dir_root, dir) = new_dir("selected_zero_copy").await;
     let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &selected, selected.layout(), 2)
         .await
         .unwrap();
+
     let selected = TensorExpression::new(selected).unwrap().into_dense();
     let copy = TensorExpression::new(copy).unwrap().into_dense();
     check(selected.eq_scalar(0.).await.unwrap(), vec![1, 1, 0, 1]).await;
@@ -904,6 +950,7 @@ async fn mixed_elementwise_transforms_and_broadcast() {
         .unwrap()
         .transpose(None)
         .unwrap();
+
     let rhs = one.view().broadcast(shape![3, 2]).unwrap();
     let condition = a.gt(&rhs).await.unwrap().and_scalar(255).await.unwrap();
     let expression = condition
@@ -912,6 +959,7 @@ async fn mixed_elementwise_transforms_and_broadcast() {
         .unwrap()
         .transpose(None)
         .unwrap();
+
     check(expression, vec![3., 2., 1., 6., 5., 4.]).await;
 
     assert!(a.eq(&one.view()).await.is_err());
@@ -928,6 +976,7 @@ async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
     for i in [0, 4095, 4096, 4100] {
         values[i] = 0.2;
     }
+
     let (_a_root, a) = source(&values, Layout::Sparse { axis: None }, 31).await;
     let (_zeros_root, zeros) = source(&vec![0f32; 4101], Layout::Sparse { axis: None }, 32).await;
     let condition = a.view().round().await.unwrap().ne_scalar(0.).await.unwrap();
@@ -941,6 +990,7 @@ async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
         .xor_scalar(0)
         .await
         .unwrap();
+
     let consume = || async {
         expression
             .read_blocks()
@@ -949,6 +999,7 @@ async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
             .await
             .unwrap()
     };
+
     let mut dropped = expression.read_blocks().unwrap();
     assert_eq!(dropped.try_next().await.unwrap().unwrap().len(), 4096);
     drop(dropped);
@@ -958,6 +1009,7 @@ async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
         first.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![4096, 5]
     );
+
     assert_eq!(
         first.into_iter().flatten().collect::<Vec<_>>(),
         values
@@ -965,6 +1017,7 @@ async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
             .map(|v| u8::from(*v != 0.))
             .collect::<Vec<_>>()
     );
+
     let entries: Vec<_> = expression
         .read_sparse_elements_in_order(range![AxisRange::In(0, 4101, 1)], axes![0])
         .await
@@ -972,6 +1025,7 @@ async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(
         entries,
         vec![
@@ -995,6 +1049,7 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
         )
         .await
         .unwrap();
+
         a.write_value(&[999_999_999], 127).await.unwrap();
         let condition = a.view().ne_scalar(0).await.unwrap();
         let expression = condition
@@ -1004,6 +1059,7 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
             .mul_scalar(2)
             .await
             .unwrap();
+
         let entries: Vec<_> = expression
             .read_sparse_elements_in_order(
                 range![AxisRange::Of(vec![999_999_999, 999_999_998, 999_999_999])],
@@ -1014,6 +1070,7 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
             .try_collect()
             .await
             .unwrap();
+
         assert_eq!(entries, vec![(vec![999_999_999], 254)]);
         let stepped: Vec<_> = expression
             .read_sparse_elements_in_order(
@@ -1025,6 +1082,7 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
             .try_collect()
             .await
             .unwrap();
+
         assert_eq!(stepped, entries);
         assert!(
             expression
@@ -1032,12 +1090,14 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
                 .await
                 .is_err()
         );
+
         assert!(
             expression
                 .read_sparse_elements_in_order(range![], axes![1])
                 .await
                 .is_err()
         );
+
         assert!(
             expression
                 .read_sparse_elements_in_order(range![AxisRange::In(1, 1, 1)], axes![0])
@@ -1072,6 +1132,7 @@ async fn conditional_live_sources_transforms_and_scalar_limit() {
         vec![4., 6., 4.],
     )
     .await;
+
     // Construction does not capture either condition values or branch values.
     a.write_value(&[1], 9.).await.unwrap();
     b.write_value(&[0], 10.).await.unwrap();
@@ -1101,6 +1162,7 @@ async fn conditional_copy_under_cache_pressure_reloads() {
         )
         .await
         .unwrap();
+
         a.write_value(&[1023], 255).await.unwrap();
         a.sync().await.unwrap();
         drop(a);
@@ -1115,14 +1177,17 @@ async fn conditional_copy_under_cache_pressure_reloads() {
             .cond(&a.view().add_scalar(1).await.unwrap(), &a.view())
             .await
             .unwrap();
+
         let (out_root, _) = new_dir("conditional_cache_copy").await;
         let out_cache =
             freqfs::Cache::<FsEntry>::new(512, None, 0, std::time::Duration::from_secs(1));
+
         let out_dir = out_cache.load(out_root.to_path_buf()).unwrap();
         let output: Tensor<FsEntry, u8> =
             Tensor::copy_from(out_dir.clone(), &expression, expression.layout(), 32)
                 .await
                 .unwrap();
+
         assert_eq!(output.read_value(&[1023]).await.unwrap(), 255);
         output.sync().await.unwrap();
         drop(output);
@@ -1130,6 +1195,7 @@ async fn conditional_copy_under_cache_pressure_reloads() {
         let reloaded = Tensor::<FsEntry, u8>::load(common::open_dir(&out_root).unwrap())
             .await
             .unwrap();
+
         assert_eq!(reloaded.read_value(&[0]).await.unwrap(), 1);
         assert_eq!(reloaded.read_value(&[1023]).await.unwrap(), 255);
     })

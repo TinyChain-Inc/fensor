@@ -69,6 +69,7 @@ impl StorageSlice {
             *step = source_step
                 .checked_mul(*step)
                 .ok_or_else(|| Error::InvalidCoord("storage slice step overflow".into()))?;
+
             *axis = base;
         }
 
@@ -175,6 +176,7 @@ impl GatherOffsets {
             // Valid descriptors address only entries in the shared table.
             self.index(self.len - 1).expect("valid gather descriptor")
         };
+
         Self {
             start,
             reversed: !self.reversed,
@@ -220,14 +222,17 @@ impl CoordinateMap {
                         .and_then(|delta| origins[base].checked_add(delta))
                         .is_some_and(|last| last < shape[base])
             };
+
             // A singleton's extent cannot distinguish its axis from a stepped
             // later axis. Preserve exact strides first, in logical axis order.
             let base = (0..shape.len())
                 .find(|&base| stride == strides[base] && eligible(base))
                 .or_else(|| (0..shape.len()).rev().find(|&base| eligible(base)));
+
             let Some(base) = base else {
                 return Ok(None);
             };
+
             axes.push((base, stride / strides[base]));
         }
 
@@ -290,6 +295,7 @@ impl CoordinateMap {
                     offset = offset
                         .checked_add(*constant)
                         .ok_or_else(|| Error::InvalidCoord("mapping offset overflow".into()))?;
+
                     strides.push(0);
                 }
                 AxisContrib::Gather(_) => return Ok(None),
@@ -332,10 +338,12 @@ impl CoordinateMap {
         validate::validate_coord(&self.shape, coord)?;
         let offset = u64::try_from(self.flat_offset(coord)?)
             .map_err(|_| Error::InvalidCoord("negative linear offset".into()))?;
+
         let size = crate::schema::checked_product(shape)?;
         if offset >= size || strides.len() != shape.len() || strides.contains(&0) {
             return Err(Error::InvalidCoord("mapped offset out of bounds".into()));
         }
+
         out.clear();
         out.extend(strides.iter().zip(shape).map(|(s, d)| (offset / *s) % *d));
         Ok(())
@@ -366,9 +374,11 @@ impl CoordinateMap {
                         min = min.min(value);
                         max = max.max(value);
                     }
+
                     (min, max)
                 }
             };
+
             lo = lo.checked_add(min).ok_or_else(overflow)?;
             hi = hi.checked_add(max).ok_or_else(overflow)?;
         }
@@ -397,11 +407,13 @@ impl CoordinateMap {
                 AxisContrib::Gather(offsets) => {
                     let i = usize::try_from(*c)
                         .map_err(|_| Error::InvalidCoord("coord overflows usize".into()))?;
+
                     *offsets.get(i).ok_or_else(|| {
                         Error::InvalidCoord("coord out of bounds for gather".into())
                     })?
                 }
             };
+
             k = k
                 .checked_add(delta)
                 .ok_or_else(|| Error::InvalidCoord("mapping offset overflow".into()))?;
@@ -524,9 +536,11 @@ impl CoordinateMap {
                 AxisRange::In(start, stop, step) => {
                     let (offset_delta, axis, extent) =
                         slice_bound_in(current, dim, *start, *stop, *step, axis_index)?;
+
                     new_base_offset = new_base_offset
                         .checked_add(offset_delta)
                         .ok_or_else(mapping_overflow)?;
+
                     new_axes.push(axis);
                     new_shape.push(extent);
                 }
@@ -561,6 +575,7 @@ impl CoordinateMap {
 
         let mut seen: SmallVec<[bool; PORTABLE_INLINE_RANK]> =
             SmallVec::from_elem(false, self.axes.len());
+
         let mut axes = Vec::with_capacity(self.axes.len());
         let mut shape = Shape::with_capacity(self.axes.len());
 
@@ -643,6 +658,7 @@ impl CoordinateMap {
                     self.shape[axis]
                 )));
             }
+
             remove[axis] = true;
         }
 
@@ -692,16 +708,19 @@ impl CoordinateMap {
                     "unsqueeze axis {axis} specified more than once"
                 )));
             }
+
             insert_before[axis] = true;
         }
 
         let new_ndim = old_ndim + axes.len();
         let mut layout: SmallVec<[Option<usize>; PORTABLE_INLINE_RANK]> =
             SmallVec::with_capacity(new_ndim);
+
         for (i, &inserted) in insert_before.iter().enumerate().take(old_ndim) {
             if inserted {
                 layout.push(None);
             }
+
             layout.push(Some(i));
         }
 
@@ -834,6 +853,7 @@ fn slice_bound_of(
                 .iter()
                 .map(|idx| (*idx as i128).checked_mul(*s).ok_or_else(mapping_overflow))
                 .collect::<Result<_>>()?;
+
             Ok(AxisContrib::Gather(offsets.into()))
         }
         AxisContrib::Gather(g) => {
@@ -852,6 +872,7 @@ fn slice_bound_of(
                         })
                     })
                     .collect::<Result<Vec<i128>>>()?;
+
             Ok(AxisContrib::Gather(offsets.into()))
         }
     }
@@ -929,6 +950,7 @@ macro_rules! transform_methods {
     // Drop owners cannot move fields out; clone only mapping metadata.
     (@mapping $mapping:expr; clone_mapping) => { $mapping.clone() };
 }
+
 pub(crate) use transform_methods;
 
 #[cfg(test)]

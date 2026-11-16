@@ -156,6 +156,7 @@ fn invalid() -> io::Error {
 
 impl<T: TensorElement> Schema for PayloadSchema<T> {
     type Error = io::Error;
+
     type Value = SparseCell<T>;
 
     fn block_size(&self) -> usize {

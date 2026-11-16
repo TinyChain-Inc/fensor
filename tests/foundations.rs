@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType};
+
 use fensor::{
     AxisRange, Error, Layout, Range, Tensor, TensorGeometry, TensorRead, TensorSchema,
     TensorTransform, TensorWrite, contiguous_strides,
 };
-use ha_ndarray::{axes, range, shape};
-use number_general::{FloatType, NumberType};
 
 mod common;
 
@@ -15,10 +16,12 @@ async fn create_tensor(name: &str, layout: Layout) -> (common::Directory, Tensor
     let (root, dir) = new_dir(name).await;
     let schema =
         TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3, 4]).expect("schema");
+
     // Keep blocks small so reads and transforms cross storage boundaries.
     let tensor = Tensor::create(dir, schema, layout, 4)
         .await
         .expect("create tensor");
+
     (root, tensor)
 }
 
@@ -76,6 +79,7 @@ async fn accessor_coordinate_offset_and_read_write_dense() {
 async fn standalone_transpose_arbitrary_permutation() {
     let (root, tensor) =
         create_tensor("standalone_transpose_arbitrary_permutation", Layout::Dense).await;
+
     seed_values(&tensor).await;
 
     let perm = axes![2, 0, 1];
@@ -104,6 +108,7 @@ async fn standalone_transpose_arbitrary_permutation() {
             .read_value(&t_coord)
             .await
             .expect("read transposed");
+
         assert_eq!(actual, expected, "coord {:?}", t_coord);
     }
 
@@ -141,6 +146,7 @@ async fn composition_transpose_slice_and_slice_transpose_consistency() {
         Layout::Dense,
     )
     .await;
+
     seed_values(&tensor).await;
 
     let perm = axes![2, 0, 1];
@@ -211,6 +217,7 @@ async fn dense_sparse_parity_for_supported_operations() {
         .view()
         .transpose(Some(axes![1, 2, 0]))
         .expect("transpose");
+
     let permuted_sparse = sparse
         .view()
         .transpose(Some(axes![1, 2, 0]))
@@ -222,6 +229,7 @@ async fn dense_sparse_parity_for_supported_operations() {
             .read_value(&coord)
             .await
             .expect("sparse read");
+
         assert_eq!(d, s, "transposed coord {:?}", coord);
     }
 
@@ -249,6 +257,7 @@ async fn public_create_rejects_invalid_sparse_axis_hint() {
     let (root, dir) = common::new_dir("invalid_sparse_axis").await;
     let schema =
         TensorSchema::new(NumberType::Float(FloatType::F32), shape![2, 3]).expect("schema");
+
     let result = fensor::Tensor::<common::FsEntry, f32>::create(
         dir,
         schema,
@@ -256,10 +265,12 @@ async fn public_create_rejects_invalid_sparse_axis_hint() {
         1000,
     )
     .await;
+
     assert!(
         matches!(result, Err(Error::InvalidSchema(_))),
         "out-of-bounds sparse axis must be rejected"
     );
+
     common::cleanup(&root).await;
 }
 
@@ -297,6 +308,7 @@ fn temporary_directory_names_are_unique_across_threads() {
 #[tokio::test]
 async fn fixture_directories_are_removed_on_completion_and_unwind() {
     use futures::FutureExt;
+
     for unwind in [false, true] {
         let (root, dir) = new_dir("scoped_directory").await;
         let path = root.to_path_buf();
@@ -307,6 +319,7 @@ async fn fixture_directories_are_removed_on_completion_and_unwind() {
         })
         .catch_unwind()
         .await;
+
         assert_eq!(result.is_err(), unwind);
         assert!(!path.exists());
 
@@ -319,6 +332,7 @@ async fn fixture_directories_are_removed_on_completion_and_unwind() {
             [1f32, 2.],
         )
         .await;
+
         let path = root.to_path_buf();
         let result = std::panic::AssertUnwindSafe(async move {
             let _root = root;
@@ -327,6 +341,7 @@ async fn fixture_directories_are_removed_on_completion_and_unwind() {
         })
         .catch_unwind()
         .await;
+
         assert_eq!(result.is_err(), unwind);
         assert!(!path.exists());
     }

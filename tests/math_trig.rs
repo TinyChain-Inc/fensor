@@ -1,9 +1,5 @@
 //! Absolute-value and trigonometric views use the same filesystem consumers.
 
-use fensor::{
-    AxisRange, Layout, Tensor, TensorAbs, TensorExpression, TensorGeometry, TensorRead,
-    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
-};
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, ArrayAccess, Buffer, NDArrayAbs, NDArrayRead, NDArrayTrig, axes, range, shape,
@@ -11,6 +7,10 @@ use ha_ndarray::{
 use number_general::FloatType;
 
 use common::{FsEntry, new_dir};
+use fensor::{
+    AxisRange, Layout, Tensor, TensorAbs, TensorExpression, TensorGeometry, TensorRead,
+    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
+};
 
 mod common;
 
@@ -28,6 +28,7 @@ fn same_float<T: Copy + Into<f64>>(actual: T, expected: T) -> bool {
         } else {
             1e-12
         };
+
         (actual - expected).abs() <= tolerance * expected.abs().max(1.0)
     }
 }
@@ -118,6 +119,7 @@ macro_rules! operation_matrix {
 }
 
 operation_matrix!(f32_abs_and_trig_consumers, f32);
+
 operation_matrix!(f64_abs_and_trig_consumers, f64);
 
 #[tokio::test]
@@ -131,9 +133,11 @@ async fn explicit_dense_chain_preserves_transforms_and_reuse() {
     )
     .await
     .unwrap();
+
     for i in 0..4101 {
         tensor.write_value(&[0, i], -0.2).await.unwrap();
     }
+
     let expression = TensorExpression::new(tensor.view())
         .unwrap()
         .into_dense()
@@ -152,6 +156,7 @@ async fn explicit_dense_chain_preserves_transforms_and_reuse() {
         .unwrap()
         .squeeze(axes![1])
         .unwrap();
+
     let mut dropped = expression.read_blocks().unwrap();
     let first = dropped.try_next().await.unwrap().unwrap();
     assert_eq!(first.len(), 4096);
@@ -163,21 +168,25 @@ async fn explicit_dense_chain_preserves_transforms_and_reuse() {
         expression.read_blocks().unwrap().try_collect::<Vec<_>>(),
     )
     .unwrap();
+
     assert_eq!(first, second);
     assert_eq!(
         first.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![4096, 6]
     );
+
     let rows: Vec<_> = expression
         .read_coordinate_blocks()
         .unwrap()
-        .map_ok(|(coords, values)| {
+        .map_ok(|batch| {
+            let (coords, values) = batch.into_coordinates(expression.shape()).unwrap();
             futures::stream::iter(coords.into_iter().zip(values).map(Ok::<_, fensor::Error>))
         })
         .try_flatten()
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(rows.len(), 4102);
     assert!(rows.iter().all(|(_, value)| *value == 1.0));
     let final_zero = expression.ln().await.unwrap().sin().await.unwrap();
@@ -187,6 +196,7 @@ async fn explicit_dense_chain_preserves_transforms_and_reuse() {
         .try_collect()
         .await
         .unwrap();
+
     assert!(values.into_iter().flatten().all(|value| value == 0.));
     // Check terminal consumers on a small selection; the full expression above
     // exercises batch boundaries without allocating thousands of sparse files.
@@ -195,11 +205,13 @@ async fn explicit_dense_chain_preserves_transforms_and_reuse() {
     let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 16)
         .await
         .unwrap();
+
     for i in 0..8 {
         let expected = 1.0;
         assert_eq!(expression.read_value(&[i]).await.unwrap(), expected);
         assert_eq!(output.read_value(&[i]).await.unwrap(), expected);
     }
+
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
 }

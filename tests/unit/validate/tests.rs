@@ -10,6 +10,7 @@ fn broadcast_geometry_preserves_logical_width_and_explicit_matrix_contract() {
         assert_eq!(broadcast_shape(&left, &right).unwrap().as_slice(), expected);
         assert_eq!(broadcast_shape(&right, &left).unwrap().as_slice(), expected);
     }
+
     assert!(broadcast_shape(&[2, 3], &[4, 3]).is_err());
     let (left, right) = matmul_broadcast_shapes(&[2, 1, 3, 4], &[5, 4, 6]).unwrap();
     assert_eq!(left.as_slice(), &[2, 5, 3, 4]);
@@ -18,6 +19,7 @@ fn broadcast_geometry_preserves_logical_width_and_explicit_matrix_contract() {
         matmul_output_shape(&left, &right).unwrap().as_slice(),
         &[2, 5, 3, 6]
     );
+
     assert!(matmul_output_shape(&[2, 1, 3, 4], &[5, 4, 6]).is_err());
     assert!(matmul_broadcast_shapes(&[3], &[3, 4]).is_err());
     assert!(matmul_broadcast_shapes(&[2, 3, 4], &[5, 4, 6]).is_err());
@@ -35,6 +37,7 @@ fn reduction_geometry_normalizes_axes_and_reverses_broadcasting() {
             expected
         );
     }
+
     assert!(reduction_axes(3, vec![3, 0, 3].into()).is_err());
 
     for (source, target, expected) in [
@@ -48,6 +51,7 @@ fn reduction_geometry_normalizes_axes_and_reverses_broadcasting() {
             expected
         );
     }
+
     assert!(broadcast_reduce_axes(&[2, 3], &[2, 2]).is_err());
     assert!(broadcast_reduce_axes(&[2, 3], &[1, 2, 3]).is_err());
 }
@@ -58,6 +62,7 @@ fn range_cardinality_handles_empty_selections_and_overflow() {
         validate_range(&[3], &Range::new()),
         Err(Error::InvalidLayout(error)) if error == "range rank must match tensor rank"
     ));
+
     for (name, bound) in [
         ("point", AxisRange::At(3)),
         ("step", AxisRange::In(0, 3, 0)),
@@ -71,6 +76,7 @@ fn range_cardinality_handles_empty_selections_and_overflow() {
             "{name}"
         );
     }
+
     for (range, expected) in [
         (smallvec::smallvec![AxisRange::In(1, 3, 2)], 1),
         (smallvec::smallvec![AxisRange::In(3, 3, 1)], 0),
@@ -88,6 +94,7 @@ fn range_cardinality_handles_empty_selections_and_overflow() {
     let long = u64::MAX / 2;
     let selection: Range =
         smallvec::smallvec![AxisRange::In(0, long, 1), AxisRange::Of(vec![0, 1, 0])];
+
     assert!(matches!(
         iter_range_coords(&[long, 2], &selection),
         Err(Error::InvalidLayout(_))

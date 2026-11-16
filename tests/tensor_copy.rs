@@ -1,12 +1,13 @@
 //! One storage constructor consumes base tensors and geometric views as readers.
 
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType, UIntType};
+
 use common::{FsEntry, new_dir};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorArray, TensorGeometry, TensorRead, TensorSchema,
     TensorSource, TensorTransform, TensorWrite,
 };
-use ha_ndarray::{axes, range, shape};
-use number_general::{FloatType, NumberType, UIntType};
 
 mod common;
 
@@ -138,7 +139,14 @@ impl TensorRead for CoordinateReader<'_> {
 
     fn read_coordinate_blocks(&self) -> fensor::Result<fensor::CoordinateBlockStream<'_, u8>> {
         use futures::StreamExt;
-        Ok(futures::stream::iter(self.blocks.clone().into_iter().map(Ok)).boxed())
+
+        Ok(futures::stream::iter(
+            self.blocks
+                .clone()
+                .into_iter()
+                .map(|(coords, values)| fensor::CoordinateBatch::from_coordinates(coords, values)),
+        )
+        .boxed())
     }
 }
 
@@ -326,6 +334,7 @@ impl TensorRead for PausedReader<'_> {
 
     fn read_coordinate_blocks(&self) -> fensor::Result<fensor::CoordinateBlockStream<'_, u8>> {
         use futures::StreamExt;
+
         Ok(self
             .0
             .read_coordinate_blocks()?
@@ -400,6 +409,7 @@ impl TensorRead for SparseOnce {
         _: ha_ndarray::Axes,
     ) -> fensor::BoxFuture<'a, fensor::Result<fensor::SparseElementStream<'a, f64>>> {
         use futures::StreamExt;
+
         Box::pin(async move {
             self.starts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

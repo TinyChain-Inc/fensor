@@ -1,12 +1,15 @@
+use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use number_general::DType;
+
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorArray, TensorExpression,
     TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorStatistics, TensorTransform,
     TensorTrig, TensorUnary, TensorView, TensorWrite,
 };
-use futures::{TryStreamExt, stream::BoxStream};
-use number_general::DType;
 
 mod common;
+
 use common::{FsEntry, fixture, new_dir, open_dir};
 
 #[derive(Clone)]

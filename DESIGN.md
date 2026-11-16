@@ -67,7 +67,10 @@ The private expression contract accepts one `BatchRequest` containing at most
 Requests preserve order and duplicates. A coordinate cursor writes into reusable
 scratch. Unary, binary, and conditional nodes share the same immutable request
 through `Arc`; they do not copy its descriptors or expand rectangles into coordinate
-lists when submitting child work. Coordinates are expanded only at consumers requiring explicit coordinates or the public coordinate-stream boundary.
+lists when submitting child work. Coordinate streams own a compact request and
+its values in `CoordinateBatch`. Native copying consumes that request directly;
+coordinates expand only when a consumer explicitly calls `into_coordinates`.
+Value-only consumption moves the batch's values without expansion.
 Owned-expression mappings share affine progression planning with storage leaves.
 They retain signed flat runs through child evaluation; irregular and nested
 mappings use reusable coordinate scratch and coalesce singleton runs.
@@ -294,6 +297,10 @@ active accumulator and chunked inputs, never a partial list. Requested axis outp
 are processed sequentially within each output batch. Output transforms map reduced coordinates
 and do not move through source axes. Selected output ranges still require their
 source groups.
+
+Native Tensor geometry has nonempty shapes. An all-axis reduction without
+retained dimensions represents its scalar output with shape `[1]`; scalar
+terminal methods return the numerical value directly.
 
 ## Matrix planning and accumulation
 
@@ -560,8 +567,9 @@ cache, or implicit persisted intermediate.
 
 Mean, population standard deviation, and Euclidean norm reuse numeric terminal
 batching and axis-group traversal. Counts include all logical values, including
-implicit sparse zeros. Partial statistics retain constant-sized state; standard
-deviation combines centered moments and uses squared complex magnitude. Real
+implicit sparse zeros. Partial statistics delegate to ha-ndarray's bounded,
+scaled accumulators; fensor owns traversal and logical cardinality. Standard
+deviation uses squared complex magnitude. Real
 results are f64; complex mean is c64 and complex standard deviation and norm are
 f64. Nonfinite arithmetic and backend reproducibility limits remain
 part of numerical evaluation, not transaction visibility.

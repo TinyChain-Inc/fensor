@@ -2,12 +2,13 @@
 
 use std::cell::Cell;
 
+use ha_ndarray::{Array, Buffer, NDArrayCast, NDArrayRead, shape};
+
+use common::numbers::same;
+use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Layout, Tensor, TensorCast, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
 };
-use ha_ndarray::{Array, Buffer, NDArrayCast, NDArrayRead, shape};
-
-use common::{FsEntry, cleanup, fixture, numbers::same};
 
 mod common;
 
@@ -44,6 +45,7 @@ async fn check_cast<From: TensorElement, To: TensorElement>(
             same(actual, expected),
             "{context} at [{i}]: actual {actual:?}, expected {expected:?}"
         );
+
         coordinate.set(i + 1);
         true
     })
@@ -124,12 +126,19 @@ macro_rules! integer_source {
 }
 
 integer_source!(u8_casts, u8);
+
 integer_source!(u16_casts, u16);
+
 integer_source!(u32_casts, u32);
+
 integer_source!(u64_casts, u64);
+
 integer_source!(i8_casts, i8);
+
 integer_source!(i16_casts, i16);
+
 integer_source!(i32_casts, i32);
+
 integer_source!(i64_casts, i64);
 
 #[tokio::test]
@@ -200,6 +209,7 @@ async fn literal_cast_boundaries() {
         &[16_777_216f64, -16_777_216.],
     )
     .await;
+
     literal_cast(&[-1i8], &[255u64]).await;
     literal_cast(&[u32::MAX], &[-1i64]).await;
 }
@@ -208,6 +218,7 @@ async fn literal_cast_boundaries() {
 #[tokio::test]
 async fn complex32_casts() {
     use fensor::complex::Complex32 as C;
+
     destinations(&[
         C::new(0., -0.),
         C::new(1.5, -2.5),
@@ -223,6 +234,7 @@ async fn complex32_casts() {
 #[tokio::test]
 async fn complex64_casts() {
     use fensor::complex::Complex64 as C;
+
     destinations(&[
         C::new(-0., 0.),
         C::new(1.5, -2.5),

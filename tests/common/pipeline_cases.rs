@@ -1,10 +1,10 @@
 //! Paired stream and copy measurements; setup remains outside timed phases.
 
-use fensor::{Layout, Tensor, TensorMatMul};
 use ha_ndarray::shape;
 
-use super::benchmark;
-use super::common::{self, FsEntry};
+use super::common::FsEntry;
+use super::{benchmark, common};
+use fensor::{Layout, Tensor, TensorMatMul};
 
 async fn source(
     rows: usize,
@@ -29,6 +29,7 @@ async fn source(
         }),
     )
     .await;
+
     super::benchmark_source::reopen(root, tensor, cache).await
 }
 
@@ -43,6 +44,7 @@ pub async fn run() {
             ("narrow", 4097, 3, 1),
         ]
     };
+
     for (name, rows, inner, cols) in cases {
         for (kind, layout) in [
             ("dense", Layout::Dense),
@@ -57,6 +59,7 @@ pub async fn run() {
                 for capacity in [1, 7, 31, 128, 4096] {
                     benchmark::copy(&name, &view, capacity, cache, cache < 1_000_000).await;
                 }
+
                 drop(view);
                 drop(a);
                 drop(b);

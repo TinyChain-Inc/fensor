@@ -42,11 +42,13 @@ pub fn broadcast_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
             .checked_sub(i + 1)
             .map(|a| right[a])
             .unwrap_or(1);
+
         if l != r && l != 1 && r != 1 {
             return Err(Error::InvalidSchema(
                 "incompatible tensor broadcast shapes".into(),
             ));
         }
+
         shape[rank - i - 1] = l.max(r);
     }
 
@@ -156,6 +158,7 @@ pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64
     for (axis, (bound, &dim)) in range.iter().zip(shape).enumerate() {
         let invalid =
             || Error::InvalidLayout(format!("range bound at axis {axis} is out of bounds"));
+
         let len = match bound {
             AxisRange::At(i) if *i < dim => 1,
             AxisRange::In(start, stop, step) if *step > 0 && start <= stop && *stop <= dim => {
@@ -164,6 +167,7 @@ pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64
             AxisRange::Of(indices) if indices.iter().all(|&i| i < dim) => indices.len() as u64,
             _ => return Err(invalid()),
         };
+
         lengths.push(len);
     }
 
@@ -233,6 +237,7 @@ impl Iterator for RangeCoords {
                 AxisRange::Of(indices) => indices[i as usize],
             })
             .collect();
+
         self.remaining -= 1;
         if self.remaining > 0 {
             for axis in (0..self.coord.len()).rev() {

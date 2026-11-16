@@ -4,14 +4,17 @@
 
 use std::ops::Deref;
 
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{
     Array, ArrayBuf, Buffer, BufferConverter, NDArray, NDArrayRead, Number, Platform,
 };
 
-use crate::request::{self, BatchRequest};
+use crate::request::BatchRequest;
 use crate::traits::BoxFuture;
-use crate::{Error, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView};
+use crate::{
+    Error, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView, request,
+};
 
 mod driver;
 
@@ -141,7 +144,7 @@ where
     Ok(preferred_batches(expression)?
         .map(move |batch| {
             let (request, batch) = batch?;
-            Ok((request.into_coordinates(expression.shape())?, batch.values))
+            crate::CoordinateBatch::new(request, batch.values)
         })
         .boxed())
 }
@@ -212,6 +215,7 @@ impl<T: TensorElement> Batch<T> {
                 .to_slice()?
                 .into_vec(),
         };
+
         batch.validate(expected)?;
 
         Ok(batch)
@@ -263,12 +267,14 @@ pub(crate) fn sparse_elements<T: TensorElement>(
                     cursor.next_into(&mut scratch),
                     "validated sparse output cardinality"
                 );
+
                 if value == T::default() {
                     return None;
                 }
 
                 #[cfg(test)]
                 crate::read_metrics::record(|m| m.expanded_coordinates += 1);
+
                 Some(Ok((scratch.to_vec(), value)))
             }
         }))
@@ -312,6 +318,7 @@ where
                 Ok((request, values))
             }
             .await;
+
             Some((result, (expression, requests)))
         },
     )

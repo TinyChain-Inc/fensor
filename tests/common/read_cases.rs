@@ -1,10 +1,10 @@
 //! Shared evaluation-only cases; production timing and test-only profiling use the same inputs.
 
-use fensor::{TensorMatMul, TensorRead, TensorReduceAll, TensorTransform, TensorUnary};
 use ha_ndarray::shape;
 
 use super::benchmark;
 use super::benchmark_source::source;
+use fensor::{TensorMatMul, TensorRead, TensorReduceAll, TensorTransform, TensorUnary};
 
 async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(name: &str, view: &V) {
     benchmark::streams(name, view, &["row", "coordinate"]).await;
@@ -64,6 +64,7 @@ pub async fn run() {
             .unwrap(),
     )
     .await;
+
     measure(
         "repeated",
         &product
@@ -76,6 +77,7 @@ pub async fn run() {
             .unwrap(),
     )
     .await;
+
     measure("unary", &product.round().await.unwrap()).await;
     let (_c_root, c) = source(7, 3, false, 7, 1, 1_000_000).await;
     let cv = c.view().broadcast(shape![2, 7, 3]).unwrap();
@@ -91,6 +93,7 @@ pub async fn run() {
         .unwrap()
         .slice(ha_ndarray::range![fensor::AxisRange::In(0, 1024, 33)])
         .unwrap();
+
     measure("diagonal", &diagonal).await;
     let (_left_root, left) = source(17, 9, false, 31, 1, 1_000_000).await;
     let (_right_root, right) = source(17, 7, false, 128, 1, 1_000_000).await;
@@ -100,6 +103,7 @@ pub async fn run() {
         &left.matmul(&right.view()).await.unwrap(),
     )
     .await;
+
     measure(
         "operand_flip",
         &left
@@ -110,6 +114,7 @@ pub async fn run() {
             .unwrap(),
     )
     .await;
+
     let (_leaf_root, leaf) = source(32, 128, false, 4096, 1, 1_000_000).await;
     measure("leaf_contiguous", &leaf.view()).await;
     measure("leaf_transpose", &leaf.view().transpose(None).unwrap()).await;
@@ -127,6 +132,7 @@ pub async fn run() {
             .unwrap(),
     )
     .await;
+
     measure(
         "leaf_gather",
         &leaf
@@ -138,6 +144,7 @@ pub async fn run() {
             .unwrap(),
     )
     .await;
+
     Box::pin(measure_shared_pages()).await;
 }
 
@@ -151,5 +158,6 @@ async fn measure_shared_pages() {
         (0..6).map(|i| (i % 5 + 1) as f32),
     )
     .await;
+
     measure("sparse_shared_pages", &alias.view()).await;
 }

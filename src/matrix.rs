@@ -172,6 +172,7 @@ where
                     coordinates.push(mapped.to_vec());
                     Ok(())
                 })?;
+
             let request = BatchRequest::explicit(coordinates)?;
             // Preserve the source's lazy ndarray expression. This
             // projection adds no evaluation or buffering boundary.

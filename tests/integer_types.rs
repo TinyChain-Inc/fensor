@@ -1,17 +1,17 @@
 //! Shared execution paths for all real storage widths; integer edge expectations are independent.
 
-use fensor::{
-    Layout, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCompare, TensorCompareScalar,
-    TensorElement, TensorExpression, TensorFileEntry, TensorMatMul, TensorMath, TensorMathScalar,
-    TensorMatrixUnary, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
-    TensorTransform, TensorUnaryBoolean, TensorWhere, TensorWrite,
-};
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, Buffer, NDArrayMath, NDArrayMathScalar, NDArrayRead, Number, Real, axes, shape,
 };
 
 use common::{FsEntry, cleanup, fixture};
+use fensor::{
+    Layout, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCompare, TensorCompareScalar,
+    TensorElement, TensorExpression, TensorFileEntry, TensorMatMul, TensorMath, TensorMathScalar,
+    TensorMatrixUnary, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
+    TensorTransform, TensorUnaryBoolean, TensorWhere, TensorWrite,
+};
 
 mod common;
 
@@ -22,6 +22,7 @@ where
     for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
         let (root, tensor) =
             fixture::source("real_width", shape![2, 2], layout, 3, 1024, input.clone()).await;
+
         let view = tensor.view();
         let dense = TensorExpression::new(view.clone()).unwrap().into_dense();
         let backend = Array::new(Buffer::from(input.clone()), shape![2, 2]).unwrap();
@@ -60,6 +61,7 @@ where
                 .await;
             };
         }
+
         arithmetic!(add, add_scalar, view, dense);
         arithmetic!(sub, sub_scalar, view, dense);
         arithmetic!(mul, mul_scalar, view, view);
@@ -90,6 +92,7 @@ where
                 .await;
             };
         }
+
         comparison!(eq, eq_scalar, |a: T, b: T| a == b, dense, view);
         comparison!(ne, ne_scalar, |a: T, b: T| a != b, view, dense);
         comparison!(gt, gt_scalar, |a: T, b: T| a > b, view, view);
@@ -103,6 +106,7 @@ where
             view,
             view
         );
+
         comparison!(
             or,
             or_scalar,
@@ -110,6 +114,7 @@ where
             view,
             dense
         );
+
         comparison!(
             xor,
             xor_scalar,
@@ -117,6 +122,7 @@ where
             view,
             dense
         );
+
         let expected: Vec<u8> = input.iter().map(|v| u8::from(*v == T::ZERO)).collect();
         fixture::blocks(&dense.not().await.unwrap(), &expected, |a, b| a == b).await;
         fixture::blocks(
@@ -125,31 +131,38 @@ where
             |a, b| a == b,
         )
         .await;
+
         let values = &input;
         assert_eq!(
             tensor.sum_all().await.unwrap(),
             values.iter().copied().reduce(Number::add).unwrap()
         );
+
         assert_eq!(
             tensor.product_all().await.unwrap(),
             values.iter().copied().reduce(Number::mul).unwrap()
         );
+
         assert_eq!(
             tensor.min_all().await.unwrap(),
             values.iter().copied().reduce(Real::min).unwrap()
         );
+
         assert_eq!(
             tensor.max_all().await.unwrap(),
             values.iter().copied().reduce(Real::max).unwrap()
         );
+
         assert_eq!(
             tensor.all().await.unwrap(),
             values.iter().all(|v| *v != T::ZERO)
         );
+
         assert_eq!(
             tensor.any().await.unwrap(),
             values.iter().any(|v| *v != T::ZERO)
         );
+
         for keep in [false, true] {
             for axes in [axes![], axes![0], axes![1], axes![1, 0]] {
                 // Every logical value, including sparse zeros, participates in each group.
@@ -159,6 +172,7 @@ where
                     [1] => vec![vec![0, 1], vec![2, 3]],
                     _ => vec![vec![0, 1, 2, 3]],
                 };
+
                 macro_rules! axis {
                     ($method:ident, $combine:path) => {
                         let expected: Vec<_> = groups
@@ -178,12 +192,14 @@ where
                         .await;
                     };
                 }
+
                 axis!(sum, Number::add);
                 axis!(product, Number::mul);
                 axis!(min, Real::min);
                 axis!(max, Real::max);
             }
         }
+
         fixture::consumers(
             &view.mt().await.unwrap(),
             &[input[0], input[2], input[1], input[3]],
@@ -191,6 +207,7 @@ where
             |a, b| a == b,
         )
         .await;
+
         fixture::consumers(
             &view.diag().await.unwrap(),
             &[input[0], input[3]],
@@ -198,6 +215,7 @@ where
             |a, b| a == b,
         )
         .await;
+
         let product = view.matmul(&view).await.unwrap();
         let expected: Vec<T> = (0..2)
             .flat_map(|i| {
@@ -210,6 +228,7 @@ where
                 })
             })
             .collect();
+
         fixture::consumers(&product, &expected, |a, b| a == b, |a, b| a == b).await;
         fixture::blocks(
             &dense
@@ -223,12 +242,14 @@ where
             |a, b| a == b,
         )
         .await;
+
         // Geometric writes, zero lifecycle, and repeated/concurrent consumption.
         view.flip(0)
             .unwrap()
             .write_value(&[0, 1], T::ONE)
             .await
             .unwrap();
+
         assert_eq!(tensor.read_value(&[1, 1]).await.unwrap(), T::ONE);
         tensor.write_value(&[1, 1], T::ZERO).await.unwrap();
         assert_eq!(tensor.read_value(&[1, 1]).await.unwrap(), T::ZERO);
@@ -241,6 +262,7 @@ where
             .unwrap()
             .broadcast(shape![1, 4097])
             .unwrap();
+
         let mut cancelled = expanded.read_blocks().unwrap();
         assert_eq!(cancelled.try_next().await.unwrap().unwrap().len(), 4096);
         drop(cancelled);
@@ -249,6 +271,7 @@ where
             expanded.read_blocks().unwrap().try_collect::<Vec<_>>()
         )
         .unwrap();
+
         assert_eq!(a, b);
         drop(tensor);
         cleanup(&root).await;
@@ -323,12 +346,19 @@ macro_rules! integer_case {
 }
 
 integer_case!(u8_operations, u8);
+
 integer_case!(u16_operations, u16);
+
 integer_case!(u32_operations, u32);
+
 integer_case!(u64_operations, u64);
+
 integer_case!(i8_operations, i8);
+
 integer_case!(i16_operations, i16);
+
 integer_case!(i32_operations, i32);
+
 integer_case!(i64_operations, i64);
 
 macro_rules! signed_case {
@@ -383,8 +413,11 @@ macro_rules! signed_case {
 }
 
 signed_case!(i8_negative_powers, i8);
+
 signed_case!(i16_negative_powers, i16);
+
 signed_case!(i32_negative_powers, i32);
+
 signed_case!(i64_negative_powers, i64);
 
 #[tokio::test]
@@ -398,6 +431,7 @@ async fn full_width_powers() {
         [2u64],
     )
     .await;
+
     assert_eq!(
         tensor
             .view()
@@ -409,6 +443,7 @@ async fn full_width_powers() {
             .unwrap(),
         0
     );
+
     cleanup(&root).await;
     let (root, tensor) = fixture::source(
         "signed_width_power",
@@ -419,6 +454,7 @@ async fn full_width_powers() {
         [-1i64],
     )
     .await;
+
     assert_eq!(
         tensor
             .view()
@@ -430,5 +466,6 @@ async fn full_width_powers() {
             .unwrap(),
         -1
     );
+
     cleanup(&root).await;
 }

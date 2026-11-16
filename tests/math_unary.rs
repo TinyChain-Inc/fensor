@@ -1,6 +1,10 @@
 //! Integration tests for `TensorUnary` (`exp`, `ln`, `round`) via lazy
 //! typed `UnaryView` chains over filesystem-backed geometric views.
 
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType};
+
 use common::{FsEntry, create_dense_tensor, create_sparse_tensor, iter_coords, new_dir};
 use fensor::unary::{Exp, Round};
 use fensor::{
@@ -8,9 +12,6 @@ use fensor::{
     TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorViewSemantics,
     TensorWrite, UnaryView,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
-use number_general::{FloatType, NumberType};
 
 mod common;
 
@@ -688,7 +689,8 @@ async fn typed_unary_composition_preserves_all_geometric_transforms() {
             let rows: Vec<_> = expression
                 .read_coordinate_blocks()
                 .unwrap()
-                .map_ok(|(coords, values)| {
+                .map_ok(|batch| {
+                    let (coords, values) = batch.into_coordinates(expression.shape()).unwrap();
                     futures::stream::iter(
                         coords.into_iter().zip(values).map(Ok::<_, fensor::Error>),
                     )

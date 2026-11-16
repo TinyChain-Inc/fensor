@@ -1,6 +1,7 @@
 //! Validated, rank-preserving selections. Only emitted requests are batch-sized.
 
-use futures::{StreamExt, stream::BoxStream};
+use futures::StreamExt;
+use futures::stream::BoxStream;
 
 use crate::expression::MAX_BATCH_ELEMENTS;
 use crate::request::{Axis, BatchRequest, Cartesian};

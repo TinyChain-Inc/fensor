@@ -7,9 +7,11 @@ use futures::channel::oneshot;
 use number_general::DType;
 
 use super::*;
+use crate::test_support::FsEntry;
 use crate::test_support::counters::Counter;
-use crate::test_support::{self, FsEntry};
-use crate::{Layout, TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite};
+use crate::{
+    Layout, TensorFileEntry, TensorRead, TensorReduceAll, TensorSchema, TensorWrite, test_support,
+};
 
 struct Source<'a, T: TensorElement>
 where
@@ -78,6 +80,7 @@ where
                 .into_iter()
                 .map(|coord| BatchRequest::explicit(vec![coord]))
         });
+
         Ok(traversal::Selection::Ready(
             futures::stream::iter(requests).boxed(),
         ))
@@ -174,6 +177,7 @@ async fn sequential_batches_are_ordered_and_cancelled_by_drop() {
         } else {
             ordered_batches(&*source, requests)
         };
+
         // A blocked request prevents evaluation of the next request.
         futures::future::poll_fn(|cx| {
             assert!(stream.as_mut().poll_next(cx).is_pending());
@@ -185,6 +189,7 @@ async fn sequential_batches_are_ordered_and_cancelled_by_drop() {
             }
         })
         .await;
+
         assert_eq!(source.started.read(), limit as u64);
         assert_eq!(source.completed.read(), (limit - 1) as u64);
 
@@ -202,11 +207,13 @@ async fn sequential_batches_are_ordered_and_cancelled_by_drop() {
                 let (_, batch) = stream.try_next().await.unwrap().unwrap();
                 assert_eq!(batch.values, vec![(i % 255) as u8]);
             }
+
             assert!(stream.try_next().await.unwrap().is_none());
             assert_eq!(source.started.read(), count as u64);
             assert_eq!(source.finished.read(), count as u64);
             drop(stream);
         }
+
         drop(source);
         assert!(
             weak.upgrade().is_none(),
@@ -261,7 +268,14 @@ async fn sequential_consumption_preserves_pairs_and_backpressure() {
     release.send(Ok(())).unwrap();
 
     for (i, value) in values.iter().enumerate() {
-        let (coords, batch) = stream.try_next().await.unwrap().unwrap();
+        let (coords, batch) = stream
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_coordinates(source.shape())
+            .unwrap();
+
         assert_eq!(coords, vec![vec![i as u64]]);
         assert_eq!(batch, vec![*value]);
         assert_eq!(source.started.read(), (i + 1) as u64);
@@ -297,8 +311,12 @@ async fn sequential_consumption_preserves_pairs_and_backpressure() {
     for blocks in [left, right] {
         let mut pairs: Vec<_> = blocks
             .into_iter()
-            .flat_map(|(coords, values)| coords.into_iter().zip(values))
+            .flat_map(|batch| {
+                let (coords, values) = batch.into_coordinates(tensor.shape()).unwrap();
+                coords.into_iter().zip(values)
+            })
             .collect();
+
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(pairs.len(), count);
 
@@ -328,6 +346,7 @@ async fn sequential_errors_stop_before_later_evaluation() {
         stream.try_next().await,
         Err(Error::Unsupported(_))
     ));
+
     drop(stream);
     assert_eq!(source.started.read(), 2);
     assert_eq!(source.finished.read(), 2);
@@ -386,6 +405,7 @@ async fn numeric_terminals_preserve_values_across_input_delays() {
                 );
             }
         }
+
         test_support::cleanup(&root).await;
     }
 
@@ -395,6 +415,7 @@ async fn numeric_terminals_preserve_values_across_input_delays() {
         .into_iter()
         .map(|v| BigRational::from_float(v).unwrap())
         .sum();
+
     let scale = values.iter().map(|v| v.abs()).sum::<f64>();
     let ku = 8. * values.len() as f64 * (f64::EPSILON / 2.);
     let (root, tensor) = stored("unordered_float", &values, false).await;
@@ -430,6 +451,7 @@ async fn numeric_terminals_preserve_values_across_input_delays() {
                 let actual = scheduled(&source, release, operation, release_first)
                     .await
                     .unwrap();
+
                 if values[1].is_nan() {
                     assert!(actual.is_nan());
                 } else if values[0] == 0. {
@@ -440,6 +462,7 @@ async fn numeric_terminals_preserve_values_across_input_delays() {
                 }
             }
         }
+
         test_support::cleanup(&root).await;
     }
 }
@@ -455,10 +478,12 @@ async fn owned_stream_error_releases_pending_evaluation_on_drop() {
     release
         .send(Err(Error::InvalidLayout("test read failure".into())))
         .unwrap();
+
     assert!(matches!(
         stream.try_next().await,
         Err(Error::InvalidLayout(_))
     ));
+
     drop(stream);
     assert!(weak.upgrade().is_none());
     test_support::cleanup(&root).await;

@@ -196,6 +196,7 @@ impl<T: TensorElement> Drop for Driver<'_, T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+
         drop(pending);
 
         while self.frames.pop().is_some() {}

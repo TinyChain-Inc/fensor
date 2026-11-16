@@ -5,12 +5,12 @@ use ha_ndarray::{
     Platform, Real,
 };
 
-use crate::expression::{self, Batch, Expression};
+use crate::expression::{Batch, Expression};
 use crate::request::BatchRequest;
 use crate::traits::BoxFuture;
 use crate::{
     Error, Layout, Result, TensorBoolean, TensorCompare, TensorElement, TensorGeometry, TensorMath,
-    TensorRead, TensorTransform, TensorViewSemantics,
+    TensorRead, TensorTransform, TensorViewSemantics, expression,
 };
 
 mod sealed {
@@ -139,6 +139,7 @@ where
             if zero != O::Output::ZERO {
                 return Err(Error::WouldDensify { operation: O::NAME });
             }
+
             zero
         } else {
             O::Output::ZERO

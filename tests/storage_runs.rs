@@ -1,13 +1,15 @@
 //! Filesystem parity between compact/affine stream requests and explicit point reads.
 
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
+
 use fensor::{
     AxisRange, Layout, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
     TensorTransform, TensorWrite,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
 
 mod common;
+
 use common::FsEntry;
 
 async fn check<T: TensorElement>(pattern: &[T], same: impl Fn(T, T) -> bool)
@@ -37,6 +39,7 @@ where
                     source.write_value(&coord, value).await.unwrap();
                 }
             }
+
             source.sync().await.unwrap();
             let before = file_names(&root).await;
             let views = [
@@ -81,6 +84,7 @@ where
 
             for view in views {
                 use fensor::TensorGeometry;
+
                 let mut expected = Vec::new();
 
                 for coord in common::iter_coords(view.shape()) {
@@ -96,23 +100,28 @@ where
                         i += 1;
                     }
                 }
+
                 assert_eq!(i, expected.len());
                 let mut stream = view.read_coordinate_blocks().unwrap();
                 let mut count = 0;
 
-                while let Some((coords, values)) = stream.try_next().await.unwrap() {
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    let (coords, values) = batch.into_coordinates(view.shape()).unwrap();
                     for (coord, value) in coords.iter().zip(values) {
                         assert!(same(value, view.read_value(coord).await.unwrap()));
                         count += 1;
                     }
                 }
+
                 assert_eq!(count, expected.len());
             }
+
             assert_eq!(
                 file_names(&root).await,
                 before,
                 "evaluation must not create computed-result files"
             );
+
             common::cleanup(&root).await;
         }
     }
@@ -133,6 +142,7 @@ async fn file_names(root: &std::path::Path) -> Vec<std::path::PathBuf> {
             }
         }
     }
+
     names.sort();
     names
 }
@@ -145,6 +155,7 @@ async fn affine_streams_match_explicit_reads_for_supported_types() {
         |a, b| (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits(),
     )
     .await;
+
     check(
         &[0f64, -0., -3., f64::NAN, f64::INFINITY, f64::NEG_INFINITY],
         |a, b| (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits(),

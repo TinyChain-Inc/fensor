@@ -5,6 +5,7 @@ use fensor::{
 };
 
 mod common;
+
 use common::{fixture, numbers};
 
 fn rejects_densification(result: fensor::Result<()>, expected: &'static str) {
@@ -37,6 +38,7 @@ async fn sparse_operation_families_validate_the_zero_background() {
             [2.0_f32, 0., 0., 0.],
         )
         .await;
+
         let view = sparse.view();
 
         for (operation, result) in [
@@ -75,6 +77,7 @@ async fn sparse_operation_families_validate_the_zero_background() {
         for scalar in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             rejects_densification(view.mul_scalar(scalar).await.map(|_| ()), "mul_scalar");
         }
+
         for (operation, result) in [
             ("div_scalar", view.div_scalar(f32::NAN).await.map(|_| ())),
             ("rem_scalar", view.rem_scalar(f32::NAN).await.map(|_| ())),
@@ -96,6 +99,7 @@ async fn sparse_operation_families_validate_the_zero_background() {
             .pow_scalar(2.)
             .await
             .unwrap();
+
         let expected = dense
             .view()
             .abs()
@@ -110,6 +114,7 @@ async fn sparse_operation_families_validate_the_zero_background() {
             .pow_scalar(2.)
             .await
             .unwrap();
+
         fixture::reads(&actual, &[9., 0., 0., 0.], numbers::same).await;
         fixture::blocks(&expected, &[9., 0., 0., 0.], numbers::same).await;
         fixture::reads(
@@ -118,16 +123,19 @@ async fn sparse_operation_families_validate_the_zero_background() {
             numbers::same,
         )
         .await;
+
         fixture::reads(
             &view.mul(&view).await.unwrap(),
             &[4., 0., 0., 0.],
             numbers::same,
         )
         .await;
+
         fixture::reads(&view.gt_scalar(1.).await.unwrap(), &[1, 0, 0, 0], |a, b| {
             a == b
         })
         .await;
+
         fixture::reads(&view.ne(&view).await.unwrap(), &[0; 4], |a, b| a == b).await;
         fixture::reads(&view.or(&view).await.unwrap(), &[1, 0, 0, 0], |a, b| a == b).await;
         fixture::reads(
@@ -143,10 +151,12 @@ async fn sparse_operation_families_validate_the_zero_background() {
             numbers::same,
         )
         .await;
+
         fixture::reads(&view.eq_scalar(2.).await.unwrap(), &[1, 0, 0, 0], |a, b| {
             a == b
         })
         .await;
+
         let mixed = view.pow(&dense.view()).await.unwrap();
         assert_eq!(mixed.layout(), Layout::Dense);
         fixture::reads(&mixed, &[4., 1., 1., 1.], numbers::same).await;
@@ -163,6 +173,7 @@ async fn sparse_operation_families_validate_the_zero_background() {
             numbers::same,
         )
         .await;
+
         fixture::blocks(
             &dense.view().exp().await.unwrap(),
             &exponentials,
@@ -183,6 +194,7 @@ async fn integer_zero_denominators_follow_native_zero_semantics() {
         [2_i32, 0, 0, 0],
     )
     .await;
+
     let view = sparse.view();
     fixture::reads(&view.div_scalar(0).await.unwrap(), &[0; 4], |a, b| a == b).await;
     fixture::reads(&view.rem_scalar(0).await.unwrap(), &[0; 4], |a, b| a == b).await;
@@ -190,11 +202,13 @@ async fn integer_zero_denominators_follow_native_zero_semantics() {
         a == b
     })
     .await;
+
     fixture::reads(&view.rem(&view).await.unwrap(), &[0; 4], |a, b| a == b).await;
     fixture::reads(&view.div_scalar(2).await.unwrap(), &[1, 0, 0, 0], |a, b| {
         a == b
     })
     .await;
+
     fixture::reads(&view.rem_scalar(2).await.unwrap(), &[0; 4], |a, b| a == b).await;
 }
 
@@ -209,6 +223,7 @@ async fn sparse_multiplication_visits_both_operands_for_nonfinite_values() {
         [2.0_f32, 0., 0., 0.],
     )
     .await;
+
     let (_right_root, right) = fixture::source(
         "sparse_ieee_right",
         vec![1, 4].into(),
@@ -218,6 +233,7 @@ async fn sparse_multiplication_visits_both_operands_for_nonfinite_values() {
         [0., f32::INFINITY, f32::NAN, 0.],
     )
     .await;
+
     let expected = [0., f32::NAN, f32::NAN, 0.];
     fixture::reads(
         &left.view().mul(&right.view()).await.unwrap(),
@@ -246,6 +262,7 @@ async fn complex_scalar_guards_preserve_zero_and_nonfinite_classifications() {
         [C::new(2., 1.), zero, zero, zero],
     )
     .await;
+
     let view = sparse.view();
     for (operation, result) in [
         (
@@ -259,9 +276,11 @@ async fn complex_scalar_guards_preserve_zero_and_nonfinite_classifications() {
     ] {
         rejects_densification(result, operation);
     }
+
     for scalar in [C::new(f32::INFINITY, 0.), C::new(f32::NAN, 0.)] {
         rejects_densification(view.mul_scalar(scalar).await.map(|_| ()), "mul_scalar");
     }
+
     let expected = [C::new(4., 2.), zero, zero, zero];
     fixture::reads(
         &view.mul_scalar(C::new(2., 0.)).await.unwrap(),
@@ -269,6 +288,7 @@ async fn complex_scalar_guards_preserve_zero_and_nonfinite_classifications() {
         numbers::same,
     )
     .await;
+
     let dense = TensorExpression::new(sparse.clone()).unwrap().into_dense();
     fixture::blocks(
         &dense.mul_scalar(C::new(2., 0.)).await.unwrap(),

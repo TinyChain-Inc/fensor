@@ -66,6 +66,7 @@ async fn request_providers_delegate_once_in_order_and_propagate_errors() {
     use crate::{TensorMath, TensorUnaryBoolean, TensorWhere};
 
     type Provide = fn(&[u64]) -> Result<Option<RequestIterator>>;
+
     let none: Provide = |_| Ok(None);
     let some: Provide = |shape| Ok(Some(Box::new(request::linear_requests(shape)?)));
     let error: Provide = |_| Err(Error::Unsupported("provider failure".into()));
@@ -134,6 +135,7 @@ async fn ordered_providers_visit_operands_left_to_right() {
     use crate::{TensorAbs, TensorMath, TensorWhere};
 
     type Provide = fn(&[u64]) -> Result<Option<RequestIterator>>;
+
     let none: Provide = |_| Ok(None);
     let some: Provide = |_| {
         Ok(Some(Box::new(
