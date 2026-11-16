@@ -1,10 +1,12 @@
-use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorWrite, TensorWriteBulk,
-};
 use ha_ndarray::{range, shape};
 use number_general::DType;
 
+use fensor::{
+    AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorWrite, TensorWriteBulk,
+};
+
 mod common;
+
 use common::{FsEntry, new_dir};
 
 #[tokio::test]
@@ -58,8 +60,10 @@ async fn writes_validate_cardinality_before_mutation() {
         (Layout::Sparse { axis: Some(0) }, 6),
         (Layout::Sparse { axis: None }, 15),
     ] {
-        use fensor::TensorSource;
         use futures::TryStreamExt;
+
+        use fensor::TensorSource;
+
         let (_root, dir) = new_dir("compact_regions").await;
         let schema = TensorSchema::new(u8::dtype(), shape![3, 5]).unwrap();
         let tensor = Tensor::<FsEntry, u8>::create(dir.clone(), schema.clone(), layout, 4)

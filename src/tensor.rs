@@ -1,6 +1,9 @@
 mod construction;
+
 mod dense_storage;
+
 mod sparse_storage;
+
 pub use sparse_storage::SparseBlocks;
 
 #[cfg(test)]
@@ -345,16 +348,9 @@ where
         let expected = crate::schema::checked_product(source.shape())?;
         let mut received = 0u64;
 
-        while let Some((coords, values)) = blocks.try_next().await? {
-            if coords.len() != values.len() || values.len() > crate::expression::MAX_BATCH_ELEMENTS
-            {
-                return Err(Error::InvalidLayout(format!(
-                    "copy block: expected equal coordinate/value lengths at most {}, got {} and {}",
-                    crate::expression::MAX_BATCH_ELEMENTS,
-                    coords.len(),
-                    values.len()
-                )));
-            }
+        while let Some(batch) = blocks.try_next().await? {
+            tokio::task::coop::consume_budget().await;
+            let (request, values) = batch.into_request(source.shape())?;
 
             received = received
                 .checked_add(values.len() as u64)
@@ -363,9 +359,7 @@ where
                     Error::InvalidLayout("reader returned more values than its shape".into())
                 })?;
 
-            output
-                .stage(BatchRequest::explicit(coords)?, values)
-                .await?;
+            output.stage(request, values).await?;
         }
 
         if received != expected {
@@ -771,6 +765,7 @@ where
     fn fill<'a>(&'a self, value: Self::DType) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             use crate::TensorSource;
+
             let geometry = self.storage_geometry();
 
             for id in 0..geometry.block_count() {

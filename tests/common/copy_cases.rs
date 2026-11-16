@@ -1,9 +1,9 @@
 //! Copy-specific transposed fixtures, including blocks revisited across batches.
 
-use fensor::{Layout, TensorTransform};
 use ha_ndarray::shape;
 
 use super::{benchmark, common};
+use fensor::{Layout, TensorTransform};
 
 pub async fn run() {
     for (rows, cols, caches) in [(9, 17, [8192, 1_000_000]), (65, 65, [32768, 1_000_000])] {
@@ -13,6 +13,7 @@ pub async fn run() {
         } else {
             (rows, cols)
         };
+
         for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
             let (root, tensor) = common::fixture::source(
                 "copy_profile",
@@ -31,6 +32,7 @@ pub async fn run() {
                 }),
             )
             .await;
+
             tensor.sync().await.unwrap();
             let view = tensor.view().transpose(None).unwrap();
             let name = format!("copy_{fixture}_{layout:?}").replace(',', "-");
@@ -39,6 +41,7 @@ pub async fn run() {
                     benchmark::copy(&name, &view, capacity, cache, cache < 1_000_000).await;
                 }
             }
+
             drop(view);
             drop(tensor);
             common::cleanup(&root).await;

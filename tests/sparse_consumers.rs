@@ -1,14 +1,17 @@
 //! Shared sparse consumption through operation-specific, transformed expressions.
-use fensor::{
-    AxisRange, Layout, Tensor, TensorElement, TensorMatMul, TensorMatrixUnary, TensorRead,
-    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
-};
 use futures::TryStreamExt;
 use ha_ndarray::{Number, shape};
 use number_general::DType;
 
+use fensor::{
+    AxisRange, Layout, Tensor, TensorElement, TensorMatMul, TensorMatrixUnary, TensorRead,
+    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
+};
+
 mod common;
-use common::{FsEntry, cleanup, iter_coords, new_dir, numbers::same};
+
+use common::numbers::same;
+use common::{FsEntry, cleanup, iter_coords, new_dir};
 
 async fn parity<V: TensorRead>(view: &V, empty: bool, intermediate_zero: bool)
 where
@@ -19,17 +22,20 @@ where
         values.len() > 4096,
         "fixture spans multiple execution batches"
     );
+
     if empty {
         assert!(values.iter().all(|value| *value == V::DType::ZERO));
     } else if intermediate_zero {
         // Zero-preserving composition treats intermediate and implicit zeros alike.
         assert!(values.contains(&V::DType::ZERO));
     }
+
     let full: fensor::Range = view
         .shape()
         .iter()
         .map(|&dim| AxisRange::In(0, dim, 1))
         .collect();
+
     let mut selected = full.clone();
     let last = view.ndim() - 1;
     selected[last] = AxisRange::Of(vec![view.shape()[last] - 1, 0, view.shape()[last] - 1, 1]);
@@ -49,6 +55,7 @@ where
                     })
             })
             .collect();
+
         let actual: Vec<_> = view
             .read_sparse_elements_in_order(range, (0..view.ndim()).collect())
             .await
@@ -56,6 +63,7 @@ where
             .try_collect()
             .await
             .unwrap();
+
         assert_eq!(actual.len(), expected.len());
         assert!(actual.windows(2).all(|pair| pair[0].0 < pair[1].0));
         for ((coord, actual), (expected_coord, expected)) in actual.into_iter().zip(expected) {
@@ -80,6 +88,7 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
         )
         .await
         .unwrap();
+
         let (right_root, right_dir) = new_dir("sparse_consumer_right").await;
         let right = Tensor::<FsEntry, f64>::create(
             right_dir,
@@ -89,6 +98,7 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
         )
         .await
         .unwrap();
+
         if !empty {
             for (coord, value) in [
                 ([0, 0], 1.0),
@@ -99,11 +109,13 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
             ] {
                 left.write_value(&coord, value).await.unwrap();
             }
+
             for row in 0..2 {
                 right.write_value(&[row, 0], 1.0).await.unwrap();
                 right.write_value(&[row, 1], 2.0).await.unwrap();
             }
         }
+
         let product = left
             .view()
             .matmul(&right.view())
@@ -113,11 +125,13 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
             .unwrap()
             .flip(1)
             .unwrap();
+
         parity(&product, empty, false).await;
         assert!(matches!(
             product.exp().await,
             Err(fensor::Error::WouldDensify { .. })
         ));
+
         parity(&product.sin().await.unwrap(), empty, true).await;
         cleanup(&left_root).await;
         cleanup(&right_root).await;
@@ -131,6 +145,7 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
         )
         .await
         .unwrap();
+
         if !empty {
             for (coord, value) in [
                 ([0, 0, 0], 0.2),
@@ -141,6 +156,7 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
                 tensor.write_value(&coord, value).await.unwrap();
             }
         }
+
         let diagonal = tensor
             .view()
             .diag()
@@ -150,17 +166,20 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
             .unwrap()
             .flip(0)
             .unwrap();
+
         parity(&diagonal, empty, false).await;
         assert!(matches!(
             diagonal.exp().await,
             Err(fensor::Error::WouldDensify { .. })
         ));
+
         parity(
             &diagonal.round().await.unwrap().sin().await.unwrap(),
             empty,
             true,
         )
         .await;
+
         cleanup(&root).await;
     }
 }
@@ -168,7 +187,9 @@ async fn matrix_and_diagonal_sparse_consumers_match_row_major_values() {
 #[cfg(feature = "complex")]
 #[tokio::test]
 async fn fourier_sparse_consumers_match_row_major_values() {
-    use fensor::{TensorFourier, complex::Complex64};
+    use fensor::TensorFourier;
+    use fensor::complex::Complex64;
+
     for empty in [false, true] {
         let (root, dir) = new_dir("sparse_consumer_fourier").await;
         let tensor = Tensor::<FsEntry, Complex64>::create(
@@ -179,6 +200,7 @@ async fn fourier_sparse_consumers_match_row_major_values() {
         )
         .await
         .unwrap();
+
         if !empty {
             for (coord, value) in [
                 ([0, 0], 0.5),
@@ -193,6 +215,7 @@ async fn fourier_sparse_consumers_match_row_major_values() {
                     .unwrap();
             }
         }
+
         let spectrum = tensor
             .view()
             .fft()
@@ -202,11 +225,13 @@ async fn fourier_sparse_consumers_match_row_major_values() {
             .unwrap()
             .flip(1)
             .unwrap();
+
         parity(&spectrum, empty, false).await;
         assert!(matches!(
             spectrum.exp().await,
             Err(fensor::Error::WouldDensify { .. })
         ));
+
         parity(&spectrum.sin().await.unwrap(), empty, true).await;
         cleanup(&root).await;
     }

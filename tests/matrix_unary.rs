@@ -2,16 +2,17 @@
 
 use std::collections::BTreeSet;
 
+use futures::TryStreamExt;
+use ha_ndarray::{Array, Buffer, MatrixUnary, NDArrayRead};
+use number_general::DType;
+use smallvec::smallvec;
+
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorCompareScalar, TensorElement, TensorExpression,
     TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnary, TensorRead,
     TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics,
     TensorWhere, TensorWrite,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{Array, Buffer, MatrixUnary, NDArrayRead};
-use number_general::DType;
-use smallvec::smallvec;
 
 mod common;
 
@@ -28,17 +29,20 @@ async fn consumers<V: TensorRead>(
     fixture::consumers(view, expected, &equal, &equal).await;
     let mut stream = view.read_coordinate_blocks().unwrap();
     let mut seen = BTreeSet::new();
-    while let Some((coords, values)) = stream.try_next().await.unwrap() {
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        let (coords, values) = batch.into_coordinates(view.shape()).unwrap();
         assert_eq!(coords.len(), values.len());
         for (coord, value) in coords.into_iter().zip(values) {
             let flat = coord
                 .iter()
                 .zip(view.shape())
                 .fold(0, |n, (c, d)| n * d + c);
+
             assert!(equal(value, expected[flat as usize]), "at {coord:?}");
             assert!(seen.insert(coord), "duplicate output");
         }
     }
+
     assert_eq!(seen.len(), expected.len());
 }
 
@@ -105,7 +109,9 @@ macro_rules! parity {
 }
 
 parity!(u8_parity, u8);
+
 parity!(f32_parity, f32);
+
 parity!(f64_parity, f64);
 
 #[tokio::test]
@@ -119,6 +125,7 @@ async fn shape_errors_and_transpose_write_through() {
         0u8..24,
     )
     .await;
+
     let mt = tensor.view().mt().await.unwrap();
     assert_eq!(mt.shape(), &[2, 4, 3]);
     assert!(mt.supports_write_through());
@@ -146,18 +153,21 @@ async fn zeros_and_expression_composition() {
         ],
     )
     .await;
+
     let rounded = tensor.view().round().await.unwrap();
     let diagonal = rounded.diag().await.unwrap();
     assert!(matches!(
         diagonal.exp().await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     let restored = TensorExpression::new(diagonal.clone())
         .unwrap()
         .into_dense()
         .exp()
         .await
         .unwrap();
+
     consumers(&restored, &[1., 1., 2f32.exp(), 1., 1., 1.], |a, b| a == b).await;
     let transposed = diagonal.mt().await.unwrap();
     fixture::blocks(&transposed, &[0., 0., 0., 0., 2., 0.], |a, b| a == b).await;
@@ -169,6 +179,7 @@ async fn zeros_and_expression_composition() {
         .unwrap()
         .flip(0)
         .unwrap();
+
     consumers(&selected, &[2., 0., 2.], |a, b| a == b).await;
     let before = tensor.view().flip(2).unwrap().diag().await.unwrap();
     fixture::blocks(&before, &[0., 0., 0., 0., 0.2, 0.], |a, b| a == b).await;
@@ -182,6 +193,7 @@ async fn zeros_and_expression_composition() {
         .diag()
         .await
         .unwrap();
+
     fixture::blocks(&chosen, &[0., 0., 2., 0., 0., 0.], |a, b| a == b).await;
     // Reducing the batch axis produces a square matrix; projection adds no aggregate boundary.
     let reduced = rounded
@@ -191,6 +203,7 @@ async fn zeros_and_expression_composition() {
         .diag()
         .await
         .unwrap();
+
     fixture::blocks(&reduced, &[0., 0., 2.], |a, b| a == b).await;
     let (identity_root, identity) = fixture::source(
         "diag_identity",
@@ -203,6 +216,7 @@ async fn zeros_and_expression_composition() {
         ],
     )
     .await;
+
     let product = rounded
         .matmul(&identity.view())
         .await
@@ -210,6 +224,7 @@ async fn zeros_and_expression_composition() {
         .diag()
         .await
         .unwrap();
+
     fixture::blocks(&product, &[0., 0., 2., 0., 0., 0.], |a, b| a == b).await;
     let reshaped = diagonal
         .reshape(smallvec![3, 2])
@@ -220,6 +235,7 @@ async fn zeros_and_expression_composition() {
         .unwrap()
         .squeeze(smallvec![0])
         .unwrap();
+
     fixture::blocks(&reshaped, &[0., 2., 0., 0., 0., 0.], |a, b| a == b).await;
     cleanup(&identity_root).await;
     cleanup(&root).await;
@@ -254,6 +270,7 @@ async fn exception_bits_and_off_diagonal_values() {
             ],
         )
         .await;
+
         let diag = tensor.view().diag().await.unwrap();
         let expected = [
             if sparse { 0. } else { -0. },
@@ -261,12 +278,15 @@ async fn exception_bits_and_off_diagonal_values() {
             f64::INFINITY,
             f64::NEG_INFINITY,
         ];
+
         consumers(&diag, &expected, |a, b| {
             (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
         })
         .await;
+
         cleanup(&root).await;
     }
+
     let (root, tensor) = fixture::source(
         "off_diagonal",
         smallvec![2, 2],
@@ -276,17 +296,20 @@ async fn exception_bits_and_off_diagonal_values() {
         [0f32, 2., 3., 0.],
     )
     .await;
+
     let diag = tensor.view().diag().await.unwrap();
     assert!(matches!(
         diag.exp().await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     let diag = TensorExpression::new(diag)
         .unwrap()
         .into_dense()
         .exp()
         .await
         .unwrap();
+
     consumers(&diag, &[1., 1.], |a, b| a == b).await;
     cleanup(&root).await;
 }
@@ -304,6 +327,7 @@ async fn bounded_batches_reuse_and_live_reads() {
         [3u8],
     )
     .await;
+
     let nested = tensor
         .view()
         .broadcast(smallvec![2, 2, 2])
@@ -314,6 +338,7 @@ async fn bounded_batches_reuse_and_live_reads() {
         .diag()
         .await
         .unwrap();
+
     fixture::blocks(&nested, &[3, 3], |a, b| a == b).await;
     let scalar = nested.slice(smallvec![AxisRange::At(0)]).unwrap();
     assert_eq!(scalar.read_value(&[]).await.unwrap(), 3);
@@ -328,14 +353,25 @@ async fn bounded_batches_reuse_and_live_reads() {
         .diag()
         .await
         .unwrap();
+
     let mut stream = diag.read_coordinate_blocks().unwrap();
-    assert!(!stream.try_next().await.unwrap().unwrap().0.is_empty());
+    assert!(
+        !stream
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .values()
+            .is_empty()
+    );
+
     drop(stream);
     let expected = vec![3; n as usize];
     let ((), ()) = futures::join!(
         fixture::blocks(&diag, &expected, |a, b| a == b),
         fixture::blocks(&diag, &expected, |a, b| a == b)
     );
+
     tensor.write_value(&[0, 0], 127).await.unwrap();
     assert_eq!(diag.read_value(&[n - 1]).await.unwrap(), 127);
     let tiny = diag.slice(smallvec![AxisRange::In(n - 2, n, 1)]).unwrap();
@@ -351,9 +387,11 @@ async fn bounded_batches_reuse_and_live_reads() {
     )
     .await
     .unwrap();
+
     for i in [0, n - 1] {
         tensor.write_value(&[i, i], 0.2).await.unwrap();
     }
+
     let diag = tensor
         .view()
         .round()
@@ -365,6 +403,7 @@ async fn bounded_batches_reuse_and_live_reads() {
         .add(&tensor.view().diag().await.unwrap())
         .await
         .unwrap();
+
     let mut expected = vec![0.; n as usize];
     expected[0] = 0.2;
     expected[n as usize - 1] = 0.2;
@@ -376,6 +415,7 @@ async fn bounded_batches_reuse_and_live_reads() {
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(entries, vec![(vec![0], 0.2), (vec![n - 1], 0.2)]);
     cleanup(&root).await;
 }
@@ -392,21 +432,25 @@ async fn constrained_cache_and_source_reload() {
         (0..33 * 33).map(|i| (i % 256) as u8),
     )
     .await;
+
     let expected: Vec<_> = (0..33).map(|i| (i * 34 % 256) as u8).collect();
     fixture::blocks(&tensor.view().diag().await.unwrap(), &expected, |a, b| {
         a == b
     })
     .await;
+
     tensor.sync().await.unwrap();
     drop(tensor);
     let dir = freqfs::Cache::<FsEntry>::new(4096, None, 0, std::time::Duration::from_secs(1))
         .load(root.to_path_buf())
         .unwrap();
+
     let tensor = Tensor::<FsEntry, u8>::load(dir).await.unwrap();
     consumers(&tensor.view().diag().await.unwrap(), &expected, |a, b| {
         a == b
     })
     .await;
+
     drop(tensor);
     cleanup(&root).await;
 }

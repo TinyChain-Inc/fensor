@@ -5,12 +5,53 @@ use super::coordinate_batches;
 use crate::expression::MAX_BATCH_ELEMENTS;
 
 #[test]
+fn default_coordinate_adapter_rejects_invalid_shapes_before_reading() {
+    use crate::{Layout, TensorGeometry, TensorRead};
+
+    struct BlocksOnly(Vec<u64>);
+
+    impl TensorGeometry for BlocksOnly {
+        type DType = u8;
+
+        fn dtype(&self) -> crate::NumberType {
+            <u8 as number_general::DType>::dtype()
+        }
+
+        fn shape(&self) -> &[u64] {
+            &self.0
+        }
+
+        fn layout(&self) -> Layout {
+            Layout::Dense
+        }
+    }
+
+    impl TensorRead for BlocksOnly {
+        fn read_value<'a>(&'a self, _: &'a [u64]) -> crate::BoxFuture<'a, crate::Result<u8>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn read_blocks(&self) -> crate::Result<crate::ValueBlockStream<'_, u8>> {
+            panic!("invalid geometry must reject before reading a custom block source")
+        }
+    }
+
+    for shape in [vec![], vec![0], vec![1, 0]] {
+        assert!(matches!(
+            BlocksOnly(shape).read_coordinate_blocks(),
+            Err(crate::Error::InvalidSchema(_))
+        ));
+    }
+}
+
+#[test]
 fn batching_only_consumes_its_bounded_prefix() {
     let consumed = Cell::new(0);
     let coords = (0..1_000_000_000u64).map(|i| {
         consumed.set(consumed.get() + 1);
         vec![i]
     });
+
     let mut batches = coordinate_batches(coords);
 
     assert_eq!(consumed.get(), 0);
@@ -127,6 +168,7 @@ async fn constructor_futures_are_send_and_defer_work_until_polled() {
         clones: Arc::clone(&clones),
         inspections: Arc::clone(&inspections),
     };
+
     let future = source.exp();
     assert_eq!((clones.read(), inspections.read()), (0, 0));
     send(future);
@@ -160,6 +202,7 @@ async fn constructor_futures_are_send_and_defer_work_until_polled() {
         let value = <_ as TensorCast<ha_ndarray::complex::Complex64>>::cast(&view)
             .await
             .unwrap();
+
         complex(&value);
     }
 }

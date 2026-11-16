@@ -3,15 +3,16 @@
 use std::future::Future;
 
 use futures::TryStreamExt;
-use ha_ndarray::{NDArrayReduceAll, Number, Real};
+use ha_ndarray::{NDArrayReduceAll, Number, Real, statistics};
 
-use crate::expression::{self, Batch, Expression};
+use crate::expression::{Batch, Expression};
 use crate::mapping::CoordinateMap;
-use crate::request::{self, BatchRequest};
+use crate::request::BatchRequest;
 use crate::schema::Coord;
 use crate::{
     Axes, BoxFuture, Error, Layout, Result, Shape, TensorElement, TensorGeometry, TensorRead,
     TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorViewSemantics,
+    expression, request,
 };
 
 mod sealed {
@@ -21,11 +22,12 @@ mod sealed {
 /// A sealed reduction delegating numerical rules to ha-ndarray.
 pub trait ReduceOp<T: TensorElement>: sealed::Sealed + Clone + Send + Sync {
     type State: Copy + Send + Sync;
+
     type Output: TensorElement;
 
     fn partial(&self, values: Vec<T>) -> Result<Self::State>;
 
-    fn combine(left: Self::State, right: Self::State) -> Self::State;
+    fn combine(left: Self::State, right: Self::State) -> Result<Self::State>;
 
     fn finish(state: Self::State) -> Result<Self::Output>;
 
@@ -44,6 +46,7 @@ impl sealed::Sealed for Sum {}
 
 impl<T: TensorElement> ReduceOp<T> for Sum {
     type State = T;
+
     type Output = T;
 
     fn finish(state: T) -> Result<T> {
@@ -54,8 +57,8 @@ impl<T: TensorElement> ReduceOp<T> for Sum {
         Ok(expression::batch_array(values)?.sum_all()?)
     }
 
-    fn combine(left: T, right: T) -> T {
-        <T as Number>::add(left, right)
+    fn combine(left: T, right: T) -> Result<T> {
+        Ok(<T as Number>::add(left, right))
     }
 
     fn empty() -> Result<T> {
@@ -71,6 +74,7 @@ impl sealed::Sealed for Product {}
 
 impl<T: TensorElement> ReduceOp<T> for Product {
     type State = T;
+
     type Output = T;
 
     fn finish(state: T) -> Result<T> {
@@ -81,8 +85,8 @@ impl<T: TensorElement> ReduceOp<T> for Product {
         Ok(expression::batch_array(values)?.product_all()?)
     }
 
-    fn combine(left: T, right: T) -> T {
-        <T as Number>::mul(left, right)
+    fn combine(left: T, right: T) -> Result<T> {
+        Ok(<T as Number>::mul(left, right))
     }
 
     fn empty() -> Result<T> {
@@ -98,6 +102,7 @@ impl sealed::Sealed for Min {}
 
 impl<T: TensorElement + Real> ReduceOp<T> for Min {
     type State = T;
+
     type Output = T;
 
     fn finish(state: T) -> Result<T> {
@@ -108,8 +113,8 @@ impl<T: TensorElement + Real> ReduceOp<T> for Min {
         Ok(expression::batch_array(values)?.min_all()?)
     }
 
-    fn combine(left: T, right: T) -> T {
-        <T as Real>::min(left, right)
+    fn combine(left: T, right: T) -> Result<T> {
+        Ok(<T as Real>::min(left, right))
     }
 
     fn empty() -> Result<T> {
@@ -125,6 +130,7 @@ impl sealed::Sealed for Max {}
 
 impl<T: TensorElement + Real> ReduceOp<T> for Max {
     type State = T;
+
     type Output = T;
 
     fn finish(state: T) -> Result<T> {
@@ -135,8 +141,8 @@ impl<T: TensorElement + Real> ReduceOp<T> for Max {
         Ok(expression::batch_array(values)?.max_all()?)
     }
 
-    fn combine(left: T, right: T) -> T {
-        <T as Real>::max(left, right)
+    fn combine(left: T, right: T) -> Result<T> {
+        Ok(<T as Real>::max(left, right))
     }
 
     fn empty() -> Result<T> {
@@ -206,27 +212,26 @@ pub struct Mean;
 impl sealed::Sealed for Mean {}
 
 impl<T: StatisticsElement> ReduceOp<T> for Mean {
-    type State = (u64, [f64; 2]);
+    type State = [statistics::Mean; 2];
+
     type Output = T::Mean;
 
+    // Keep this batch kernel out of the shared expression evaluator's hot path.
+    // Inlining it slowed unrelated reductions in paired complete-consumer runs.
+    #[inline(never)]
     fn partial(&self, values: Vec<T>) -> Result<Self::State> {
-        let count = values.len() as u64;
-        let sum = values.into_iter().fold([0.0; 2], |sum, value| {
-            let value = value.components();
-            [sum[0] + value[0], sum[1] + value[1]]
-        });
-        Ok((count, sum))
+        Ok([
+            statistics::Mean::from_batch(&values, |value| value.components()[0])?,
+            statistics::Mean::from_batch(&values, |value| value.components()[1])?,
+        ])
     }
 
-    fn combine((n, l): Self::State, (m, r): Self::State) -> Self::State {
-        (n + m, [l[0] + r[0], l[1] + r[1]])
+    fn combine(left: Self::State, right: Self::State) -> Result<Self::State> {
+        Ok([left[0].merge(right[0])?, left[1].merge(right[1])?])
     }
 
-    fn finish((count, sum): Self::State) -> Result<Self::Output> {
-        Ok(T::mean_value([
-            sum[0] / count as f64,
-            sum[1] / count as f64,
-        ]))
+    fn finish(state: Self::State) -> Result<Self::Output> {
+        Ok(T::mean_value(state.map(statistics::Mean::finish)))
     }
 
     fn empty() -> Result<Self::Output> {
@@ -247,39 +252,27 @@ pub struct StandardDeviation;
 impl sealed::Sealed for StandardDeviation {}
 
 impl<T: StatisticsElement> ReduceOp<T> for StandardDeviation {
-    type State = (u64, [f64; 2], f64);
+    type State = [statistics::StandardDeviation; 2];
+
     type Output = f64;
 
     fn partial(&self, values: Vec<T>) -> Result<Self::State> {
-        let mut state = (0, [0.0; 2], 0.0);
-
+        let mut state = Self::State::default();
         for value in values {
-            let value = value.components();
-            let count = state.0 + 1;
-            let delta = [value[0] - state.1[0], value[1] - state.1[1]];
-            let mean = [
-                state.1[0] + delta[0] / count as f64,
-                state.1[1] + delta[1] / count as f64,
-            ];
-            let variance =
-                state.2 + delta[0] * (value[0] - mean[0]) + delta[1] * (value[1] - mean[1]);
-            state = (count, mean, variance);
+            for (state, component) in state.iter_mut().zip(value.components()) {
+                state.push(component)?;
+            }
         }
 
         Ok(state)
     }
 
-    fn combine((n, l, lv): Self::State, (m, r, rv): Self::State) -> Self::State {
-        let count = n + m;
-        let delta = [r[0] - l[0], r[1] - l[1]];
-        let weight = m as f64 / count as f64;
-        let mean = [l[0] + delta[0] * weight, l[1] + delta[1] * weight];
-        let variance = lv + rv + (delta[0] * delta[0] + delta[1] * delta[1]) * n as f64 * weight;
-        (count, mean, variance)
+    fn combine(left: Self::State, right: Self::State) -> Result<Self::State> {
+        Ok([left[0].merge(right[0])?, left[1].merge(right[1])?])
     }
 
-    fn finish((count, _, variance): Self::State) -> Result<f64> {
-        Ok((variance / count as f64).sqrt())
+    fn finish(state: Self::State) -> Result<f64> {
+        Ok(statistics::StandardDeviation::finish_norm(state))
     }
 
     fn empty() -> Result<f64> {
@@ -300,25 +293,27 @@ pub struct Norm;
 impl sealed::Sealed for Norm {}
 
 impl<T: StatisticsElement> ReduceOp<T> for Norm {
-    type State = f64;
+    type State = statistics::Norm;
+
     type Output = f64;
 
-    fn partial(&self, values: Vec<T>) -> Result<f64> {
-        Ok(values
-            .into_iter()
-            .map(|value| {
-                let value = value.components();
-                value[0] * value[0] + value[1] * value[1]
-            })
-            .sum())
+    fn partial(&self, values: Vec<T>) -> Result<Self::State> {
+        let mut state = Self::State::default();
+        for value in values {
+            for component in value.components() {
+                state.push(component);
+            }
+        }
+
+        Ok(state)
     }
 
-    fn combine(left: f64, right: f64) -> f64 {
-        left + right
+    fn combine(left: Self::State, right: Self::State) -> Result<Self::State> {
+        Ok(left.merge(right))
     }
 
-    fn finish(state: f64) -> Result<f64> {
-        Ok(state.sqrt())
+    fn finish(state: Self::State) -> Result<f64> {
+        Ok(state.finish())
     }
 
     fn empty() -> Result<f64> {
@@ -332,7 +327,9 @@ where
     Self::DType: StatisticsElement,
 {
     type MeanOutput: TensorRead<DType = <Self::DType as StatisticsElement>::Mean>;
+
     type StdOutput: TensorRead<DType = f64>;
+
     type NormOutput: TensorRead<DType = f64>;
 
     fn mean_all(&self) -> BoxFuture<'_, Result<<Self::DType as StatisticsElement>::Mean>>;
@@ -378,7 +375,9 @@ where
     E::DType: StatisticsElement,
 {
     axis_constructor!(MeanOutput, mean, Mean);
+
     axis_constructor!(StdOutput, std, StandardDeviation);
+
     axis_constructor!(NormOutput, norm, Norm);
 
     fn mean_all(&self) -> BoxFuture<'_, Result<<Self::DType as StatisticsElement>::Mean>> {
@@ -404,12 +403,14 @@ fn accumulate<T: TensorElement, O: ReduceOp<T>>(
     *remaining = remaining.checked_sub(values.len() as u64).ok_or_else(|| {
         Error::InvalidLayout("reduction requests exceed selected cardinality".into())
     })?;
+
     if !values.is_empty() {
         #[cfg(test)]
         crate::read_metrics::record(|m| m.reduction_calls += 1);
+
         let partial = op.partial(values)?;
         *state = Some(match *state {
-            Some(previous) => O::combine(previous, partial),
+            Some(previous) => O::combine(previous, partial)?,
             None => partial,
         });
     }
@@ -432,19 +433,22 @@ fn accumulate_zeros<T: TensorElement, O: ReduceOp<T>>(
 
     #[cfg(test)]
     crate::read_metrics::record(|m| m.reduction_calls += 1);
+
     let mut partial = op.partial(vec![zero])?;
     loop {
         if count & 1 != 0 {
             *state = Some(match *state {
-                Some(previous) => O::combine(previous, partial),
+                Some(previous) => O::combine(previous, partial)?,
                 None => partial,
             });
         }
+
         count >>= 1;
         if count == 0 {
             return Ok(());
         }
-        partial = O::combine(partial, partial);
+
+        partial = O::combine(partial, partial)?;
     }
 }
 
@@ -618,6 +622,7 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
         let coord = self
             .mapping
             .resolve(coord, &self.output_shape, &self.output_strides)?;
+
         let mut next = 0;
         let axes = self
             .source
@@ -635,6 +640,7 @@ impl<S: TensorGeometry, O> ReduceView<S, O> {
                         next += 1;
                         i
                     };
+
                     request::Axis::range(coord[i], 1)
                 }
             })
@@ -745,6 +751,7 @@ where
                         let batch = context
                             .evaluate(&self.source, std::sync::Arc::new(request))
                             .await?;
+
                         accumulate::<_, O>(&self.op, &mut state, &mut remaining, batch.values)?;
                     }
 
@@ -754,6 +761,7 @@ where
                         remaining,
                         self.source.implicit_zero(),
                     )?;
+
                     values.push(O::finish_axis(state)?);
                     continue;
                 }
@@ -770,10 +778,12 @@ where
                         self.source.shape(),
                         self.source_group_axes(&coord)?,
                     )?;
+
                     if next.len() > expression::MAX_BATCH_ELEMENTS as u64 - total {
                         pending = Some(next);
                         break;
                     }
+
                     total += next.len();
                     lengths.push(next.len());
                     rectangles.push(next.rectangle()?);
@@ -785,12 +795,14 @@ where
                         std::sync::Arc::new(BatchRequest::rectangles(rectangles)?),
                     )
                     .await?;
+
                 let mut input = batch.values.into_iter();
 
                 // The validated batch contains every nonempty group in full.
                 for len in lengths {
                     #[cfg(test)]
                     crate::read_metrics::record(|m| m.reduction_calls += 1);
+
                     let group = input.by_ref().take(len as usize).collect();
                     values.push(O::finish(self.op.partial(group)?)?);
                 }

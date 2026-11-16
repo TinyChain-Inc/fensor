@@ -1,5 +1,12 @@
 #![cfg(feature = "complex")]
 
+use futures::TryStreamExt;
+use ha_ndarray::{
+    Array, ArrayBuf, Buffer, Complex, NDArrayFourier, NDArrayRead, NDArrayTransform, shape,
+};
+use number_general::DType;
+use safecast::CastFrom;
+
 use common::numbers::same;
 use common::{FsEntry, cleanup, fixture, new_dir};
 use fensor::complex::{Complex32, Complex64};
@@ -10,12 +17,6 @@ use fensor::{
     TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics,
     TensorWrite,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, ArrayBuf, Buffer, Complex, NDArrayFourier, NDArrayRead, NDArrayTransform, shape,
-};
-use number_general::DType;
-use safecast::CastFrom;
 
 mod common;
 
@@ -45,20 +46,24 @@ where
         |a, b| close(a, b, bound),
     )
     .await;
+
     let mut stream = view.read_coordinate_blocks().unwrap();
     let mut seen = vec![false; expected.len()];
-    while let Some((coords, values)) = stream.try_next().await.unwrap() {
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        let (coords, values) = batch.into_coordinates(view.shape()).unwrap();
         assert_eq!(coords.len(), values.len());
         for (coord, actual) in coords.into_iter().zip(values) {
             let flat = coord
                 .iter()
                 .zip(view.shape())
                 .fold(0, |n, (i, d)| n * d + i) as usize;
+
             assert!(!seen[flat]);
             seen[flat] = true;
             assert!(close(actual, expected[flat], bound), "coordinate {coord:?}");
         }
     }
+
     assert!(seen.into_iter().all(|v| v));
 }
 
@@ -76,6 +81,7 @@ where
             let input: Vec<T> = (0..3 * n)
                 .map(|i| value((i % 7) as f64 - 3., (i % 5) as f64 - 2.))
                 .collect();
+
             let (root, tensor) = fixture::source(
                 "fourier",
                 shape![3, n as u64],
@@ -85,6 +91,7 @@ where
                 input.clone(),
             )
             .await;
+
             let source = tensor.view();
             let backend = Array::new(Buffer::from(input.clone()), shape![3, n]).unwrap();
             let forward = source.fft().await.unwrap();
@@ -99,6 +106,7 @@ where
                 .to_slice()
                 .unwrap()
                 .to_vec();
+
             let inverse_expected = backend
                 .ifft()
                 .unwrap()
@@ -107,6 +115,7 @@ where
                 .to_slice()
                 .unwrap()
                 .to_vec();
+
             let gamma = (32. * n as f64 * u) / (1. - 32. * n as f64 * u);
             let scale = input
                 .chunks(n)
@@ -120,6 +129,7 @@ where
                         .sum::<f64>()
                 })
                 .fold(0., f64::max);
+
             consumers(&forward, &expected, gamma * scale).await;
             consumers(&inverse, &inverse_expected, gamma * scale).await;
 
@@ -134,16 +144,20 @@ where
                                 let (r, i) = components(v);
                                 let phase =
                                     sign * std::f64::consts::TAU * (j * k) as f64 / n as f64;
+
                                 sum + Complex64::new(r, i) * Complex64::from_polar(1., phase)
                             },
                         );
+
                         value::<T>(sum.re, sum.im)
                     };
+
                     assert!(close(
                         forward.read_value(&[batch as u64, k as u64]).await.unwrap(),
                         reference(-1.),
                         gamma * scale
                     ));
+
                     assert!(close(
                         inverse.read_value(&[batch as u64, k as u64]).await.unwrap(),
                         reference(1.),
@@ -161,6 +175,7 @@ where
                     value::<T>(r * n as f64, i * n as f64)
                 })
                 .collect();
+
             let bound = n as f64 * gamma * scale * (2. + gamma);
             fixture::blocks(&roundtrip, &expected_roundtrip, |a, b| close(a, b, bound)).await;
 
@@ -181,16 +196,19 @@ where
                 .unwrap()
                 .transpose(None)
                 .unwrap();
+
             let mut gathered_expected = Vec::new();
             for frequency in [0, 0, n - 1] {
                 for batch in [2, 0, 2] {
                     gathered_expected.push(expected[batch * n + frequency]);
                 }
             }
+
             fixture::blocks(&gathered, &gathered_expected, |a, b| {
                 close(a, b, gamma * scale)
             })
             .await;
+
             cleanup(&root).await;
         }
     }
@@ -224,6 +242,7 @@ where
             input.clone(),
         )
         .await;
+
         let v = tensor.view();
         let hermitian = v.mh().await.unwrap();
         assert_eq!(hermitian.shape(), &[2, 3, 2]);
@@ -236,6 +255,7 @@ where
                 }
             }
         }
+
         consumers(&hermitian, &expected, 0.).await;
 
         let forward = fft2(&v).await.unwrap();
@@ -254,6 +274,7 @@ where
                     .sum::<f64>()
             })
             .fold(0., f64::max);
+
         let bound = delta * scale;
 
         let backend = Array::new(Buffer::from(input.clone()), shape![2, 2, 3]).unwrap();
@@ -265,6 +286,7 @@ where
             .unwrap()
             .transpose(axes.clone())
             .unwrap();
+
         let expected_forward = Fft
             .apply(first.into_read().unwrap())
             .unwrap()
@@ -277,6 +299,7 @@ where
             .to_slice()
             .unwrap()
             .to_vec();
+
         let first = Ifft
             .apply(
                 backend
@@ -290,6 +313,7 @@ where
             .unwrap()
             .transpose(axes)
             .unwrap();
+
         let expected_inverse = Ifft
             .apply(first.into_read().unwrap())
             .unwrap()
@@ -298,6 +322,7 @@ where
             .to_slice()
             .unwrap()
             .to_vec();
+
         let reference = |sign: f64| {
             let mut values = Vec::new();
             for b in 0..2 {
@@ -310,15 +335,19 @@ where
                                 let phase = sign
                                     * std::f64::consts::TAU
                                     * ((r * i) as f64 / 2. + (c * j) as f64 / 3.);
+
                                 sum += Complex64::new(re, im) * Complex64::from_polar(1., phase);
                             }
                         }
+
                         values.push(value::<T>(sum.re, sum.im));
                     }
                 }
             }
+
             values
         };
+
         consumers(&forward, &expected_forward, bound).await;
         consumers(&inverse, &expected_inverse, bound).await;
         fixture::blocks(&forward, &reference(-1.), |a, b| close(a, b, bound)).await;
@@ -331,6 +360,7 @@ where
                 value::<T>(6. * r, 6. * i)
             })
             .collect();
+
         fixture::blocks(&roundtrip, &expected, |a, b| {
             close(a, b, 6. * bound * (2. + delta))
         })
@@ -347,6 +377,7 @@ where
             .unwrap()
             .flip(0)
             .unwrap();
+
         let mut expected = reference(1.);
         expected.reverse();
         fixture::blocks(&reshaped, &expected, |a, b| close(a, b, bound)).await;
@@ -377,6 +408,7 @@ async fn sparse_group_support_and_live_sources() {
         [one, z, z, z, z, z, z, z],
     )
     .await;
+
     let v = tensor.view();
     let forward = v.fft().await.unwrap();
     consumers(&forward, &[one, one, one, one, z, z, z, z], 0.).await;
@@ -386,23 +418,27 @@ async fn sparse_group_support_and_live_sources() {
         transformed.exp().await,
         Err(Error::WouldDensify { operation: "exp" })
     ));
+
     let retained = TensorExpression::new(transformed)
         .unwrap()
         .into_dense()
         .exp()
         .await
         .unwrap();
+
     consumers(&retained, &[one; 8], 0.).await;
     let (copy_root, dir) = new_dir("fourier_support_copy").await;
     let copy = Tensor::<FsEntry, Complex64>::copy_from(dir, &zero, zero.layout(), 2)
         .await
         .unwrap();
+
     let copied = TensorExpression::new(copy.view().fft().await.unwrap())
         .unwrap()
         .into_dense()
         .exp()
         .await
         .unwrap();
+
     fixture::blocks(&copied, &[one; 8], same).await;
 
     // Both transform axes retain ordinary zeros before dense conversion.
@@ -412,6 +448,7 @@ async fn sparse_group_support_and_live_sources() {
         .exp()
         .await
         .unwrap();
+
     fixture::blocks(&both_axes, &[one; 8], same).await;
     tensor.write_value(&[0, 0], z).await.unwrap();
     tensor.write_value(&[1, 1], one).await.unwrap();
@@ -434,11 +471,13 @@ async fn bounds_corruption_and_exceptional_values() {
         )
         .await
         .unwrap();
+
         if *shape.last().unwrap() > 4096 {
             assert!(
                 matches!(tensor.view().fft().await, Err(Error::Unsupported(message)) if message.contains("4097") && message.contains("4096"))
             );
         }
+
         assert!(fft2(&tensor.view()).await.is_err());
         cleanup(&root).await;
     }
@@ -452,12 +491,14 @@ async fn bounds_corruption_and_exceptional_values() {
         [Complex64::ONE; 8],
     )
     .await;
+
     tensor.sync().await.unwrap();
     drop(tensor);
     let dir = common::open_dir(&root).unwrap();
     let tensor = Tensor::<FsEntry, Complex64>::load(dir.clone())
         .await
         .unwrap();
+
     let v = tensor.view();
     assert!(v.clone().reshape(shape![8]).unwrap().mh().await.is_err());
     assert!(fft2(&v.clone().reshape(shape![8]).unwrap()).await.is_err());
@@ -469,6 +510,7 @@ async fn bounds_corruption_and_exceptional_values() {
         fft.read_value(&[0, 0]).await.unwrap(),
         Complex64::new(4., 0.)
     );
+
     assert!(fft.read_value(&[1, 0]).await.is_err());
     drop(dir);
     cleanup(&root).await;
@@ -487,6 +529,7 @@ async fn bounds_corruption_and_exceptional_values() {
             [x],
         )
         .await;
+
         let expected = Array::new(Buffer::from(vec![x]), shape![1])
             .unwrap()
             .fft()
@@ -496,6 +539,7 @@ async fn bounds_corruption_and_exceptional_values() {
             .to_slice()
             .unwrap()
             .to_vec();
+
         fixture::blocks(&tensor.view().fft().await.unwrap(), &expected, same).await;
         cleanup(&root).await;
     }
@@ -512,6 +556,7 @@ async fn expression_boundaries_and_tiny_far_end_selection() {
         [Complex64::ONE; 4],
     )
     .await;
+
     let v = tensor.view();
     let product = v.matmul(&v).await.unwrap().fft().await.unwrap();
     fixture::blocks(
@@ -525,6 +570,7 @@ async fn expression_boundaries_and_tiny_far_end_selection() {
         same,
     )
     .await;
+
     let reduced = v
         .sum(ha_ndarray::axes![0], true)
         .await
@@ -532,6 +578,7 @@ async fn expression_boundaries_and_tiny_far_end_selection() {
         .fft()
         .await
         .unwrap();
+
     fixture::blocks(&reduced, &[Complex64::new(4., 0.), Complex64::ZERO], same).await;
     let before = v.clone().flip(0).unwrap().fft().await.unwrap();
     fixture::blocks(
@@ -545,6 +592,7 @@ async fn expression_boundaries_and_tiny_far_end_selection() {
         same,
     )
     .await;
+
     cleanup(&root).await;
 
     let (root, dir) = new_dir("fft_huge").await;
@@ -557,10 +605,12 @@ async fn expression_boundaries_and_tiny_far_end_selection() {
     )
     .await
     .unwrap();
+
     tensor
         .write_value(&[n - 1, 0], Complex64::ONE)
         .await
         .unwrap();
+
     let view = tensor.view().fft().await.unwrap();
     let values: Vec<_> = view
         .read_sparse_elements_in_order(
@@ -572,12 +622,14 @@ async fn expression_boundaries_and_tiny_far_end_selection() {
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(
         values,
         (0..4)
             .map(|i| (vec![n - 1, i], Complex64::ONE))
             .collect::<Vec<_>>()
     );
+
     cleanup(&root).await;
 }
 
@@ -593,6 +645,7 @@ async fn largest_axis_impulse_and_multiple_packs() {
     )
     .await
     .unwrap();
+
     tensor.write_value(&[1, 0], Complex32::ONE).await.unwrap();
     let view = tensor.view().fft().await.unwrap();
     let expected: Vec<_> = (0..8192)
@@ -604,6 +657,7 @@ async fn largest_axis_impulse_and_multiple_packs() {
             }
         })
         .collect();
+
     fixture::blocks(&view, &expected, same).await;
     cleanup(&root).await;
 }

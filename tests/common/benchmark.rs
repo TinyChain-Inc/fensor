@@ -2,11 +2,12 @@
 
 use std::time::Instant;
 
-use fensor::{Tensor, TensorRead, TensorReduceAll};
 use futures::TryStreamExt;
 use get_size::GetSize;
 
-use super::common::{self, FsEntry, counters};
+use super::common;
+use super::common::{FsEntry, counters};
+use fensor::{Tensor, TensorRead, TensorReduceAll};
 
 pub async fn consume<V: TensorRead>(view: &V, mode: &str) -> usize {
     let mut count = 0;
@@ -22,18 +23,21 @@ pub async fn consume<V: TensorRead>(view: &V, mode: &str) -> usize {
         "coordinate" => {
             let mut stream = view.read_coordinate_blocks().unwrap();
 
-            while let Some((coords, values)) = stream.try_next().await.unwrap() {
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                let (coords, values) = batch.into_coordinates(view.shape()).unwrap();
                 count += values.len();
                 std::hint::black_box((coords, values));
             }
         }
         _ => panic!("unknown benchmark stream mode {mode}"),
     }
+
     assert_eq!(
         count as u64,
         view.size().unwrap(),
         "complete {mode} consumption"
     );
+
     count
 }
 
@@ -70,6 +74,7 @@ pub async fn measure(
     ] {
         record(name, operation, temperature, metric, "count", value);
     }
+
     record(
         name,
         operation,
@@ -95,6 +100,7 @@ pub async fn streams<V: TensorRead<DType = f32> + TensorReduceAll>(
                     "max" => view.max_all().await.unwrap(),
                     _ => return consume(view, mode).await,
                 };
+
                 std::hint::black_box(value);
                 1
             })
@@ -115,6 +121,7 @@ pub async fn copy<V: TensorRead<DType = f32>>(
     let dir = freqfs::Cache::<FsEntry>::new(cache, None, 0, std::time::Duration::from_secs(1))
         .load(root.to_path_buf())
         .unwrap();
+
     let name = format!("{name}_dst{capacity}_cache{cache}");
     // A rejected attempt is not successful-copy latency. Keep all original
     // pressure cases, and compare wall time only when both attempts complete.
@@ -128,6 +135,7 @@ pub async fn copy<V: TensorRead<DType = f32>>(
             result
         }
         .await;
+
         let admitted = match result {
             Ok(()) => true,
             Err(fensor::Error::Io(error))
@@ -148,6 +156,7 @@ pub async fn copy<V: TensorRead<DType = f32>>(
             }
             Err(error) => panic!("copy failed for {name}: {error}"),
         };
+
         for (metric, value) in [
             ("admitted", u128::from(admitted)),
             ("capacity_rejected", u128::from(!admitted)),
@@ -156,6 +165,7 @@ pub async fn copy<V: TensorRead<DType = f32>>(
             let unit = if metric == "sync" { "ns" } else { "count" };
             record(&name, "copy-attempt", "new", metric, unit, value);
         }
+
         if admitted {
             view.size().unwrap() as usize
         } else {
@@ -163,6 +173,7 @@ pub async fn copy<V: TensorRead<DType = f32>>(
         }
     })
     .await;
+
     common::cleanup(&root).await;
 }
 
@@ -175,6 +186,7 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
     let (mut bytes, mut payload_bytes, mut table_bytes) = (0u128, 0u128, 0u128);
     let (mut leaves, mut leaf_rows, mut index_rows, mut retained, mut max_node) =
         (0u128, 0u128, 0u128, 0u128, 0u128);
+
     let (mut leaf_bytes, mut index_bytes, mut leaf_retained, mut index_retained) =
         (0u128, 0u128, 0u128, 0u128);
 
@@ -186,6 +198,7 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
                 dirs.push(entry.path());
                 continue;
             }
+
             files += 1;
             bytes += u128::from(metadata.len());
             if entry.path().parent().unwrap().ends_with("blocks") {
@@ -193,8 +206,10 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
                     payload_files += 1;
                     payload_bytes += u128::from(metadata.len());
                 }
+
                 continue;
             }
+
             nodes += 1;
             table_bytes += u128::from(metadata.len());
             let file = tokio::fs::File::open(entry.path()).await.unwrap();
@@ -206,6 +221,7 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
                 FsEntry::SparseF64(node) => node_metrics(&node),
                 _ => panic!("unexpected benchmark node"),
             };
+
             leaves += u128::from(leaf);
             if leaf {
                 leaf_rows += rows as u128;
@@ -216,10 +232,12 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
                 index_bytes += u128::from(metadata.len());
                 index_retained += memory as u128;
             }
+
             retained += memory as u128;
             max_node = max_node.max(memory as u128);
         }
     }
+
     for (metric, value) in [
         ("files", files),
         ("nodes", nodes),
@@ -247,5 +265,6 @@ fn node_metrics<V: GetSize>(node: &b_tree::Node<Vec<Vec<V>>>) -> (bool, usize, u
         b_tree::Node::Leaf(rows) => (true, rows),
         b_tree::Node::Index(rows, _) => (false, rows),
     };
+
     (leaf, rows.len(), node.get_size())
 }

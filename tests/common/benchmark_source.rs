@@ -1,9 +1,10 @@
 //! Shared benchmark setup and consumption; callers own timing and observation.
 
-use fensor::Tensor;
 use ha_ndarray::shape;
 
-use super::common::{self, FsEntry};
+use super::common;
+use super::common::FsEntry;
+use fensor::Tensor;
 
 pub async fn source(
     m: usize,
@@ -28,6 +29,7 @@ pub async fn source(
         }),
     )
     .await;
+
     reopen(root, tensor, cache).await
 }
 
@@ -42,6 +44,7 @@ pub async fn reopen(
     let dir = freqfs::Cache::new(cache, None, 0, std::time::Duration::from_secs(1))
         .load(root.to_path_buf())
         .unwrap();
+
     let tensor = Tensor::load(dir).await.unwrap();
     (root, tensor)
 }

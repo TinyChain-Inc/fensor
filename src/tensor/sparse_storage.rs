@@ -13,6 +13,7 @@ use crate::sparse::{PayloadSchema, SparseCell, SparseCollator};
 use crate::{BoxFuture, Error, Result, StorageGeometry, Tensor, TensorElement, TensorFileEntry};
 
 const VALUES: &str = "values";
+
 const PRIMARY: &str = "primary";
 
 type Blocks<F, T> = BTreeLock<PayloadSchema<T>, SparseCollator<T>, F>;
@@ -68,6 +69,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseBlocks<F, T> {
         range: Range<u64>,
     ) -> futures::stream::BoxStream<'static, Result<u64>> {
         use futures::{StreamExt, TryStreamExt};
+
         futures::stream::try_unfold((self.clone(), range), |(owner, range)| async move {
             let keys = owner.occupied_page(range.clone()).await?;
             let Some(&last) = keys.last() else {
@@ -95,7 +97,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseBlocks<F, T> {
             inner: Arc::new(BlockData {
                 blocks: BTreeLock::create(
                     PayloadSchema::new(geometry.clone()),
-                    SparseCollator::default(),
+                    b_tree::IndexOrder::new(SparseCollator::default()),
                     primary,
                 )
                 .await?,
@@ -143,7 +145,7 @@ impl<F: TensorFileEntry<T>, T: TensorElement> SparseBlocks<F, T> {
             inner: Arc::new(BlockData {
                 blocks: BTreeLock::load(
                     PayloadSchema::new(geometry.clone()),
-                    SparseCollator::default(),
+                    b_tree::IndexOrder::new(SparseCollator::default()),
                     primary,
                 )?,
                 values_dir: values,

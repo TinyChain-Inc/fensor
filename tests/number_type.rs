@@ -1,10 +1,10 @@
 //! Number classes follow the typed filesystem adapter.
 
-use fensor::{Error, Layout, Tensor, TensorCast, TensorGeometry, TensorNumeric, TensorSchema};
 use ha_ndarray::shape;
 use number_general::{ComplexType, DType, FloatType, IntType, NumberType, UIntType};
 
 use common::{FsEntry, new_dir};
+use fensor::{Error, Layout, Tensor, TensorCast, TensorGeometry, TensorNumeric, TensorSchema};
 
 mod common;
 
@@ -36,6 +36,7 @@ async fn computed_views_report_the_output_number_class() {
     )
     .await
     .unwrap();
+
     let cast = TensorCast::<f64>::cast(&tensor.view()).await.unwrap();
     assert_eq!(cast.dtype(), f64::dtype());
     assert_eq!(cast.is_nan().await.unwrap().dtype(), u8::dtype());

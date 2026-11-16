@@ -191,6 +191,7 @@ async fn cancelled_sparse_replacement_before_mutation_releases_owner() {
         let owner = tensor.storage.sparse().unwrap();
         {
             use futures::FutureExt;
+
             let held = crate::tensor::corruption::block_index(owner).write().await;
             assert!(matches!(
                 tensor
@@ -619,6 +620,7 @@ async fn storage_batch_groups_logical_blocks_across_sparse_regions() {
 #[tokio::test]
 async fn dense_sparse_matrix_products_include_zero_values() {
     use crate::{TensorMatMul, TensorTransform};
+
     let (root, dir) = new_dir("dense_matrix_support").await;
     let dense = Tensor::<TestFE, f32>::create(
         dir,
@@ -695,6 +697,7 @@ impl crate::expression::Expression for CompactSource<'_> {
 #[tokio::test]
 async fn compact_requests_survive_elementwise_composition() {
     use crate::{TensorCompareScalar, TensorMath, TensorUnary, TensorWhere};
+
     let (root, tensor) = create_sparse("compact_composition", shape![2, 2], 2, None).await;
     tensor.write_value(&[1, 1], 2.).await.unwrap();
     let source = CompactSource(&tensor);
@@ -938,6 +941,7 @@ async fn sparse_copy_zeros_do_not_create_storage() {
 #[tokio::test]
 async fn ordered_sparse_consumers_visit_candidate_blocks_with_intermediate_zeros() {
     use crate::{TensorExpression, TensorMath, TensorStatistics};
+
     let (root, tensor) = create_sparse("ordered_support", shape![1_000_000, 4], 4, None).await;
     let (baseline_root, baseline) =
         create_sparse("ordered_baseline", shape![1_000_000, 4], 4, None).await;
@@ -988,6 +992,7 @@ async fn ordered_sparse_consumers_visit_candidate_blocks_with_intermediate_zeros
 #[tokio::test]
 async fn reordered_sparse_stream_preserves_row_major_values() {
     use crate::{TensorExpression, TensorTransform};
+
     let (root, tensor) = create_sparse("ordered_transpose", shape![2, 3], 2, None).await;
     tensor.write_value(&[0, 2], f32::NAN).await.unwrap();
     tensor.write_value(&[1, 0], f32::INFINITY).await.unwrap();

@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use futures::stream::BoxStream;
 
-use crate::expression::{self, Batch, Expression};
+use crate::expression::{Batch, Expression};
 use crate::mapping::CoordinateMap;
 use crate::request::BatchRequest;
 use crate::{
     BoxFuture, Error, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
-    TensorViewSemantics,
+    TensorViewSemantics, expression,
 };
 
 /// An owned, read-only tensor value for runtime composition.
@@ -108,6 +108,7 @@ impl<T: TensorElement> TensorExpression<T> {
     pub fn into_sparse_elements(self) -> Result<crate::SparseElementStream<'static, T>> {
         let requests =
             expression::traversal::ordered(&self, crate::slice::Slice::full(self.shape())?, None)?;
+
         Ok(expression::sparse_stream(Box::new(self), requests))
     }
 }
@@ -161,6 +162,7 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
             else {
                 return Ok(expression::traversal::Preferred::Ready(None));
             };
+
             Some(local.compose(mapping)?)
         };
 
@@ -188,6 +190,7 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
                 .ok_or_else(|| Error::Unsupported(
                     "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
                 ))?;
+
             Some(local.compose(mapping)?)
         };
 
@@ -216,6 +219,7 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
                 .ok_or_else(|| Error::Unsupported(
                     "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
                 ))?;
+
             Some(local.compose(mapping)?)
         };
 

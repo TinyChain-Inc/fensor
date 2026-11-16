@@ -15,10 +15,32 @@ results; offline summaries read only the CSV.
 
 ## Measurement and reproduction
 
-The opt-in `benchmarks` feature compiles two ignored tests which use the same workloads in `tests/common/workloads.rs`:
+The opt-in `benchmarks` feature compiles two workload entrypoints which use the same workloads in `tests/common/workloads.rs`:
 
 - Integration `benchmark` measures production execution without internal metrics.
 - Unit `profiling::profile` additionally observes task-local read/copy counters.
+
+The integration target also provides statistics-specific measurements:
+
+- `statistical_accumulators` isolates numeric partials and finalization, including
+  the adapter's owned input allocation. It reports median nanoseconds per value.
+- `statistics::statistical_reductions` measures complete warm-cache mean, norm,
+  and population standard deviation, including expression construction and full
+  consumption. It covers whole-tensor and axis reductions on f64 and, with the
+  `complex` feature, c64 inputs; dense and sparse layouts; and storage capacities
+  256 and 4096. Each operation warms once before seven timed samples. Fixture
+  construction is outside timing. These are cached execution measurements, not
+  physical-device throughput.
+
+Build identical before/after integration executables with `benchmarks,complex`
+to compare the complete statistics workloads using the existing paired runner:
+
+```sh
+python3 benchmarks/compare.py BEFORE_EXECUTABLE AFTER_EXECUTABLE \
+  --entry statistics::statistical_reductions --pairs 5 --threads 1 4 \
+  --before-revision BEFORE_ID --after-revision AFTER_ID \
+  --output benchmarks/results/statistics.csv
+```
 
 `FENSOR_BENCH_SUITE` selects `matrix`, `reduction`, `completion`, `owned`, `pipeline`,
 `copy`, `sparse`, `storage`, `mutation`, `traversal`, `layout`, `read-ahead`,

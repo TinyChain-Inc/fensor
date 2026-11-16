@@ -3,7 +3,8 @@
 //! Implementations own their visibility and mutation policy. fensor only maps and
 //! evaluates bounded requests; it does not acquire transaction reservations.
 
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::mapping::{CoordinateMap, StorageSlice};
 use crate::request::BatchRequest;

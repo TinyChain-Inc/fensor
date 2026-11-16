@@ -1,10 +1,5 @@
 //! Dtype-changing expressions preserve numerical zeros and evaluate at consumption.
 
-use fensor::unary::Cast;
-use fensor::{
-    AxisRange, Layout, Tensor, TensorArray, TensorCast, TensorGeometry, TensorRead, TensorSchema,
-    TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
-};
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, ArrayAccess, Buffer, NDArrayCast, NDArrayRead, NDArrayTrig, NDArrayUnary, axes, range,
@@ -13,6 +8,11 @@ use ha_ndarray::{
 use number_general::{FloatType, NumberType};
 
 use common::{FsEntry, new_dir};
+use fensor::unary::Cast;
+use fensor::{
+    AxisRange, Layout, Tensor, TensorArray, TensorCast, TensorGeometry, TensorRead, TensorSchema,
+    TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
+};
 
 mod common;
 
@@ -40,6 +40,7 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
         f32::NEG_INFINITY,
         f32::NAN,
     ];
+
     let tensor = Tensor::<FsEntry, f32>::create(
         dir,
         TensorSchema::new(
@@ -52,18 +53,22 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     )
     .await
     .unwrap();
+
     let cast: UnaryView<TensorView<fensor::Tensor<FsEntry, f32>>, Cast<f64>> =
         tensor.view().cast().await.unwrap();
+
     // Constructing the cast must not capture source values.
     for (i, &value) in input.iter().enumerate() {
         tensor.write_value(&[i as u64], value).await.unwrap();
     }
+
     let reference: ArrayAccess<'_, f64> = ArrayAccess::from(
         Array::new(Buffer::from(input.clone()), shape![input.len()])
             .unwrap()
             .cast()
             .unwrap(),
     );
+
     let expected = reference.buffer().unwrap().to_slice().unwrap().into_vec();
     let blocks: Vec<Vec<f64>> = cast.read_blocks().unwrap().try_collect().await.unwrap();
     let values: Vec<_> = blocks.into_iter().flatten().collect();
@@ -79,6 +84,7 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
     let reloaded = Tensor::<FsEntry, f64>::load(common::open_dir(&out_root).unwrap())
         .await
         .unwrap();
+
     for (i, expected) in expected.into_iter().enumerate() {
         let coord = [i as u64];
         assert_value(expected, f64::from(input[i]));
@@ -86,6 +92,7 @@ async fn f32_to_f64_cast_agrees_across_consumers_and_reload() {
         assert_value(values[i], expected);
         assert_value(reloaded.read_value(&coord).await.unwrap(), expected);
     }
+
     assert!(cast.read_value(&[1]).await.unwrap().is_sign_negative());
     assert!(values[1].is_sign_negative());
     assert!(reloaded.read_value(&[1]).await.unwrap().is_sign_negative());
@@ -104,12 +111,14 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
     )
     .await
     .unwrap();
+
     for i in 0..4100 {
         tensor
             .write_value(&[0, i], i as f32 / 4100.0)
             .await
             .unwrap();
     }
+
     let expression = TensorCast::<f64>::cast(
         &(tensor
             .view()
@@ -128,6 +137,7 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
     .unwrap()
     .squeeze(axes![1])
     .unwrap();
+
     let mut dropped = expression.read_blocks().unwrap();
     assert_eq!(dropped.try_next().await.unwrap().unwrap().len(), 4096);
     drop(dropped);
@@ -136,11 +146,13 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
         expression.read_blocks().unwrap().try_collect::<Vec<_>>(),
     )
     .unwrap();
+
     assert_eq!(first, second);
     assert_eq!(
         first.iter().map(Vec::len).collect::<Vec<_>>(),
         vec![4096, 4]
     );
+
     let input: Vec<f32> = (0..4100).rev().map(|i| i as f32 / 4100.0).collect();
     let reference: ArrayAccess<'_, f64> = ArrayAccess::from(
         Array::new(Buffer::from(input), shape![4100])
@@ -150,6 +162,7 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
             .cast()
             .unwrap(),
     );
+
     let expected = reference
         .exp()
         .unwrap()
@@ -158,6 +171,7 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
         .to_slice()
         .unwrap()
         .into_vec();
+
     assert_eq!(first.into_iter().flatten().collect::<Vec<_>>(), expected);
     for i in [0, 4095, 4099] {
         assert_eq!(
@@ -165,6 +179,7 @@ async fn mixed_dtype_chain_preserves_precision_transforms_and_batching() {
             expected[i as usize]
         );
     }
+
     common::cleanup(&root).await;
 }
 
@@ -179,14 +194,17 @@ async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
     )
     .await
     .unwrap();
+
     tensor.write_value(&[1, 2], 0.2).await.unwrap();
     let rounded = TensorCast::<f64>::cast(&(tensor.view().round().await.unwrap()))
         .await
         .unwrap();
+
     assert!(matches!(
         rounded.cos().await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     let expression = TensorCast::<f64>::cast(&tensor.view())
         .await
         .unwrap()
@@ -195,6 +213,7 @@ async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
         .sin()
         .await
         .unwrap();
+
     let nonzero = (0.2f32 as f64).sin();
     assert_eq!(expression.read_value(&[2, 1]).await.unwrap(), nonzero);
     assert_eq!(expression.read_value(&[0, 0]).await.unwrap(), 0.0f64);
@@ -206,23 +225,27 @@ async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(rows, vec![(vec![2, 1], nonzero)]);
     let (out_root, out_dir) = new_dir("cast_sparse_out").await;
     let output = Tensor::copy_from(out_dir, &expression, expression.layout(), 2)
         .await
         .unwrap();
+
     let blocks: Vec<Vec<f64>> = expression
         .read_blocks()
         .unwrap()
         .try_collect()
         .await
         .unwrap();
+
     let values: Vec<_> = blocks.into_iter().flatten().collect();
     for (i, coord) in common::iter_coords(&[3, 2]).enumerate() {
         let expected = if coord == vec![2, 1] { nonzero } else { 0.0 };
         assert_eq!(values[i], expected);
         assert_eq!(output.read_value(&coord).await.unwrap(), expected);
     }
+
     let final_zero = expression.round().await.unwrap();
     let rows: Vec<_> = final_zero
         .read_sparse_elements_in_order(selection, axes![0, 1])
@@ -231,6 +254,7 @@ async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
         .try_collect()
         .await
         .unwrap();
+
     assert!(rows.is_empty());
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;

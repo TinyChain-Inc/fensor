@@ -1,4 +1,3 @@
-use fensor::AxisRange;
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
@@ -6,6 +5,7 @@ use super::*;
 use crate::schema::row_major_coords;
 use crate::test_support::{FsEntry as TestFE, cleanup, new_dir};
 use crate::{Error, Layout, Shape, Tensor, TensorSchema};
+use fensor::AxisRange;
 
 async fn create_dense(
     name: &str,
@@ -1581,6 +1581,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
     use futures::TryStreamExt;
 
     use crate::{TensorExpression, TensorSource};
+
     let (root, tensor) = create_dense("owned_compact_runs", shape![3, 4097], 256).await;
     let geometry = tensor.storage_geometry();
 
@@ -1649,6 +1650,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
     // Preferred coordinate reads preserve physical order even when the same
     // transform crosses an owned unary boundary.
     use crate::TensorAbs;
+
     for expression in [
         TensorExpression::new(tensor.view().transpose(None).unwrap().abs().await.unwrap()).unwrap(),
         TensorExpression::new(

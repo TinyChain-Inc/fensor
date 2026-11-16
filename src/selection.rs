@@ -2,11 +2,11 @@
 
 use ha_ndarray::NDArrayWhere;
 
-use crate::expression::{self, Batch, Expression};
+use crate::expression::{Batch, Expression};
 use crate::request::BatchRequest;
 use crate::{
     BoxFuture, Error, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
-    TensorViewSemantics, TensorWhere,
+    TensorViewSemantics, TensorWhere, expression,
 };
 
 /// Read-only selection over the condition and both branches.

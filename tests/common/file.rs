@@ -16,56 +16,80 @@ use super::{counters, sparse_codec};
 // Private adapter tags, grouped by dtype. Gaps have no decoding meaning.
 mod tag {
     pub(super) const BLOCK_U8: u8 = 3;
+
     pub(super) const METADATA_U8: u8 = 5;
+
     pub(super) const SPARSE_U8: u8 = 30;
 
     pub(super) const BLOCK_U16: u8 = 7;
+
     pub(super) const METADATA_U16: u8 = 8;
+
     pub(super) const SPARSE_U16: u8 = 31;
 
     pub(super) const BLOCK_U32: u8 = 9;
+
     pub(super) const METADATA_U32: u8 = 10;
+
     pub(super) const SPARSE_U32: u8 = 32;
 
     pub(super) const BLOCK_U64: u8 = 11;
+
     pub(super) const METADATA_U64: u8 = 12;
+
     pub(super) const SPARSE_U64: u8 = 33;
 
     pub(super) const BLOCK_I8: u8 = 13;
+
     pub(super) const METADATA_I8: u8 = 14;
+
     pub(super) const SPARSE_I8: u8 = 34;
 
     pub(super) const BLOCK_I16: u8 = 15;
+
     pub(super) const METADATA_I16: u8 = 16;
+
     pub(super) const SPARSE_I16: u8 = 35;
 
     pub(super) const BLOCK_I32: u8 = 17;
+
     pub(super) const METADATA_I32: u8 = 18;
+
     pub(super) const SPARSE_I32: u8 = 36;
 
     pub(super) const BLOCK_I64: u8 = 19;
+
     pub(super) const METADATA_I64: u8 = 20;
+
     pub(super) const SPARSE_I64: u8 = 37;
 
     pub(super) const BLOCK_F32: u8 = 1;
+
     pub(super) const METADATA_F32: u8 = 2;
+
     pub(super) const SPARSE_F32: u8 = 38;
 
     pub(super) const BLOCK_F64: u8 = 4;
+
     pub(super) const METADATA_F64: u8 = 6;
+
     pub(super) const SPARSE_F64: u8 = 39;
 
     #[cfg(feature = "complex")]
     pub(super) const BLOCK_C32: u8 = 21;
+
     #[cfg(feature = "complex")]
     pub(super) const METADATA_C32: u8 = 22;
+
     #[cfg(feature = "complex")]
     pub(super) const SPARSE_C32: u8 = 40;
 
     #[cfg(feature = "complex")]
     pub(super) const BLOCK_C64: u8 = 23;
+
     #[cfg(feature = "complex")]
     pub(super) const METADATA_C64: u8 = 24;
+
     #[cfg(feature = "complex")]
     pub(super) const SPARSE_C64: u8 = 41;
 }
@@ -308,11 +332,14 @@ impl<T: de::FromStream<Context = ()> + Send> de::FromStream for BlockValues<T> {
                     if values.len() == fensor::MAX_BLOCK_CAPACITY {
                         return Err(de::Error::custom("tensor block exceeds storage capacity"));
                     }
+
                     values.push(value);
                 }
+
                 Ok(BlockValues(values))
             }
         }
+
         decoder.decode_seq(Visitor(std::marker::PhantomData)).await
     }
 }
@@ -438,35 +465,48 @@ impl de::FromStream for FsEntry {
 }
 
 as_type!(FsEntry, F32, Vec<f32>);
+
 as_type!(FsEntry, MetadataF32, fensor::TensorMetadata<f32>);
+
 as_type!(FsEntry, U8, Vec<u8>);
+
 as_type!(FsEntry, F64, Vec<f64>);
+
 as_type!(FsEntry, MetadataU8, fensor::TensorMetadata<u8>);
+
 as_type!(FsEntry, MetadataF64, fensor::TensorMetadata<f64>);
 
 as_type!(FsEntry, U16, Vec<u16>);
+
 as_type!(FsEntry, MetadataU16, fensor::TensorMetadata<u16>);
 
 as_type!(FsEntry, U32, Vec<u32>);
+
 as_type!(FsEntry, MetadataU32, fensor::TensorMetadata<u32>);
 
 as_type!(FsEntry, U64, Vec<u64>);
+
 as_type!(FsEntry, MetadataU64, fensor::TensorMetadata<u64>);
 
 as_type!(FsEntry, I8, Vec<i8>);
+
 as_type!(FsEntry, MetadataI8, fensor::TensorMetadata<i8>);
 
 as_type!(FsEntry, I16, Vec<i16>);
+
 as_type!(FsEntry, MetadataI16, fensor::TensorMetadata<i16>);
 
 as_type!(FsEntry, I32, Vec<i32>);
+
 as_type!(FsEntry, MetadataI32, fensor::TensorMetadata<i32>);
 
 as_type!(FsEntry, I64, Vec<i64>);
+
 as_type!(FsEntry, MetadataI64, fensor::TensorMetadata<i64>);
 
 #[cfg(feature = "complex")]
 as_type!(FsEntry, C32, Vec<fensor::complex::Complex32>);
+
 #[cfg(feature = "complex")]
 as_type!(
     FsEntry,
@@ -476,6 +516,7 @@ as_type!(
 
 #[cfg(feature = "complex")]
 as_type!(FsEntry, C64, Vec<fensor::complex::Complex64>);
+
 #[cfg(feature = "complex")]
 as_type!(
     FsEntry,
@@ -515,21 +556,32 @@ impl freqfs::FileSave for FsEntry {
 }
 
 as_type!(FsEntry, SparseU8, fensor::SparseNode<u8>);
+
 as_type!(FsEntry, SparseU16, fensor::SparseNode<u16>);
+
 as_type!(FsEntry, SparseU32, fensor::SparseNode<u32>);
+
 as_type!(FsEntry, SparseU64, fensor::SparseNode<u64>);
+
 as_type!(FsEntry, SparseI8, fensor::SparseNode<i8>);
+
 as_type!(FsEntry, SparseI16, fensor::SparseNode<i16>);
+
 as_type!(FsEntry, SparseI32, fensor::SparseNode<i32>);
+
 as_type!(FsEntry, SparseI64, fensor::SparseNode<i64>);
+
 as_type!(FsEntry, SparseF32, fensor::SparseNode<f32>);
+
 as_type!(FsEntry, SparseF64, fensor::SparseNode<f64>);
+
 #[cfg(feature = "complex")]
 as_type!(
     FsEntry,
     SparseC32,
     fensor::SparseNode<fensor::complex::Complex32>
 );
+
 #[cfg(feature = "complex")]
 as_type!(
     FsEntry,

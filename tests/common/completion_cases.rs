@@ -1,13 +1,13 @@
 //! Request consumption and numeric terminals, with row-stream controls.
 
-use fensor::{
-    TensorMatMul, TensorRead, TensorReduce, TensorReduceAll, TensorTransform, TensorTrig,
-    TensorUnary,
-};
 use ha_ndarray::axes;
 
 use super::benchmark;
 use super::benchmark_source::source;
+use fensor::{
+    TensorMatMul, TensorRead, TensorReduce, TensorReduceAll, TensorTransform, TensorTrig,
+    TensorUnary,
+};
 
 async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(
     name: &str,
@@ -22,6 +22,7 @@ async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(
         &["row", "coordinate", "sum", "product", "min", "max"],
     )
     .await;
+
     benchmark::copy(&name, view, 31, cache, cache < 1_000_000).await;
 }
 
@@ -34,6 +35,7 @@ pub async fn run() {
             let (rows, cols) = if smoke { (2, 3) } else { (65, 129) };
             let (_tensor_root, tensor) =
                 source(rows, cols, sparse, 128, if sparse { 7 } else { 1 }, cache).await;
+
             let geometric = tensor.view().transpose(None).unwrap();
             measure("geometric", kind, cache, &geometric).await;
             measure(
@@ -43,6 +45,7 @@ pub async fn run() {
                 &geometric.round().await.unwrap().sin().await.unwrap(),
             )
             .await;
+
             let (_tensor_root, tensor) = source(
                 if smoke { 3 } else { 4097 },
                 2,
@@ -52,6 +55,7 @@ pub async fn run() {
                 cache,
             )
             .await;
+
             measure(
                 "reduction",
                 kind,
@@ -59,11 +63,14 @@ pub async fn run() {
                 &tensor.view().sum(axes![1], false).await.unwrap(),
             )
             .await;
+
             let (m, k, n) = if smoke { (2, 3, 2) } else { (65, 17, 65) };
             let (_left_root, left) =
                 source(m, k, sparse, 128, if sparse { 7 } else { 1 }, cache).await;
+
             let (_right_root, right) =
                 source(k, n, sparse, 31, if sparse { 7 } else { 1 }, cache).await;
+
             measure(
                 "matrix",
                 kind,
@@ -77,9 +84,8 @@ pub async fn run() {
 
 // Isolate mapping construction from consumption; no filesystem setup is timed.
 pub async fn owned() {
-    use fensor::{AxisRange, Layout, TensorAbs, TensorExpression};
-
     use super::common;
+    use fensor::{AxisRange, Layout, TensorAbs, TensorExpression};
 
     let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();
     for sparse in [false, true] {
@@ -104,6 +110,7 @@ pub async fn owned() {
                 std::iter::repeat_n(1f32, 256),
             )
             .await;
+
             let mut expression = TensorExpression::new(tensor).unwrap();
             if gather {
                 expression = expression
@@ -116,9 +123,11 @@ pub async fn owned() {
                     )
                     .unwrap();
             }
+
             for _ in 0..16 {
                 expression = TensorExpression::new(expression.abs().await.unwrap()).unwrap();
             }
+
             let name = format!("owned_{name}_{}", if sparse { "sparse" } else { "dense" });
             let builds = if smoke { 2 } else { 50_000 };
             benchmark::measure(&name, "transform", "warm", async {
@@ -134,9 +143,11 @@ pub async fn owned() {
                             .unwrap(),
                     );
                 }
+
                 builds
             })
             .await;
+
             for mode in ["row", "coordinate"] {
                 benchmark::consume(&expression, mode).await;
                 benchmark::measure(&name, mode, "warm", async {
@@ -144,6 +155,7 @@ pub async fn owned() {
                     for _ in 0..if smoke { 2 } else { 128 } {
                         count += benchmark::consume(&expression, mode).await;
                     }
+
                     count
                 })
                 .await;

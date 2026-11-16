@@ -3,11 +3,6 @@
 use std::io;
 use std::path::Path;
 
-use fensor::{
-    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorExpression,
-    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMetadata, TensorRead,
-    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorWhere, TensorWrite,
-};
 use freqfs::{Cache, FileLoad, FileSave};
 use futures::TryStreamExt;
 use get_size::GetSize;
@@ -15,7 +10,14 @@ use ha_ndarray::shape;
 use safecast::AsType;
 use tokio::io::AsyncWriteExt;
 
+use fensor::{
+    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorExpression,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMetadata, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorWhere, TensorWrite,
+};
+
 mod common;
+
 use common::FsEntry;
 
 // This adapter chooses JSON explicitly. Its envelope belongs to the application.
@@ -135,6 +137,7 @@ async fn file_decoding_preserves_containers_and_rejects_malformed_payloads() {
 
     async fn reject_node(leaf: bool, rows: Vec<Vec<u64>>, child_count: usize) {
         use futures::{TryStreamExt, stream};
+
         let b_tree::Node::Index(_, children) =
             b_tree::Node::<Vec<Vec<u64>>>::Index(Vec::new(), vec![Default::default(); child_count])
         else {
@@ -380,7 +383,7 @@ async fn reload_rejects_out_of_bounds_sparse_axis() {
     let metadata = root.join("blocks").join("metadata");
     // Preserve the adapter envelope and valid geometry; corrupt only the axis.
     let original = tokio::fs::read(&metadata).await.unwrap();
-    let malformed = (2u8, (vec![3u64, 4], true, Some(2u64), vec![1u64, 1]));
+    let malformed = (2u8, (vec![3u64, 4], true, Some(2u64), 2u64));
     let mut bytes = Vec::new();
     let mut encoded = destream_json::en::encode(&malformed).unwrap();
 

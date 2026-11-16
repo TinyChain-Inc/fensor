@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 
 use ha_ndarray::{MatrixDual, NDArrayRead, NDArrayTransform, Number};
 
-use crate::expression::{self, Batch, Expression};
+use crate::expression::{Batch, Expression};
 use crate::mapping::CoordinateMap;
-use crate::request::{self, Axis, BatchRequest, Cartesian, RequestKind};
+use crate::request::{Axis, BatchRequest, Cartesian, RequestKind};
 use crate::schema::Coord;
 use crate::{
     BoxFuture, Layout, Result, Shape, TensorElement, TensorGeometry, TensorMatMul, TensorRead,
-    TensorTransform, TensorViewSemantics,
+    TensorTransform, TensorViewSemantics, expression, request,
 };
 
 /// Maximum rows and columns per spatial tile; result size is TILE_SIDE squared.
