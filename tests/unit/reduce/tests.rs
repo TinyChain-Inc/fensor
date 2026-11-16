@@ -56,6 +56,7 @@ async fn indexed_reductions_account_for_implicit_zero_gaps() {
     )
     .await
     .unwrap();
+
     tensor.write_value(&[0, 1], 2.).await.unwrap();
     tensor.write_value(&[0, len - 1], 3.).await.unwrap();
 
@@ -81,6 +82,7 @@ async fn indexed_reductions_account_for_implicit_zero_gaps() {
                     .unwrap(),
                 5.
             );
+
             let zeros = tensor.view().sub(&tensor.view()).await.unwrap();
             assert_eq!(zeros.mean_all().await.unwrap(), 0.);
             CURRENT.with(|metrics| {

@@ -53,6 +53,7 @@ pub enum Step<'a, I, T> {
 }
 
 pub type Preferred<'a> = Step<'a, (&'a [u64], Option<StorageSlice>), Option<RequestIterator>>;
+
 pub type Ordered<'a> = Step<'a, (Slice, Option<StorageSlice>), Requests<'static>>;
 
 pub enum Selection<'a> {
@@ -77,6 +78,7 @@ fn visit(count: &mut usize) -> Result<()> {
         .checked_add(1)
         .filter(|&n| n <= MAX_EXPRESSION_NODES)
         .ok_or_else(|| Error::Unsupported("expression traversal limit exceeded".into()))?;
+
     Ok(())
 }
 
@@ -205,6 +207,7 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
                                     })
                             },
                         );
+
                         return Poll::Ready(Some(flat));
                     }
 
@@ -222,6 +225,7 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
             })
         })
         .collect();
+
     let union = collate::try_union(Collator::default(), inputs).boxed();
     futures::stream::try_unfold(
         (union, shape, Coord::new()),
@@ -232,6 +236,7 @@ fn merge(streams: Vec<Requests<'static>>, shape: crate::Shape) -> Requests<'stat
                 let Some(flat) = union.try_next().await? else {
                     break;
                 };
+
                 decode_flat(flat, &shape, &mut scratch)?;
                 output.push(scratch.to_vec());
             }

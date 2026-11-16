@@ -9,13 +9,18 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
 use freqfs::{Cache, DirLock};
 
+use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
+
 pub mod counters;
+
 mod file;
+
 pub mod fixture;
+
 pub mod numbers;
+
 mod sparse_codec;
 
 pub use file::FsEntry;
@@ -29,6 +34,7 @@ pub fn unique_tmp_dir(name: &str) -> PathBuf {
 
     // Wall-clock timestamps alone can collide between concurrent tests.
     static NEXT_DIR: counters::Counter = counters::Counter::new();
+
     let sequence = NEXT_DIR.increment();
     let process = std::process::id();
     path.push(format!("fensor_test_{name}_{unique}_{process}_{sequence}"));

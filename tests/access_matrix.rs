@@ -2,14 +2,15 @@ mod common;
 
 use std::collections::HashMap;
 
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType};
+
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 use fensor::{
     AxisRange, Error, Layout, Range, Shape, Tensor, TensorArray, TensorGeometry, TensorRead,
     TensorSchema, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
-use number_general::{FloatType, NumberType};
 
 fn schema_f32(shape: Shape) -> TensorSchema {
     TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema")

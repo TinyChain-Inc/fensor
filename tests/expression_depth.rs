@@ -7,16 +7,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::TryStreamExt;
+
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorAbs, TensorArray,
     TensorExpression, TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorReduce,
     TensorSchema, TensorSource, TensorTransform, TensorView,
 };
-use futures::TryStreamExt;
 
 mod common;
 
 const CASE_ENV: &str = "FENSOR_EXPRESSION_DEPTH_CASE";
+
 const TEST: &str = "owned_expression_depth_is_independent_of_the_worker_stack";
 
 #[derive(Clone)]
@@ -85,6 +87,7 @@ async fn exercise(case: &str) {
     } else {
         Layout::Dense
     };
+
     let (_root, tensor) = common::fixture::source(
         "expression_depth",
         vec![2].into(),
@@ -94,6 +97,7 @@ async fn exercise(case: &str) {
         [0., -2.],
     )
     .await;
+
     let dtype = tensor.dtype();
     let lease = Arc::new(AtomicUsize::new(0));
     let weak = Arc::downgrade(&lease);
@@ -103,11 +107,13 @@ async fn exercise(case: &str) {
         "error" => "error",
         _ => "read",
     };
+
     let source = Source {
         tensor,
         lease,
         behavior,
     };
+
     let mut expression = TensorExpression::new(TensorView::new(source)).unwrap();
     if case == "wide" {
         let leaf = expression
@@ -115,10 +121,12 @@ async fn exercise(case: &str) {
             .unwrap()
             .broadcast(vec![2048, 2].into())
             .unwrap();
+
         expression = leaf.clone();
         for _ in 0..1024 {
             expression = TensorExpression::new(leaf.add(&expression).await.unwrap()).unwrap();
         }
+
         drop(leaf);
         let mut stream = expression.into_blocks().unwrap();
         let values = stream.try_next().await.unwrap().unwrap();
@@ -126,21 +134,25 @@ async fn exercise(case: &str) {
         for pair in values.as_chunks::<2>().0 {
             assert_eq!(*pair, [0., -2050.]);
         }
+
         assert!(stream.try_next().await.unwrap().is_none());
         drop(stream);
         assert!(
             weak.upgrade().is_none(),
             "completed wide expression retained its source"
         );
+
         eprintln!("completed {case}");
         return;
     }
+
     let depth = match case {
         "drop" | "unpolled" | "concurrent-drop" | "transform-error" => 4096,
         "limit" => 20_000,
         "construction-limit" => 40_000,
         _ => 1024,
     };
+
     for i in 0..depth {
         let next = if case == "reduce" {
             TensorExpression::new(expression.sum(ha_ndarray::axes![0], true).await.unwrap())
@@ -158,6 +170,7 @@ async fn exercise(case: &str) {
         } else {
             TensorExpression::new(expression.abs().await.unwrap())
         };
+
         match next {
             Ok(next) => expression = next,
             Err(fensor::Error::Unsupported(_)) if case == "construction-limit" => {
@@ -166,21 +179,25 @@ async fn exercise(case: &str) {
                     weak.upgrade().is_none(),
                     "rejected construction retained its source"
                 );
+
                 eprintln!("completed {case} after {i} operations");
                 return;
             }
             Err(error) => panic!("construct {case} at {i}: {error}"),
         }
     }
+
     assert_ne!(
         case, "construction-limit",
         "expression resource bound was not enforced"
     );
+
     eprintln!("constructed {case} depth={depth}");
     assert_eq!(
         expression.shape(),
         if case == "reduce" { &[1][..] } else { &[2][..] }
     );
+
     assert_eq!(expression.layout(), layout);
     assert_eq!(expression.dtype(), dtype);
     eprintln!("metadata complete");
@@ -208,6 +225,7 @@ async fn exercise(case: &str) {
                 other_barrier.wait().await;
                 drop(other);
             });
+
             barrier.wait().await;
             drop(expression);
             task.await.unwrap();
@@ -229,8 +247,10 @@ async fn exercise(case: &str) {
                     }
                 })
                 .await;
+
                 assert!(polls > 1, "ready descent monopolized one poll");
             }
+
             drop(stream);
         }
         "cancel" => {
@@ -248,6 +268,7 @@ async fn exercise(case: &str) {
                 })
                 .await;
             }
+
             drop(stream);
         }
         "limit" => {
@@ -255,6 +276,7 @@ async fn exercise(case: &str) {
                 expression.read_value(&[1]).await,
                 Err(fensor::Error::Unsupported(_))
             ));
+
             assert_eq!(weak.upgrade().unwrap().load(Ordering::Relaxed), 0);
             drop(expression);
         }
@@ -262,6 +284,7 @@ async fn exercise(case: &str) {
             let mut stream = expression.into_blocks().unwrap();
             assert!(matches!(stream.try_next().await,
                 Err(fensor::Error::InvalidLayout(message)) if message == "injected deep leaf failure"));
+
             drop(stream);
         }
         "sparse" => {
@@ -275,6 +298,7 @@ async fn exercise(case: &str) {
                     .unwrap(),
             )
             .unwrap();
+
             drop(zeros);
             drop(expression);
             assert_eq!(transformed.read_value(&[0]).await.unwrap(), 0.);
@@ -284,6 +308,7 @@ async fn exercise(case: &str) {
                 .try_collect()
                 .await
                 .unwrap();
+
             assert_eq!(entries, [(vec![1], 3.)]);
         }
         "dense" | "mixed" | "mixed-sparse" => {
@@ -291,11 +316,13 @@ async fn exercise(case: &str) {
                 // Both operands retain the same deep graph.
                 let shared =
                     TensorExpression::new(expression.add(&expression).await.unwrap()).unwrap();
+
                 drop(expression);
                 (shared, 4.)
             } else {
                 (expression, 2.)
             };
+
             assert_eq!(expression.read_value(&[1]).await.unwrap(), expected);
             if case == "mixed-sparse" {
                 let entries: Vec<_> = expression
@@ -304,6 +331,7 @@ async fn exercise(case: &str) {
                     .try_collect()
                     .await
                     .unwrap();
+
                 assert_eq!(entries, [(vec![1], expected)]);
             } else {
                 assert_eq!(
@@ -319,10 +347,12 @@ async fn exercise(case: &str) {
         }
         _ => panic!("unknown depth case {case}"),
     }
+
     assert!(
         weak.upgrade().is_none(),
         "source lease retained after {case}"
     );
+
     eprintln!("completed {case}");
 }
 
@@ -332,10 +362,12 @@ async fn owned_expression_depth_is_independent_of_the_worker_stack() {
         std::env::var_os("RUST_MIN_STACK").is_none(),
         "normal worker stacks required"
     );
+
     if let Ok(case) = std::env::var(CASE_ENV) {
         tokio::spawn(async move { exercise(&case).await })
             .await
             .unwrap();
+
         return;
     }
 
@@ -343,10 +375,12 @@ async fn owned_expression_depth_is_independent_of_the_worker_stack() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+
     let logs = std::env::temp_dir().join(format!(
         "fensor-expression-depth-{}-{nonce}",
         std::process::id()
     ));
+
     std::fs::create_dir(&logs).unwrap();
     for case in [
         "dense",
@@ -375,18 +409,22 @@ async fn owned_expression_depth_is_independent_of_the_worker_stack() {
             .stdout(output)
             .spawn()
             .unwrap();
+
         let started = Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
+
             if started.elapsed() > Duration::from_secs(60) {
                 child.kill().unwrap();
                 child.wait().unwrap();
                 panic!("{case} timed out; log: {}", log.display());
             }
+
             std::thread::sleep(Duration::from_millis(10));
         };
+
         let transcript = std::fs::read_to_string(&log).unwrap();
         assert!(
             status.success()
@@ -397,5 +435,6 @@ async fn owned_expression_depth_is_independent_of_the_worker_stack() {
             transcript
         );
     }
+
     std::fs::remove_dir_all(logs).unwrap();
 }

@@ -1,12 +1,5 @@
 #![cfg(feature = "complex")]
 
-use fensor::{
-    Layout, Tensor, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
-    TensorCompareScalar, TensorComplex, TensorElement, TensorExpression, TensorFileEntry,
-    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric,
-    TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig,
-    TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite,
-};
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, Buffer, Complex, MatrixDual, NDArrayAbs, NDArrayBoolean, NDArrayBooleanScalar,
@@ -15,7 +8,15 @@ use ha_ndarray::{
     Number, axes, shape,
 };
 
-use common::{FsEntry, cleanup, fixture, numbers::same};
+use common::numbers::same;
+use common::{FsEntry, cleanup, fixture};
+use fensor::{
+    Layout, Tensor, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare,
+    TensorCompareScalar, TensorComplex, TensorElement, TensorExpression, TensorFileEntry,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric,
+    TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig,
+    TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite,
+};
 
 mod common;
 
@@ -34,6 +35,7 @@ where
             input.clone(),
         )
         .await;
+
         let v = tensor.view();
         let dense = TensorExpression::new(v.clone()).unwrap().into_dense();
         let a = Array::new(Buffer::from(input.clone()), shape![2, 2]).unwrap();
@@ -54,6 +56,7 @@ where
                 .await;
             };
         }
+
         unary!(abs, v);
         unary!(conj, v);
         unary!(re, v);
@@ -103,6 +106,7 @@ where
                 .await;
             };
         }
+
         binary!(add, add_scalar, v, dense);
         binary!(sub, sub_scalar, v, dense);
         binary!(mul, mul_scalar, v, v);
@@ -120,18 +124,22 @@ where
             tensor.sum_all().await.unwrap(),
             values_array.as_ref().sum_all().unwrap()
         ));
+
         assert!(same(
             tensor.product_all().await.unwrap(),
             values_array.product_all().unwrap()
         ));
+
         assert_eq!(
             tensor.all().await.unwrap(),
             values.iter().all(|v| *v != T::ZERO)
         );
+
         assert_eq!(
             tensor.any().await.unwrap(),
             values.iter().any(|v| *v != T::ZERO)
         );
+
         for keep in [false, true] {
             fixture::consumers(
                 &v.sum(axes![0], keep).await.unwrap(),
@@ -143,6 +151,7 @@ where
                 same,
             )
             .await;
+
             let expected: Vec<_> = [vec![0, 2], vec![1, 3]]
                 .iter()
                 .map(|group| {
@@ -153,8 +162,10 @@ where
                         .unwrap_or(T::ZERO)
                 })
                 .collect();
+
             fixture::blocks(&v.product(axes![0], keep).await.unwrap(), &expected, same).await;
         }
+
         fixture::consumers(
             &v.mt().await.unwrap(),
             &[input[0], input[2], input[1], input[3]],
@@ -162,6 +173,7 @@ where
             same,
         )
         .await;
+
         fixture::consumers(&v.diag().await.unwrap(), &[input[0], input[3]], same, same).await;
         let expected = a
             .as_ref()
@@ -172,6 +184,7 @@ where
             .to_slice()
             .unwrap()
             .to_vec();
+
         fixture::consumers(&v.matmul(&v).await.unwrap(), &expected, same, same).await;
         fixture::blocks(
             &dense.eq(&dense).await.unwrap().cond(&v, &v).await.unwrap(),
@@ -179,6 +192,7 @@ where
             same,
         )
         .await;
+
         let conjugate = v.conj().await.unwrap();
         let expected: Vec<_> = input.iter().map(|v| Complex::conj(*v)).collect();
         // Sparse materialization omits all-zero elements, canonicalizing their zero signs.
@@ -186,29 +200,35 @@ where
             same(a, b) || (matches!(layout, Layout::Sparse { .. }) && a == T::ZERO && b == T::ZERO)
         })
         .await;
+
         let entries = conjugate
             .read_coordinate_blocks()
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        for (coords, values) in entries {
+
+        for batch in entries {
+            let (coords, values) = batch.into_coordinates(conjugate.shape()).unwrap();
             for (c, value) in coords.iter().zip(values) {
                 assert!(same(value, expected[(c[0] * 2 + c[1]) as usize]));
             }
         }
+
         let cancelled = TensorExpression::new(v.sub(&v).await.unwrap())
             .unwrap()
             .into_dense()
             .exp()
             .await
             .unwrap();
+
         fixture::blocks(&cancelled, &[T::ONE; 4], same).await;
 
         if matches!(layout, Layout::Sparse { .. }) {
             for coord in common::iter_coords(&[2, 2]) {
                 tensor.write_value(&coord, T::ZERO).await.unwrap();
             }
+
             assert_eq!(tensor.sum_all().await.unwrap(), T::ZERO);
             assert_eq!(tensor.product_all().await.unwrap(), T::ZERO);
             assert!(!tensor.all().await.unwrap());
@@ -225,6 +245,7 @@ where
             )
             .await;
         }
+
         drop(tensor);
         cleanup(&root).await;
     }
@@ -233,6 +254,7 @@ where
 #[tokio::test]
 async fn complex32_operations() {
     use fensor::complex::Complex32 as C;
+
     operations(vec![
         C::new(0., 0.),
         C::new(1., 2.),
@@ -245,6 +267,7 @@ async fn complex32_operations() {
 #[tokio::test]
 async fn complex64_operations() {
     use fensor::complex::Complex64 as C;
+
     operations(vec![
         C::new(0., 0.),
         C::new(1., 2.),
@@ -324,11 +347,13 @@ macro_rules! exceptional {
 }
 
 exceptional!(complex32_exceptional, fensor::complex::Complex32, f32);
+
 exceptional!(complex64_exceptional, fensor::complex::Complex64, f64);
 
 #[tokio::test]
 async fn projection_batching_and_live_sources() {
     use fensor::complex::Complex64 as C;
+
     let (root, tensor) = fixture::source(
         "complex_projection",
         shape![1, 2],
@@ -338,6 +363,7 @@ async fn projection_batching_and_live_sources() {
         [C::new(0., 2.), C::new(0., 0.)],
     )
     .await;
+
     let projected = tensor.view().re().await.unwrap();
     let expanded = TensorExpression::new(projected.broadcast(shape![4097, 2]).unwrap())
         .unwrap()
@@ -347,6 +373,7 @@ async fn projection_batching_and_live_sources() {
         .unwrap()
         .flip(0)
         .unwrap();
+
     let expected: Vec<_> = (0..4097).flat_map(|_| [1., 1.]).collect();
     let mut dropped = expanded.read_blocks().unwrap();
     dropped.try_next().await.unwrap().unwrap();
@@ -356,6 +383,7 @@ async fn projection_batching_and_live_sources() {
         expanded.read_blocks().unwrap().try_collect::<Vec<_>>()
     )
     .unwrap();
+
     assert_eq!(a, b);
     assert_eq!(a.into_iter().flatten().collect::<Vec<_>>(), expected);
     assert_eq!(
@@ -370,11 +398,13 @@ async fn projection_batching_and_live_sources() {
             .unwrap(),
         1
     );
+
     let (copy_root, dir) = common::new_dir("projection_boundary").await;
     let copy: Tensor<FsEntry, f64> =
         Tensor::copy_from(dir, &tensor.view().re().await.unwrap(), tensor.layout(), 2)
             .await
             .unwrap();
+
     assert_eq!(
         TensorExpression::new(copy.view())
             .unwrap()
@@ -387,6 +417,7 @@ async fn projection_batching_and_live_sources() {
             .unwrap(),
         1.
     );
+
     tensor.write_value(&[0, 0], C::new(1., 2.)).await.unwrap();
     assert_eq!(expanded.read_value(&[0, 0]).await.unwrap(), 1f64.exp());
     cleanup(&root).await;

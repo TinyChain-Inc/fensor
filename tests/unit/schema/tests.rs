@@ -104,6 +104,7 @@ fn storage_schema_new_rejects_empty_shape() {
 #[test]
 fn compact_linear_blocks_cover_regions_and_progressions() {
     use crate::schema::LinearBlocks;
+
     for shape in [vec![1], vec![3, 5], vec![5, 7, 11], vec![2, 3, 4]] {
         for prefix in 0..=shape.len() {
             let layout = if prefix == 0 {
@@ -200,6 +201,7 @@ fn compact_linear_blocks_cover_regions_and_progressions() {
 #[test]
 fn compact_flat_rectangles_preserve_exact_coverage() {
     use crate::schema::flat_rectangles;
+
     for shape in [vec![1], vec![3, 5], vec![2, 3, 4], vec![3, 2, 4, 2]] {
         let size: u64 = shape.iter().product();
         let strides = crate::schema::contiguous_strides(&shape).unwrap();

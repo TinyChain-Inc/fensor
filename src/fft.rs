@@ -9,14 +9,14 @@ use ha_ndarray::{
     Platform,
 };
 
-use crate::expression::{self, Batch, Expression, MAX_BATCH_ELEMENTS};
+use crate::expression::{Batch, Expression, MAX_BATCH_ELEMENTS};
 use crate::mapping::CoordinateMap;
 use crate::request::{Axis, BatchRequest};
 use crate::schema::Coord;
 use crate::slice::Slice;
 use crate::{
     Axes, BoxFuture, Error, Layout, Result, Shape, Strides, TensorElement, TensorFourier,
-    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics,
+    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, expression,
 };
 
 mod sealed {
@@ -129,6 +129,7 @@ fn validate_axes(shape: &[u64], count: usize, operation: &str) -> Result<()> {
             "{operation} requires rank >= {count} and nonempty dimensions: {shape:?}"
         )));
     }
+
     crate::schema::contiguous_strides(shape)?;
 
     for &len in &shape[shape.len() - count..] {
@@ -168,6 +169,7 @@ where
     Ifft: FourierOp<E::DType>,
 {
     type FftOutput = FourierView<Self, Fft>;
+
     type IfftOutput = FourierView<Self, Ifft>;
 
     async fn fft(&self) -> Result<Self::FftOutput> {
@@ -256,9 +258,11 @@ where
                     .entry(mapped.clone())
                     .or_default()
                     .push((destination, frequency));
+
                 Ok(())
             },
         )?;
+
         Ok(groups)
     }
 }
@@ -308,20 +312,25 @@ where
                             .map(|&i| Axis::range(i, 1))
                             .chain(std::iter::once(Axis::range(0, width as u64)))
                             .collect();
+
                         Slice::new(self.source.shape(), axes)?.rectangle()
                     })
                     .collect::<Result<Vec<_>>>()?;
+
                 let input = BatchRequest::rectangles(rectangles)?;
                 let expected = input.len();
                 let batch = context
                     .evaluate(&self.source, std::sync::Arc::new(input))
                     .await?;
+
                 let array = expression::batch_array(batch.values)?
                     .reshape(ha_ndarray::shape![pack.len(), width])?;
+
                 let transformed = self.op.apply(array)?.into_read()?;
                 let transformed = BufferConverter::from(transformed.into_access().into_inner())
                     .to_slice()?
                     .into_vec();
+
                 if transformed.len() != expected {
                     return Err(Error::InvalidLayout(format!(
                         "{} output: expected {} elements, got {}",

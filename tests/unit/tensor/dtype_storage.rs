@@ -1,14 +1,14 @@
 //! Storage contracts are parameterized independently of the numerical matrix.
 
+use ha_ndarray::shape;
+
+use crate::test_support as common;
 use common::numbers::same;
 use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Error, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
     TensorSchema, TensorTransform, TensorWrite, TensorWriteBulk,
 };
-use ha_ndarray::shape;
-
-use crate::test_support as common;
 
 async fn storage<T: TensorElement>(samples: Option<[T; 2]>)
 where
@@ -239,14 +239,23 @@ macro_rules! storage_case {
 }
 
 storage_case!(u8_storage, u8);
+
 storage_case!(u16_storage, u16);
+
 storage_case!(u32_storage, u32);
+
 storage_case!(u64_storage, u64);
+
 storage_case!(i8_storage, i8);
+
 storage_case!(i16_storage, i16);
+
 storage_case!(i32_storage, i32);
+
 storage_case!(i64_storage, i64);
+
 storage_case!(f32_storage, f32);
+
 storage_case!(
     f64_storage,
     f64,
@@ -255,6 +264,7 @@ storage_case!(
 
 #[cfg(feature = "complex")]
 storage_case!(complex32_storage, fensor::complex::Complex32);
+
 #[cfg(feature = "complex")]
 storage_case!(complex64_storage, fensor::complex::Complex64);
 

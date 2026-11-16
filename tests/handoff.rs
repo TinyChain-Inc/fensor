@@ -1,11 +1,12 @@
 //! Downstream public API smoke coverage, not a transaction or storage-provider test.
 
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
+
 use fensor::{
     AxisRange, Layout, Tensor, TensorExpression, TensorGeometry, TensorMathScalar, TensorRead,
     TensorReduce, TensorSource, TensorTransform, TensorWrite,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
 
 mod common;
 
@@ -13,7 +14,8 @@ async fn coordinates<R: TensorRead<DType = f32>>(reader: &R, expected: &[f32]) {
     let mut seen = vec![false; expected.len()];
     let mut blocks = reader.read_coordinate_blocks().unwrap();
 
-    while let Some((coordinates, values)) = blocks.try_next().await.unwrap() {
+    while let Some(batch) = blocks.try_next().await.unwrap() {
+        let (coordinates, values) = batch.into_coordinates(reader.shape()).unwrap();
         assert_eq!(coordinates.len(), values.len());
 
         for (coordinate, value) in coordinates.into_iter().zip(values) {
@@ -64,6 +66,7 @@ async fn public_composition_storage_access_and_persistence() {
             .sum(axes![1], false)
             .await
             .unwrap();
+
         coordinates(&expression, &[9.0, 11.0]).await;
 
         let (copy_root, dir) = common::new_dir("handoff_copy").await;
@@ -71,12 +74,14 @@ async fn public_composition_storage_access_and_persistence() {
             Tensor::copy_from(dir.clone(), &expression, expression.layout(), 2)
                 .await
                 .unwrap();
+
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);
         let copy = Tensor::<common::FsEntry, f32>::load(common::open_dir(&copy_root).unwrap())
             .await
             .unwrap();
+
         coordinates(&copy, &[9.0, 11.0]).await;
         drop(copy);
         drop(expression);

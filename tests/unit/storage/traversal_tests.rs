@@ -146,7 +146,8 @@ async fn preferred_regions_skip_gaps_and_include_sparse_zeros() {
 
     let mut blocks = view.read_coordinate_blocks().unwrap();
     let mut count = 0;
-    while let Some((coordinates, values)) = blocks.try_next().await.unwrap() {
+    while let Some(batch) = blocks.try_next().await.unwrap() {
+        let (coordinates, values) = batch.into_coordinates(view.shape()).unwrap();
         assert_eq!(coordinates.len(), values.len());
         assert!(values.iter().all(|&value| value == 0.));
         count += values.len();
@@ -307,6 +308,7 @@ impl Clone for ReadyCandidates {
 
 impl crate::TensorGeometry for ReadyCandidates {
     type DType = f64;
+
     fn dtype(&self) -> crate::NumberType {
         f64::dtype()
     }

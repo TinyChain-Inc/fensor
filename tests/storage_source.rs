@@ -1,15 +1,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::{StreamExt, TryStreamExt};
+use number_general::FloatType;
+
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorAbs, TensorArray,
     TensorExpression, TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorSchema,
     TensorSource, TensorTransform, TensorUnary, TensorView, TensorWrite,
 };
-use futures::{StreamExt, TryStreamExt};
-use number_general::FloatType;
 
 mod common;
+
 use common::{FsEntry, cleanup, new_dir};
 
 #[derive(Clone)]
@@ -90,9 +92,11 @@ async fn custom_owned_source_feeds_existing_lazy_operations() {
             first: vec![7.0, 8.0],
             scans: Arc::default(),
         };
+
         let view = TensorView::new(source).transpose(None).unwrap();
         TensorExpression::new(view.add_scalar(1.0).await.unwrap()).unwrap()
     };
+
     assert_eq!(tensor.read_value(&[0, 0]).await.unwrap(), 0.0);
     drop(tensor);
     let values = expression
@@ -101,6 +105,7 @@ async fn custom_owned_source_feeds_existing_lazy_operations() {
         .try_concat()
         .await
         .unwrap();
+
     assert_eq!(values, [8.0, 4.0, 9.0, 5.0]);
     cleanup(&root).await;
 }
@@ -114,6 +119,7 @@ async fn strict_load_never_initializes_missing_storage() {
     let tensor = Tensor::<FsEntry, f64>::create(dir.clone(), schema, Layout::Dense, 2)
         .await
         .unwrap();
+
     tensor.sync().await.unwrap();
     let blocks = dir.read().await.get_dir("blocks").cloned().unwrap();
     blocks.write().await.delete("0").await;
@@ -126,16 +132,19 @@ async fn strict_load_never_initializes_missing_storage() {
 #[tokio::test]
 async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansion() {
     use fensor::AxisRange;
+
     let (root, dir) = new_dir("block_bounds").await;
     let schema = TensorSchema::new(NumberType::Float(FloatType::F64), vec![4, 8].into()).unwrap();
     let tensor = Tensor::<FsEntry, f64>::create(dir, schema, Layout::Dense, 4)
         .await
         .unwrap();
+
     let geometry = tensor.storage_geometry();
     let point = tensor
         .view()
         .slice(vec![AxisRange::At(2), AxisRange::At(7)].into())
         .unwrap();
+
     let id = geometry.block_position(&[2, 7]).unwrap().0;
     assert_eq!(point.logical_block_range(&geometry).unwrap(), id..id + 1);
     for view in [
@@ -156,9 +165,11 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
                 .block_position(&view.resolve_base_coord(&coord).unwrap())
                 .unwrap()
                 .0;
+
             assert!(bounds.contains(&block));
         }
     }
+
     cleanup(&root).await;
 }
 
@@ -170,6 +181,7 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
             assert!(left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan()));
         }
     }
+
     for layout in [Layout::Dense, Layout::Sparse { axis: None }] {
         let (root, tensor) = common::fixture::source(
             "owned_consumers",
@@ -180,6 +192,7 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
             [0.0f64, 1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 3.0],
         )
         .await;
+
         // Caller callback errors must not acquire native-corruption provenance.
         // Cover both unique lookup and consecutive borrowed visitation.
         for ids in [&[1][..], &[0, 1][..]] {
@@ -189,14 +202,17 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                 })
                 .await
                 .unwrap_err();
+
             let fensor::Error::Io(error) = error else {
                 panic!("expected callback error")
             };
+
             assert_eq!(error.to_string(), "consumer failure");
             assert!(!freqfs::IntegrityError::is_marked(&error));
             // Acquiring the writer proves the failed callback released the reader.
             tensor.write_value(&[0, 0], 0.).await.unwrap();
         }
+
         // Rounding makes the stored value 1 an intermediate zero. The other
         // operand restores its value; NaN and infinities retain their classifications.
         let inner = tensor
@@ -207,6 +223,7 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
             .round()
             .await
             .unwrap();
+
         let expression = TensorExpression::new(
             inner
                 .add(&tensor.view())
@@ -217,6 +234,7 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                 .unwrap(),
         )
         .unwrap();
+
         for value in [
             expression.clone(),
             expression.transpose(None).unwrap().flip(0).unwrap(),
@@ -229,6 +247,7 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                 .try_concat()
                 .await
                 .unwrap();
+
             same(&borrowed, &owned);
             let entries: Vec<_> = value
                 .clone()
@@ -237,6 +256,7 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                 .try_collect()
                 .await
                 .unwrap();
+
             assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
             if matches!(layout, Layout::Sparse { .. }) {
                 let range = value
@@ -244,6 +264,7 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                     .iter()
                     .map(|&dim| fensor::AxisRange::In(0, dim, 1))
                     .collect();
+
                 let order = (0..value.ndim()).collect();
                 let borrowed: Vec<_> = value
                     .read_sparse_elements_in_order(range, order)
@@ -252,18 +273,22 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                     .try_collect()
                     .await
                     .unwrap();
+
                 assert_eq!(
                     entries.iter().map(|(coord, _)| coord).collect::<Vec<_>>(),
                     borrowed.iter().map(|(coord, _)| coord).collect::<Vec<_>>()
                 );
+
                 same(
                     &entries.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
                     &borrowed.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
                 );
+
                 assert!(entries.iter().any(|(_, value)| *value == 2.0));
                 assert_eq!(entries.len(), 5);
             }
         }
+
         cleanup(&root).await;
     }
 }
@@ -282,12 +307,14 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         std::iter::repeat_n(2.0f64, rows as usize * 2),
     )
     .await;
+
     let scans = Arc::default();
     let source = Source {
         tensor,
         first: vec![2.; 2],
         scans: Arc::clone(&scans),
     };
+
     let expression = TensorExpression::new(TensorView::new(source.clone())).unwrap();
     let mut entries = expression.clone().into_sparse_elements().unwrap();
     let mut count = 0;
@@ -296,6 +323,7 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         assert_eq!(value, 2.);
         count += 1;
     }
+
     assert_eq!(count, rows * 2);
     assert_eq!(scans.load(Ordering::Relaxed), 1);
     drop(entries);
@@ -310,10 +338,12 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
             .unwrap(),
     )
     .unwrap();
+
     let after_ownership = TensorExpression::new(expression.clone().abs().await.unwrap())
         .unwrap()
         .slice(select_column())
         .unwrap();
+
     let nested = TensorExpression::new(expression.clone().transpose(None).unwrap())
         .unwrap()
         .transpose(None)
@@ -330,6 +360,7 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
             assert_eq!(value, 2.);
             count += 1;
         }
+
         assert_eq!(count, rows);
         assert_eq!(scans.load(Ordering::Relaxed), 1);
     }
@@ -340,6 +371,7 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         .unwrap()
         .slice(select_column())
         .unwrap();
+
     scans.store(0, Ordering::Relaxed);
     let mut entries = combined.into_sparse_elements().unwrap();
     let mut count = 0;
@@ -348,6 +380,7 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         assert_eq!(value, 4.);
         count += 1;
     }
+
     assert_eq!(count, rows);
     assert_eq!(scans.load(Ordering::Relaxed), 2);
     drop(entries);
@@ -364,6 +397,7 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         .unwrap()
         .transpose(None)
         .unwrap();
+
     scans.store(0, Ordering::Relaxed);
     let mut entries = singleton.into_sparse_elements().unwrap();
     let mut count = 0;
@@ -372,6 +406,7 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         assert_eq!(value, 2.);
         count += 1;
     }
+
     assert_eq!(count, rows);
     assert_eq!(scans.load(Ordering::Relaxed), 1);
     drop(entries);
@@ -382,16 +417,19 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
         transposed.clone().into_sparse_elements(),
         Err(fensor::Error::Unsupported(_))
     ));
+
     assert_eq!(scans.load(Ordering::Relaxed), 0);
     let mut blocks = transposed.read_coordinate_blocks().unwrap();
     let mut seen = std::collections::BTreeSet::new();
-    while let Some((coordinates, values)) = blocks.try_next().await.unwrap() {
+    while let Some(batch) = blocks.try_next().await.unwrap() {
+        let (coordinates, values) = batch.into_coordinates(transposed.shape()).unwrap();
         assert_eq!(coordinates.len(), values.len());
         for (coord, value) in coordinates.into_iter().zip(values) {
             assert!(seen.insert(coord));
             assert_eq!(value, 2.);
         }
     }
+
     assert_eq!(seen.len() as u64, rows * 2);
     assert_eq!(scans.load(Ordering::Relaxed), 0);
 
@@ -411,6 +449,7 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
             unsupported.clone().into_sparse_elements(),
             Err(fensor::Error::Unsupported(_))
         ));
+
         assert_eq!(unsupported.read_value(&[0, 0]).await.unwrap(), 2.);
         assert_eq!(
             unsupported

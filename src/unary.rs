@@ -9,7 +9,7 @@ use ha_ndarray::{
     NDArrayUnary, NDArrayUnaryBoolean, Number, Platform,
 };
 
-use crate::expression::{self, Batch, Expression};
+use crate::expression::{Batch, Expression};
 use crate::request::BatchRequest;
 use crate::schema::Layout;
 use crate::tensor::TensorElement;
@@ -17,7 +17,7 @@ use crate::traits::{
     BoxFuture, TensorAbs, TensorCast, TensorGeometry, TensorNumeric, TensorRead, TensorTransform,
     TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics,
 };
-use crate::{Error, Result};
+use crate::{Error, Result, expression};
 
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -218,6 +218,7 @@ where
             if zero != O::Output::ZERO {
                 return Err(Error::WouldDensify { operation: O::NAME });
             }
+
             zero
         } else {
             O::Output::ZERO

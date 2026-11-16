@@ -6,6 +6,38 @@ use crate::tensor::copy_metrics;
 use crate::test_support::{FsEntry, cleanup, new_dir};
 use crate::{BoxFuture, Layout, Result, TensorSchema, TensorSource};
 
+#[tokio::test]
+async fn dense_copy_retains_compact_requests_through_construction() {
+    use crate::{TensorRead, TensorTransform};
+
+    let (root, dir) = new_dir("compact_copy_source").await;
+    let tensor = Tensor::<FsEntry, f64>::create(
+        dir,
+        TensorSchema::new(f64::dtype(), vec![17, 19].into()).unwrap(),
+        Layout::Dense,
+        64,
+    )
+    .await
+    .unwrap();
+
+    let view = tensor.view().transpose(None).unwrap();
+    let (output_root, output) = new_dir("compact_copy_output").await;
+    crate::read_metrics::CURRENT
+        .scope(Default::default(), async {
+            let copied = Tensor::copy_from(output, &view, Layout::Dense, 64)
+                .await
+                .unwrap();
+
+            assert_eq!(copied.read_value(&[18, 16]).await.unwrap(), 0.);
+            crate::read_metrics::CURRENT
+                .with(|metrics| assert_eq!(metrics.borrow().expanded_coordinates, 0));
+        })
+        .await;
+
+    cleanup(&output_root).await;
+    cleanup(&root).await;
+}
+
 #[derive(Debug)]
 enum InputError {
     Native(Error),
@@ -266,6 +298,7 @@ async fn dense_replacement_validates_required_payload_without_repair() {
 
         assert!(tensor.replace_logical_block(0, vec![3.; 2]).await.is_err());
         use crate::TensorWrite;
+
         let point = tensor.write_value(&[0], 3.).await;
         assert!(point.is_err());
         if malformed == 0 {

@@ -1,13 +1,13 @@
 //! Identical cases for production timing and test-only structural profiling.
 
-use fensor::{
-    AxisRange, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
-    TensorTrig, TensorUnary, TensorWrite,
-};
 use ha_ndarray::{axes, shape};
 use number_general::DType;
 
 use super::common;
+use fensor::{
+    AxisRange, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
+    TensorTrig, TensorUnary, TensorWrite,
+};
 
 async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(name: &str, view: &V) {
     super::benchmark::streams(
@@ -26,6 +26,7 @@ pub async fn run() {
             TensorSchema::new(f32::dtype(), shape![2, 3]).unwrap(),
         )
         .await;
+
         source.write_value(&[0, 1], 2.).await.unwrap();
         assert_eq!(source.sum_all().await.unwrap(), 2.);
         measure("smoke", &source.view().sum(axes![1], false).await.unwrap()).await;
@@ -53,6 +54,7 @@ pub async fn run() {
                     }),
                 )
                 .await;
+
                 tensor.sync().await.unwrap();
                 // Check the complete fixture outside the timed region. In particular,
                 // occupied traversal must not skip entries between index separators.
@@ -61,6 +63,7 @@ pub async fn run() {
                     .filter(|(i, j)| !sparse || (i * 129 + j) % 97 == 0)
                     .map(|(i, j)| (((i + j) % 7) as f32 + 0.2) as f64)
                     .sum();
+
                 let actual = tensor.sum_all().await.unwrap() as f64;
                 assert!((actual - expected).abs() <= expected.abs().max(1.) * 1e-5);
                 let label = format!("c{capacity}_s{sparse}_cache{cache_size}");
@@ -71,26 +74,31 @@ pub async fn run() {
                     &view.sum(axes![1], false).await.unwrap(),
                 )
                 .await;
+
                 measure(
                     &format!("{label}_columns"),
                     &view.sum(axes![0], false).await.unwrap(),
                 )
                 .await;
+
                 let selected = view
                     .clone()
                     .slice(vec![AxisRange::In(0, 32, 2), AxisRange::In(1, 129, 2)].into())
                     .unwrap();
+
                 measure(
                     &format!("{label}_strided"),
                     &selected.sum(axes![0], false).await.unwrap(),
                 )
                 .await;
+
                 let unary = view.round().await.unwrap().sin().await.unwrap();
                 measure(
                     &format!("{label}_unary"),
                     &unary.sum(axes![1], false).await.unwrap(),
                 )
                 .await;
+
                 let nested = view
                     .sum(axes![1], true)
                     .await
@@ -98,6 +106,7 @@ pub async fn run() {
                     .sum(axes![0], false)
                     .await
                     .unwrap();
+
                 measure(&format!("{label}_nested"), &nested).await;
                 drop(tensor);
                 common::cleanup(&root).await;
@@ -115,6 +124,7 @@ pub async fn run() {
             (0..2).flat_map(|_| (0..8193).map(|col| if col % 257 == 0 { 1f32 } else { 0. })),
         )
         .await;
+
         tensor.sync().await.unwrap();
         let reduced = tensor.view().sum(axes![1], false).await.unwrap();
         assert_eq!(reduced.read_value(&[0]).await.unwrap(), 32.);

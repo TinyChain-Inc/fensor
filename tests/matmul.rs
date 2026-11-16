@@ -1,16 +1,18 @@
 //! Filesystem-backed tiled matrix multiplication and zero-extended sparse values.
 
+use futures::TryStreamExt;
+use ha_ndarray::{Array, Buffer, MatrixDual, NDArrayRead, Number, axes, range, shape};
+use number_general::DType;
+
 use fensor::{
     AxisRange, Layout, Shape, Tensor, TensorCast, TensorCompareScalar, TensorElement,
     TensorExpression, TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorRead,
     TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere,
     TensorWrite,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{Array, Buffer, MatrixDual, NDArrayRead, Number, axes, range, shape};
-use number_general::DType;
 
 mod common;
+
 use common::{FsEntry, new_dir};
 
 async fn source<T: TensorElement>(
@@ -99,8 +101,11 @@ macro_rules! parity {
         }
     };
 }
+
 parity!(f32_parity, f32, true);
+
 parity!(f64_parity, f64, false);
+
 parity!(u8_parity, u8, false);
 
 #[tokio::test]
@@ -115,19 +120,23 @@ async fn sparse_zero_intermediates_and_copy_match_dense_semantics() {
         .matmul(&b.view())
         .await
         .unwrap();
+
     check(&view, &[0.; 4]).await;
     assert!(matches!(
         view.eq_scalar(0.).await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     let (_dir_root, dir) = new_dir("matmul_zero_copy").await;
     let copy: Tensor<FsEntry, f32> = Tensor::copy_from(dir, &view, view.layout(), 2)
         .await
         .unwrap();
+
     assert!(matches!(
         copy.view().eq_scalar(0.).await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     assert_eq!(view.sum_all().await.unwrap(), 0.);
     let view = TensorExpression::new(view).unwrap().into_dense();
     let copy = TensorExpression::new(copy).unwrap().into_dense();
@@ -139,6 +148,7 @@ async fn sparse_zero_intermediates_and_copy_match_dense_semantics() {
         empty.exp().await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     check(
         &TensorExpression::new(empty)
             .unwrap()
@@ -149,6 +159,7 @@ async fn sparse_zero_intermediates_and_copy_match_dense_semantics() {
         &[1.; 4],
     )
     .await;
+
     let (_cancel_root, cancel) = source(&[1f32, -1.], shape![1, 2], true, 2).await;
     let (_ones_root, ones) = source(&[1f32, 1.], shape![2, 1], true, 1).await;
     let product = cancel.view().matmul(&ones.view()).await.unwrap();
@@ -186,6 +197,7 @@ async fn exceptional_values_and_wrapping_arithmetic() {
         .to_slice()
         .unwrap()
         .into_vec();
+
     check(&a.view().matmul(&b.view()).await.unwrap(), &expected).await;
 }
 
@@ -198,6 +210,7 @@ async fn batches_nested_expressions_and_transforms() {
         3,
     )
     .await;
+
     let (_identity_root, identity) = source(&[1f32, 0., 0., 1.], shape![1, 2, 2], false, 2).await;
     let b = identity.view().broadcast(shape![2, 2, 2]).unwrap();
     let product = a.view().matmul(&b).await.unwrap();
@@ -207,11 +220,13 @@ async fn batches_nested_expressions_and_transforms() {
         &[1., 3., 2., 4., 5., 7., 6., 8.],
     )
     .await;
+
     check(
         &product.clone().reshape(shape![8]).unwrap().flip(0).unwrap(),
         &[8., 7., 6., 5., 4., 3., 2., 1.],
     )
     .await;
+
     check(
         &product
             .clone()
@@ -224,6 +239,7 @@ async fn batches_nested_expressions_and_transforms() {
         &[7., 8., 5., 6., 7., 8.],
     )
     .await;
+
     let selected = product
         .gt_scalar(0.)
         .await
@@ -231,24 +247,28 @@ async fn batches_nested_expressions_and_transforms() {
         .cond(&product, &product)
         .await
         .unwrap();
+
     let nested = selected.matmul(&b).await.unwrap();
     check(
         &nested.sum(axes![0], false).await.unwrap(),
         &[6., 8., 10., 12.],
     )
     .await;
+
     let reduced = a.view().sum(axes![0], true).await.unwrap();
     check(
         &reduced.matmul(&identity.view()).await.unwrap(),
         &[6., 8., 10., 12.],
     )
     .await;
+
     let cast = TensorCast::<f64>::cast(&product).await.unwrap();
     check(
         &cast.matmul(&b.cast().await.unwrap()).await.unwrap(),
         &[1f64, 2., 3., 4., 5., 6., 7., 8.],
     )
     .await;
+
     assert!(a.view().matmul(&identity.view()).await.is_err());
     assert!(
         a.view()
@@ -258,6 +278,7 @@ async fn batches_nested_expressions_and_transforms() {
             .await
             .is_err()
     );
+
     let (_wrong_root, wrong) = source(&[1f32; 6], shape![2, 3], false, 2).await;
     assert!(
         wrong
@@ -266,6 +287,7 @@ async fn batches_nested_expressions_and_transforms() {
             .await
             .is_err()
     );
+
     check(
         &a.view()
             .add(&a.view())
@@ -277,6 +299,7 @@ async fn batches_nested_expressions_and_transforms() {
         &[2., 4., 6., 8., 10., 12., 14., 16.],
     )
     .await;
+
     check(
         &a.view()
             .transpose(Some(axes![0, 2, 1]))
@@ -287,6 +310,7 @@ async fn batches_nested_expressions_and_transforms() {
         &[1., 3., 2., 4., 5., 7., 6., 8.],
     )
     .await;
+
     check(
         &product
             .clone()
@@ -297,6 +321,7 @@ async fn batches_nested_expressions_and_transforms() {
         &[1., 2., 3., 4., 5., 6., 7., 8.],
     )
     .await;
+
     check(
         &product.clone().broadcast(shape![2, 2, 2, 2]).unwrap(),
         &[
@@ -304,6 +329,7 @@ async fn batches_nested_expressions_and_transforms() {
         ],
     )
     .await;
+
     a.write_value(&[0, 0, 0], 9.).await.unwrap();
     assert_eq!(product.read_value(&[0, 0, 0]).await.unwrap(), 9.);
 }
@@ -311,6 +337,7 @@ async fn batches_nested_expressions_and_transforms() {
 fn check_dot_bound(left: &[f64], right: &[f64], actual: f64, u: f64) {
     use num_rational::BigRational;
     use num_traits::Signed;
+
     let mut exact = BigRational::from_integer(0.into());
     let mut scale = exact.clone();
 
@@ -322,6 +349,7 @@ fn check_dot_bound(left: &[f64], right: &[f64], actual: f64, u: f64) {
 
     let ku =
         BigRational::from_float(u).unwrap() * BigRational::from_integer((8 * left.len()).into());
+
     let one = BigRational::from_integer(1.into());
     assert!(ku < one);
     let gamma = &ku / (one - &ku);
@@ -400,7 +428,9 @@ macro_rules! accuracy {
         }
     };
 }
+
 accuracy!(f32_exact_dot, f32);
+
 accuracy!(f64_exact_dot, f64);
 
 #[tokio::test]
@@ -441,6 +471,7 @@ async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
                 .await
                 .unwrap()
         };
+
         let (left, right) = futures::join!(consume(), consume());
         assert_eq!(left, right);
         assert!(left.into_iter().flatten().all(|v| v == 3));
@@ -450,12 +481,14 @@ async fn repeated_concurrent_cancelled_and_cache_pressure_reads() {
         let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, view.layout(), 32)
             .await
             .unwrap();
+
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);
         let copy = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
             .await
             .unwrap();
+
         assert_eq!(copy.read_value(&[64, 64]).await.unwrap(), 3);
     })
     .await
@@ -473,22 +506,26 @@ async fn coordinate_traversal_propagates_and_preserves_coverage() {
         let mut all = Vec::new();
         let mut first_tile = false;
 
-        while let Some((coords, values)) = blocks.try_next().await.unwrap() {
+        while let Some(batch) = blocks.try_next().await.unwrap() {
+            let (coords, values) = batch.into_coordinates(view.shape()).unwrap();
             if coords.first() == Some(&vec![0, 0]) {
                 assert_eq!(coords.len(), 4096);
                 assert_eq!(coords[32], vec![1, 0]);
                 assert_eq!(coords[1024], vec![0, 32]);
                 first_tile = true;
             }
+
             assert!(coords.len() <= 4096);
             assert_eq!(coords.len(), values.len());
             assert!(values.iter().all(|v| *v == 2.));
             all.extend(coords);
         }
+
         assert!(first_tile);
         all.sort();
         assert_eq!(all, common::iter_coords(view.shape()).collect::<Vec<_>>());
     }
+
     tiled(&product).await;
     tiled(&product.round().await.unwrap()).await;
     let (_zero_root, zero) = source(&vec![0f32; 32 * 129], shape![32, 129], true, 31).await;
@@ -519,6 +556,7 @@ async fn coordinate_traversal_propagates_and_preserves_coverage() {
             .unwrap(),
     )
     .await;
+
     tiled(&yes.cond(&product, &zero.view()).await.unwrap()).await;
     tiled(&no.cond(&zero.view(), &product).await.unwrap()).await;
 
@@ -526,7 +564,8 @@ async fn coordinate_traversal_propagates_and_preserves_coverage() {
         let mut seen = Vec::new();
         let mut stream = view.read_coordinate_blocks().unwrap();
 
-        while let Some((coords, values)) = stream.try_next().await.unwrap() {
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let (coords, values) = batch.into_coordinates(view.shape()).unwrap();
             assert_eq!(coords.len(), values.len());
             assert!(coords.len() <= 4096);
 
@@ -535,9 +574,11 @@ async fn coordinate_traversal_propagates_and_preserves_coverage() {
                 assert_eq!(value, view.read_value(&coord).await.unwrap());
             }
         }
+
         seen.sort();
         assert_eq!(seen, common::iter_coords(view.shape()).collect::<Vec<_>>());
     }
+
     covered(&twos.view()).await;
     // Even an empty-axis reduction is a new traversal boundary.
     covered(&product.sum(axes![], false).await.unwrap()).await;
@@ -547,12 +588,14 @@ async fn coordinate_traversal_propagates_and_preserves_coverage() {
     let mut seen = Vec::new();
     let mut blocks = transformed.read_coordinate_blocks().unwrap();
 
-    while let Some((coords, values)) = blocks.try_next().await.unwrap() {
+    while let Some(batch) = blocks.try_next().await.unwrap() {
+        let (coords, values) = batch.into_coordinates(transformed.shape()).unwrap();
         for (coord, value) in coords.iter().zip(values) {
             assert_eq!(transformed.read_value(coord).await.unwrap(), value);
             seen.push(coord.clone());
         }
     }
+
     seen.sort();
     assert_eq!(
         seen,

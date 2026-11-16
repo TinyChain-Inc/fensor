@@ -15,6 +15,7 @@ async fn complete_groups_pack_without_materialization() {
         std::iter::repeat_n(Complex64::ONE, count * width),
     )
     .await;
+
     tensor.sync().await.unwrap();
 
     fn files(path: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
@@ -28,6 +29,7 @@ async fn complete_groups_pack_without_materialization() {
                 paths.insert(path);
             }
         }
+
         paths
     }
 
@@ -37,6 +39,7 @@ async fn complete_groups_pack_without_materialization() {
         .map(|i| vec![i as u64, 0])
         .chain([vec![0, 0], vec![0, 1]])
         .collect();
+
     let request = BatchRequest::explicit(coords).unwrap();
 
     crate::read_metrics::CURRENT
@@ -47,6 +50,7 @@ async fn complete_groups_pack_without_materialization() {
                     .iter()
                     .all(|&v| v == Complex64::new(width as f64, 0.))
             );
+
             let ku = 32. * width as f64 * f64::EPSILON / 2.;
             assert!(batch.values[count + 1].norm() <= ku / (1. - ku) * width as f64);
             crate::read_metrics::CURRENT.with(|m| {
@@ -56,16 +60,19 @@ async fn complete_groups_pack_without_materialization() {
             });
         })
         .await;
+
     assert!(
         crate::expression::traversal::preferred(&view, view.shape())
             .unwrap()
             .is_none()
     );
+
     assert_eq!(
         files(&root),
         before,
         "evaluation must not create result storage"
     );
+
     cleanup(&root).await;
 }
 
@@ -77,10 +84,12 @@ fn invalid_axes_fail_before_execution() {
             Err(Error::InvalidLayout(_))
         ));
     }
+
     assert!(validate_axes(&[MAX_BATCH_ELEMENTS as u64], 1, "fft").is_ok());
     assert!(matches!(
         validate_axes(&[MAX_BATCH_ELEMENTS as u64 + 1], 1, "fft"),
         Err(Error::Unsupported(_))
     ));
+
     assert!(validate_axes(&[u64::MAX, 2], 1, "fft").is_err());
 }

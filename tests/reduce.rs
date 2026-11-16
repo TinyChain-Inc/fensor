@@ -1,14 +1,16 @@
 //! Filesystem-backed reduction semantics and bounded consumption.
+use futures::TryStreamExt;
+use ha_ndarray::{Array, Buffer, NDArrayRead, NDArrayReduce, NDArrayReduceAll, axes, range, shape};
+use number_general::DType;
+
 use fensor::{
     AxisRange, Layout, Shape, Tensor, TensorCompareScalar, TensorElement, TensorFileEntry,
     TensorGeometry, TensorMath, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
     TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
 };
-use futures::TryStreamExt;
-use ha_ndarray::{Array, Buffer, NDArrayRead, NDArrayReduce, NDArrayReduceAll, axes, range, shape};
-use number_general::DType;
 
 mod common;
+
 use common::{FsEntry, new_dir};
 
 async fn source<T: TensorElement>(
@@ -105,13 +107,16 @@ macro_rules! parity {
                                         .unwrap();
                                 let view =
                                     tensor.view().$method(axes.clone(), keepdims).await.unwrap();
-                                assert_eq!(
-                                    view.shape(),
-                                    ha_ndarray::NDArray::shape(&expected)
-                                        .iter()
-                                        .map(|&d| d as u64)
-                                        .collect::<Vec<_>>()
-                                );
+                                let mut expected_shape = ha_ndarray::NDArray::shape(&expected)
+                                    .iter()
+                                    .map(|&d| d as u64)
+                                    .collect::<Vec<_>>();
+                                // Native Tensor shapes are nonempty; all-axis
+                                // reductions represent their scalar as one element.
+                                if expected_shape.is_empty() {
+                                    expected_shape.push(1);
+                                }
+                                assert_eq!(view.shape(), expected_shape);
                                 let buffer = expected.buffer().unwrap();
                                 let expected = buffer.to_slice().unwrap();
                                 if $consumers && axes.as_slice() == [1] {
@@ -132,8 +137,11 @@ macro_rules! parity {
         }
     };
 }
+
 parity!(f32_parity, f32, true);
+
 parity!(f64_parity, f64, false);
+
 parity!(u8_parity, u8, false);
 
 #[tokio::test]
@@ -151,11 +159,13 @@ async fn sparse_zero_extension_preserves_reductions_through_copy() {
         sum.eq_scalar(0.).await,
         Err(fensor::Error::WouldDensify { .. })
     ));
+
     check(
         &rounded.product(axes![1], false).await.unwrap(),
         &[0., 0., 6.],
     )
     .await;
+
     check(&rounded.min(axes![1], false).await.unwrap(), &[0., 0., 2.]).await;
     check(&rounded.max(axes![1], false).await.unwrap(), &[0., 0., 3.]).await;
     let (_dir_root, dir) = new_dir("reduced_support").await;
@@ -174,6 +184,7 @@ async fn sparse_zero_extension_preserves_reductions_through_copy() {
         &[0, 0],
     )
     .await;
+
     check(&empty.view().min(axes![1], false).await.unwrap(), &[0, 0]).await;
 }
 
@@ -188,6 +199,7 @@ async fn composition_transforms_and_live_sources() {
         &[30., 27., 12., 9.],
     )
     .await;
+
     check(
         &view
             .clone()
@@ -196,15 +208,18 @@ async fn composition_transforms_and_live_sources() {
         &[30., 27., 30.],
     )
     .await;
+
     let single = view
         .clone()
         .slice(range![AxisRange::In(0, 1, 1), AxisRange::In(0, 2, 1)])
         .unwrap();
+
     check(
         &single.broadcast(shape![2, 2]).unwrap(),
         &[9., 12., 9., 12.],
     )
     .await;
+
     check(
         &view
             .clone()
@@ -215,6 +230,7 @@ async fn composition_transforms_and_live_sources() {
         &[9., 12., 27., 30.],
     )
     .await;
+
     let transformed = a
         .view()
         .transpose(Some(axes![2, 1, 0]))
@@ -222,6 +238,7 @@ async fn composition_transforms_and_live_sources() {
         .sum(axes![1], false)
         .await
         .unwrap();
+
     check(&transformed, &[9., 27., 12., 30.]).await;
     assert_eq!(
         view.sum(axes![0], true)
@@ -232,6 +249,7 @@ async fn composition_transforms_and_live_sources() {
             .unwrap(),
         78.
     );
+
     let selected = view
         .gt_scalar(20.)
         .await
@@ -239,12 +257,14 @@ async fn composition_transforms_and_live_sources() {
         .cond(&view, &view.add(&view).await.unwrap())
         .await
         .unwrap();
+
     check(&selected.sum(axes![0], false).await.unwrap(), &[45., 54.]).await;
     a.write_value(&[0, 0, 0], 2.).await.unwrap();
     assert_eq!(view.read_value(&[0, 0]).await.unwrap(), 10.);
     let scalar = view
         .slice(range![AxisRange::At(0), AxisRange::At(0)])
         .unwrap();
+
     assert_eq!(scalar.read_value(&[]).await.unwrap(), 10.);
     assert!(scalar.sum_all().await.is_err());
     assert!(scalar.sum(axes![], false).await.is_err());
@@ -292,8 +312,11 @@ macro_rules! sparse_parity {
         }
     };
 }
+
 sparse_parity!(sparse_f32, f32);
+
 sparse_parity!(sparse_f64, f64);
+
 sparse_parity!(sparse_u8, u8);
 
 macro_rules! exceptional {
@@ -335,7 +358,9 @@ macro_rules! exceptional {
         }
     };
 }
+
 exceptional!(f32_exceptional, f32);
+
 exceptional!(f64_exceptional, f64);
 
 #[tokio::test]
@@ -366,13 +391,16 @@ fn exact_bound(values: &[f64], actual: f64, unit_roundoff: f64, product: bool) {
             exact += value;
         }
     }
+
     if product {
         // Normalize once instead of repeatedly taking GCDs of growing exact products.
         exact = BigRational::new(numerator, denominator);
         scale = exact.abs();
     }
+
     let ku = BigRational::from_float(unit_roundoff).unwrap()
         * BigRational::from_integer((8 * values.len()).into());
+
     assert!(ku < one);
     let gamma = &ku / (one - &ku);
     let error = (BigRational::from_float(actual).unwrap() - exact).abs();
@@ -441,7 +469,9 @@ macro_rules! accuracy {
         }
     };
 }
+
 accuracy!(f32_exact_accuracy, f32);
+
 accuracy!(f64_exact_accuracy, f64);
 
 #[tokio::test]
@@ -458,6 +488,7 @@ async fn repeated_concurrent_and_dropped_reduction_streams() {
             .await
             .unwrap()
     };
+
     let (left, right) = futures::join!(consume(), consume());
     assert_eq!(left, right);
     assert_eq!(left.iter().map(Vec::len).collect::<Vec<_>>(), vec![4096, 5]);
@@ -477,6 +508,7 @@ async fn reduction_copy_spills_and_reloads() {
         )
         .await
         .unwrap();
+
         tensor.write_value(&[1023, 3], 255).await.unwrap();
         tensor.sync().await.unwrap();
         drop(tensor);
@@ -492,12 +524,14 @@ async fn reduction_copy_spills_and_reloads() {
         let copy: Tensor<FsEntry, u8> = Tensor::copy_from(dir.clone(), &view, view.layout(), 32)
             .await
             .unwrap();
+
         copy.sync().await.unwrap();
         drop(copy);
         drop(dir);
         let copy = Tensor::<FsEntry, u8>::load(common::open_dir(&root).unwrap())
             .await
             .unwrap();
+
         assert_eq!(copy.read_value(&[1023]).await.unwrap(), 255);
         assert_eq!(copy.sum_all().await.unwrap(), 255);
     })
@@ -508,9 +542,11 @@ async fn reduction_copy_spills_and_reloads() {
 #[tokio::test]
 async fn statistics_include_implicit_zeros_across_batches_and_axes() {
     use fensor::TensorStatistics;
+
     for sparse in [false, true] {
         let (_tensor_root, tensor) =
             source(vec![2.0f64, 0.0, 4.0, 0.0, 0.0, 0.0], shape![2, 3], sparse).await;
+
         assert_eq!(tensor.mean_all().await.unwrap(), 1.0);
         assert!((tensor.std_all().await.unwrap() - (7.0_f64 / 3.0).sqrt()).abs() < 1e-12);
         assert_eq!(tensor.norm_all().await.unwrap(), 20.0_f64.sqrt());
@@ -524,6 +560,7 @@ async fn statistics_include_implicit_zeros_across_batches_and_axes() {
         assert_eq!(zeros.std_all().await.unwrap(), 0.0);
         assert_eq!(zeros.norm_all().await.unwrap(), 0.0);
     }
+
     let (_tensor_root, tensor) = source(vec![3.0f64; 8193], shape![8193], false).await;
     assert_eq!(tensor.mean_all().await.unwrap(), 3.0);
     assert_eq!(tensor.std_all().await.unwrap(), 0.0);
@@ -541,6 +578,7 @@ async fn statistics_include_implicit_zeros_across_batches_and_axes() {
         } else {
             mean == value
         });
+
         assert!(if value.is_nan() {
             tensor.norm_all().await.unwrap().is_nan()
         } else {
@@ -562,6 +600,7 @@ async fn statistics_include_implicit_zeros_across_batches_and_axes() {
         )
         .await
         .unwrap();
+
         tensor.write_value(&[0, 1], 2.).await.unwrap();
         tensor.write_value(&[0, len - 1], 3.).await.unwrap();
 
@@ -614,10 +653,96 @@ async fn statistics_include_implicit_zeros_across_batches_and_axes() {
     .expect("indexed reductions must not scan implicit-zero gaps");
 }
 
+#[tokio::test]
+async fn statistical_scaling_survives_batches_axes_and_sparse_zeros() {
+    use fensor::TensorStatistics;
+
+    for sparse in [false, true] {
+        // Cross the execution batch boundary and leave implicit sparse zeros.
+        let mut values = vec![0.; 8194];
+        values[0] = -1e200;
+        values[4096] = 1e200;
+        let (_root, tensor) = source(values, shape![2, 4097], sparse).await;
+        let close = |actual: f64, expected: f64| {
+            assert!(
+                (actual / expected - 1.).abs() < 1e-14,
+                "{actual:e} != {expected:e}"
+            );
+        };
+
+        assert_eq!(tensor.mean_all().await.unwrap(), 0.);
+        close(tensor.norm_all().await.unwrap(), 2f64.sqrt() * 1e200);
+        close(tensor.std_all().await.unwrap(), 1e200 / 4097f64.sqrt());
+        let norms = tensor.view().norm(axes![1], false).await.unwrap();
+        let deviations = tensor.view().std(axes![1], true).await.unwrap();
+        // Both nonzero values are in row zero, row one is entirely absent.
+        assert_eq!(norms.shape(), &[2]);
+        common::fixture::blocks(&norms, &[2f64.sqrt() * 1e200, 0.], |a, b| {
+            a == b || (a / b - 1.).abs() < 1e-14
+        })
+        .await;
+
+        close(norms.read_value(&[0]).await.unwrap(), 2f64.sqrt() * 1e200);
+        assert_eq!(norms.read_value(&[1]).await.unwrap(), 0.);
+        assert_eq!(deviations.shape(), &[2, 1]);
+        common::fixture::blocks(&deviations, &[1e200 * (2. / 4097f64).sqrt(), 0.], |a, b| {
+            a == b || (a / b - 1.).abs() < 1e-14
+        })
+        .await;
+
+        close(
+            deviations.read_value(&[0, 0]).await.unwrap(),
+            1e200 * (2. / 4097f64).sqrt(),
+        );
+
+        assert_eq!(deviations.read_value(&[1, 0]).await.unwrap(), 0.);
+
+        let (_root, tensor) = source(vec![1e308; 2], shape![2], sparse).await;
+        assert_eq!(tensor.mean_all().await.unwrap(), 1e308);
+        let means = tensor.view().mean(axes![0], false).await.unwrap();
+        assert_eq!(means.read_value(&[0]).await.unwrap(), 1e308);
+        let (_root, tensor) = source(vec![1e-200], shape![1], sparse).await;
+        assert_eq!(tensor.norm_all().await.unwrap(), 1e-200);
+    }
+}
+
+#[cfg(feature = "complex")]
+#[tokio::test]
+async fn complex_statistical_components_scale_independently() {
+    use fensor::TensorStatistics;
+    use fensor::complex::Complex64;
+
+    for sparse in [false, true] {
+        let (_root, tensor) = source(
+            vec![Complex64::new(1e308, 1.), Complex64::new(1e308, 2.)],
+            shape![2],
+            sparse,
+        )
+        .await;
+
+        assert_eq!(tensor.mean_all().await.unwrap(), Complex64::new(1e308, 1.5));
+        assert_eq!(tensor.std_all().await.unwrap(), 0.5);
+        let deviation = tensor.view().std(axes![0], false).await.unwrap();
+        assert_eq!(deviation.read_value(&[0]).await.unwrap(), 0.5);
+
+        let tiny = f64::from_bits(1);
+        let (_root, tensor) = source(
+            vec![Complex64::new(0., 0.), Complex64::new(tiny, tiny)],
+            shape![2],
+            sparse,
+        )
+        .await;
+
+        assert_eq!(tensor.std_all().await.unwrap(), tiny);
+    }
+}
+
 #[cfg(feature = "complex")]
 #[tokio::test]
 async fn complex_statistics_use_magnitude_and_preserve_mean_dtype() {
-    use fensor::{TensorStatistics, complex::Complex64};
+    use fensor::TensorStatistics;
+    use fensor::complex::Complex64;
+
     for sparse in [false, true] {
         let (_tensor_root, tensor) = source(
             vec![Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)],
@@ -625,11 +750,13 @@ async fn complex_statistics_use_magnitude_and_preserve_mean_dtype() {
             sparse,
         )
         .await;
+
         assert_eq!(tensor.mean_all().await.unwrap(), Complex64::new(2.0, 3.0));
         assert_eq!(tensor.std_all().await.unwrap(), 2.0f64.sqrt());
         assert_eq!(tensor.norm_all().await.unwrap(), 30.0f64.sqrt());
         let (_baseline_root, baseline) =
             source(vec![Complex64::new(1.0, 2.0); 2], shape![2], sparse).await;
+
         let zeros = tensor.view().sub(&baseline.view()).await.unwrap();
         assert_eq!(zeros.mean_all().await.unwrap(), Complex64::new(1.0, 1.0));
         let mean = zeros.mean(axes![0], true).await.unwrap();
@@ -637,6 +764,7 @@ async fn complex_statistics_use_magnitude_and_preserve_mean_dtype() {
             mean.read_value(&[0]).await.unwrap(),
             Complex64::new(1.0, 1.0)
         );
+
         assert_eq!(
             zeros
                 .std(axes![0], false)
@@ -671,24 +799,33 @@ macro_rules! statistics_dtype {
         }
     };
 }
+
 statistics_dtype!(statistics_u8, u8);
+
 statistics_dtype!(statistics_u16, u16);
+
 statistics_dtype!(statistics_u32, u32);
+
 statistics_dtype!(statistics_u64, u64);
+
 statistics_dtype!(statistics_i8, i8);
+
 statistics_dtype!(statistics_i16, i16);
+
 statistics_dtype!(statistics_i32, i32);
+
 statistics_dtype!(statistics_i64, i64);
+
 statistics_dtype!(statistics_f32, f32);
+
 statistics_dtype!(statistics_f64, f64);
 
 #[cfg(feature = "complex")]
 #[tokio::test]
 async fn complex32_statistics_promote_to_complex64_and_float64() {
-    use fensor::{
-        TensorStatistics,
-        complex::{Complex32, Complex64},
-    };
+    use fensor::TensorStatistics;
+    use fensor::complex::{Complex32, Complex64};
+
     let (_tensor_root, tensor) = source(
         vec![
             Complex32::new(1.0, 2.0),
@@ -700,6 +837,7 @@ async fn complex32_statistics_promote_to_complex64_and_float64() {
         true,
     )
     .await;
+
     let mean: Complex64 = tensor.mean_all().await.unwrap();
     assert_eq!(mean, Complex64::new(1.0, 1.5));
     assert_eq!(tensor.std_all().await.unwrap(), 4.25f64.sqrt());

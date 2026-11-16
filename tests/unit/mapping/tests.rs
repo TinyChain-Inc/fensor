@@ -7,6 +7,7 @@ fn signed_mapping_overflow_is_a_structured_error() {
         axes: vec![AxisContrib::Stride(i128::MAX)],
         shape: smallvec::smallvec![3],
     };
+
     assert!(matches!(map.flat_offset(&[2]), Err(Error::InvalidCoord(_))));
     assert!(matches!(map.clone().flip(0), Err(Error::InvalidLayout(_))));
     assert!(matches!(
@@ -14,6 +15,7 @@ fn signed_mapping_overflow_is_a_structured_error() {
             .slice(smallvec::smallvec![AxisRange::In(0, 3, 2)]),
         Err(Error::InvalidLayout(_))
     ));
+
     assert!(matches!(
         map.slice(smallvec::smallvec![AxisRange::Of(vec![2])]),
         Err(Error::InvalidLayout(_))
@@ -30,14 +32,17 @@ fn gather_transforms_share_the_original_table() {
     for view in [&sliced, &flipped, &nested] {
         assert!(Arc::ptr_eq(&original.offsets, &view.offsets));
     }
+
     assert_eq!(
         (0..3).map(|i| *flipped.get(i).unwrap()).collect::<Vec<_>>(),
         [3, 4, 2]
     );
+
     assert_eq!(
         (0..2).map(|i| *nested.get(i).unwrap()).collect::<Vec<_>>(),
         [4, 2]
     );
+
     assert_eq!(*original.get(0).unwrap(), *original.get(2).unwrap());
     assert_eq!(
         *nested

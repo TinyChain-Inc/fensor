@@ -73,11 +73,13 @@ impl TensorTransform for Operand {
         let AxisRange::Of(indices) = &range[0] else {
             panic!("expected owned indices")
         };
+
         assert_eq!(indices, &[1, 0, 1]);
         self.visited
             .lock()
             .unwrap()
             .push((self.id, indices.as_ptr() as usize));
+
         if self.fail_at == Some(self.id) {
             Err(Error::InvalidCoord(format!("operand {}", self.id)))
         } else {

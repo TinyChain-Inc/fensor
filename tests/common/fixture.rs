@@ -1,13 +1,13 @@
 //! Concrete filesystem fixtures and consumer checks. Comparators belong to the
 //! numerical case: exact equality, signed zeros, NaNs, and tolerances differ.
 
-use fensor::{
-    AxisRange, Layout, Shape, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
-};
 use futures::TryStreamExt;
 use ha_ndarray::Number;
 
 use super::{Directory, FsEntry, cleanup, iter_coords, new_dir, open_dir};
+use fensor::{
+    AxisRange, Layout, Shape, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
+};
 
 pub fn layout(sparse: bool) -> Layout {
     if sparse {
@@ -33,6 +33,7 @@ where
     let dir = freqfs::Cache::new(cache, None, 0, std::time::Duration::from_secs(1))
         .load(root.to_path_buf())
         .unwrap();
+
     let schema = TensorSchema::new(T::dtype(), shape.clone()).unwrap();
     let mut values = values.into_iter();
     let tensor = match layout {
@@ -47,6 +48,7 @@ where
                 let value = values.next().expect("fixture value for every coordinate");
                 (value != T::ZERO).then_some(Ok::<_, fensor::Error>((coord, value)))
             });
+
             Tensor::from_sparse_elements(
                 dir,
                 schema,
@@ -58,6 +60,7 @@ where
             .unwrap()
         }
     };
+
     assert!(values.next().is_none(), "excess fixture values");
     (root, tensor)
 }
@@ -81,9 +84,11 @@ pub async fn blocks<V: TensorRead>(
                 "at {offset}: actual {value:?}, expected {:?}",
                 expected[offset]
             );
+
             offset += 1;
         }
     }
+
     assert_eq!(offset, expected.len(), "output count");
 }
 
@@ -102,6 +107,7 @@ pub async fn reads<V: TensorRead>(
             "at {coord:?}: {actual:?} != {value:?}"
         );
     }
+
     if matches!(view.layout(), Layout::Sparse { .. }) {
         let mut entries = view
             .read_sparse_elements_in_order(
@@ -113,6 +119,7 @@ pub async fn reads<V: TensorRead>(
             )
             .await
             .unwrap();
+
         for (coord, value) in iter_coords(view.shape())
             .zip(expected)
             .filter(|(_, v)| **v != V::DType::ZERO)
@@ -124,6 +131,7 @@ pub async fn reads<V: TensorRead>(
                 "at {coord:?}: {actual:?} != {value:?}"
             );
         }
+
         assert!(entries.try_next().await.unwrap().is_none());
     }
 }
@@ -140,12 +148,14 @@ pub async fn copied<V: TensorRead>(
     let copy: Tensor<FsEntry, V::DType> = Tensor::copy_from(dir.clone(), view, view.layout(), 17)
         .await
         .unwrap();
+
     copy.sync().await.unwrap();
     drop(copy);
     drop(dir);
     let copy = Tensor::<FsEntry, V::DType>::load(open_dir(&root).unwrap())
         .await
         .unwrap();
+
     blocks(&copy, expected, equal).await;
     drop(copy);
     cleanup(&root).await;

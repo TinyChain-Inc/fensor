@@ -1,13 +1,12 @@
 use std::future::Future;
 
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
-
+pub use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use number_general::NumberType;
 
 use crate::schema::Layout;
 use crate::{Axes, Error, Range, Result, Shape, TensorSchema, validate};
-
-pub use futures::future::BoxFuture;
 
 /// Minimal shape/dtype surface shared by base tensors AND their views.
 pub trait TensorGeometry: Send + Sync {
@@ -52,7 +51,54 @@ pub type ValueBlockStream<'a, T> = BoxStream<'a, Result<Vec<T>>>;
 /// Coordinates and values have equal length within the
 /// [`crate::MAX_BATCH_ELEMENTS`] execution limit.
 /// Each call is independent.
-pub type CoordinateBlockStream<'a, T> = BoxStream<'a, Result<(Vec<Vec<u64>>, Vec<T>)>>;
+pub type CoordinateBlockStream<'a, T> = BoxStream<'a, Result<CoordinateBatch<T>>>;
+
+/// One bounded numerical batch with its compact coordinate request.
+/// Coordinate expansion is explicit; native construction consumes the request directly.
+#[derive(Debug)]
+pub struct CoordinateBatch<T> {
+    request: crate::request::BatchRequest,
+    values: Vec<T>,
+}
+
+impl<T> CoordinateBatch<T> {
+    pub(crate) fn new(request: crate::request::BatchRequest, values: Vec<T>) -> Result<Self> {
+        if request.len() != values.len() {
+            return Err(Error::InvalidLayout(
+                "coordinate/value cardinality mismatch".into(),
+            ));
+        }
+
+        Ok(Self { request, values })
+    }
+
+    /// Construct a batch from explicit coordinates. Consumers validate its shape.
+    pub fn from_coordinates(coords: Vec<Vec<u64>>, values: Vec<T>) -> Result<Self> {
+        Self::new(crate::request::BatchRequest::explicit(coords)?, values)
+    }
+
+    pub fn values(&self) -> &[T] {
+        &self.values
+    }
+
+    pub fn into_values(self) -> Vec<T> {
+        self.values
+    }
+
+    /// Expand at an explicit coordinate consumer, retaining the execution-batch bound.
+    pub fn into_coordinates(self, shape: &[u64]) -> Result<(Vec<Vec<u64>>, Vec<T>)> {
+        let (request, values) = self.into_request(shape)?;
+        Ok((request.into_coordinates(shape)?, values))
+    }
+
+    pub(crate) fn into_request(
+        self,
+        shape: &[u64],
+    ) -> Result<(crate::request::BatchRequest, Vec<T>)> {
+        self.request.validate(shape)?;
+        Ok((self.request, self.values))
+    }
+}
 
 /// Async value reads aligned with ndarray coordinate semantics.
 pub trait TensorRead: TensorGeometry {
@@ -78,12 +124,13 @@ pub trait TensorRead: TensorGeometry {
     /// Read all logical coordinates in bounded blocks, without promising row-major order.
     /// Exactly-once coverage is an implementer's contract, not globally tracked state.
     fn read_coordinate_blocks(&self) -> Result<CoordinateBlockStream<'_, Self::DType>> {
-        let coords = crate::schema::row_major_coords(self.shape())?;
+        crate::schema::validate_shape_dims(self.shape())?;
+        let expected = self.size()?;
         let blocks = self.read_blocks()?;
         Ok(
-            futures::stream::try_unfold((coords, blocks), |(mut coords, mut blocks)| async move {
+            futures::stream::try_unfold((0u64, blocks), move |(start, mut blocks)| async move {
                 let Some(values) = blocks.try_next().await? else {
-                    if coords.next().is_some() {
+                    if start != expected {
                         return Err(Error::InvalidLayout(
                             "reader returned fewer values than its shape".into(),
                         ));
@@ -92,22 +139,21 @@ pub trait TensorRead: TensorGeometry {
                     return Ok(None);
                 };
 
-                if values.len() > crate::expression::MAX_BATCH_ELEMENTS {
-                    return Err(Error::InvalidLayout(format!(
-                        "coordinate block: expected at most {} values, got {}",
-                        crate::expression::MAX_BATCH_ELEMENTS,
-                        values.len()
-                    )));
-                }
+                let request = crate::request::BatchRequest::linear(start, values.len())?;
+                let end = start
+                    .checked_add(values.len() as u64)
+                    .filter(|end| *end <= expected);
 
-                let selected: Vec<_> = coords.by_ref().take(values.len()).collect();
-                if selected.len() != values.len() {
+                let Some(end) = end else {
                     return Err(Error::InvalidLayout(
                         "reader returned more values than its shape".into(),
                     ));
-                }
+                };
 
-                Ok(Some(((selected, values), (coords, blocks))))
+                Ok(Some((
+                    CoordinateBatch::new(request, values)?,
+                    (end, blocks),
+                )))
             })
             .boxed(),
         )
@@ -365,6 +411,7 @@ where
     type LogOutput: TensorRead<DType = Self::DType>
     where
         Self::DType: ha_ndarray::Float;
+
     type RemOutput: TensorRead<DType = Self::DType>
     where
         Self::DType: ha_ndarray::Real;
@@ -745,6 +792,7 @@ pub trait TensorMatrixUnaryComplex: TensorGeometry {
 #[cfg(feature = "complex")]
 pub trait TensorFourier: TensorGeometry {
     type FftOutput: TensorRead<DType = Self::DType>;
+
     type IfftOutput: TensorRead<DType = Self::DType>;
 
     fn fft(&self) -> impl Future<Output = Result<Self::FftOutput>> + Send + '_;

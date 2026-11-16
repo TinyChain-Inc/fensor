@@ -250,9 +250,14 @@ responsible for limiting decoding allocations before fensor receives a payload.
 |---|---|
 | `read_blocks()` | Logical row-major values |
 | `read_sparse_elements_in_order()` | Requested row-major sparse order |
-| `read_coordinate_blocks()` | Preferred-request-order batches of paired coordinates/values |
+| `read_coordinate_blocks()` | Preferred-request-order `CoordinateBatch` values retaining compact coordinates |
 | Whole-tensor numeric terminals | Accumulate batches in request order |
 | Boolean terminals | Logical order with short-circuiting |
+
+A `CoordinateBatch` owns its compact request and value buffer. Native copying
+consumes that request directly; `into_values` moves a value-only result, while
+`into_coordinates(shape)` explicitly expands a bounded batch for coordinate
+consumers. Custom readers construct checked batches with `from_coordinates`.
 
 A successful complete coordinate stream visits every logical coordinate exactly
 once, including zeros. Its default adapter pairs row-major values with coordinates;

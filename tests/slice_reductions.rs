@@ -1,11 +1,12 @@
 mod common;
 
+use ha_ndarray::{axes, shape};
+use number_general::DType;
+
 use fensor::{
     Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
     TensorWrite,
 };
-use ha_ndarray::{axes, shape};
-use number_general::DType;
 
 macro_rules! indexed_dtype {
     ($test:ident,$dtype:ty) => {
@@ -72,7 +73,9 @@ macro_rules! indexed_dtype {
 }
 
 indexed_dtype!(indexed_f32, f32);
+
 indexed_dtype!(indexed_f64, f64);
+
 indexed_dtype!(indexed_u8, u8);
 
 // Index topology is dtype-independent; the fixtures above own dtype parity.
@@ -114,11 +117,13 @@ async fn indexed_topology() {
                         .unwrap(),
                     expected
                 );
+
                 tensor.sync().await.unwrap();
                 drop(tensor);
                 let loaded = Tensor::<common::FsEntry, f32>::load(common::open_dir(&root).unwrap())
                     .await
                     .unwrap();
+
                 assert_eq!(loaded.sum_all().await.unwrap(), expected);
                 common::cleanup(&root).await;
             }

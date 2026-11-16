@@ -74,6 +74,7 @@ where
         source: crate::TensorExpression<S::DType>,
     ) -> Result<futures::stream::BoxStream<'static, Result<crate::BlockUpdates<S::DType>>>> {
         use futures::StreamExt;
+
         self.validate_geometry(geometry)?;
         if self.shape() != source.shape() {
             return Err(Error::InvalidLayout(

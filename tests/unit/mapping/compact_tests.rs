@@ -15,6 +15,7 @@ fn identity_is_structural_and_mapping_reuses_scratch() {
             .unwrap()
             .is_identity(&shape, &strides)
     );
+
     let mut out = Coord::with_capacity(2);
     let ptr = out.as_ptr();
 
@@ -23,6 +24,7 @@ fn identity_is_structural_and_mapping_reuses_scratch() {
             flipped
                 .resolve_into(&[row, col], &shape, &strides, &mut out)
                 .unwrap();
+
             assert_eq!(out.as_slice(), &[row, 3 - col]);
             assert_eq!(out.as_ptr(), ptr);
         }
@@ -34,6 +36,7 @@ fn identity_is_structural_and_mapping_reuses_scratch() {
         bad.resolve_into(&[0, 0], &shape, &strides, &mut out)
             .is_err()
     );
+
     bad.base_offset = i128::MAX;
     assert!(
         bad.resolve_into(&[2, 3], &shape, &strides, &mut out)

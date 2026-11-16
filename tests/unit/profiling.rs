@@ -41,6 +41,7 @@ async fn observe(
                         benchmark::record(name, operation, temperature, metric, "count", value);
                     }
                 });
+
                 crate::tensor::copy_metrics::CURRENT.with(|m| {
                     let m = m.borrow();
 
@@ -54,6 +55,7 @@ async fn observe(
                         benchmark::record(name, operation, temperature, metric, "count", value);
                     }
                 });
+
                 count
             }),
         )

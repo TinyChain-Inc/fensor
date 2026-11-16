@@ -70,10 +70,10 @@ mod math_unary {
     use ha_ndarray::{axes, range, shape};
     use number_general::{FloatType, NumberType};
 
-    use crate::test_support::{self as common, FsEntry, new_dir};
+    use crate::test_support::{FsEntry, new_dir};
     use crate::{
         AxisRange, Layout, Tensor, TensorExpression, TensorRead, TensorSchema, TensorTransform,
-        TensorUnary, TensorWrite,
+        TensorUnary, TensorWrite, test_support as common,
     };
 
     #[tokio::test]
@@ -225,6 +225,7 @@ mod storage_source {
         assert_eq!(reopened.read_value(&[1, 0]).await.unwrap(), 2.0);
         cleanup(&root).await;
         use crate::{AxisRange, TensorTransform, TensorWriteBulk};
+
         for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
             let (root, dir) = new_dir("compact_borrowed_fragments").await;
             let tensor = Tensor::<FsEntry, f64>::create(
@@ -248,9 +249,12 @@ mod storage_source {
             let view = tensor.view().transpose(None).unwrap();
             crate::read_metrics::CURRENT
                 .scope(Default::default(), async {
+                    use crate::TensorGeometry;
+
                     let mut stream = view.read_coordinate_blocks().unwrap();
                     let mut count = 0;
-                    while let Some((coords, values)) = stream.try_next().await.unwrap() {
+                    while let Some(batch) = stream.try_next().await.unwrap() {
+                        let (coords, values) = batch.into_coordinates(view.shape()).unwrap();
                         for (coord, value) in coords.into_iter().zip(values) {
                             assert_eq!(value, (coord[1] * 5 + coord[0] + 1) as f64);
                             count += 1;
@@ -330,10 +334,10 @@ mod matmul {
     use ha_ndarray::{axes, range, shape};
     use number_general::DType;
 
-    use crate::test_support::{self as common, FsEntry, new_dir};
+    use crate::test_support::{FsEntry, new_dir};
     use crate::{
         AxisRange, Layout, Tensor, TensorMatMul, TensorRead, TensorSchema, TensorTransform,
-        TensorWrite,
+        TensorWrite, test_support as common,
     };
 
     #[tokio::test]
@@ -406,10 +410,11 @@ mod math_binary {
     use ha_ndarray::{range, shape};
     use number_general::DType;
 
-    use crate::test_support::{self as common, FsEntry, new_dir};
+    use crate::test_support::{FsEntry, new_dir};
     use crate::{
         AxisRange, Layout, Tensor, TensorBooleanScalar, TensorExpression, TensorMath, TensorRead,
         TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
+        test_support as common,
     };
 
     #[tokio::test]

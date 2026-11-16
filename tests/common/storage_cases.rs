@@ -2,10 +2,10 @@
 
 use std::time::Instant;
 
-use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
 use number_general::DType;
 
 use super::{benchmark, common};
+use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
 
 pub async fn storage() {
     let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();
@@ -135,6 +135,7 @@ pub async fn storage() {
 
 pub async fn mutation() {
     use fensor::{StorageGeometry, TensorWriteBulk};
+
     for (layout, capacities) in [
         (Layout::Dense, [64, 256]),
         (Layout::Sparse { axis: Some(0) }, [16, 64]),
@@ -250,8 +251,10 @@ pub async fn replacement() {
 }
 
 pub async fn traversal() {
-    use fensor::{TensorExpression, TensorReduceAll, TensorTransform};
     use futures::TryStreamExt;
+
+    use fensor::{TensorExpression, TensorReduceAll, TensorTransform};
+
     let repeats = workload_repetitions(4);
     for layout in [
         Layout::Dense,
@@ -388,8 +391,9 @@ pub async fn traversal() {
 }
 
 async fn sparse_output() {
-    use fensor::TensorExpression;
     use futures::TryStreamExt;
+
+    use fensor::TensorExpression;
 
     let repeats = workload_repetitions(32);
     for rank in [1, 20] {
@@ -435,8 +439,9 @@ async fn sparse_output() {
 }
 
 async fn sparse_union() {
-    use fensor::{TensorExpression, TensorMath};
     use futures::TryStreamExt;
+
+    use fensor::{TensorExpression, TensorMath};
 
     let repeats = workload_repetitions(4);
     for rank in [2, 9] {
@@ -528,8 +533,9 @@ async fn sparse_union() {
 }
 
 async fn sparse_selections() {
-    use fensor::{AxisRange, TensorExpression, TensorTransform};
     use futures::TryStreamExt;
+
+    use fensor::{AxisRange, TensorExpression, TensorTransform};
 
     let repeats = workload_repetitions(128);
     let (_root, tensor) = common::fixture::source(

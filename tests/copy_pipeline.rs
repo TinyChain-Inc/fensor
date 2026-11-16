@@ -3,20 +3,93 @@
 use std::sync::Mutex;
 use std::task::Poll;
 
-use fensor::{
-    CoordinateBlockStream, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorWrite,
-};
 use freqfs::{DirLock, FileWriteGuardOwned};
 use futures::channel::oneshot;
 use futures::{FutureExt, StreamExt};
 use ha_ndarray::shape;
 use number_general::{DType, NumberType};
 
+use fensor::{
+    CoordinateBlockStream, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorWrite,
+};
+
 mod common;
+
 use common::FsEntry;
 use common::counters::Counter;
 
 type GuardSender = oneshot::Sender<FileWriteGuardOwned<FsEntry, Vec<u8>>>;
+
+#[tokio::test]
+async fn empty_ready_batches_yield_without_speculative_reads() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmptyPrefix {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        consumed: Arc<AtomicUsize>,
+    }
+
+    impl TensorGeometry for EmptyPrefix {
+        type DType = u8;
+
+        fn dtype(&self) -> NumberType {
+            u8::dtype()
+        }
+
+        fn shape(&self) -> &[u64] {
+            &[1]
+        }
+
+        fn layout(&self) -> Layout {
+            Layout::Dense
+        }
+    }
+
+    impl TensorRead for EmptyPrefix {
+        fn read_value<'a>(&'a self, _: &'a [u64]) -> fensor::BoxFuture<'a, fensor::Result<u8>> {
+            Box::pin(async { Ok(1) })
+        }
+
+        fn read_coordinate_blocks(&self) -> fensor::Result<CoordinateBlockStream<'_, u8>> {
+            let mut started = self.started.lock().unwrap().take();
+            let consumed = self.consumed.clone();
+            Ok(futures::stream::iter(0..=10_000)
+                .map(move |index| {
+                    if let Some(started) = started.take() {
+                        started.send(()).unwrap();
+                    }
+
+                    consumed.fetch_add(1, Ordering::Relaxed);
+                    if index == 10_000 {
+                        fensor::CoordinateBatch::from_coordinates(vec![vec![0]], vec![1])
+                    } else {
+                        fensor::CoordinateBatch::from_coordinates(vec![], vec![])
+                    }
+                })
+                .boxed())
+        }
+    }
+
+    let (started, wait) = oneshot::channel();
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let source = EmptyPrefix {
+        started: Mutex::new(Some(started)),
+        consumed: consumed.clone(),
+    };
+
+    let (_root, dir) = common::new_dir("empty_copy_batches").await;
+    let (copied, ()) = tokio::join!(
+        Tensor::<FsEntry, u8>::copy_from(dir, &source, Layout::Dense, 1),
+        async {
+            wait.await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(consumed.load(Ordering::Relaxed) < 10_000);
+        }
+    );
+
+    assert_eq!(copied.unwrap().read_value(&[0]).await.unwrap(), 1);
+}
 
 struct Reader<'a> {
     source: &'a Tensor<FsEntry, u8>,
@@ -65,6 +138,7 @@ impl TensorRead for Reader<'_> {
                 if index == 3 {
                     return Ok(None);
                 }
+
                 if index == 0 {
                     // Inject a valid construction block and hold it so the first
                     // update waits on freqfs before another source batch is requested.
@@ -75,12 +149,14 @@ impl TensorRead for Reader<'_> {
                         .get_dir("blocks")
                         .unwrap()
                         .clone();
+
                     blocks
                         .write()
                         .await
                         .create_file("0".into(), vec![0u8])
                         .await
                         .unwrap();
+
                     let file = blocks.read().await.get_file("0").unwrap().clone();
                     let guard = file.write_owned::<Vec<u8>>().await.unwrap();
                     self.guard
@@ -95,8 +171,12 @@ impl TensorRead for Reader<'_> {
                 } else if self.stall_read {
                     futures::future::pending::<()>().await;
                 }
+
                 let value = self.source.read_value(&[index]).await?;
-                Ok(Some(((vec![vec![index]], vec![value]), (index + 1, drop))))
+                let batch =
+                    fensor::CoordinateBatch::from_coordinates(vec![vec![index]], vec![value])?;
+
+                Ok(Some((batch, (index + 1, drop))))
             },
         )
         .boxed())
@@ -113,9 +193,11 @@ async fn source() -> (common::Directory, Tensor<FsEntry, u8>) {
     )
     .await
     .unwrap();
+
     for i in 0..3 {
         tensor.write_value(&[i], i as u8 + 1).await.unwrap();
     }
+
     (root, tensor)
 }
 
@@ -133,11 +215,13 @@ async fn destination_backpressure_stops_source_consumption() {
         fail_read: false,
         stall_read: false,
     };
+
     let mut copy = Box::pin(Tensor::copy_from(dir.clone(), &reader, reader.layout(), 1));
     let guard = futures::select! {
         guard = receive.fuse() => guard.unwrap(),
         _ = copy.as_mut().fuse() => panic!("copy completed before releasing its block"),
     };
+
     assert!(matches!(futures::poll!(copy.as_mut()), Poll::Pending));
     assert_eq!(reader.reads.read(), 1, "no source lookahead while writing");
     let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
@@ -149,15 +233,18 @@ async fn destination_backpressure_stops_source_consumption() {
         4,
         "three blocks and exactly one EOF poll"
     );
+
     assert_eq!(reader.dropped.read(), 1);
     output.sync().await.unwrap();
     drop(output);
     let loaded = Tensor::<FsEntry, u8>::load(common::open_dir(&out_root).unwrap())
         .await
         .unwrap();
+
     for i in 0..3 {
         assert_eq!(loaded.read_value(&[i]).await.unwrap(), i as u8 + 1);
     }
+
     common::cleanup(&root).await;
     common::cleanup(&out_root).await;
 }
@@ -184,16 +271,19 @@ async fn cancellation_and_errors_release_the_active_operation_and_source() {
             fail_read,
             stall_read,
         };
+
         let mut copy = Box::pin(Tensor::copy_from(dir.clone(), &reader, reader.layout(), 1));
         let mut guard = Some(futures::select! {
             guard = receive.fuse() => guard.unwrap(),
             _ = copy.as_mut().fuse() => panic!("copy completed before releasing its block"),
         });
+
         assert!(futures::poll!(copy.as_mut()).is_pending());
         assert_eq!(reader.reads.read(), 1);
         if corrupt {
             guard.as_mut().unwrap().clear();
         }
+
         if fail_read || stall_read {
             drop(guard.take());
             if corrupt {
@@ -201,6 +291,7 @@ async fn cancellation_and_errors_release_the_active_operation_and_source() {
                     copy.as_mut().await,
                     Err(fensor::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
                 ));
+
                 assert_eq!(
                     reader.reads.read(),
                     1,
@@ -215,9 +306,11 @@ async fn cancellation_and_errors_release_the_active_operation_and_source() {
                 } else {
                     assert!(futures::poll!(copy.as_mut()).is_pending());
                 }
+
                 assert_eq!(reader.reads.read(), 2);
             }
         }
+
         // The write-cancellation case still owns its destination guard here.
         drop(copy);
         drop(guard);
@@ -231,5 +324,6 @@ async fn cancellation_and_errors_release_the_active_operation_and_source() {
         assert_eq!(reader.reads.read(), reads);
         common::cleanup(&out_root).await;
     }
+
     common::cleanup(&root).await;
 }

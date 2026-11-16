@@ -1,10 +1,9 @@
 //! Matched resident layout controls, shared by timing and test-local profiling.
 
+use super::{benchmark, common};
 use fensor::{
     Layout, TensorAbs, TensorExpression, TensorRead, TensorReduceAll, TensorSource, TensorTransform,
 };
-
-use super::{benchmark, common};
 
 async fn consume<E: TensorRead<DType = f32> + TensorReduceAll>(
     name: &str,
