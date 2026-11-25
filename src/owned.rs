@@ -11,8 +11,8 @@ use crate::expression::{Batch, Expression};
 use crate::mapping::CoordinateMap;
 use crate::request::BatchRequest;
 use crate::{
-    BoxFuture, Error, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
-    TensorViewSemantics, expression,
+    BoxFuture, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
+    expression,
 };
 
 /// An owned, read-only tensor value for runtime composition.
@@ -32,7 +32,6 @@ pub struct TensorExpression<T: TensorElement> {
 struct Owned<T: TensorElement> {
     expression: Box<dyn Expression<DType = T>>,
     nodes: usize,
-    zero: T,
     layout: Layout,
 }
 
@@ -65,7 +64,6 @@ impl<T: TensorElement> TensorExpression<T> {
     pub fn new<E: Expression<DType = T> + 'static>(source: E) -> Result<Self> {
         let nodes = expression::traversal::node_count([source.expression_nodes()?])?;
         let layout = source.layout();
-        let zero = source.implicit_zero();
         let strides = crate::contiguous_strides(source.shape())?;
         let mapping = CoordinateMap::identity(source.shape().into(), &strides);
 
@@ -73,7 +71,6 @@ impl<T: TensorElement> TensorExpression<T> {
             source: Some(Arc::new(Owned {
                 expression: Box::new(source),
                 nodes,
-                zero,
                 layout,
             })),
             mapping,
@@ -106,10 +103,8 @@ impl<T: TensorElement> TensorExpression<T> {
     }
 
     pub fn into_sparse_elements(self) -> Result<crate::SparseElementStream<'static, T>> {
-        let requests =
-            expression::traversal::ordered(&self, crate::slice::Slice::full(self.shape())?, None)?;
-
-        Ok(expression::sparse_stream(Box::new(self), requests))
+        let range = crate::validate::full_range(self.shape());
+        expression::ordered_sparse(Box::new(self), range)
     }
 }
 
@@ -137,12 +132,6 @@ impl<T: TensorElement> TensorGeometry for TensorExpression<T> {
 
     fn shape(&self) -> &[u64] {
         self.mapping.shape()
-    }
-}
-
-impl<T: TensorElement> TensorViewSemantics for TensorExpression<T> {
-    fn is_base_tensor(&self) -> bool {
-        false
     }
 }
 
@@ -186,10 +175,12 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
             mapping
         } else {
             let strides = crate::contiguous_strides(self.source().shape())?;
-            let local = self.mapping.storage_slice(self.source().shape(), &strides)?
-                .ok_or_else(|| Error::Unsupported(
-                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
-                ))?;
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.source().shape(), &strides)?
+            else {
+                return Ok(expression::traversal::Selection::Ready(slice.stream()));
+            };
 
             Some(local.compose(mapping)?)
         };
@@ -215,10 +206,12 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
             mapping
         } else {
             let strides = crate::contiguous_strides(self.source().shape())?;
-            let local = self.mapping.storage_slice(self.source().shape(), &strides)?
-                .ok_or_else(|| Error::Unsupported(
-                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
-                ))?;
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.source().shape(), &strides)?
+            else {
+                return Ok(expression::traversal::Ordered::Ready(slice.stream()));
+            };
 
             Some(local.compose(mapping)?)
         };
@@ -231,10 +224,6 @@ impl<T: TensorElement> crate::expression::traversal::Plan for TensorExpression<T
 }
 
 impl<T: TensorElement> Expression for TensorExpression<T> {
-    fn implicit_zero(&self) -> Self::DType {
-        self.owned().zero
-    }
-
     fn expression_nodes(&self) -> Result<usize> {
         Ok(self.owned().nodes)
     }
@@ -269,7 +258,7 @@ impl<T: TensorElement> TensorRead for TensorExpression<T> {
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 

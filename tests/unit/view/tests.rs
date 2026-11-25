@@ -1,3 +1,4 @@
+use fensor::AxisRange;
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
@@ -5,7 +6,6 @@ use super::*;
 use crate::schema::row_major_coords;
 use crate::test_support::{FsEntry as TestFE, cleanup, new_dir};
 use crate::{Error, Layout, Shape, Tensor, TensorSchema};
-use fensor::AxisRange;
 
 async fn create_dense(
     name: &str,
@@ -368,7 +368,7 @@ async fn broadcast_rejects_lower_rank_target() {
     let view = tensor.view();
     assert!(matches!(
         view.broadcast(shape![3]),
-        Err(Error::InvalidLayout(_))
+        Err(Error::InvalidSchema(_))
     ));
 
     cleanup(&root).await;
@@ -382,7 +382,7 @@ async fn broadcast_rejects_incompatible_dim() {
     let view = tensor.view();
     assert!(matches!(
         view.broadcast(shape![2, 5]),
-        Err(Error::InvalidLayout(_))
+        Err(Error::InvalidSchema(_))
     ));
 
     cleanup(&root).await;
@@ -390,26 +390,49 @@ async fn broadcast_rejects_incompatible_dim() {
 
 #[tokio::test]
 async fn broadcast_noop_same_shape_preserves_write_through() {
-    // broadcasting to the current shape is a no-op: axes unchanged, still fully write-through
-    let (root, tensor) = create_dense(
-        "broadcast_noop_same_shape_preserves_write_through",
-        shape![2, 3],
-        1000,
-    )
-    .await;
+    use futures::TryStreamExt;
+
+    let width = crate::MAX_BATCH_ELEMENTS as u64 + 1;
+    let layout = Layout::Sparse { axis: Some(0) };
+    let (root, dir) = new_dir("sparse_broadcast_noop").await;
+    let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape![1, width]).unwrap();
+    let tensor = Tensor::<TestFE, f32>::create(dir, schema, layout, 128)
+        .await
+        .unwrap();
 
     let view = tensor.view();
-    let broadcasted = view
-        .broadcast(shape![2, 3])
-        .expect("no-op broadcast must be supported");
+    let broadcasted = view.clone().broadcast(shape![1, width]).unwrap();
 
+    assert_eq!(broadcasted.layout(), layout);
     assert!(broadcasted.supports_write_through());
     broadcasted
-        .write_value(&[1, 2], 5.0)
+        .write_value(&[0, width - 1], 5.0)
         .await
         .expect("write through no-op broadcast");
 
-    assert_eq!(tensor.read_value(&[1, 2]).await.expect("base read"), 5.0);
+    let entries: Vec<_> = broadcasted
+        .read_sparse_elements(range![AxisRange::At(0), AxisRange::In(0, width, 1)])
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(entries, [(vec![0, width - 1], 5.)]);
+    let expanded = view
+        .unsqueeze(axes![0])
+        .unwrap()
+        .broadcast(shape![2, 1, width])
+        .unwrap();
+    assert!(!expanded.supports_write_through());
+    let selected = expanded
+        .slice(range![
+            AxisRange::At(1),
+            AxisRange::In(0, 1, 1),
+            AxisRange::In(0, width, 1)
+        ])
+        .unwrap();
+    assert!(selected.supports_write_through());
     cleanup(&root).await;
 }
 
@@ -693,7 +716,7 @@ async fn flip_invalid_axis_out_of_bounds() {
         create_dense("flip_invalid_axis_out_of_bounds", shape![3, 4, 5], 1000).await;
 
     let view = tensor.view();
-    assert!(matches!(view.flip(3), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.flip(3), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -937,7 +960,7 @@ async fn slice_rank_mismatch_rejected() {
     let (root, tensor) = create_dense("slice_rank_mismatch_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::In(0, 3, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -946,7 +969,7 @@ async fn at_slice_out_of_bounds_rejected() {
     let (root, tensor) = create_dense("at_slice_out_of_bounds_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::At(3), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -955,7 +978,7 @@ async fn in_slice_step_zero_rejected() {
     let (root, tensor) = create_dense("in_slice_step_zero_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::In(0, 3, 0), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -966,7 +989,7 @@ async fn in_slice_start_after_stop_rejected() {
 
     let view = tensor.view();
     let r = range![AxisRange::In(2, 1, 1), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -977,7 +1000,7 @@ async fn in_slice_stop_exceeds_dim_rejected() {
 
     let view = tensor.view();
     let r = range![AxisRange::In(0, 5, 1), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -986,7 +1009,7 @@ async fn of_slice_out_of_bounds_rejected() {
     let (root, tensor) = create_dense("of_slice_out_of_bounds_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::Of(vec![0, 5]), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 

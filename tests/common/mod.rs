@@ -9,19 +9,14 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
 use freqfs::{Cache, DirLock};
 
-use fensor::{Layout, Tensor, TensorElement, TensorFileEntry, TensorSchema};
-
 pub mod counters;
-
 mod file;
-
 pub mod fixture;
 
 pub mod numbers;
-
-mod sparse_codec;
 
 pub use file::FsEntry;
 

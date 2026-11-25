@@ -10,7 +10,7 @@ use crate::request::BatchRequest;
 use crate::traits::BoxFuture;
 use crate::{
     Error, Layout, Result, TensorBoolean, TensorCompare, TensorElement, TensorGeometry, TensorMath,
-    TensorRead, TensorTransform, TensorViewSemantics, expression,
+    TensorRead, TensorTransform, expression,
 };
 
 mod sealed {
@@ -111,7 +111,6 @@ where
     left: Left,
     right: Right,
     op: Op,
-    zero: Op::Output,
 }
 
 impl<L, R, O> BinaryView<L, R, O>
@@ -130,27 +129,18 @@ where
             )));
         }
 
-        let zero = if matches!(left.layout(), Layout::Sparse { .. })
+        if matches!(left.layout(), Layout::Sparse { .. })
             && matches!(right.layout(), Layout::Sparse { .. })
         {
-            let left_zero = expression::batch_array(vec![left.implicit_zero()])?;
-            let right_zero = expression::batch_array(vec![right.implicit_zero()])?;
+            let left_zero = expression::batch_array(vec![L::DType::ZERO])?;
+            let right_zero = expression::batch_array(vec![L::DType::ZERO])?;
             let zero = op.apply(left_zero, right_zero)?.read_value(&[0])?;
             if zero != O::Output::ZERO {
                 return Err(Error::WouldDensify { operation: O::NAME });
             }
+        }
 
-            zero
-        } else {
-            O::Output::ZERO
-        };
-
-        Ok(Self {
-            left,
-            right,
-            op,
-            zero,
-        })
+        Ok(Self { left, right, op })
     }
 }
 
@@ -273,18 +263,6 @@ where
     }
 }
 
-impl<L, R, O> TensorViewSemantics for BinaryView<L, R, O>
-where
-    L: TensorGeometry,
-    R: TensorGeometry<DType = L::DType>,
-    L::DType: TensorElement,
-    O: BinaryOp<L::DType>,
-{
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 impl<L, R, O> crate::expression::traversal::Plan for BinaryView<L, R, O>
 where
     L: Expression,
@@ -336,10 +314,6 @@ where
     L::DType: TensorElement,
     O: BinaryOp<L::DType>,
 {
-    fn implicit_zero(&self) -> Self::DType {
-        self.zero
-    }
-
     fn expression_nodes(&self) -> Result<usize> {
         crate::expression::traversal::node_count([
             self.left.expression_nodes()?,
@@ -377,7 +351,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 

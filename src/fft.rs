@@ -16,7 +16,7 @@ use crate::schema::Coord;
 use crate::slice::Slice;
 use crate::{
     Axes, BoxFuture, Error, Layout, Result, Shape, Strides, TensorElement, TensorFourier,
-    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, expression,
+    TensorGeometry, TensorRead, TensorTransform, expression,
 };
 
 mod sealed {
@@ -231,12 +231,6 @@ impl<S: TensorGeometry, O: Send + Sync> TensorGeometry for FourierView<S, O> {
     }
 }
 
-impl<S: TensorGeometry, O: Send + Sync> TensorViewSemantics for FourierView<S, O> {
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 // Group keys and scatter entries contain at most one entry per requested output.
 type Groups = BTreeMap<Coord, Vec<(usize, usize)>>;
 
@@ -363,7 +357,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 

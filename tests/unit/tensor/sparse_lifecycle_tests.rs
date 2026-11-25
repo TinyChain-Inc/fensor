@@ -25,14 +25,10 @@ async fn create_sparse(
 async fn block_id_for_coord(tensor: &Tensor<TestFE, f32>, coord: &[u64]) -> Option<u64> {
     let BlockPosition { block_id, .. } = tensor.block_position_from_base_coord(coord);
     tensor
-        .storage
-        .sparse()
-        .unwrap()
-        .occupied_page(block_id..block_id + 1)
+        .occupied_blocks(block_id..block_id + 1)
+        .try_next()
         .await
         .expect("lookup")
-        .contains(&block_id)
-        .then_some(block_id)
 }
 
 // Caller-selected sparse block geometry is preserved through loading.
@@ -97,7 +93,7 @@ async fn clearing_one_value_preserves_the_rest_of_its_sparse_key() {
 }
 
 #[tokio::test]
-async fn zero_writes_respect_persisted_regions_edges_and_shared_pages() {
+async fn zero_writes_respect_persisted_regions_edges_and_shared_nodes() {
     for (axis, block_shape) in [
         (None, shape![1, 1, 1]),
         (Some(0), shape![1, 2, 2]),
@@ -132,7 +128,7 @@ async fn zero_writes_respect_persisted_regions_edges_and_shared_pages() {
         );
 
         // A different sparse prefix stays independent, including when its native
-        // row shares a filesystem page with the replaced block.
+        // row shares a leaf node with the replaced block's row.
         let independent = [1, 0, 0];
         tensor.write_value(&independent, 5.).await.unwrap();
         tensor.write_value(&neighbor, 0.).await.unwrap();
@@ -288,40 +284,34 @@ async fn sparse_capacity_spans_grids_without_axis_padding() {
 }
 
 #[tokio::test]
-async fn occupied_block_pages_resume_after_delivered_ids() {
+async fn occupied_block_scan_resumes_after_a_bounded_batch() {
     use crate::TensorReduceAll;
 
-    let entries = SPARSE_INDEX_PAGE_ENTRIES + 1;
+    let entries = OCCUPIED_BATCH_SIZE as u64 + 2;
 
-    for axis in [None, Some(1)] {
-        let (root, tensor) =
-            create_sparse("slice_pages", shape![1_u64, entries as u64], 1, axis).await;
-
-        for col in 0..entries as u64 {
-            tensor.write_value(&[0, col], 1.).await.unwrap();
-        }
-
-        let owner = tensor.storage.sparse().unwrap();
-        let first = owner.occupied_page(0..entries as u64).await.unwrap();
-        assert_eq!(first.len(), SPARSE_INDEX_PAGE_ENTRIES);
-        let second = owner
-            .occupied_page(first.last().copied().unwrap() + 1..entries as u64)
-            .await
-            .unwrap();
-
-        assert_eq!(second.len(), 1);
-        assert!(first.last().unwrap() < second.first().unwrap());
-        assert!(
-            owner
-                .occupied_page(second[0] + 1..entries as u64)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        assert_eq!(tensor.sum_all().await.unwrap(), entries as f32);
-        cleanup(&root).await;
+    let (root, tensor) = create_sparse("occupied_scan", shape![1_u64, entries], 1, None).await;
+    for col in 0..entries {
+        tensor.write_value(&[0, col], 1.).await.unwrap();
     }
+
+    crate::read_metrics::CURRENT
+        .scope(Default::default(), async {
+            let mut blocks = tensor.occupied_blocks(0..entries);
+            assert_eq!(blocks.try_next().await.unwrap(), Some(0));
+            crate::read_metrics::CURRENT.with(|m| {
+                assert!(m.borrow().index_entries <= OCCUPIED_BATCH_SIZE + 1);
+            });
+
+            for id in 1..entries {
+                assert_eq!(blocks.try_next().await.unwrap(), Some(id));
+            }
+
+            assert!(blocks.try_next().await.unwrap().is_none());
+        })
+        .await;
+
+    assert_eq!(tensor.sum_all().await.unwrap(), entries as f32);
+    cleanup(&root).await;
 }
 
 #[tokio::test]
@@ -1148,14 +1138,13 @@ async fn construction_preserves_interleaved_blocks_across_batches() {
     cleanup(&root).await;
 }
 
-// Reuse one dense-suffix block to distinguish representation changes from numerical changes.
-async fn replace_payload_bits<T: crate::TensorElement>(
+async fn replace_payload<T: crate::TensorElement>(
     cases: impl IntoIterator<Item = Vec<T>>,
-    bits: impl Fn(T) -> [u64; 2],
+    same: impl Fn(T, T) -> bool,
 ) where
     TestFE: crate::TensorFileEntry<T>,
 {
-    let (root, dir) = new_dir("sparse_replacement_bits").await;
+    let (root, dir) = new_dir("sparse_replacement").await;
     let tensor = Tensor::<TestFE, T>::create(
         dir,
         TensorSchema::new(T::dtype(), shape![1, 2]).unwrap(),
@@ -1165,13 +1154,19 @@ async fn replace_payload_bits<T: crate::TensorElement>(
     .await
     .unwrap();
 
+    let check_values = |actual: Vec<T>, expected: &[T]| {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected.iter().copied()) {
+            assert!(same(actual, expected), "{actual:?} != {expected:?}");
+        }
+    };
+
     let mut expected = Vec::new();
     for values in cases {
-        expected = values.iter().copied().map(&bits).collect::<Vec<_>>();
+        expected.clone_from(&values);
         tensor.replace_logical_block(0, values).await.unwrap();
         tensor.validate().await.unwrap();
-        let actual = tensor.read_logical_block(0).await.unwrap();
-        assert_eq!(actual.into_iter().map(&bits).collect::<Vec<_>>(), expected);
+        check_values(tensor.read_logical_block(0).await.unwrap(), &expected);
     }
 
     tensor.sync_all().await.unwrap();
@@ -1180,17 +1175,20 @@ async fn replace_payload_bits<T: crate::TensorElement>(
         .await
         .unwrap();
 
-    let actual = tensor.read_logical_block(0).await.unwrap();
-    assert_eq!(actual.into_iter().map(bits).collect::<Vec<_>>(), expected);
+    check_values(tensor.read_logical_block(0).await.unwrap(), &expected);
     drop(tensor);
     cleanup(&root).await;
 }
 
 #[tokio::test]
-async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
+async fn tiny_blocks_share_nodes_and_preserve_numeric_values() {
     use collate::Collate;
 
     use crate::sparse::{SparseCell, SparseCollator};
+
+    fn same(a: f64, b: f64) -> bool {
+        (a.is_nan() && b.is_nan()) || (a == b && a.is_sign_negative() == b.is_sign_negative())
+    }
 
     let collator = SparseCollator::<f64>::default();
     assert!(
@@ -1212,7 +1210,7 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
         SparseCell::Payload(vec![-f64::NAN])
     );
 
-    let (root, _) = new_dir("sparse_bits").await;
+    let (root, _) = new_dir("sparse_values").await;
     let dir = freqfs::Cache::new(
         4 * crate::schema::SPARSE_NODE_MEMORY,
         None,
@@ -1231,12 +1229,7 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
     .await
     .unwrap();
 
-    let values = [
-        f64::from_bits(0x7ff8000000000123),
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        3.,
-    ];
+    let values = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 3.];
 
     for id in 0..257 {
         tensor
@@ -1264,7 +1257,7 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
     let primary = values_dir.read().await.get_dir("primary").cloned().unwrap();
     assert!(
         primary.read().await.len() < 257,
-        "logical blocks must share native pages"
+        "logical blocks share native nodes"
     );
 
     tensor.validate().await.unwrap();
@@ -1284,28 +1277,16 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
             _ => values[id as usize % 4],
         };
 
-        assert_eq!(
-            tensor.read_logical_block(id).await.unwrap()[0].to_bits(),
-            expected.to_bits()
-        );
+        assert!(same(
+            tensor.read_logical_block(id).await.unwrap()[0],
+            expected
+        ));
     }
 
     drop(tensor);
     cleanup(&root).await;
 
-    let nan = f64::from_bits(0x7ff8000000000123);
-    let other_nan = f64::from_bits(0x7ff8000000000456);
-    replace_payload_bits(
-        [
-            vec![nan, 0.],
-            vec![nan, 0.],
-            vec![other_nan, 0.],
-            vec![1., 0.],
-            vec![1., -0.],
-        ],
-        |v: f64| [v.to_bits(), 0],
-    )
-    .await;
+    replace_payload([vec![f64::NAN, 0.], vec![1., 0.], vec![1., -0.]], same).await;
 
     #[cfg(feature = "complex")]
     {
@@ -1316,20 +1297,11 @@ async fn tiny_blocks_share_pages_and_preserve_scalar_bits() {
         assert_ne!(a, b);
         assert!(SparseCollator::<Complex64>::default().cmp(&a, &b).is_eq());
 
-        let cases = [
-            (nan, 0.),
-            (nan, 0.),
-            (other_nan, 0.),
-            (0., nan),
-            (0., other_nan),
-            (-0., other_nan),
-            (1., 0.),
-            (1., -0.),
-        ]
-        .into_iter()
-        .map(|(re, im)| vec![Complex64::new(re, im), Complex64::new(1., 0.)]);
+        let cases = [(f64::NAN, 0.), (0., f64::NAN), (1., 0.), (1., -0.)]
+            .into_iter()
+            .map(|(re, im)| vec![Complex64::new(re, im), Complex64::new(1., 0.)]);
 
-        replace_payload_bits(cases, |v: Complex64| [v.re.to_bits(), v.im.to_bits()]).await;
+        replace_payload(cases, |a, b| same(a.re, b.re) && same(a.im, b.im)).await;
     }
 }
 
@@ -1397,4 +1369,69 @@ async fn strict_reopen_rejects_malformed_sparse_storage() {
 
         cleanup(&root).await;
     }
+}
+
+#[tokio::test]
+async fn strict_reopen_rejects_duplicate_ids_across_leaves() {
+    use crate::sparse::SparseCell;
+
+    type NativeNode = b_tree::Node<Vec<Vec<SparseCell<f32>>>>;
+
+    let capacity = MAX_BLOCK_CAPACITY as u64;
+    let (root, tensor) = create_sparse(
+        "duplicate_sparse_id",
+        shape![5, capacity],
+        MAX_BLOCK_CAPACITY,
+        Some(0),
+    )
+    .await;
+    for id in 0..5 {
+        tensor.write_value(&[id, 0], (id + 1) as f32).await.unwrap();
+    }
+
+    let right_row = {
+        let (leaf, slot) = corruption::sparse_row(&tensor, 2).await;
+        let b_tree::Node::Leaf(rows) = &*leaf else {
+            panic!("expected the right leaf");
+        };
+        assert_eq!(slot, 0);
+        rows[slot].clone()
+    };
+
+    corruption::corrupt_sparse_key(&tensor, 1, 2).await;
+    {
+        let values = tensor
+            .directory
+            .read()
+            .await
+            .get_dir("values")
+            .unwrap()
+            .clone();
+        let primary = values.read().await.get_dir("primary").unwrap().clone();
+        let primary = primary.read().await;
+        let root_node = primary
+            .get_file("00000000-0000-0000-0000-000000000000")
+            .unwrap();
+        let mut node = root_node.write::<NativeNode>().await.unwrap();
+        let b_tree::Node::Index(separators, _) = &mut *node else {
+            panic!("expected an index root");
+        };
+        let [separator] = separators.as_mut_slice() else {
+            panic!("expected one separator");
+        };
+
+        *separator = right_row;
+    }
+
+    // The full rows sort correctly and differ in value. Only their IDs collide.
+    let owner = tensor.storage.sparse().unwrap();
+    corruption::block_index(owner).validate().await.unwrap();
+    tensor.sync().await.unwrap();
+    drop(tensor);
+
+    assert!(matches!(
+        Tensor::<TestFE, f32>::load(open_dir(&root).unwrap()).await,
+        Err(Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
+    ));
+    cleanup(&root).await;
 }

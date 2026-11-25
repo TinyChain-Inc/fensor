@@ -1,16 +1,15 @@
 //! Absolute-value and trigonometric views use the same filesystem consumers.
 
-use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, ArrayAccess, Buffer, NDArrayAbs, NDArrayRead, NDArrayTrig, axes, range, shape,
-};
-use number_general::FloatType;
-
 use common::{FsEntry, new_dir};
 use fensor::{
     AxisRange, Layout, Tensor, TensorAbs, TensorExpression, TensorGeometry, TensorRead,
     TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{
+    Array, ArrayAccess, Buffer, NDArrayAbs, NDArrayRead, NDArrayTrig, axes, range, shape,
+};
+use number_general::FloatType;
 
 mod common;
 
@@ -68,6 +67,7 @@ macro_rules! operation_matrix {
                         let mut expected = Vec::new();
                         for &value in &input {
                             {
+                                let value = common::fixture::logical_value(layout, value);
                                 let array = ArrayAccess::from(
                                     Array::new(Buffer::from(vec![value]), shape![1]).unwrap(),
                                 );
@@ -89,16 +89,11 @@ macro_rules! operation_matrix {
                             source
                         };
                         let view = source.$method().await.unwrap();
-                        let equal = |actual: $t, expected: $t| {
-                            same_float(actual, expected)
-                                || (matches!(layout, Layout::Sparse { .. })
-                                    && actual == 0.0
-                                    && expected == 0.0)
-                        };
                         if stringify!($method) == "sin" {
-                            common::fixture::consumers(&view, &expected, equal, equal).await;
+                            common::fixture::consumers(&view, &expected, same_float, same_float)
+                                .await;
                         } else {
-                            common::fixture::blocks(&view, &expected, equal).await;
+                            common::fixture::blocks(&view, &expected, same_float).await;
                         }
                     }};
                 }

@@ -1,5 +1,5 @@
-use super::{AxisContrib, CoordinateMap};
 use crate::Shape;
+use super::{AxisContrib, CoordinateMap};
 
 pub(crate) fn affine(offset: i128, stride: i128, shape: Shape) -> CoordinateMap {
     CoordinateMap {

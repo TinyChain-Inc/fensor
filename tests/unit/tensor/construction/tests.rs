@@ -1,10 +1,10 @@
 use futures::{FutureExt, StreamExt};
 use number_general::DType;
 
-use super::*;
 use crate::tensor::copy_metrics;
 use crate::test_support::{FsEntry, cleanup, new_dir};
 use crate::{BoxFuture, Layout, Result, TensorSchema, TensorSource};
+use super::*;
 
 #[tokio::test]
 async fn dense_copy_retains_compact_requests_through_construction() {

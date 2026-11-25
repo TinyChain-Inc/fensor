@@ -1,7 +1,7 @@
 use number_general::DType;
 
-use super::*;
 use crate::Shape;
+use super::*;
 
 #[test]
 fn block_consumers_share_order_padding_and_rank_scratch() {

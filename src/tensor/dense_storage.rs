@@ -3,10 +3,10 @@
 use freqfs::{Dir, DirLock, FileLoad, FileLock, FileReadGuardOwned};
 use futures::{StreamExt, TryStreamExt, stream};
 
-use super::{Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates};
 use crate::request::BatchRequest;
 use crate::schema::StorageSchema;
 use crate::{BoxFuture, Error, Result, StorageGeometry, TensorSource};
+use super::{Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates};
 
 pub(super) struct DenseStorage<FE> {
     blocks: DirLock<FE>,

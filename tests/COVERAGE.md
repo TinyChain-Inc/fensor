@@ -2,7 +2,8 @@
 
 Keep broad numerical cases separate from expensive full-consumer parity. Shared
 filesystem scaffolding lives in `common/mod.rs`; `common/file.rs` owns its
-test-only file representation and codec. Unit tests reuse the same support.
+test-only file envelope and format selection. Sparse nodes use fensor's production
+codec, covered directly by `sparse_codec`; unit tests reuse the same file support.
 Special codec/error/independent-adapter fixtures remain local to their contracts.
 
 | Contract | Primary coverage |
@@ -17,17 +18,17 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Matrix transforms, batches, nesting, exceptional values and exact bounds | Dedicated `matmul` cases, retained independently |
 | Sparse slice dtype semantics and persistence | `slice_reductions` small f32/f64/u8 fixtures |
 | Multi-node sparse index topology across axes/capacities/shapes | `slice_reductions::indexed_topology` (f32) |
-| Exclusive block-ID continuation at the index-page limit | Tensor unit `occupied_block_pages_resume_after_delivered_ids` |
+| Block-ID scan continuation and bounded lookahead | Tensor unit `occupied_block_scan_resumes_after_a_bounded_batch` |
 | Matrix, diagonal, and Fourier sparse consumer delegation | `sparse_consumers`: transformed outputs, cross-batch selections, zeros, nonfinite values, empty sparse storage |
 | Sparse output order, duplicates, final zeros, NaN and lengths | Expression unit `sparse_output_*` |
 | Request/affine/irregular planning bounds and block grouping | Request, storage-read, matrix and tensor unit cases; mapping compact-run/reference parity and view owned-consumption counters |
 | Compact block ranges, exact payload lengths, region tails, high-rank scratch reuse | Storage geometry traversal tests; sparse replacement lock/validation precedence fixture; Collection stored-length and materialization-handoff fixtures |
 | Ordinary implicit zeros, dense-equivalent statistics, explicit dense conversion and bounded groups | `dense_sparse_rows`; `sparse_semantics`; reduction zero-gap integration/unit cases |
-| Expression zero signs during indexed gap aggregation | Reduction unit `zero_gap_products_preserve_expression_signed_zeros` |
+| Canonical sparse zeros through reads, dense conversion, and indexed reductions | Reduction unit `sparse_zeros_are_canonical_in_reads_and_reductions` |
 | Corruption, boolean decision boundaries, cache pressure, cancellation and live reads | Native `tensor::physical_tests` and `tensor::dtype_storage`; dedicated copy cases |
 | Reshape/slice, repeated flips, gather/flip, slice/broadcast, and no implicit result storage | `storage_runs` (streams versus point reads across sparse axes and block capacities) |
 | Recursive operand order, first-error propagation, and final-argument ownership | Mapping unit `recursive_transforms_stop_at_first_error_and_move_the_final_argument` |
-| Transform input rejection and structured sparse-order errors | Public access integration cases; view unit tests retain mapping/write-through contracts |
+| Transform input rejection and ordered scans for unindexed mappings | Public access, storage-source, and slice-reduction integration cases. View unit tests retain mapping and write-through coverage. |
 | Sparse axis bounds on creation and reload | `foundations::public_create_rejects_invalid_sparse_axis_hint`, `storage_codec::reload_rejects_out_of_bounds_sparse_axis` |
 | Shared preferred/ordered walker: precedence, errors and single invocation | Expression units `request_providers_delegate_once_in_order_and_propagate_errors`, `ordered_providers_visit_operands_left_to_right` |
 | Tiled propagation, reduction boundaries and transformed current-shape coverage | Matrix `coordinate_traversal_propagates_and_preserves_coverage` |
@@ -50,7 +51,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Public type restrictions and no adapter Clone requirement | Doctests |
 | Composition and coordinate-stream consumption example | Crate-level compile-checked doctest in `src/lib.rs` |
 
-Do not replace topology/pagination tests with dtype permutations, or structural
+Do not replace topology/scan tests with dtype permutations, or structural
 assertions with timing thresholds. Ignored benchmarks share fixtures but are not
 ordinary regression tests. [BENCHMARKS.md](../BENCHMARKS.md#measurement-and-reproduction)
 describes the shared workloads, two entrypoints, smoke instructions and record schema. Smoke runs are not performance evidence.
@@ -62,13 +63,13 @@ checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
 ## Concrete dtype coverage
 
 - The `tensor::sparse_lifecycle_tests` module in the Tensor test directory owns same-key zero writes, persisted block geometry,
-  compact region tails, shared pages, interrupted publication, and capacity/axis
+  compact region tails, shared leaf nodes, interrupted publication, and capacity/axis
   allocation. `tensor::dtype_storage` checks geometric and bulk zero writes for every
   supported dtype. Existing storage/planner tests retain logical block grouping coverage
   with explicitly persisted layouts.
-  Its `tiny_blocks_share_pages_and_preserve_scalar_bits` fixture also checks
-  unchanged/distinct NaN payloads, signed-zero replacement within a nonzero block,
-  complex component identity, and reopening after replacement.
+  Its `tiny_blocks_share_nodes_and_preserve_numeric_values` fixture also checks
+  NaN and infinity, signed-zero replacement within a nonzero block, complex
+  component identity, and reopening after replacement.
 
 - `fourier` owns complex conjugate transpose, independent forward/inverse Fourier
   expectations, propagated round-trip bounds, consumer parity, sparse values,
@@ -132,7 +133,7 @@ bounded requests and execution with the structural suites listed above.
 
 | Contract | Primary coverage |
 |---|---|
-| Absent-zero, insertion, replacement, deletion, reinsertion, block presence and stable logical addressing | `sparse_point_mutation_lifecycle`; shared-page, edge and interrupted-publication fixtures remain separate |
+| Absent-zero, insertion, replacement, deletion, reinsertion, block presence and stable logical addressing | `sparse_point_mutation_lifecycle`; shared-node, edge and interrupted-publication fixtures remain separate |
 | Every dtype/layout, borrowed non-Unpin input, schema/type checks, write-through, original mutation/reopen, transformed copy/reopen and malformed payloads | `tensor::dtype_storage`; full block comparisons, exhaustive sparse point/entry checks, dense point probes at special values, every block boundary and the modified final element |
 | Dense trailing regions, scalar sparsity, omitted zero blocks, compact tails, exact nonfinite bits, capacity-independent values and reopening | `dense_sparse_rows` parameterized cases |
 | Lazy dense conversion, unchanged operand clones, transformed layout and implicit zeros across batch boundaries | `dense_sparse_rows::lazy_dense_conversion_includes_implicit_zeros_across_batches` and companion geometry case |
@@ -140,7 +141,7 @@ bounded requests and execution with the structural suites listed above.
 | Typed source errors, cardinality, coordinate bounds/order/duplicates, cancellation, incomplete metadata and strict rejection | `tensor::construction::tests`; interrupted staging, publication and completion release guards |
 | Replacement ID-before-length validation, missing/wrong-type/malformed payloads remain unrepaired | Native replacement fixtures, with borrowed dense validation |
 | Creation-only metadata publication preserves existing contents | Native metadata tests |
-| Occupied-key validation and full cursor continuation | Native page tests |
+| Occupied-key validation and full cursor continuation | Native index scan tests |
 | Shared metadata fields and extra-field rejection | `storage_codec` |
 | Ordered insertion errors, duplicates, cancellation, reopening and subsequent mutation | b-tree example tests |
 | Transaction overlay suppression and prefetched-workspace cleanup | Collection storage tests |
@@ -169,14 +170,14 @@ batch error boundaries, high-rank scratch, and expression integration coverage.
 
 ## Call-site cleanup assertion ownership
 
-- `access_matrix::section_g_sparse_iteration::in_order_iteration_matches_base_order`
-  retains the original full-range assertions and the former
-  `in_order_iteration_with_partial_range` assertions in one directory fixture.
-  The partial read precedes the third insertion; both original inputs are retained.
-- `incompatible_order_returns_structured_error` owns structured order errors and
-  named invalid-range cases formerly repeated by `sparse_consumers::parity`.
-  Numerical parity retains every full, selected, and empty-range comparison,
-  including transformed matrix, diagonal, and Fourier outputs.
+- `access_matrix::section_g_sparse_iteration` owns row-major output, sliced
+  output, and invalid sparse ranges. `sparse_consumers::parity` checks full
+  and selected sparse reads against logical values for transformed matrix,
+  diagonal, and Fourier outputs, including empty selections.
+- `traits::tests::default_sparse_reader_pulls_points_across_batches` checks
+  that the point reader starts on demand and streams across a batch boundary.
+  `strict_reopen_rejects_duplicate_ids_across_leaves`
+  checks that two correctly ordered rows sharing a block ID fail sparse reopen.
 - `validate::tests::range_cardinality_handles_empty_selections_and_overflow`
   owns shared range-validation boundaries; `slice` unit tests retain independent
   descriptor validation. Iterator construction and sparse conversion share the

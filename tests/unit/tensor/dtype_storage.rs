@@ -1,14 +1,14 @@
 //! Storage contracts are parameterized independently of the numerical matrix.
 
-use ha_ndarray::shape;
-
-use crate::test_support as common;
 use common::numbers::same;
 use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Error, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
     TensorSchema, TensorTransform, TensorWrite, TensorWriteBulk,
 };
+use ha_ndarray::shape;
+
+use crate::test_support as common;
 
 async fn storage<T: TensorElement>(samples: Option<[T; 2]>)
 where

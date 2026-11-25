@@ -10,7 +10,7 @@ use crate::request::{Axis, BatchRequest, Cartesian, RequestKind};
 use crate::schema::Coord;
 use crate::{
     BoxFuture, Layout, Result, Shape, TensorElement, TensorGeometry, TensorMatMul, TensorRead,
-    TensorTransform, TensorViewSemantics, expression, request,
+    TensorTransform, expression, request,
 };
 
 /// Maximum rows and columns per spatial tile; result size is TILE_SIDE squared.
@@ -603,17 +603,6 @@ where
     }
 }
 
-impl<L, R> TensorViewSemantics for MatMulView<L, R>
-where
-    L: TensorGeometry,
-    R: TensorGeometry<DType = L::DType>,
-    L::DType: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 impl<L, R> TensorRead for MatMulView<L, R>
 where
     L: Expression,
@@ -624,7 +613,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 

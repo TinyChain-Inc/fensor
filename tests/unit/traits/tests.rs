@@ -62,6 +62,59 @@ fn batching_only_consumes_its_bounded_prefix() {
     assert_eq!(consumed.get(), MAX_BATCH_ELEMENTS);
 }
 
+#[tokio::test]
+async fn default_sparse_reader_pulls_points_across_batches() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::TryStreamExt;
+
+    use crate::{AxisRange, Layout, TensorGeometry, TensorRead};
+
+    struct PointReader {
+        shape: [u64; 1],
+        reads: AtomicUsize,
+    }
+
+    impl TensorGeometry for PointReader {
+        type DType = u8;
+
+        fn dtype(&self) -> crate::NumberType {
+            <u8 as number_general::DType>::dtype()
+        }
+
+        fn shape(&self) -> &[u64] {
+            &self.shape
+        }
+
+        fn layout(&self) -> Layout {
+            Layout::Sparse { axis: None }
+        }
+    }
+
+    impl TensorRead for PointReader {
+        fn read_value<'a>(&'a self, coord: &'a [u64]) -> crate::BoxFuture<'a, crate::Result<u8>> {
+            Box::pin(async {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok(u8::from(coord[0] == 0 || coord[0] + 1 == self.shape[0]))
+            })
+        }
+    }
+
+    let limit = MAX_BATCH_ELEMENTS as u64;
+    let reader = PointReader {
+        shape: [limit + 1],
+        reads: AtomicUsize::new(0),
+    };
+
+    let range = [AxisRange::In(0, limit + 1, 1)].into_iter().collect();
+    let mut values = reader.read_sparse_elements(range).await.unwrap();
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 0);
+    assert_eq!(values.try_next().await.unwrap(), Some((vec![0], 1)));
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(values.try_next().await.unwrap(), Some((vec![limit], 1)));
+    assert!(values.try_next().await.unwrap().is_none());
+}
+
 // Observe constructor work without involving filesystem storage or evaluation.
 struct ConstructorProbe {
     clones: Arc<crate::test_support::counters::Counter>,

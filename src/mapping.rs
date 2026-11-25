@@ -444,7 +444,7 @@ impl CoordinateMap {
         let old_size = schema::checked_product(&self.shape)?;
         let new_size = schema::checked_product(&shape)?;
         if old_size != new_size {
-            return Err(Error::InvalidLayout(
+            return Err(Error::InvalidSchema(
                 "reshape requires an equal number of elements".to_string(),
             ));
         }
@@ -471,8 +471,12 @@ impl CoordinateMap {
     pub(crate) fn broadcast(self, shape: Shape) -> Result<Self> {
         schema::validate_shape_dims(&shape)?;
         schema::checked_product(&shape)?;
+        if self.shape == shape {
+            return Ok(self);
+        }
+
         if shape.len() < self.shape.len() {
-            return Err(Error::InvalidLayout(format!(
+            return Err(Error::InvalidSchema(format!(
                 "cannot broadcast shape {:?} to a lower rank shape {:?}",
                 self.shape, shape
             )));
@@ -482,25 +486,29 @@ impl CoordinateMap {
         let mut axes = Vec::with_capacity(shape.len());
         axes.extend(iter::repeat_n(AxisContrib::Broadcast(0), rank_diff));
 
-        for (axis_index, (&old_dim, &new_dim)) in
-            self.shape.iter().zip(shape[rank_diff..].iter()).enumerate()
+        for (axis_index, ((&old_dim, &new_dim), axis)) in self
+            .shape
+            .iter()
+            .zip(&shape[rank_diff..])
+            .zip(self.axes)
+            .enumerate()
         {
             if old_dim != 1 && old_dim != new_dim {
-                return Err(Error::InvalidLayout(format!(
+                return Err(Error::InvalidSchema(format!(
                     "cannot broadcast axis {axis_index} from dimension {old_dim} to {new_dim}"
                 )));
             }
 
-            let axis_contrib = if old_dim == 1u64 {
-                AxisContrib::Broadcast(match &self.axes[axis_index] {
+            let axis_contrib = if old_dim != new_dim {
+                AxisContrib::Broadcast(match axis {
                     AxisContrib::Stride(_) => 0i128,
-                    AxisContrib::Broadcast(c) => *c,
+                    AxisContrib::Broadcast(c) => c,
                     AxisContrib::Gather(g) => *g.first().ok_or_else(|| {
                         Error::InvalidLayout(format!("axis {axis_index} has an empty gather table"))
                     })?,
                 })
             } else {
-                self.axes[axis_index].clone()
+                axis
             };
 
             axes.push(axis_contrib);
@@ -515,7 +523,7 @@ impl CoordinateMap {
 
     pub(crate) fn slice(self, range: Range) -> Result<Self> {
         if range.len() != self.shape.len() {
-            return Err(Error::InvalidLayout(
+            return Err(Error::InvalidCoord(
                 "slice range rank must match tensor rank".to_string(),
             ));
         }
@@ -552,11 +560,12 @@ impl CoordinateMap {
         }
 
         if new_shape.contains(&0) {
-            return Err(Error::InvalidLayout(
-                "slice produced a zero-extent axis".to_string(),
+            return Err(Error::InvalidCoord(
+                "slice produced a zero-extent axis".into(),
             ));
         }
 
+        schema::checked_product(&new_shape)?;
         Ok(Self {
             base_offset: new_base_offset,
             axes: new_axes,
@@ -581,7 +590,7 @@ impl CoordinateMap {
 
         for permuted_axis in permutation {
             if permuted_axis >= self.axes.len() || seen[permuted_axis] {
-                return Err(Error::InvalidLayout(
+                return Err(Error::InvalidCoord(
                     "transpose permutation must be a valid axis permutation".to_string(),
                 ));
             }
@@ -600,7 +609,7 @@ impl CoordinateMap {
 
     pub(crate) fn flip(self, axis: usize) -> Result<Self> {
         if axis >= self.shape.len() {
-            return Err(Error::InvalidLayout(format!(
+            return Err(Error::InvalidCoord(format!(
                 "flip axis {axis} is out of bounds for rank {}",
                 self.shape.len()
             )));
@@ -626,13 +635,13 @@ impl CoordinateMap {
         let ndim = self.shape.len();
 
         if axes.is_empty() {
-            return Err(Error::InvalidLayout(
+            return Err(Error::InvalidCoord(
                 "squeeze requires a non-empty list of axes".to_string(),
             ));
         }
 
         if axes.len() == ndim {
-            return Err(Error::InvalidLayout(
+            return Err(Error::InvalidSchema(
                 "squeeze cannot remove every axis; rank-0 tensors are not supported".to_string(),
             ));
         }
@@ -641,19 +650,19 @@ impl CoordinateMap {
 
         for &axis in axes.iter() {
             if axis >= ndim {
-                return Err(Error::InvalidLayout(format!(
+                return Err(Error::InvalidCoord(format!(
                     "squeeze axis {axis} is out of bounds for rank {ndim}"
                 )));
             }
 
             if remove[axis] {
-                return Err(Error::InvalidLayout(format!(
+                return Err(Error::InvalidCoord(format!(
                     "squeeze axis {axis} specified more than once"
                 )));
             }
 
             if self.shape[axis] != 1 {
-                return Err(Error::InvalidLayout(format!(
+                return Err(Error::InvalidCoord(format!(
                     "cannot squeeze axis {axis} with dimension {}",
                     self.shape[axis]
                 )));
@@ -688,7 +697,7 @@ impl CoordinateMap {
         let old_ndim = self.shape.len();
 
         if axes.is_empty() {
-            return Err(Error::InvalidLayout(
+            return Err(Error::InvalidCoord(
                 "unsqueeze requires a non-empty list of axes".to_string(),
             ));
         }
@@ -698,13 +707,13 @@ impl CoordinateMap {
 
         for &axis in axes.iter() {
             if axis >= old_ndim {
-                return Err(Error::InvalidLayout(format!(
+                return Err(Error::InvalidCoord(format!(
                     "unsqueeze axis {axis} is out of bounds for rank {old_ndim}"
                 )));
             }
 
             if insert_before[axis] {
-                return Err(Error::InvalidLayout(format!(
+                return Err(Error::InvalidCoord(format!(
                     "unsqueeze axis {axis} specified more than once"
                 )));
             }
@@ -755,7 +764,7 @@ fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Axes> {
     let axes: Axes = permutation.unwrap_or_else(|| (0..ndim).rev().collect());
 
     if axes.len() != ndim {
-        return Err(Error::InvalidLayout(
+        return Err(Error::InvalidCoord(
             "transpose permutation rank must match tensor rank".to_string(),
         ));
     }
@@ -765,7 +774,7 @@ fn default_permutation(ndim: usize, permutation: Option<Axes>) -> Result<Axes> {
 
 fn slice_bound_at(current: &AxisContrib, dim: u64, index: u64, axis_index: usize) -> Result<i128> {
     if index >= dim {
-        return Err(Error::InvalidLayout(format!(
+        return Err(Error::InvalidCoord(format!(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
@@ -796,7 +805,7 @@ fn slice_bound_in(
     axis_index: usize,
 ) -> Result<(i128, AxisContrib, u64)> {
     if step == 0 || start > stop || stop > dim {
-        return Err(Error::InvalidLayout(format!(
+        return Err(Error::InvalidCoord(format!(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }
@@ -840,7 +849,7 @@ fn slice_bound_of(
     axis_index: usize,
 ) -> Result<AxisContrib> {
     if indices.iter().any(|index| *index >= dim) {
-        return Err(Error::InvalidLayout(format!(
+        return Err(Error::InvalidCoord(format!(
             "slice bound at axis {axis_index} is out of bounds"
         )));
     }

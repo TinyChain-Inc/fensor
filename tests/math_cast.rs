@@ -1,18 +1,17 @@
 //! Dtype-changing expressions preserve numerical zeros and evaluate at consumption.
 
-use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, ArrayAccess, Buffer, NDArrayCast, NDArrayRead, NDArrayTrig, NDArrayUnary, axes, range,
-    shape,
-};
-use number_general::{FloatType, NumberType};
-
 use common::{FsEntry, new_dir};
 use fensor::unary::Cast;
 use fensor::{
     AxisRange, Layout, Tensor, TensorArray, TensorCast, TensorGeometry, TensorRead, TensorSchema,
     TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{
+    Array, ArrayAccess, Buffer, NDArrayCast, NDArrayRead, NDArrayTrig, NDArrayUnary, axes, range,
+    shape,
+};
+use number_general::{FloatType, NumberType};
 
 mod common;
 
@@ -219,7 +218,7 @@ async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
     assert_eq!(expression.read_value(&[0, 0]).await.unwrap(), 0.0f64);
     let selection = range![AxisRange::In(0, 3, 1), AxisRange::In(0, 2, 1)];
     let rows: Vec<_> = expression
-        .read_sparse_elements_in_order(selection.clone(), axes![0, 1])
+        .read_sparse_elements(selection.clone())
         .await
         .unwrap()
         .try_collect()
@@ -248,7 +247,7 @@ async fn sparse_cast_preserves_zeros_and_filters_only_final_values() {
 
     let final_zero = expression.round().await.unwrap();
     let rows: Vec<_> = final_zero
-        .read_sparse_elements_in_order(selection, axes![0, 1])
+        .read_sparse_elements(selection)
         .await
         .unwrap()
         .try_collect()

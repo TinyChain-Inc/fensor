@@ -1,10 +1,9 @@
 //! Number classes follow the typed filesystem adapter.
 
-use ha_ndarray::shape;
-use number_general::{ComplexType, DType, FloatType, IntType, NumberType, UIntType};
-
 use common::{FsEntry, new_dir};
 use fensor::{Error, Layout, Tensor, TensorCast, TensorGeometry, TensorNumeric, TensorSchema};
+use ha_ndarray::shape;
+use number_general::{ComplexType, DType, FloatType, IntType, NumberType, UIntType};
 
 mod common;
 

@@ -1,9 +1,8 @@
-use ha_ndarray::{range, shape};
-use number_general::DType;
-
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorWrite, TensorWriteBulk,
 };
+use ha_ndarray::{range, shape};
+use number_general::DType;
 
 mod common;
 
@@ -118,13 +117,10 @@ async fn writes_validate_cardinality_before_mutation() {
             .unwrap();
 
         let last = geometry.block_count() - 1;
-        assert_eq!(
-            blocks.read(last).await.unwrap(),
-            vec![0; geometry.block_len(last).unwrap()]
-        );
+        assert_eq!(blocks.read(last).await.unwrap(), None);
 
         blocks
-            .replace(last, vec![7; geometry.block_len(last).unwrap()])
+            .replace(last, Some(vec![7; geometry.block_len(last).unwrap()]))
             .await
             .unwrap();
 
@@ -139,10 +135,7 @@ async fn writes_validate_cardinality_before_mutation() {
 
         let retained = blocks.clone();
         drop(blocks);
-        retained
-            .replace(last, vec![0; geometry.block_len(last).unwrap()])
-            .await
-            .unwrap();
+        retained.replace(last, None).await.unwrap();
 
         assert!(
             retained

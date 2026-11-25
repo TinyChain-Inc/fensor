@@ -15,7 +15,7 @@ use crate::schema::Layout;
 use crate::tensor::TensorElement;
 use crate::traits::{
     BoxFuture, TensorAbs, TensorCast, TensorGeometry, TensorNumeric, TensorRead, TensorTransform,
-    TensorTrig, TensorUnary, TensorUnaryBoolean, TensorViewSemantics,
+    TensorTrig, TensorUnary, TensorUnaryBoolean,
 };
 use crate::{Error, Result, expression};
 
@@ -202,7 +202,6 @@ where
 {
     source: Source,
     op: Op,
-    zero: Op::Output,
 }
 
 impl<S, O> UnaryView<S, O>
@@ -212,19 +211,15 @@ where
     O: UnaryOp<S::DType>,
 {
     pub(crate) fn new(source: S, op: O) -> Result<Self> {
-        let zero = if matches!(source.layout(), Layout::Sparse { .. }) {
-            let input = expression::batch_array(vec![source.implicit_zero()])?;
+        if matches!(source.layout(), Layout::Sparse { .. }) {
+            let input = expression::batch_array(vec![S::DType::ZERO])?;
             let zero = op.apply(input)?.read_value(&[0])?;
             if zero != O::Output::ZERO {
                 return Err(Error::WouldDensify { operation: O::NAME });
             }
+        }
 
-            zero
-        } else {
-            O::Output::ZERO
-        };
-
-        Ok(Self { source, op, zero })
+        Ok(Self { source, op })
     }
 }
 
@@ -338,17 +333,6 @@ where
     }
 }
 
-impl<S, O> TensorViewSemantics for UnaryView<S, O>
-where
-    S: TensorGeometry,
-    S::DType: TensorElement,
-    O: UnaryOp<S::DType>,
-{
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 impl<S, O> TensorRead for UnaryView<S, O>
 where
     S: Expression,
@@ -359,7 +343,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 
@@ -419,10 +403,6 @@ where
     S::DType: TensorElement,
     O: UnaryOp<S::DType>,
 {
-    fn implicit_zero(&self) -> Self::DType {
-        self.zero
-    }
-
     fn expression_nodes(&self) -> Result<usize> {
         crate::expression::traversal::node_count([self.source.expression_nodes()?])
     }

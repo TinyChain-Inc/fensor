@@ -1,17 +1,16 @@
 //! Native u8 storage and lazy boolean expressions over real filesystem tensors.
 
+use common::{FsEntry, new_dir};
+use fensor::{
+    AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorGeometry, TensorNumeric,
+    TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
+};
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, ArrayAccess, Buffer, NDArrayNumeric, NDArrayRead, NDArrayUnaryBoolean, axes, range,
     shape,
 };
 use number_general::{FloatType, NumberType, UIntType};
-
-use common::{FsEntry, new_dir};
-use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorGeometry, TensorNumeric,
-    TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
-};
 
 mod common;
 

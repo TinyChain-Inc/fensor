@@ -4,7 +4,6 @@ use crate::test_support as common;
 
 #[path = "../common/benchmark.rs"]
 mod benchmark;
-
 #[path = "../common/workloads.rs"]
 mod workloads;
 

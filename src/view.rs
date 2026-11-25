@@ -6,7 +6,7 @@ use crate::mapping::CoordinateMap;
 use crate::schema::Layout;
 use crate::{
     BoxFuture, Error, Result, TensorArray, TensorElement, TensorGeometry, TensorRead, TensorSource,
-    TensorTransform, TensorViewSemantics, TensorWrite,
+    TensorTransform, TensorWrite,
 };
 
 /// A geometric view of filesystem-backed tensor storage.
@@ -29,8 +29,21 @@ where
         &self.tensor
     }
 
+    /// Whether this mapping addresses the entire base in its original order.
+    pub fn is_base_tensor(&self) -> bool {
+        self.mapping.is_base_mapping(self.tensor.shape())
+    }
+
+    /// Whether this geometry permits writes through a writable source.
+    pub fn supports_write_through(&self) -> bool {
+        self.mapping.supports_write_through()
+    }
+
     /// Replace a source with identical base geometry, retaining this view's mapping.
-    pub fn with_source<R: TensorArray<DType = S::DType>>(self, source: R) -> Result<TensorView<R>> {
+    pub fn with_source<R: TensorArray<DType = S::DType>>(
+        &self,
+        source: R,
+    ) -> Result<TensorView<R>> {
         if self.tensor.schema() != source.schema() || self.tensor.layout() != source.layout() {
             return Err(Error::InvalidLayout(
                 "replacement source geometry differs".into(),
@@ -39,7 +52,7 @@ where
 
         Ok(TensorView {
             tensor: source,
-            mapping: self.mapping,
+            mapping: self.mapping.clone(),
         })
     }
 
@@ -144,19 +157,6 @@ where
     }
 }
 
-impl<S: TensorArray> TensorViewSemantics for TensorView<S>
-where
-    S::DType: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        self.mapping.is_base_mapping(self.tensor.shape())
-    }
-
-    fn supports_write_through(&self) -> bool {
-        self.mapping.supports_write_through()
-    }
-}
-
 impl<S: TensorArray> TensorTransform for TensorView<S>
 where
     S::DType: TensorElement,
@@ -168,11 +168,7 @@ impl<S: TensorSource> TensorRead for TensorView<S>
 where
     S::DType: TensorElement,
 {
-    crate::expression::reader_members!(
-        read_blocks,
-        read_coordinate_blocks,
-        read_sparse_elements_in_order
-    );
+    crate::expression::reader_members!(read_blocks, read_coordinate_blocks, read_sparse_elements);
 
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
@@ -268,10 +264,14 @@ where
         {
             mapping
         } else {
-            let local = self.mapping.storage_slice(self.tensor.shape(), self.tensor.strides())?
-                .ok_or_else(|| Error::Unsupported(
-                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
-                ))?;
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.tensor.shape(), self.tensor.strides())?
+            else {
+                return Ok(crate::expression::traversal::Selection::Ready(
+                    slice.stream(),
+                ));
+            };
 
             Some(local.compose(mapping)?)
         };
@@ -296,10 +296,12 @@ where
         {
             mapping
         } else {
-            let local = self.mapping.storage_slice(self.tensor.shape(), self.tensor.strides())?
-                .ok_or_else(|| Error::Unsupported(
-                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
-                ))?;
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.tensor.shape(), self.tensor.strides())?
+            else {
+                return Ok(crate::expression::traversal::Ordered::Ready(slice.stream()));
+            };
 
             Some(local.compose(mapping)?)
         };

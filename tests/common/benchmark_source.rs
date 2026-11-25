@@ -1,10 +1,10 @@
 //! Shared benchmark setup and consumption; callers own timing and observation.
 
+use fensor::Tensor;
 use ha_ndarray::shape;
 
 use super::common;
 use super::common::FsEntry;
-use fensor::Tensor;
 
 pub async fn source(
     m: usize,
@@ -40,7 +40,7 @@ pub async fn reopen(
 ) -> (common::Directory, Tensor<FsEntry, f32>) {
     tensor.sync().await.unwrap();
     drop(tensor);
-    // The measured read budget need not hold construction's pinned pages.
+    // The measured read budget need not hold construction's pinned nodes.
     let dir = freqfs::Cache::new(cache, None, 0, std::time::Duration::from_secs(1))
         .load(root.to_path_buf())
         .unwrap();

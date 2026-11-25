@@ -1,13 +1,12 @@
 //! Logical geometry is independent of backend allocation and pointer width.
 
-use futures::TryStreamExt;
-use number_general::DType;
-use smallvec::smallvec;
-
 use fensor::{
     AxisRange, Error, Layout, Shape, Strides, Tensor, TensorGeometry, TensorMatMul, TensorRead,
     TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorWrite, contiguous_strides,
 };
+use futures::TryStreamExt;
+use number_general::DType;
+use smallvec::smallvec;
 
 mod common;
 

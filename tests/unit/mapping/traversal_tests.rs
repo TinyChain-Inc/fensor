@@ -1,5 +1,5 @@
-use super::*;
 use crate::request::{Axis, BatchRequest, Cartesian};
+use super::*;
 
 #[test]
 fn mapped_visits_preserve_request_order_and_reset_scratch() {

@@ -7,13 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::TryStreamExt;
-
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorAbs, TensorArray,
     TensorExpression, TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorReduce,
     TensorSchema, TensorSource, TensorTransform, TensorView,
 };
+use futures::TryStreamExt;
 
 mod common;
 

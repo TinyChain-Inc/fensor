@@ -3,8 +3,13 @@
 //! Implementations own their visibility and mutation policy. fensor only maps and
 //! evaluates bounded requests; it does not acquire transaction reservations.
 
-use futures::stream::BoxStream;
+use std::ops::Range;
+use std::pin::Pin;
+
+use futures::stream::{BoxStream, Peekable, Stream, try_unfold};
 use futures::{StreamExt, TryStreamExt};
+use ha_ndarray::Number;
+use number_general::DType;
 
 use crate::mapping::{CoordinateMap, StorageSlice};
 use crate::request::BatchRequest;
@@ -137,6 +142,158 @@ impl StorageGeometry {
             Layout::Sparse { axis } => Some(axis.unwrap_or(self.schema.shape().len() - 1)),
         }
     }
+
+    /// Stream payloads in destination block order. Sparse output omits zero blocks.
+    /// The shape, dtype, and layout kind must match. Retains one bounded source
+    /// read and one destination block between items.
+    pub fn read_blocks<'a, S: TensorSource>(
+        &'a self,
+        source: &'a S,
+    ) -> Result<impl Stream<Item = Result<(u64, Vec<S::DType>)>> + Send + 'a>
+    where
+        S::DType: TensorElement,
+    {
+        let geometry = source.storage_geometry();
+        let sparse = self.sparse_axis().is_some();
+        if self.schema() != geometry.schema()
+            || self.schema().dtype() != S::DType::dtype()
+            || sparse != geometry.sparse_axis().is_some()
+        {
+            return Err(Error::InvalidSchema(
+                "block copy requires matching shapes, dtypes, and layout kinds".into(),
+            ));
+        }
+
+        let blocks = 0..geometry.block_count();
+        let keys = if sparse {
+            source.occupied_blocks(blocks).left_stream()
+        } else {
+            futures::stream::iter(blocks.map(Ok)).right_stream()
+        };
+
+        Ok(try_unfold(
+            (keys.peekable(), geometry, None, None, None),
+            move |(mut keys, geometry, mut previous, mut input, mut output)| async move {
+                let ready = loop {
+                    tokio::task::coop::consume_budget().await;
+                    let (range, start, values) = match input.take() {
+                        Some(block) => block,
+                        None => {
+                            let Some((range, values)) =
+                                read_block_span(source, &geometry, &mut keys, &mut previous)
+                                    .await?
+                            else {
+                                break output.take();
+                            };
+
+                            let start = range.start;
+                            (range, start, values)
+                        }
+                    };
+
+                    let id = self.storage.blocks.position(start).block_id;
+                    if output.as_ref().is_some_and(|(current, _)| *current != id) {
+                        // The next input starts beyond the current destination block.
+                        input = Some((range, start, values));
+                        break output.take();
+                    }
+
+                    let target = self.block_range(id)?;
+                    if range == target {
+                        if !sparse || values.iter().any(|value| *value != S::DType::ZERO) {
+                            break Some((id, values));
+                        }
+
+                        continue;
+                    }
+
+                    let end = range.end.min(target.end);
+                    let fragment =
+                        &values[(start - range.start) as usize..(end - range.start) as usize];
+                    if !sparse || fragment.iter().any(|value| *value != S::DType::ZERO) {
+                        let (_, block) = output.get_or_insert_with(|| {
+                            (
+                                id,
+                                vec![S::DType::ZERO; (target.end - target.start) as usize],
+                            )
+                        });
+
+                        let offset = (start - target.start) as usize;
+                        block[offset..offset + fragment.len()].copy_from_slice(fragment);
+                    }
+
+                    if end < range.end {
+                        input = Some((range, end, values));
+                    }
+
+                    if end == target.end && output.is_some() {
+                        break output.take();
+                    }
+                };
+
+                Ok(ready.map(|block| (block, (keys, geometry, previous, input, output))))
+            },
+        ))
+    }
+}
+
+// Group adjacent blocks through the ordinary bounded native reader.
+// Keep gaps out of the request and move a single block's buffer when possible.
+async fn read_block_span<S: TensorSource>(
+    source: &S,
+    geometry: &StorageGeometry,
+    keys: &mut Peekable<impl Stream<Item = Result<u64>> + Unpin>,
+    previous: &mut Option<u64>,
+) -> Result<Option<(Range<u64>, Vec<S::DType>)>>
+where
+    S::DType: TensorElement,
+{
+    let Some(first) = keys.try_next().await? else {
+        return Ok(None);
+    };
+
+    if previous.is_some_and(|previous| previous >= first) {
+        return Err(Error::InvalidCoord("invalid source block order".into()));
+    }
+
+    let mut range = geometry.block_range(first)?;
+    let mut last = first;
+    while let Some(&Ok(next)) = Pin::new(&mut *keys).peek().await {
+        if last.checked_add(1) != Some(next) {
+            break;
+        }
+
+        let end = geometry.block_range(next)?.end;
+        if end - range.start > crate::MAX_BATCH_ELEMENTS as u64 {
+            break;
+        }
+
+        keys.try_next().await?;
+        range.end = end;
+        last = next;
+    }
+
+    *previous = Some(last);
+    let len = (range.end - range.start) as usize;
+    let values = if first == last {
+        source.read_logical_block(first).await?
+    } else {
+        let request = BatchRequest::linear(range.start, len)?;
+        source
+            .read_storage(StorageRead {
+                request: &request,
+                mapping: None,
+            })
+            .await?
+    };
+
+    if values.len() != len {
+        return Err(Error::InvalidLayout(
+            "invalid source block span length".into(),
+        ));
+    }
+
+    Ok(Some((range, values)))
 }
 
 /// A validated bounded read request produced by the geometric mapper.
@@ -383,7 +540,7 @@ where
     .boxed())
 }
 
-/// Preserve row-major candidate order without sorting or scanning implicit zeros.
+/// Use occupied blocks when they preserve logical row-major candidate order.
 pub(crate) fn ordered_requests<S: TensorSource>(
     source: &S,
     slice: crate::slice::Slice,
@@ -404,7 +561,7 @@ where
         }
 
         if previous.is_some_and(|previous| previous >= base) {
-            return Err(Error::Unsupported("sparse block order does not preserve this selection's row-major order; use copy_from_values to materialize this layout".into()));
+            return Ok(slice.stream());
         }
 
         previous = Some(base);

@@ -3,15 +3,14 @@
 use std::sync::Mutex;
 use std::task::Poll;
 
+use fensor::{
+    CoordinateBlockStream, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorWrite,
+};
 use freqfs::{DirLock, FileWriteGuardOwned};
 use futures::channel::oneshot;
 use futures::{FutureExt, StreamExt};
 use ha_ndarray::shape;
 use number_general::{DType, NumberType};
-
-use fensor::{
-    CoordinateBlockStream, Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorWrite,
-};
 
 mod common;
 

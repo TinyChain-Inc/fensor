@@ -1,13 +1,12 @@
 //! Filesystem-backed reduction semantics and bounded consumption.
-use futures::TryStreamExt;
-use ha_ndarray::{Array, Buffer, NDArrayRead, NDArrayReduce, NDArrayReduceAll, axes, range, shape};
-use number_general::DType;
-
 use fensor::{
     AxisRange, Layout, Shape, Tensor, TensorCompareScalar, TensorElement, TensorFileEntry,
     TensorGeometry, TensorMath, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
     TensorSchema, TensorTransform, TensorUnary, TensorWhere, TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{Array, Buffer, NDArrayRead, NDArrayReduce, NDArrayReduceAll, axes, range, shape};
+use number_general::DType;
 
 mod common;
 
@@ -559,6 +558,12 @@ async fn statistics_include_implicit_zeros_across_batches_and_axes() {
         assert_eq!(zeros.mean_all().await.unwrap(), 0.0);
         assert_eq!(zeros.std_all().await.unwrap(), 0.0);
         assert_eq!(zeros.norm_all().await.unwrap(), 0.0);
+
+        let (_tensor_root, integer) =
+            source(vec![u64::MAX - 1, u64::MAX], shape![1, 2], sparse).await;
+        assert_eq!(integer.std_all().await.unwrap(), 0.5);
+        let deviation = integer.view().std(axes![1], false).await.unwrap();
+        assert_eq!(deviation.read_value(&[0]).await.unwrap(), 0.5);
     }
 
     let (_tensor_root, tensor) = source(vec![3.0f64; 8193], shape![8193], false).await;

@@ -2,8 +2,8 @@
 
 use futures::{StreamExt, TryStreamExt};
 
-use super::{Tensor, TensorElement, TensorFileEntry, sparse_storage};
 use crate::Error;
+use super::{Tensor, TensorElement, TensorFileEntry, sparse_storage};
 
 pub(super) async fn sparse<F, T, S, E>(
     tensor: Tensor<F, T>,

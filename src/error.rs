@@ -7,15 +7,7 @@ pub enum Error {
     InvalidSchema(String),
     InvalidCoord(String),
     InvalidLayout(String),
-    SparseIndex(String),
-    UnsupportedSparseIterationOrder {
-        requested_order: Vec<usize>,
-        base_order: Vec<usize>,
-        hint: String,
-    },
-    WouldDensify {
-        operation: &'static str,
-    },
+    WouldDensify { operation: &'static str },
     Unsupported(String),
     DataMismatch(String),
 }
@@ -46,18 +38,8 @@ impl fmt::Display for Error {
             Self::InvalidSchema(cause)
             | Self::InvalidCoord(cause)
             | Self::InvalidLayout(cause)
-            | Self::SparseIndex(cause)
             | Self::Unsupported(cause)
             | Self::DataMismatch(cause) => f.write_str(cause),
-            Self::UnsupportedSparseIterationOrder {
-                requested_order,
-                base_order,
-                hint,
-            } => write!(
-                f,
-                "unsupported sparse iteration order: requested {:?}, base {:?}. {}",
-                requested_order, base_order, hint
-            ),
         }
     }
 }

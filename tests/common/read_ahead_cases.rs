@@ -1,10 +1,10 @@
 //! Resident-cache and cache-pressure reads; OS page-cache state is uncontrolled.
 
+use fensor::{AxisRange, TensorGeometry, TensorRead, TensorReduceAll, TensorTransform};
 use futures::TryStreamExt;
 use ha_ndarray::range;
 
 use super::{benchmark, benchmark_source};
-use fensor::{AxisRange, TensorGeometry, TensorRead, TensorReduceAll, TensorTransform};
 
 pub async fn run() {
     let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();

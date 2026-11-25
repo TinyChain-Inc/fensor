@@ -148,7 +148,7 @@ pub fn matmul_output_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
 /// Validate range bounds and cardinality without cloning explicit selections.
 pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64)> {
     if range.len() != shape.len() {
-        return Err(Error::InvalidLayout(
+        return Err(Error::InvalidCoord(
             "range rank must match tensor rank".into(),
         ));
     }
@@ -157,7 +157,7 @@ pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64
 
     for (axis, (bound, &dim)) in range.iter().zip(shape).enumerate() {
         let invalid =
-            || Error::InvalidLayout(format!("range bound at axis {axis} is out of bounds"));
+            || Error::InvalidCoord(format!("range bound at axis {axis} is out of bounds"));
 
         let len = match bound {
             AxisRange::At(i) if *i < dim => 1,
@@ -174,8 +174,7 @@ pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64
     let remaining = if lengths.contains(&0) {
         0
     } else {
-        crate::schema::checked_product(&lengths)
-            .map_err(|_| Error::InvalidLayout("range size overflow".into()))?
+        crate::schema::checked_product(&lengths)?
     };
 
     Ok((lengths, remaining))

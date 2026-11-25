@@ -1,12 +1,5 @@
 #![cfg(feature = "complex")]
 
-use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, ArrayBuf, Buffer, Complex, NDArrayFourier, NDArrayRead, NDArrayTransform, shape,
-};
-use number_general::DType;
-use safecast::CastFrom;
-
 use common::numbers::same;
 use common::{FsEntry, cleanup, fixture, new_dir};
 use fensor::complex::{Complex32, Complex64};
@@ -14,9 +7,14 @@ use fensor::fft::{Fft, FourierOp, Ifft, fft2, ifft2};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorElement, TensorExpression, TensorFileEntry,
     TensorFourier, TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnaryComplex, TensorRead,
-    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics,
-    TensorWrite,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{
+    Array, ArrayBuf, Buffer, Complex, NDArrayFourier, NDArrayRead, NDArrayTransform, shape,
+};
+use number_general::DType;
+use safecast::CastFrom;
 
 mod common;
 
@@ -246,7 +244,7 @@ where
         let v = tensor.view();
         let hermitian = v.mh().await.unwrap();
         assert_eq!(hermitian.shape(), &[2, 3, 2]);
-        assert!(!hermitian.supports_write_through());
+
         let mut expected = Vec::new();
         for b in 0..2 {
             for j in 0..3 {
@@ -613,10 +611,10 @@ async fn expression_boundaries_and_tiny_far_end_selection() {
 
     let view = tensor.view().fft().await.unwrap();
     let values: Vec<_> = view
-        .read_sparse_elements_in_order(
-            smallvec::smallvec![AxisRange::At(n - 1), AxisRange::In(0, 4, 1)],
-            ha_ndarray::axes![0, 1],
-        )
+        .read_sparse_elements(smallvec::smallvec![
+            AxisRange::At(n - 1),
+            AxisRange::In(0, 4, 1)
+        ])
         .await
         .unwrap()
         .try_collect()

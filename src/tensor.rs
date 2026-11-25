@@ -1,7 +1,5 @@
 mod construction;
-
 mod dense_storage;
-
 mod sparse_storage;
 
 pub use sparse_storage::SparseBlocks;
@@ -28,7 +26,7 @@ use crate::request::BatchRequest;
 use crate::schema::{BlockPosition, Layout, MAX_BLOCK_CAPACITY, StorageSchema, TensorSchema};
 use crate::traits::{
     BoxFuture, TensorArray, TensorGeometry, TensorRead, TensorTransform, TensorWrite,
-    TensorWriteBulk, ValueBlockStream,
+    TensorWriteBulk,
 };
 use crate::view::TensorView;
 use crate::{Range, TensorMetadata, TensorSource, validate};
@@ -39,11 +37,10 @@ const INDEX: &str = "index";
 
 const METADATA: &str = "metadata";
 
-/// Maximum sparse-index keys retained per page, independent of execution batches.
-const SPARSE_INDEX_PAGE_ENTRIES: usize = 4096;
+/// Maximum occupied block IDs buffered by one scan step.
+const OCCUPIED_BATCH_SIZE: usize = 4096;
 
-/// A concrete numerical element. Filesystem adapters own payload serialization;
-/// elements themselves need no destream implementation.
+/// A concrete numerical element supported by Tensor operations.
 pub trait TensorElement:
     ha_ndarray::Number + number_general::DType + Copy + Default + PartialEq + Send + Sync + 'static
 {
@@ -63,7 +60,7 @@ tensor_elements!(
 
 pub trait TensorFileEntry<T: TensorElement>:
     FileLoad
-    + AsType<crate::SparseNode<T>>
+    + AsType<b_tree::Node<Vec<Vec<crate::SparseCell<T>>>>>
     + AsType<Vec<T>>
     + AsType<TensorMetadata<T>>
     + Send
@@ -75,7 +72,7 @@ pub trait TensorFileEntry<T: TensorElement>:
 impl<FE, T> TensorFileEntry<T> for FE
 where
     FE: FileLoad
-        + AsType<crate::SparseNode<T>>
+        + AsType<b_tree::Node<Vec<Vec<crate::SparseCell<T>>>>>
         + AsType<Vec<T>>
         + AsType<TensorMetadata<T>>
         + Send
@@ -334,10 +331,7 @@ where
         let output = Self::unpublished(dir, schema, destination_layout, max_capacity).await?;
         if matches!(destination_layout, Layout::Sparse { .. }) {
             let entries = source
-                .read_sparse_elements_in_order(
-                    crate::validate::full_range(source.shape()),
-                    (0..source.ndim()).collect(),
-                )
+                .read_sparse_elements(crate::validate::full_range(source.shape()))
                 .await?;
 
             return construction::sparse(output, entries).await;
@@ -372,109 +366,6 @@ where
         output.finish().await
     }
 
-    /// Explicitly materialize every logical value in row-major order.
-    ///
-    /// Unlike [`Self::copy_from`], this does not require indexed sparse traversal.
-    /// It reads implicit zeros too, so its cost follows logical cardinality rather
-    /// than sparse occupancy. Each batch is bounded and counted before sparse
-    /// zero filtering; exact total cardinality is required before publication.
-    /// The destination retains the source's dense/sparse kind; callers choose its
-    /// layout and capacity.
-    /// Failed or cancelled construction publishes no loadable metadata and releases
-    /// the source stream. The caller owns cleanup of partial destination storage.
-    pub async fn copy_from_values<'a, R>(
-        dir: DirLock<FE>,
-        source: &'a R,
-        destination_layout: Layout,
-        max_capacity: usize,
-    ) -> Result<Self>
-    where
-        R: TensorRead<DType = T> + ?Sized,
-    {
-        let schema =
-            TensorSchema::new(<T as number_general::DType>::dtype(), source.shape().into())?;
-
-        if matches!(source.layout(), Layout::Dense) != matches!(destination_layout, Layout::Dense) {
-            return Err(Error::Unsupported(
-                "copy requires matching dense/sparse kinds; convert the source explicitly first"
-                    .into(),
-            ));
-        }
-
-        let output = Self::unpublished(dir, schema, destination_layout, max_capacity).await?;
-        let expected = crate::schema::checked_product(source.shape())?;
-        let blocks = futures::stream::try_unfold(
-            (source.read_blocks()?, 0u64),
-            move |(mut blocks, received): (ValueBlockStream<'a, T>, u64)| async move {
-                tokio::task::coop::consume_budget().await;
-                let Some(values) = blocks.try_next().await? else {
-                    return if received == expected {
-                        Ok(None)
-                    } else {
-                        Err(Error::InvalidLayout(
-                            "reader returned fewer values than its shape".into(),
-                        ))
-                    };
-                };
-
-                if values.len() > crate::expression::MAX_BATCH_ELEMENTS {
-                    return Err(Error::InvalidLayout(format!(
-                        "copy block: expected at most {} values, got {}",
-                        crate::expression::MAX_BATCH_ELEMENTS,
-                        values.len()
-                    )));
-                }
-
-                let end = received
-                    .checked_add(values.len() as u64)
-                    .filter(|n| *n <= expected)
-                    .ok_or_else(|| {
-                        Error::InvalidLayout("reader returned more values than its shape".into())
-                    })?;
-
-                Ok(Some(((received, values), (blocks, end))))
-            },
-        )
-        .boxed();
-
-        if matches!(destination_layout, Layout::Sparse { .. }) {
-            let shape = source.shape();
-            let entries = blocks
-                .map_ok(move |(start, values)| {
-                    let mut coord = crate::schema::Coord::new();
-                    futures::stream::iter(
-                        values
-                            .into_iter()
-                            .enumerate()
-                            .filter(|(_, value)| *value != T::ZERO)
-                            .map(move |(offset, value)| {
-                                crate::request::decode_flat(
-                                    start + offset as u64,
-                                    shape,
-                                    &mut coord,
-                                )?;
-
-                                Ok((coord.to_vec(), value))
-                            }),
-                    )
-                })
-                .try_flatten();
-
-            return construction::sparse(output, entries).await;
-        }
-
-        let output = dense_storage::Construction(output);
-        let mut blocks = blocks;
-
-        while let Some((start, values)) = blocks.try_next().await? {
-            output
-                .stage(BatchRequest::linear(start, values.len())?, values)
-                .await?;
-        }
-
-        output.finish().await
-    }
-
     /// Strictly reopen materialized storage without creating or repairing files.
     /// The caller excludes concurrent native writes while loading and validating.
     pub async fn load(dir: DirLock<FE>) -> Result<Self> {
@@ -495,10 +386,12 @@ where
                     ));
                 }
 
-                Storage::Dense(DenseStorage::new(blocks, geometry))
+                let dense = DenseStorage::new(blocks, geometry);
+                dense.validate::<T>().await?;
+                Storage::Dense(dense)
             }
             Layout::Sparse { .. } => {
-                Storage::Sparse(sparse_storage::SparseBlocks::load(&dir, blocks, geometry)?)
+                Storage::Sparse(sparse_storage::SparseBlocks::load(dir.clone(), geometry).await?)
             }
         };
 
@@ -508,7 +401,6 @@ where
             schema,
         };
 
-        tensor.validate().await?;
         Ok(tensor)
     }
 
@@ -667,11 +559,7 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    crate::expression::reader_members!(
-        read_blocks,
-        read_coordinate_blocks,
-        read_sparse_elements_in_order
-    );
+    crate::expression::reader_members!(read_blocks, read_coordinate_blocks, read_sparse_elements);
 
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move { Ok(self.read_batch(&BatchRequest::point(coord), None).await?[0]) })
@@ -890,31 +778,24 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE
         &self,
         range: std::ops::Range<u64>,
     ) -> futures::stream::BoxStream<'static, Result<u64>> {
-        futures::stream::try_unfold((self.clone(), range), move |(tensor, range)| async move {
-            let keys = tensor
-                .storage
-                .sparse()
-                .ok_or_else(|| Error::InvalidLayout("dense storage has no occupancy".into()))?
-                .occupied_page(range.clone())
-                .await?;
-
-            let Some(&last) = keys.last() else {
-                return Ok::<_, Error>(None);
-            };
-
-            Ok(Some((
-                futures::stream::iter(keys.into_iter().map(Ok)),
-                (tensor, last + 1..range.end),
-            )))
-        })
-        .try_flatten()
-        .boxed()
+        match self.storage.sparse() {
+            Some(sparse) => sparse.occupied_blocks(range),
+            None => futures::stream::once(async {
+                Err(Error::InvalidLayout(
+                    "dense storage has no occupancy".into(),
+                ))
+            })
+            .boxed(),
+        }
     }
 
     fn read_logical_block(&self, id: u64) -> BoxFuture<'_, Result<Vec<T>>> {
         Box::pin(async move {
             match self.storage.as_ref() {
-                Storage::Sparse(sparse) => sparse.read(id).await,
+                Storage::Sparse(sparse) => match sparse.read(id).await? {
+                    Some(values) => Ok(values),
+                    None => Ok(vec![T::ZERO; sparse.geometry().block_len(id)?]),
+                },
                 Storage::Dense(dense) => Ok(dense.read::<T>(id).await?.to_vec()),
             }
         })
@@ -929,7 +810,7 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
     /// Failure may leave partial changes; this method supplies no transaction policy.
     pub async fn replace_logical_block(&self, id: u64, block: Vec<T>) -> Result<()> {
         match self.storage.as_ref() {
-            Storage::Sparse(sparse) => sparse.replace(id, block).await?,
+            Storage::Sparse(sparse) => sparse.replace(id, Some(block)).await?,
             Storage::Dense(dense) => dense.replace(id, block).await?,
         }
 

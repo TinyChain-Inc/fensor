@@ -5,7 +5,7 @@ use crate::mapping::CoordinateMap;
 use crate::request::BatchRequest;
 use crate::{
     Axes, BoxFuture, Error, Layout, Result, Shape, Strides, TensorElement, TensorGeometry,
-    TensorMatrixUnary, TensorRead, TensorTransform, TensorViewSemantics,
+    TensorMatrixUnary, TensorRead, TensorTransform,
 };
 
 /// A lazy, read-only diagonal projection. Transforms address its output geometry.
@@ -131,12 +131,6 @@ impl<S: TensorGeometry> TensorGeometry for DiagView<S> {
     }
 }
 
-impl<S: TensorGeometry> TensorViewSemantics for DiagView<S> {
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 impl<S> crate::expression::traversal::Plan for DiagView<S>
 where
     S: Expression,
@@ -192,7 +186,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 

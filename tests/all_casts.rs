@@ -2,13 +2,12 @@
 
 use std::cell::Cell;
 
-use ha_ndarray::{Array, Buffer, NDArrayCast, NDArrayRead, shape};
-
 use common::numbers::same;
 use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Layout, Tensor, TensorCast, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
 };
+use ha_ndarray::{Array, Buffer, NDArrayCast, NDArrayRead, shape};
 
 mod common;
 

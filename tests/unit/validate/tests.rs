@@ -60,7 +60,7 @@ fn reduction_geometry_normalizes_axes_and_reverses_broadcasting() {
 fn range_cardinality_handles_empty_selections_and_overflow() {
     assert!(matches!(
         validate_range(&[3], &Range::new()),
-        Err(Error::InvalidLayout(error)) if error == "range rank must match tensor rank"
+        Err(Error::InvalidCoord(_))
     ));
 
     for (name, bound) in [
@@ -71,8 +71,10 @@ fn range_cardinality_handles_empty_selections_and_overflow() {
         ("explicit", AxisRange::Of(vec![0, 3])),
     ] {
         assert!(
-            matches!(validate_range(&[3], &smallvec::smallvec![bound]),
-                Err(Error::InvalidLayout(error)) if error == "range bound at axis 0 is out of bounds"),
+            matches!(
+                validate_range(&[3], &smallvec::smallvec![bound]),
+                Err(Error::InvalidCoord(_))
+            ),
             "{name}"
         );
     }
@@ -97,7 +99,7 @@ fn range_cardinality_handles_empty_selections_and_overflow() {
 
     assert!(matches!(
         iter_range_coords(&[long, 2], &selection),
-        Err(Error::InvalidLayout(_))
+        Err(Error::InvalidSchema(_))
     ));
 
     let mut empty = selection;

@@ -1,16 +1,15 @@
 //! Shared execution paths for all real storage widths; integer edge expectations are independent.
 
-use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, Buffer, NDArrayMath, NDArrayMathScalar, NDArrayRead, Number, Real, axes, shape,
-};
-
 use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Layout, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCompare, TensorCompareScalar,
     TensorElement, TensorExpression, TensorFileEntry, TensorMatMul, TensorMath, TensorMathScalar,
     TensorMatrixUnary, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
     TensorTransform, TensorUnaryBoolean, TensorWhere, TensorWrite,
+};
+use futures::TryStreamExt;
+use ha_ndarray::{
+    Array, Buffer, NDArrayMath, NDArrayMathScalar, NDArrayRead, Number, Real, axes, shape,
 };
 
 mod common;

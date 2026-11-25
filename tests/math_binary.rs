@@ -1,12 +1,4 @@
 //! Filesystem-backed binary expression parity and implicit-zero regressions.
-use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{
-    Array, ArrayAccess, Buffer, NDArrayBoolean, NDArrayBooleanScalar, NDArrayCompare,
-    NDArrayCompareScalar, NDArrayMath, NDArrayMathScalar, NDArrayRead, NDArrayWhere, Number, axes,
-    range, shape,
-};
-use number_general::DType;
-
 use common::numbers::same;
 use common::{FsEntry, new_dir};
 use fensor::{
@@ -15,6 +7,13 @@ use fensor::{
     TensorGeometry, TensorMath, TensorMathScalar, TensorNumeric, TensorRead, TensorSchema,
     TensorTransform, TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite,
 };
+use futures::{StreamExt, TryStreamExt};
+use ha_ndarray::{
+    Array, ArrayAccess, Buffer, NDArrayBoolean, NDArrayBooleanScalar, NDArrayCompare,
+    NDArrayCompareScalar, NDArrayMath, NDArrayMathScalar, NDArrayRead, NDArrayWhere, axes, range,
+    shape,
+};
+use number_general::DType;
 
 mod common;
 
@@ -42,11 +41,7 @@ where
     V::DType: TensorElement,
     FsEntry: TensorFileEntry<V::DType>,
 {
-    let sparse = matches!(view.layout(), Layout::Sparse { .. });
-    common::fixture::consumers(&view, &expected, same, |a, b| {
-        same(a, b) || (sparse && a == V::DType::ZERO && b == V::DType::ZERO)
-    })
-    .await;
+    common::fixture::consumers(&view, &expected, same, same).await;
 }
 
 macro_rules! matrix {
@@ -351,10 +346,11 @@ async fn far_end_sparse_range_is_bounded_and_ordered() {
 
     let run = async {
         expression
-            .read_sparse_elements_in_order(
-                range![AxisRange::Of(vec![999_999_999, 999_999_998, 999_999_999])],
-                axes![0],
-            )
+            .read_sparse_elements(range![AxisRange::Of(vec![
+                999_999_999,
+                999_999_998,
+                999_999_999
+            ])])
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -373,24 +369,16 @@ async fn far_end_sparse_range_is_bounded_and_ordered() {
 
     assert!(
         expression
-            .read_sparse_elements_in_order(
-                range![AxisRange::In(999_999_999, 1_000_000_001, 1)],
-                axes![0]
-            )
+            .read_sparse_elements(range![AxisRange::In(999_999_999, 1_000_000_001, 1)],)
             .await
             .is_err()
     );
 
-    assert!(
-        expression
-            .read_sparse_elements_in_order(range![], axes![1])
-            .await
-            .is_err()
-    );
+    assert!(expression.read_sparse_elements(range![]).await.is_err());
 
     assert!(
         expression
-            .read_sparse_elements_in_order(range![AxisRange::In(5, 5, 1)], axes![0])
+            .read_sparse_elements(range![AxisRange::In(5, 5, 1)])
             .await
             .unwrap()
             .next()
@@ -473,7 +461,7 @@ async fn sparse_batch_boundaries_preserve_zero_intermediates_and_order() {
 
     let read = || async {
         expression
-            .read_sparse_elements_in_order(range![AxisRange::In(0, 4101, 1)], axes![0])
+            .read_sparse_elements(range![AxisRange::In(0, 4101, 1)])
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -500,7 +488,7 @@ async fn sparse_batch_boundaries_preserve_zero_intermediates_and_order() {
 
     assert_eq!(read().await, first);
     let selected: Vec<_> = expression
-        .read_sparse_elements_in_order(range![AxisRange::In(4094, 4101, 2)], axes![0])
+        .read_sparse_elements(range![AxisRange::In(4094, 4101, 2)])
         .await
         .unwrap()
         .try_collect()
@@ -1019,7 +1007,7 @@ async fn conditional_batch_boundary_repeated_concurrent_and_dropped_streams() {
     );
 
     let entries: Vec<_> = expression
-        .read_sparse_elements_in_order(range![AxisRange::In(0, 4101, 1)], axes![0])
+        .read_sparse_elements(range![AxisRange::In(0, 4101, 1)])
         .await
         .unwrap()
         .try_collect()
@@ -1061,10 +1049,11 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
             .unwrap();
 
         let entries: Vec<_> = expression
-            .read_sparse_elements_in_order(
-                range![AxisRange::Of(vec![999_999_999, 999_999_998, 999_999_999])],
-                axes![0],
-            )
+            .read_sparse_elements(range![AxisRange::Of(vec![
+                999_999_999,
+                999_999_998,
+                999_999_999
+            ])])
             .await
             .unwrap()
             .try_collect()
@@ -1073,10 +1062,7 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
 
         assert_eq!(entries, vec![(vec![999_999_999], 254)]);
         let stepped: Vec<_> = expression
-            .read_sparse_elements_in_order(
-                range![AxisRange::In(999_999_997, 1_000_000_000, 2)],
-                axes![0],
-            )
+            .read_sparse_elements(range![AxisRange::In(999_999_997, 1_000_000_000, 2)])
             .await
             .unwrap()
             .try_collect()
@@ -1086,21 +1072,16 @@ async fn conditional_far_end_range_is_bounded_and_validated() {
         assert_eq!(stepped, entries);
         assert!(
             expression
-                .read_sparse_elements_in_order(range![AxisRange::At(1_000_000_000)], axes![0])
+                .read_sparse_elements(range![AxisRange::At(1_000_000_000)])
                 .await
                 .is_err()
         );
 
-        assert!(
-            expression
-                .read_sparse_elements_in_order(range![], axes![1])
-                .await
-                .is_err()
-        );
+        assert!(expression.read_sparse_elements(range![]).await.is_err());
 
         assert!(
             expression
-                .read_sparse_elements_in_order(range![AxisRange::In(1, 1, 1)], axes![0])
+                .read_sparse_elements(range![AxisRange::In(1, 1, 1)])
                 .await
                 .unwrap()
                 .next()

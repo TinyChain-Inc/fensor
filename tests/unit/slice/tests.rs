@@ -2,12 +2,12 @@ use futures::TryStreamExt;
 use ha_ndarray::{axes, shape};
 use number_general::DType;
 
-use super::*;
 use crate::test_support::{FsEntry, new_dir};
 use crate::{
     AxisRange, Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema,
     TensorSource, TensorTransform, TensorUnary, TensorWrite,
 };
+use super::*;
 
 #[test]
 fn ordered_coverage_and_permanent_exhaustion() {

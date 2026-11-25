@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
-use ha_ndarray::{axes, range, shape};
-use number_general::{FloatType, NumberType};
-
 use fensor::{
     AxisRange, Error, Layout, Range, Tensor, TensorGeometry, TensorRead, TensorSchema,
     TensorTransform, TensorWrite, contiguous_strides,
 };
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType};
 
 mod common;
 

@@ -1,14 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures::{StreamExt, TryStreamExt};
-use number_general::FloatType;
-
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorAbs, TensorArray,
     TensorExpression, TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorSchema,
     TensorSource, TensorTransform, TensorUnary, TensorView, TensorWrite,
 };
+use futures::{StreamExt, TryStreamExt};
+use number_general::FloatType;
 
 mod common;
 
@@ -107,6 +106,50 @@ async fn custom_owned_source_feeds_existing_lazy_operations() {
         .unwrap();
 
     assert_eq!(values, [8.0, 4.0, 9.0, 5.0]);
+    cleanup(&root).await;
+}
+
+#[tokio::test]
+async fn sparse_block_reads_split_and_join_occupied_spans() {
+    let (root, dir) = new_dir("sparse_reblock").await;
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F64), vec![2, 2, 5].into()).unwrap();
+    let source =
+        Tensor::<FsEntry, f64>::create(dir, schema.clone(), Layout::Sparse { axis: Some(0) }, 4)
+            .await
+            .unwrap();
+
+    for (coord, value) in [
+        ([0, 0, 3], 3.0),
+        ([0, 0, 4], 4.0),
+        ([0, 1, 4], 9.0),
+        ([1, 0, 0], 10.0),
+        ([1, 0, 3], 13.0),
+        ([1, 1, 4], 19.0),
+    ] {
+        source.write_value(&coord, value).await.unwrap();
+    }
+
+    let geometry = StorageGeometry::new(schema, Layout::Sparse { axis: Some(1) }, 3).unwrap();
+    let blocks: Vec<_> = geometry
+        .read_blocks(&source)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        blocks,
+        [
+            (1, vec![3.0, 4.0]),
+            (3, vec![0.0, 9.0]),
+            (4, vec![10.0, 0.0, 0.0]),
+            (5, vec![13.0, 0.0]),
+            (7, vec![0.0, 19.0]),
+        ]
+    );
+
+    drop(source);
     cleanup(&root).await;
 }
 
@@ -249,25 +292,24 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                 .unwrap();
 
             same(&borrowed, &owned);
-            let entries: Vec<_> = value
-                .clone()
-                .into_sparse_elements()
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-
-            assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
             if matches!(layout, Layout::Sparse { .. }) {
+                let entries: Vec<_> = value
+                    .clone()
+                    .into_sparse_elements()
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+
+                assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
                 let range = value
                     .shape()
                     .iter()
                     .map(|&dim| fensor::AxisRange::In(0, dim, 1))
                     .collect();
 
-                let order = (0..value.ndim()).collect();
                 let borrowed: Vec<_> = value
-                    .read_sparse_elements_in_order(range, order)
+                    .read_sparse_elements(range)
                     .await
                     .unwrap()
                     .try_collect()
@@ -286,6 +328,11 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
 
                 assert!(entries.iter().any(|(_, value)| *value == 2.0));
                 assert_eq!(entries.len(), 5);
+            } else {
+                assert!(matches!(
+                    value.into_sparse_elements(),
+                    Err(fensor::Error::Unsupported(_))
+                ));
             }
         }
 
@@ -413,27 +460,24 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
 
     let transposed = expression.clone().transpose(None).unwrap();
     scans.store(0, Ordering::Relaxed);
-    assert!(matches!(
-        transposed.clone().into_sparse_elements(),
-        Err(fensor::Error::Unsupported(_))
-    ));
-
-    assert_eq!(scans.load(Ordering::Relaxed), 0);
-    let mut blocks = transposed.read_coordinate_blocks().unwrap();
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(batch) = blocks.try_next().await.unwrap() {
-        let (coordinates, values) = batch.into_coordinates(transposed.shape()).unwrap();
-        assert_eq!(coordinates.len(), values.len());
-        for (coord, value) in coordinates.into_iter().zip(values) {
-            assert!(seen.insert(coord));
-            assert_eq!(value, 2.);
+    {
+        let mut blocks = transposed.read_coordinate_blocks().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(batch) = blocks.try_next().await.unwrap() {
+            let (coordinates, values) = batch.into_coordinates(transposed.shape()).unwrap();
+            assert_eq!(coordinates.len(), values.len());
+            for (coord, value) in coordinates.into_iter().zip(values) {
+                assert!(seen.insert(coord));
+                assert_eq!(value, 2.);
+            }
         }
-    }
 
-    assert_eq!(seen.len() as u64, rows * 2);
+        assert_eq!(seen.len() as u64, rows * 2);
+    }
     assert_eq!(scans.load(Ordering::Relaxed), 0);
 
-    for unsupported in [
+    for view in [
+        transposed,
         expression.clone().flip(0).unwrap(),
         expression
             .slice(
@@ -445,21 +489,22 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
             )
             .unwrap(),
     ] {
-        assert!(matches!(
-            unsupported.clone().into_sparse_elements(),
-            Err(fensor::Error::Unsupported(_))
-        ));
+        let shape = view.shape().to_vec();
+        let range = shape
+            .iter()
+            .map(|&dim| fensor::AxisRange::In(0, dim, 1))
+            .collect();
+        let mut borrowed = view.read_sparse_elements(range).await.unwrap();
+        let mut owned = view.clone().into_sparse_elements().unwrap();
 
-        assert_eq!(unsupported.read_value(&[0, 0]).await.unwrap(), 2.);
-        assert_eq!(
-            unsupported
-                .read_blocks()
-                .unwrap()
-                .try_concat()
-                .await
-                .unwrap()
-                .len() as u64,
-            rows * 2
-        );
+        for coord in common::iter_coords(&shape) {
+            let expected = Some((coord, 2.));
+            assert_eq!(borrowed.try_next().await.unwrap(), expected);
+            assert_eq!(owned.try_next().await.unwrap(), expected);
+        }
+
+        assert!(borrowed.try_next().await.unwrap().is_none());
+        assert!(owned.try_next().await.unwrap().is_none());
+        assert_eq!(scans.load(Ordering::Relaxed), 0);
     }
 }

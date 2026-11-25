@@ -3,7 +3,12 @@
 use std::future::Future;
 
 use futures::TryStreamExt;
-use ha_ndarray::{NDArrayReduceAll, Number, Real, statistics};
+use ha_ndarray::host::Host;
+use ha_ndarray::statistics::BlockReduce;
+pub use ha_ndarray::statistics::{
+    MeanOp as Mean, NormOp as Norm, StandardDeviationOp as StandardDeviation,
+};
+use ha_ndarray::{NDArrayReduceAll, Number, Real};
 
 use crate::expression::{Batch, Expression};
 use crate::mapping::CoordinateMap;
@@ -11,8 +16,7 @@ use crate::request::BatchRequest;
 use crate::schema::Coord;
 use crate::{
     Axes, BoxFuture, Error, Layout, Result, Shape, TensorElement, TensorGeometry, TensorRead,
-    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorViewSemantics,
-    expression, request,
+    TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, expression, request,
 };
 
 mod sealed {
@@ -150,189 +154,61 @@ impl<T: TensorElement + Real> ReduceOp<T> for Max {
     }
 }
 
-/// Numeric conversion owned by the statistics reductions.
-pub trait StatisticsElement: TensorElement + sealed::Sealed {
-    type Mean: TensorElement;
+macro_rules! block_reduction {
+    ($(#[$attr:meta])* $op:ident) => {
+        impl sealed::Sealed for $op {}
 
-    fn components(self) -> [f64; 2];
+        impl<T: TensorElement> ReduceOp<T> for $op
+        where
+            Self: BlockReduce<Host, T, Block = [T]>,
+            <Self as BlockReduce<Host, T>>::Output: TensorElement,
+        {
+            type State = <Self as BlockReduce<Host, T>>::State;
 
-    fn mean_value(value: [f64; 2]) -> Self::Mean;
-}
+            type Output = <Self as BlockReduce<Host, T>>::Output;
 
-macro_rules! real_statistics {
-    ($($ty:ty),+ $(,)?) => {
-        $(
-            impl sealed::Sealed for $ty {}
-
-            impl StatisticsElement for $ty {
-                type Mean = f64;
-
-                fn components(self) -> [f64; 2] {
-                    [self as f64, 0.0]
-                }
-
-                fn mean_value(value: [f64; 2]) -> f64 {
-                    value[0]
-                }
+            $(#[$attr])*
+            fn partial(&self, values: Vec<T>) -> Result<Self::State> {
+                Ok(<Self as BlockReduce<Host, T>>::partial(self, &values)?)
             }
-        )+
+
+            fn combine(left: Self::State, right: Self::State) -> Result<Self::State> {
+                Ok(<Self as BlockReduce<Host, T>>::merge(left, right)?)
+            }
+
+            fn finish(state: Self::State) -> Result<Self::Output> {
+                Ok(<Self as BlockReduce<Host, T>>::finish(state))
+            }
+
+            fn empty() -> Result<Self::Output> {
+                <Self as ReduceOp<T>>::finish(Self::State::default())
+            }
+
+            fn finish_axis(state: Option<Self::State>) -> Result<Self::Output> {
+                <Self as ReduceOp<T>>::finish(state.unwrap_or_default())
+            }
+        }
     };
 }
 
-real_statistics!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
-
-#[cfg(feature = "complex")]
-macro_rules! complex_statistics {
-    ($($ty:ty),+ $(,)?) => {
-        $(
-            impl sealed::Sealed for $ty {}
-
-            impl StatisticsElement for $ty {
-                type Mean = crate::complex::Complex64;
-
-                fn components(self) -> [f64; 2] {
-                    [self.re as f64, self.im as f64]
-                }
-
-                fn mean_value(value: [f64; 2]) -> Self::Mean {
-                    Self::Mean::new(value[0], value[1])
-                }
-            }
-        )+
-    };
-}
-
-#[cfg(feature = "complex")]
-complex_statistics!(crate::complex::Complex32, crate::complex::Complex64);
-
-/// Mean counts every logical value, including implicit sparse zeros.
-#[derive(Clone, Copy, Debug)]
-pub struct Mean;
-
-impl sealed::Sealed for Mean {}
-
-impl<T: StatisticsElement> ReduceOp<T> for Mean {
-    type State = [statistics::Mean; 2];
-
-    type Output = T::Mean;
-
-    // Keep this batch kernel out of the shared expression evaluator's hot path.
-    // Inlining it slowed unrelated reductions in paired complete-consumer runs.
+// Inlining the mean kernel slowed unrelated reductions in paired consumer runs.
+block_reduction!(
     #[inline(never)]
-    fn partial(&self, values: Vec<T>) -> Result<Self::State> {
-        Ok([
-            statistics::Mean::from_batch(&values, |value| value.components()[0])?,
-            statistics::Mean::from_batch(&values, |value| value.components()[1])?,
-        ])
-    }
+    Mean
+);
 
-    fn combine(left: Self::State, right: Self::State) -> Result<Self::State> {
-        Ok([left[0].merge(right[0])?, left[1].merge(right[1])?])
-    }
-
-    fn finish(state: Self::State) -> Result<Self::Output> {
-        Ok(T::mean_value(state.map(statistics::Mean::finish)))
-    }
-
-    fn empty() -> Result<Self::Output> {
-        Ok(T::mean_value([f64::NAN; 2]))
-    }
-
-    fn finish_axis(state: Option<Self::State>) -> Result<Self::Output> {
-        state
-            .map(<Self as ReduceOp<T>>::finish)
-            .unwrap_or_else(<Self as ReduceOp<T>>::empty)
-    }
-}
-
-/// Population standard deviation using squared complex magnitude.
-#[derive(Clone, Copy, Debug)]
-pub struct StandardDeviation;
-
-impl sealed::Sealed for StandardDeviation {}
-
-impl<T: StatisticsElement> ReduceOp<T> for StandardDeviation {
-    type State = [statistics::StandardDeviation; 2];
-
-    type Output = f64;
-
-    fn partial(&self, values: Vec<T>) -> Result<Self::State> {
-        let mut state = Self::State::default();
-        for value in values {
-            for (state, component) in state.iter_mut().zip(value.components()) {
-                state.push(component)?;
-            }
-        }
-
-        Ok(state)
-    }
-
-    fn combine(left: Self::State, right: Self::State) -> Result<Self::State> {
-        Ok([left[0].merge(right[0])?, left[1].merge(right[1])?])
-    }
-
-    fn finish(state: Self::State) -> Result<f64> {
-        Ok(statistics::StandardDeviation::finish_norm(state))
-    }
-
-    fn empty() -> Result<f64> {
-        Ok(f64::NAN)
-    }
-
-    fn finish_axis(state: Option<Self::State>) -> Result<f64> {
-        state
-            .map(<Self as ReduceOp<T>>::finish)
-            .unwrap_or_else(<Self as ReduceOp<T>>::empty)
-    }
-}
-
-/// Euclidean norm over logical values.
-#[derive(Clone, Copy, Debug)]
-pub struct Norm;
-
-impl sealed::Sealed for Norm {}
-
-impl<T: StatisticsElement> ReduceOp<T> for Norm {
-    type State = statistics::Norm;
-
-    type Output = f64;
-
-    fn partial(&self, values: Vec<T>) -> Result<Self::State> {
-        let mut state = Self::State::default();
-        for value in values {
-            for component in value.components() {
-                state.push(component);
-            }
-        }
-
-        Ok(state)
-    }
-
-    fn combine(left: Self::State, right: Self::State) -> Result<Self::State> {
-        Ok(left.merge(right))
-    }
-
-    fn finish(state: Self::State) -> Result<f64> {
-        Ok(state.finish())
-    }
-
-    fn empty() -> Result<f64> {
-        Ok(0.0)
-    }
-}
+block_reduction!(StandardDeviation);
+block_reduction!(Norm);
 
 /// Statistics include implicit zeros and share native batching and axis traversal.
-pub trait TensorStatistics: TensorGeometry
-where
-    Self::DType: StatisticsElement,
-{
-    type MeanOutput: TensorRead<DType = <Self::DType as StatisticsElement>::Mean>;
+pub trait TensorStatistics: TensorGeometry<DType: TensorElement> {
+    type MeanOutput: TensorRead<DType: TensorElement>;
 
     type StdOutput: TensorRead<DType = f64>;
 
     type NormOutput: TensorRead<DType = f64>;
 
-    fn mean_all(&self) -> BoxFuture<'_, Result<<Self::DType as StatisticsElement>::Mean>>;
+    fn mean_all(&self) -> BoxFuture<'_, Result<<Self::MeanOutput as TensorGeometry>::DType>>;
 
     fn std_all(&self) -> BoxFuture<'_, Result<f64>>;
 
@@ -372,7 +248,10 @@ macro_rules! axis_constructor {
 impl<E> TensorStatistics for E
 where
     E: Expression + Clone,
-    E::DType: StatisticsElement,
+    E::DType: TensorElement,
+    Mean: ReduceOp<E::DType>,
+    StandardDeviation: ReduceOp<E::DType, Output = f64>,
+    Norm: ReduceOp<E::DType, Output = f64>,
 {
     axis_constructor!(MeanOutput, mean, Mean);
 
@@ -380,7 +259,7 @@ where
 
     axis_constructor!(NormOutput, norm, Norm);
 
-    fn mean_all(&self) -> BoxFuture<'_, Result<<Self::DType as StatisticsElement>::Mean>> {
+    fn mean_all(&self) -> BoxFuture<'_, Result<<Self::MeanOutput as TensorGeometry>::DType>> {
         Box::pin(terminal(self, Mean))
     }
 
@@ -425,7 +304,6 @@ fn accumulate_zeros<T: TensorElement, O: ReduceOp<T>>(
     op: &O,
     state: &mut Option<O::State>,
     mut count: u64,
-    zero: T,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
@@ -434,7 +312,7 @@ fn accumulate_zeros<T: TensorElement, O: ReduceOp<T>>(
     #[cfg(test)]
     crate::read_metrics::record(|m| m.reduction_calls += 1);
 
-    let mut partial = op.partial(vec![zero])?;
+    let mut partial = op.partial(vec![T::ZERO])?;
     loop {
         if count & 1 != 0 {
             *state = Some(match *state {
@@ -469,7 +347,7 @@ where
         accumulate::<_, O>(&op, &mut state, &mut remaining, batch.values)?;
     }
 
-    accumulate_zeros::<_, O>(&op, &mut state, remaining, source.implicit_zero())?;
+    accumulate_zeros::<_, O>(&op, &mut state, remaining)?;
     state.map(O::finish).unwrap_or_else(O::empty)
 }
 
@@ -688,17 +566,6 @@ where
     }
 }
 
-impl<S, O> TensorViewSemantics for ReduceView<S, O>
-where
-    S: TensorGeometry,
-    S::DType: TensorElement,
-    O: ReduceOp<S::DType>,
-{
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 impl<S, O> crate::expression::traversal::Plan for ReduceView<S, O>
 where
     S: Expression,
@@ -755,12 +622,7 @@ where
                         accumulate::<_, O>(&self.op, &mut state, &mut remaining, batch.values)?;
                     }
 
-                    accumulate_zeros::<_, O>(
-                        &self.op,
-                        &mut state,
-                        remaining,
-                        self.source.implicit_zero(),
-                    )?;
+                    accumulate_zeros::<_, O>(&self.op, &mut state, remaining)?;
 
                     values.push(O::finish_axis(state)?);
                     continue;
@@ -819,7 +681,7 @@ where
     S::DType: TensorElement,
     O: ReduceOp<S::DType>,
 {
-    crate::expression::reader_members!(read_value, read_blocks, read_sparse_elements_in_order);
+    crate::expression::reader_members!(read_value, read_blocks, read_sparse_elements);
 }
 
 impl<S, O> TensorTransform for ReduceView<S, O>

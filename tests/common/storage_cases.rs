@@ -2,10 +2,10 @@
 
 use std::time::Instant;
 
+use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
 use number_general::DType;
 
 use super::{benchmark, common};
-use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
 
 pub async fn storage() {
     let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();

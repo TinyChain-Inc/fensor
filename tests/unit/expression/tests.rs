@@ -1,6 +1,6 @@
-use super::*;
 use crate::Layout;
 use crate::test_support::counters::Counter;
+use super::*;
 
 // Wrap real storage only to observe dispatch; numerical reads still delegate.
 #[derive(Clone)]

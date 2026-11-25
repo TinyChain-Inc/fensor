@@ -29,6 +29,7 @@ pub trait Plan: Send + Sync {
     }
 
     /// Describe ordered occupied-request candidates, independent of numerical values.
+    /// The default streams logical coordinates in bounded row-major requests.
     fn ordered_step(
         &self,
         slice: crate::slice::Slice,

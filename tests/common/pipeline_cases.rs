@@ -1,10 +1,10 @@
 //! Paired stream and copy measurements; setup remains outside timed phases.
 
+use fensor::{Layout, Tensor, TensorMatMul};
 use ha_ndarray::shape;
 
 use super::common::FsEntry;
 use super::{benchmark, common};
-use fensor::{Layout, Tensor, TensorMatMul};
 
 async fn source(
     rows: usize,

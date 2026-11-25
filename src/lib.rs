@@ -80,7 +80,6 @@ mod matmul;
 mod matrix;
 
 mod metadata;
-
 mod owned;
 
 #[cfg(test)]
@@ -105,11 +104,8 @@ mod schema;
 mod selection;
 
 mod slice;
-
 mod sparse;
-
 mod storage;
-
 mod storage_read;
 
 mod tensor;
@@ -129,21 +125,20 @@ mod validate;
 
 mod view;
 
-pub use ha_ndarray::Axes;
-#[cfg(feature = "complex")]
-pub use ha_ndarray::complex;
-pub use number_general::NumberType;
-
 pub use binary::BinaryView;
 pub use error::{Error, Result};
 pub use expression::MAX_BATCH_ELEMENTS;
 #[cfg(feature = "complex")]
 pub use fft::FourierView;
+pub use ha_ndarray::Axes;
+#[cfg(feature = "complex")]
+pub use ha_ndarray::complex;
 pub use matmul::MatMulView;
 pub use matrix::DiagView;
 pub use metadata::TensorMetadata;
+pub use number_general::NumberType;
 pub use owned::TensorExpression;
-pub use reduce::{ReduceView, StatisticsElement, TensorStatistics};
+pub use reduce::{ReduceView, TensorStatistics};
 pub use schema::{
     AxisRange, Layout, MAX_BLOCK_CAPACITY, Range, RowMajorCoords, Shape, Strides, TensorSchema,
     contiguous_strides, row_major_coords,
@@ -157,8 +152,7 @@ pub use traits::{
     TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar,
     TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric,
     TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig,
-    TensorUnary, TensorUnaryBoolean, TensorViewSemantics, TensorWhere, TensorWrite,
-    TensorWriteBulk, ValueBlockStream,
+    TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite, TensorWriteBulk, ValueBlockStream,
 };
 #[cfg(feature = "complex")]
 pub use traits::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};

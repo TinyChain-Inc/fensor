@@ -1,12 +1,11 @@
 //! Shared sparse consumption through operation-specific, transformed expressions.
-use futures::TryStreamExt;
-use ha_ndarray::{Number, shape};
-use number_general::DType;
-
 use fensor::{
     AxisRange, Layout, Tensor, TensorElement, TensorMatMul, TensorMatrixUnary, TensorRead,
     TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{Number, shape};
+use number_general::DType;
 
 mod common;
 
@@ -19,7 +18,7 @@ where
 {
     let values = view.read_blocks().unwrap().try_concat().await.unwrap();
     assert!(
-        values.len() > 4096,
+        values.len() > fensor::MAX_BATCH_ELEMENTS,
         "fixture spans multiple execution batches"
     );
 
@@ -35,10 +34,11 @@ where
         .iter()
         .map(|&dim| AxisRange::In(0, dim, 1))
         .collect();
-
-    let mut selected = full.clone();
-    let last = view.ndim() - 1;
-    selected[last] = AxisRange::Of(vec![view.shape()[last] - 1, 0, view.shape()[last] - 1, 1]);
+    let selected = view
+        .shape()
+        .iter()
+        .map(|&dim| AxisRange::Of(vec![dim - 1, 0, dim / 2, dim - 1]))
+        .collect();
     let mut empty_range = full.clone();
     empty_range[0] = AxisRange::In(0, 0, 1);
     for range in [full, selected, empty_range] {
@@ -57,7 +57,7 @@ where
             .collect();
 
         let actual: Vec<_> = view
-            .read_sparse_elements_in_order(range, (0..view.ndim()).collect())
+            .read_sparse_elements(range)
             .await
             .unwrap()
             .try_collect()
