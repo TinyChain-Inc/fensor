@@ -521,6 +521,7 @@ where
             )?;
 
             let mut values = vec![L::DType::ZERO; coords.len()];
+            let output_value = expression::output_value(self.layout());
             let inner = self.left.shape()[self.left.ndim() - 1];
 
             for MatrixPlan {
@@ -570,7 +571,7 @@ where
 
                 let accumulated = accumulated.expect("nonzero contraction dimension");
                 scatter.each(columns.len(), |position, offset| {
-                    values[position] = accumulated[offset];
+                    values[position] = output_value(accumulated[offset]);
                 });
             }
 

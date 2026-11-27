@@ -417,8 +417,11 @@ where
         coords: std::sync::Arc<BatchRequest>,
     ) -> BoxFuture<'a, Result<Batch<Self::DType>>> {
         Box::pin(async move {
+            let expected = coords.len();
             let source = context.batch(&self.source, coords).await?;
-            Batch::from_array(self.op.apply(source.into_array())?)
+
+            Batch::from_array(self.op.apply(source.into_array())?)?
+                .normalize_sparse(self.layout(), expected)
         })
     }
 }

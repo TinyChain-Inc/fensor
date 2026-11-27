@@ -4,6 +4,39 @@ use number_general::DType;
 use crate::test_support::{FsEntry, cleanup, new_dir};
 use crate::{Error, Layout, StorageGeometry, Tensor, TensorSchema, TensorSource};
 
+#[cfg(feature = "complex")]
+#[tokio::test]
+async fn fill_empty_preserves_dense_complex_zero_signs() {
+    use crate::complex::Complex64;
+
+    let (root, dir) = new_dir("dense_complex_block_fill").await;
+    let schema = TensorSchema::new(Complex64::dtype(), vec![3].into()).unwrap();
+    let geometry = StorageGeometry::new(schema, Layout::Dense, 2).unwrap();
+    let storage = crate::SparseBlocks::<FsEntry, Complex64>::create(dir, geometry)
+        .await
+        .unwrap();
+
+    storage.fill_empty(Complex64::new(0., 0.)).await.unwrap();
+    assert!(storage.read(0).await.unwrap().is_none());
+    let value = Complex64::new(0., -0.);
+    storage.fill_empty(value).await.unwrap();
+    assert!(matches!(
+        storage.fill_empty(Complex64::new(0., 0.)).await,
+        Err(Error::InvalidLayout(_))
+    ));
+
+    for (id, len) in [(0, 2), (1, 1)] {
+        let block = storage.read(id).await.unwrap().unwrap();
+        assert_eq!(block.len(), len);
+        for element in block {
+            assert_eq!(element.re.to_bits(), value.re.to_bits());
+            assert_eq!(element.im.to_bits(), value.im.to_bits());
+        }
+    }
+
+    cleanup(&root).await;
+}
+
 #[tokio::test]
 async fn replacement_validation_preserves_lock_precedence() {
     use b_tree::Schema;
@@ -175,7 +208,12 @@ async fn replacement_validation_preserves_lock_precedence() {
     crate::read_metrics::CURRENT
         .scope(Default::default(), async {
             let request = crate::request::BatchRequest::linear(0, 1).unwrap();
-            assert_eq!(tensor.read_batch(&request, None).await.unwrap(), vec![0.]);
+            assert_eq!(
+                crate::storage::read_batch(&tensor, &request, None)
+                    .await
+                    .unwrap(),
+                vec![0.]
+            );
             crate::read_metrics::CURRENT.with(|m| assert_eq!(m.borrow().block_bounds, 0));
         })
         .await;
@@ -215,7 +253,7 @@ async fn index_guards_preserve_batch_reads_and_partial_updates() {
         .unwrap();
     let request = BatchRequest::explicit(vec![vec![0, 0], vec![1, 0], vec![3, 0]]).unwrap();
     {
-        let mut read = std::pin::pin!(tensor.read_batch(&request, None));
+        let mut read = std::pin::pin!(crate::storage::read_batch(&tensor, &request, None));
         assert!(futures::poll!(read.as_mut()).is_pending());
         let mut write = std::pin::pin!(storage.update(3, &[(0, 2.)]));
         assert!(futures::poll!(write.as_mut()).is_pending());

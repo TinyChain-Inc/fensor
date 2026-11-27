@@ -6,7 +6,7 @@ use number_general::DType;
 
 use crate::request::BatchRequest;
 use crate::test_support::{FsEntry, new_dir};
-use crate::{Layout, Tensor, TensorSchema};
+use crate::{Layout, Tensor, TensorSchema, TensorSource};
 
 #[tokio::test]
 async fn dense_reads_delegate_capacity_and_release_failed_work() {
@@ -29,11 +29,13 @@ async fn dense_reads_delegate_capacity_and_release_failed_work() {
         let cache = freqfs::Cache::<FsEntry>::new(32768, handles, 0, Duration::from_secs(1));
         let dir = cache.load(root.to_path_buf()).unwrap();
         let tensor = Tensor::<FsEntry, f32>::load(dir).await.unwrap();
-        let values =
-            tokio::time::timeout(Duration::from_secs(5), tensor.read_batch(&request, None))
-                .await
-                .unwrap()
-                .unwrap();
+        let values = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::storage::read_batch(&tensor, &request, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert_eq!(values, vec![0.; 2048]);
     }
@@ -51,10 +53,13 @@ async fn dense_reads_delegate_capacity_and_release_failed_work() {
 
     let held = owner.read::<f32>(0).await.unwrap();
     let request = BatchRequest::linear(512, 512).unwrap();
-    let error = tokio::time::timeout(Duration::from_secs(5), tensor.read_batch(&request, None))
-        .await
-        .unwrap()
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::storage::read_batch(&tensor, &request, None),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
 
     assert!(
         matches!(error, crate::Error::Io(error) if error.kind() == std::io::ErrorKind::ResourceBusy)
@@ -63,7 +68,9 @@ async fn dense_reads_delegate_capacity_and_release_failed_work() {
     drop(held);
 
     assert_eq!(
-        tensor.read_batch(&request, None).await.unwrap(),
+        crate::storage::read_batch(&tensor, &request, None)
+            .await
+            .unwrap(),
         vec![0.; 512]
     );
 }
@@ -145,7 +152,7 @@ async fn buffered_reads_preserve_order_and_release_guards() {
 
     for cancel in [false, true] {
         let held = first.write::<Vec<f32>>().await.unwrap();
-        let mut read = Box::pin(tensor.read_batch(&request, None));
+        let mut read = Box::pin(crate::storage::read_batch(&tensor, &request, None));
         assert!(read.as_mut().now_or_never().is_none());
 
         if num_cpus::get() > 1 {
@@ -168,7 +175,7 @@ async fn buffered_reads_preserve_order_and_release_guards() {
     let mut held = first.write::<Vec<f32>>().await.unwrap();
     held.clear();
     owner.blocks.write().await.delete("1").await;
-    let mut read = Box::pin(tensor.read_batch(&request, None));
+    let mut read = Box::pin(crate::storage::read_batch(&tensor, &request, None));
     assert!(read.as_mut().now_or_never().is_none());
     drop(held);
     assert!(read.await.unwrap_err().to_string().contains("length"));

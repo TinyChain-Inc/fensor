@@ -596,6 +596,7 @@ where
         Box::pin(async move {
             // Output buffers are bounded by the current evaluation batch.
             let mut values = Vec::with_capacity(coords.len());
+            let output_value = expression::output_value(self.layout());
             let mut cursor = coords.cursor(self.shape())?;
             let mut coord = Coord::new();
             let mut pending = None;
@@ -624,7 +625,7 @@ where
 
                     accumulate_zeros::<_, O>(&self.op, &mut state, remaining)?;
 
-                    values.push(O::finish_axis(state)?);
+                    values.push(output_value(O::finish_axis(state)?));
                     continue;
                 }
 
@@ -666,7 +667,7 @@ where
                     crate::read_metrics::record(|m| m.reduction_calls += 1);
 
                     let group = input.by_ref().take(len as usize).collect();
-                    values.push(O::finish(self.op.partial(group)?)?);
+                    values.push(output_value(O::finish(self.op.partial(group)?)?));
                 }
             }
 

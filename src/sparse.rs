@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 
 use b_tree::Schema;
 use collate::Collate;
-use number_general::{Float, FloatCollator, Number, NumberInstance, NumberType};
+use number_general::{Float, Number, NumberCollator, NumberType};
 
 use crate::{Layout, TensorElement};
 
@@ -34,25 +34,6 @@ impl<T> Default for SparseCell<T> {
     }
 }
 
-fn number_cmp(a: Number, b: Number) -> Ordering {
-    match (a, b) {
-        (Number::Float(a), Number::Float(b)) => FloatCollator.cmp(&a, &b),
-        (Number::Complex(a), Number::Complex(b)) => {
-            let (ar, ai): (Float, Float) = a.into();
-            let (br, bi): (Float, Float) = b.into();
-
-            FloatCollator.cmp(
-                &Float::F64(f64::from(ar).hypot(ai.into())),
-                &Float::F64(f64::from(br).hypot(bi.into())),
-            )
-        }
-        (Number::Int(a), Number::Int(b)) => a.cmp(&b),
-        (Number::UInt(a), Number::UInt(b)) => a.cmp(&b),
-        (Number::Bool(a), Number::Bool(b)) => bool::from(a).cmp(&bool::from(b)),
-        (a, b) => a.class().cmp(&b.class()),
-    }
-}
-
 impl<T: TensorElement> PartialEq for SparseCell<T> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -70,8 +51,6 @@ impl<T: TensorElement> PartialEq for SparseCell<T> {
 
 impl<T: TensorElement> Eq for SparseCell<T> {}
 
-// Collation deliberately groups unequal complex values with the same norm.
-// It therefore belongs to Collate, not SparseCell's Eq/Ord implementation.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SparseCollator<T>(PhantomData<T>);
 
@@ -90,8 +69,9 @@ impl<T: TensorElement> Collate for SparseCollator<T> {
         match (a, b) {
             (SparseCell::Key(a), SparseCell::Key(b)) => a.cmp(b),
             (SparseCell::Payload(a), SparseCell::Payload(b)) => {
+                let collator = NumberCollator::default();
                 for (&a, &b) in a.iter().zip(b) {
-                    let order = number_cmp(a.into(), b.into());
+                    let order = collator.cmp(&a.into(), &b.into());
                     if !order.is_eq() {
                         return order;
                     }
@@ -135,6 +115,10 @@ impl<T> PayloadSchema<T> {
             geometry,
             dtype: PhantomData,
         }
+    }
+
+    pub(crate) fn geometry(&self) -> &crate::StorageGeometry {
+        &self.geometry
     }
 }
 

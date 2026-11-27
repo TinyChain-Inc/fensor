@@ -7,11 +7,13 @@ use std::ops::Deref;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use ha_ndarray::{Array, ArrayBuf, Buffer, BufferConverter, NDArray, NDArrayRead, Platform};
+use number_general::NumberType;
 
 use crate::request::BatchRequest;
 use crate::traits::BoxFuture;
 use crate::{
-    Error, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView, request,
+    Error, Layout, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView,
+    request,
 };
 
 mod driver;
@@ -22,7 +24,7 @@ pub(crate) use driver::evaluate_batch;
 pub(crate) mod traversal;
 
 /// Maximum element count per execution batch, custom-reader batch, or
-/// [`crate::TensorView::plan_updates`] call.
+/// [`crate::WriteSelection::plan_updates`] call.
 ///
 /// Independent of [`crate::MAX_BLOCK_CAPACITY`]. This is not an aggregate memory
 /// limit: independent consumers and suspended expression frames retain buffers.
@@ -61,6 +63,7 @@ where
     /// Detach runtime-owned operands before releasing this expression description.
     fn detach_sources(&mut self, _pending: &mut Vec<Box<dyn crate::owned::Drain>>) {}
 
+    /// Produce a bounded batch with canonical zeros for sparse output.
     fn build<'a>(
         &'a self,
         context: Context<'a>,
@@ -70,6 +73,22 @@ where
 
 /// Owned bounded requests; expression types themselves use static dispatch.
 pub(crate) type RequestIterator = Box<dyn Iterator<Item = BatchRequest> + Send>;
+
+fn requires_canonical_zeros<T: TensorElement>(layout: Layout) -> bool {
+    matches!(layout, Layout::Sparse { .. })
+        && matches!(T::dtype(), NumberType::Float(_) | NumberType::Complex(_))
+}
+
+pub(crate) fn output_value<T: TensorElement>(layout: Layout) -> impl Fn(T) -> T {
+    let canonicalize = requires_canonical_zeros::<T>(layout);
+    move |value| {
+        if canonicalize && value == T::ZERO {
+            T::ZERO
+        } else {
+            value
+        }
+    }
+}
 
 pub(crate) async fn read_value<E: Expression + ?Sized>(
     source: &E,
@@ -199,10 +218,14 @@ impl<T: TensorElement> Batch<T> {
         validate_len("batch expression", self.array.size(), expected)
     }
 
-    fn normalize_zeros(self) -> Result<Self> {
-        Ok(Self {
-            array: self.array.normalize_zeros()?,
-        })
+    /// Canonicalize a buffer returned by a storage source or numerical kernel.
+    pub(crate) fn normalize_sparse(mut self, layout: Layout, expected: usize) -> Result<Self> {
+        if requires_canonical_zeros::<T>(layout) {
+            validate_len("batch expression", self.array.size(), expected)?;
+            self.array = self.array.normalize_zeros()?;
+        }
+
+        Ok(self)
     }
 
     fn into_evaluated(self) -> Result<EvaluatedBatch<T>> {
@@ -335,7 +358,7 @@ where
         Box::pin(async move {
             let values = self.read_batch(&coords).await?;
 
-            Batch::from_values(values)
+            Batch::from_values(values)?.normalize_sparse(self.layout(), coords.len())
         })
     }
 }
@@ -381,8 +404,8 @@ where
         coords: std::sync::Arc<BatchRequest>,
     ) -> BoxFuture<'a, Result<Batch<T>>> {
         Box::pin(async move {
-            let values = self.read_batch(&coords, None).await?;
-            Batch::from_values(values)
+            let values = crate::storage::read_batch(self, &coords, None).await?;
+            Batch::from_values(values)?.normalize_sparse(self.layout(), coords.len())
         })
     }
 }

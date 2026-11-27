@@ -295,6 +295,7 @@ where
             let width = *self.shape.last().expect("validated Fourier rank") as usize;
             let mut groups = groups.into_iter().peekable();
             let mut values = vec![S::DType::ZERO; request.len()];
+            let output_value = expression::output_value(self.layout());
 
             while groups.peek().is_some() {
                 let pack: Vec<_> = groups.by_ref().take(MAX_BATCH_ELEMENTS / width).collect();
@@ -337,7 +338,7 @@ where
                 for (group, (_, destinations)) in pack.into_iter().enumerate() {
                     let start = group * width;
                     for (destination, frequency) in destinations {
-                        values[destination] = transformed[start + frequency];
+                        values[destination] = output_value(transformed[start + frequency]);
                     }
                 }
             }

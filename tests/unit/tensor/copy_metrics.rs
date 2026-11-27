@@ -7,8 +7,6 @@ pub(crate) struct Metrics {
     pub payload_writes: usize,
     pub block_updates: usize,
     pub constructed_blocks: usize,
-    pub staged_elements: usize,
-    pub max_staging_batch: usize,
 }
 
 tokio::task_local! {

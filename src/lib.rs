@@ -145,14 +145,14 @@ pub use schema::{
 };
 pub use selection::WhereView;
 pub use sparse::{SparseCell, SparseNode};
-pub use storage::{BlockUpdates, StorageGeometry, StorageRead, StorageReadPlan, TensorSource};
+pub use storage::{BlockUpdates, StorageGeometry, TensorSource, WriteSelection};
 pub use tensor::{SparseBlocks, Tensor, TensorElement, TensorFileEntry};
 pub use traits::{
     BoxFuture, CoordinateBatch, CoordinateBlockStream, SparseElementStream, TensorAbs, TensorArray,
     TensorBoolean, TensorBooleanScalar, TensorCast, TensorCompare, TensorCompareScalar,
     TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMatrixUnary, TensorNumeric,
     TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean, TensorTransform, TensorTrig,
-    TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite, TensorWriteBulk, ValueBlockStream,
+    TensorUnary, TensorUnaryBoolean, TensorWhere, TensorWrite, ValueBlockStream,
 };
 #[cfg(feature = "complex")]
 pub use traits::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};

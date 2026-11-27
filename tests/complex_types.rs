@@ -25,8 +25,8 @@ async fn sparse_zero_normalization_keeps_nonzero_complex_component_signs() {
 
     let (root, tensor) = fixture::source(
         "sparse_complex_zero",
-        shape![2],
-        Layout::Sparse { axis: None },
+        shape![1, 2],
+        Layout::Sparse { axis: Some(0) },
         2,
         1024,
         [Complex64::new(0., 0.), Complex64::new(1., -0.)],
@@ -34,15 +34,29 @@ async fn sparse_zero_normalization_keeps_nonzero_complex_component_signs() {
     .await;
 
     tensor
-        .write_value(&[0], Complex64::new(-0., -0.))
+        .write_value(&[0, 0], Complex64::new(-0., -0.))
         .await
         .unwrap();
-    let first = tensor.read_value(&[0]).await.unwrap();
-    let second = tensor.read_value(&[1]).await.unwrap();
+    let first = tensor.read_value(&[0, 0]).await.unwrap();
+    let second = tensor.read_value(&[0, 1]).await.unwrap();
     assert_eq!(first.re.to_bits(), 0.0_f64.to_bits());
     assert_eq!(first.im.to_bits(), 0.0_f64.to_bits());
     assert_eq!(second.re, 1.0);
     assert_eq!(second.im.to_bits(), (-0.0_f64).to_bits());
+
+    let scale = Complex64::new(-1., 0.);
+    let sparse = tensor.view().mul_scalar(scale).await.unwrap();
+    let angle = sparse.angle().await.unwrap();
+    assert_eq!(angle.read_value(&[0, 0]).await.unwrap().to_bits(), 0);
+
+    let dense = TensorExpression::new(tensor.view()).unwrap().into_dense();
+    let dense = dense.mul_scalar(scale).await.unwrap();
+    let angle = dense.angle().await.unwrap();
+    assert_eq!(
+        angle.read_value(&[0, 0]).await.unwrap(),
+        std::f64::consts::PI
+    );
+
     cleanup(&root).await;
 }
 

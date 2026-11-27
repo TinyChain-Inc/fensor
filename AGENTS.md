@@ -58,8 +58,8 @@ No whole-result collectors or whole-index compaction APIs.
 
 ## Semantics and validation
 
-- Preserve one writable base and constrained geometric write-through. Computed
-  views remain read-only; numerical definitions belong to ha-ndarray.
+- Base tensors own writes in base coordinates. Views are read-only. Numerical
+  definitions belong to ha-ndarray.
 - Sparse absence is numerical zero. Reductions count logical cardinality; sparse
   pointwise construction rejects nonzero implicit backgrounds unless explicitly
   converted to dense. Candidate traversal is an index optimization, never a

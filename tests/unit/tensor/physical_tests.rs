@@ -217,7 +217,7 @@ mod storage_source {
         let reopened = Tensor::<FsEntry, f64>::load(dir).await.unwrap();
         assert_eq!(reopened.read_value(&[1, 0]).await.unwrap(), 2.0);
         cleanup(&root).await;
-        use crate::{AxisRange, TensorTransform, TensorWriteBulk};
+        use crate::{AxisRange, TensorTransform, TensorWrite};
 
         for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
             let (root, dir) = new_dir("compact_borrowed_fragments").await;
@@ -631,11 +631,11 @@ mod bulk_mutation {
     use crate::test_support::{FsEntry, cleanup, new_dir};
     use crate::{
         AxisRange, Layout, StorageGeometry, Tensor, TensorRead, TensorSchema, TensorSource,
-        TensorWrite, TensorWriteBulk,
+        TensorWrite,
     };
 
     #[tokio::test]
-    async fn bulk_writes_publish_blocks_and_preserve_padding_and_duplicates() {
+    async fn bulk_writes_publish_compact_blocks_and_preserve_unselected_values() {
         for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
             let (root, dir) = new_dir("bulk_blocks").await;
             let geometry = StorageGeometry::new(
@@ -659,12 +659,7 @@ mod bulk_mutation {
             CURRENT
                 .scope(Default::default(), async {
                     for value in [2., 0., f64::NAN] {
-                        let before = CURRENT.with(|m| m.borrow().block_updates);
                         tensor.fill(value).await.unwrap();
-                        assert_eq!(
-                            CURRENT.with(|m| m.borrow().block_updates) - before,
-                            geometry.block_count() as usize
-                        );
 
                         for id in 0..geometry.block_count() {
                             let block = tensor.read_logical_block(id).await.unwrap();
@@ -695,15 +690,11 @@ mod bulk_mutation {
                         }
                     }
 
-                    let range = vec![
-                        AxisRange::Of(vec![8, 0, 8]),
-                        AxisRange::Of(vec![128, 1, 128]),
-                    ]
-                    .into();
+                    let range = vec![AxisRange::In(0, 9, 8), AxisRange::In(1, 129, 127)].into();
 
                     let before = CURRENT.with(|m| m.borrow().block_updates);
                     tensor
-                        .write_values(range, (1..=9).map(f64::from).collect())
+                        .write_values(range, vec![1., 2., 3., 4.])
                         .await
                         .unwrap();
 
@@ -719,10 +710,10 @@ mod bulk_mutation {
                         expected
                     );
 
-                    assert_eq!(tensor.read_value(&[8, 128]).await.unwrap(), 9.);
-                    assert_eq!(tensor.read_value(&[8, 1]).await.unwrap(), 8.);
-                    assert_eq!(tensor.read_value(&[0, 128]).await.unwrap(), 6.);
-                    assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), 5.);
+                    assert_eq!(tensor.read_value(&[8, 128]).await.unwrap(), 4.);
+                    assert_eq!(tensor.read_value(&[8, 1]).await.unwrap(), 3.);
+                    assert_eq!(tensor.read_value(&[0, 128]).await.unwrap(), 2.);
+                    assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), 1.);
                     assert!(tensor.read_value(&[0, 2]).await.unwrap().is_nan());
                     assert!(
                         tensor
@@ -779,7 +770,7 @@ mod bulk_mutation {
 
         assert_eq!(tensor.read_value(&[5]).await.unwrap(), 8.);
         tensor
-            .write_values(vec![AxisRange::Of(vec![])].into(), vec![])
+            .write_values(vec![AxisRange::In(0, 0, 1)].into(), vec![])
             .await
             .unwrap();
 

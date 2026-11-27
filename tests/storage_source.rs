@@ -40,14 +40,10 @@ impl TensorArray for Source {
     fn schema(&self) -> &TensorSchema {
         self.tensor.schema()
     }
-
-    fn strides(&self) -> &[u64] {
-        self.tensor.strides()
-    }
 }
 
 impl TensorSource for Source {
-    fn storage_geometry(&self) -> StorageGeometry {
+    fn storage_geometry(&self) -> &StorageGeometry {
         self.tensor.storage_geometry()
     }
 
@@ -130,6 +126,11 @@ async fn sparse_block_reads_split_and_join_occupied_spans() {
         source.write_value(&coord, value).await.unwrap();
     }
 
+    assert_eq!(
+        source.read_value(&[0, 0, 0]).await.unwrap().to_bits(),
+        0.0f64.to_bits()
+    );
+    assert_eq!(source.read_value(&[1, 1, 4]).await.unwrap(), 19.);
     let geometry = StorageGeometry::new(schema, Layout::Sparse { axis: Some(1) }, 3).unwrap();
     let blocks: Vec<_> = geometry
         .read_blocks(&source)
@@ -156,7 +157,10 @@ async fn sparse_block_reads_split_and_join_occupied_spans() {
 #[tokio::test]
 async fn strict_load_never_initializes_missing_storage() {
     let (root, dir) = new_dir("strict_empty").await;
-    assert!(Tensor::<FsEntry, f64>::load(dir.clone()).await.is_err());
+    assert!(matches!(
+        Tensor::<FsEntry, f64>::load(dir.clone()).await,
+        Err(fensor::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
+    ));
     assert!(dir.read().await.is_empty());
     let schema = TensorSchema::new(NumberType::Float(FloatType::F64), vec![4].into()).unwrap();
     let tensor = Tensor::<FsEntry, f64>::create(dir.clone(), schema, Layout::Dense, 2)
@@ -164,6 +168,13 @@ async fn strict_load_never_initializes_missing_storage() {
         .unwrap();
 
     tensor.sync().await.unwrap();
+    dir.write().await.create_dir("values".into()).unwrap();
+    assert!(matches!(
+        Tensor::<FsEntry, f64>::load(dir.clone()).await,
+        Err(fensor::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
+    ));
+    dir.write().await.delete("values").await;
+
     let blocks = dir.read().await.get_dir("blocks").cloned().unwrap();
     blocks.write().await.delete("0").await;
     assert!(Tensor::<FsEntry, f64>::load(dir.clone()).await.is_err());
@@ -178,10 +189,16 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
 
     let (root, dir) = new_dir("block_bounds").await;
     let schema = TensorSchema::new(NumberType::Float(FloatType::F64), vec![4, 8].into()).unwrap();
-    let tensor = Tensor::<FsEntry, f64>::create(dir, schema, Layout::Dense, 4)
+    let tensor = Tensor::<FsEntry, f64>::create(dir, schema, Layout::Dense, 3)
         .await
         .unwrap();
 
+    tensor.write_value(&[3, 7], -0.0).await.unwrap();
+    tensor.write_value(&[2, 7], 7.0).await.unwrap();
+    assert_eq!(
+        tensor.read_value(&[3, 7]).await.unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
     let geometry = tensor.storage_geometry();
     let point = tensor
         .view()
@@ -189,7 +206,8 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
         .unwrap();
 
     let id = geometry.block_position(&[2, 7]).unwrap().0;
-    assert_eq!(point.logical_block_range(&geometry).unwrap(), id..id + 1);
+    assert_eq!(point.logical_block_range(geometry).unwrap(), id..id + 1);
+    assert_eq!(point.read_value(&[]).await.unwrap(), 7.);
     for view in [
         tensor
             .view()
@@ -202,14 +220,17 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
             .slice(vec![AxisRange::Of(vec![3, 1]), AxisRange::In(1, 8, 2)].into())
             .unwrap(),
     ] {
-        let bounds = view.logical_block_range(&geometry).unwrap();
+        let bounds = view.logical_block_range(geometry).unwrap();
         for coord in fensor::row_major_coords(view.shape()).unwrap() {
-            let block = geometry
-                .block_position(&view.resolve_base_coord(&coord).unwrap())
-                .unwrap()
-                .0;
+            let base = view.resolve_base_coord(&coord).unwrap();
+            let block = geometry.block_position(&base).unwrap().0;
 
             assert!(bounds.contains(&block));
+            let value = view.read_value(&coord).await.unwrap();
+            assert_eq!(
+                value.to_bits(),
+                tensor.read_value(&base).await.unwrap().to_bits()
+            );
         }
     }
 

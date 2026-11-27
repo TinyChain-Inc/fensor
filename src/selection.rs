@@ -204,6 +204,7 @@ where
             let then = context.batch(&self.then, coords.clone()).await?;
             let or_else = context.batch(&self.or_else, coords).await?;
 
+            // A sparse result selects between two already-canonical sparse batches.
             Batch::from_array(
                 condition
                     .into_array()

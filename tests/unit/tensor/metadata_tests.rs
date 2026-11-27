@@ -15,7 +15,7 @@ async fn metadata_publication_does_not_replace_existing_contents() {
     use crate::test_support::{FsEntry, new_dir};
 
     let (_root, dir) = new_dir("metadata_once").await;
-    let mut tensor = Tensor::<FsEntry, f32>::create(
+    let tensor = Tensor::<FsEntry, f32>::create(
         dir,
         TensorSchema::new(NumberType::Float(FloatType::F32), vec![3].into()).unwrap(),
         Layout::Dense,
@@ -24,17 +24,13 @@ async fn metadata_publication_does_not_replace_existing_contents() {
     .await
     .unwrap();
 
-    let file = crate::tensor::corruption::files(&tensor.storage)
-        .read()
-        .await
-        .get_file(METADATA)
-        .cloned()
-        .unwrap();
+    let blocks = crate::tensor::corruption::files(&tensor.storage);
+    let file = blocks.read().await.get_file(METADATA).cloned().unwrap();
 
     let original = file.read::<TensorMetadata<f32>>().await.unwrap().clone();
-    tensor.schema = TensorSchema::new(NumberType::Float(FloatType::F32), vec![4].into()).unwrap();
+    let replacement = TensorMetadata::<f32>::new(vec![4].into(), Layout::Dense, 2).unwrap();
     assert!(matches!(
-        tensor.publish_metadata().await,
+        create_metadata_file(blocks, replacement).await,
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
     ));
 

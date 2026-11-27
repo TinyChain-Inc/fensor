@@ -34,8 +34,6 @@ pub trait TensorGeometry: Send + Sync {
 /// Adds the persistent, storage-backed schema -- implemented ONLY by base tensors.
 pub trait TensorArray: TensorGeometry {
     fn schema(&self) -> &TensorSchema;
-
-    fn strides(&self) -> &[u64];
 }
 
 /// A lazily-produced, row-major-ordered stream of populated sparse elements.
@@ -159,42 +157,38 @@ pub trait TensorRead: TensorGeometry {
         )
     }
 
-    /// Read nonzero elements in logical row-major order. The default visits each
-    /// selected coordinate; readers may use an index to skip implicit zeros.
+    /// Read nonzero elements in logical row-major order. Readers that support
+    /// sparse iteration provide their own stream.
     fn read_sparse_elements<'a>(
         &'a self,
-        range: Range,
+        _range: Range,
     ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>>
     where
         Self::DType: Default + PartialEq,
     {
-        Box::pin(async move {
-            let range = sparse_range(self, range)?;
-            let coords = validate::iter_range_coords(self.shape(), &range)?;
-            let elements = futures::stream::iter(coords)
-                .then(move |coord| async move {
-                    tokio::task::coop::consume_budget().await;
-                    let value = self.read_value(&coord).await?;
-                    Ok((value != Self::DType::default()).then_some((coord, value)))
-                })
-                .try_filter_map(|entry| futures::future::ready(Ok(entry)));
-
-            Ok(elements.boxed())
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "reader does not expose sparse elements".into(),
+            ))
         })
     }
 }
 
-/// Async value writes aligned with ndarray coordinate semantics.
+/// Write a base tensor using its own coordinates. Bulk writes use bounded
+/// working memory in addition to caller-owned values.
+///
+/// ```compile_fail
+/// use fensor::{Tensor, TensorFileEntry, TensorTransform, TensorWrite};
+/// fn writable(_: impl TensorWrite) {}
+/// fn example<F: TensorFileEntry<f32>>(tensor: &Tensor<F, f32>) {
+///     writable(tensor.view().transpose(None).unwrap());
+/// }
+/// ```
 pub trait TensorWrite: TensorGeometry {
     fn write_value<'a>(&'a self, coord: &'a [u64], value: Self::DType)
     -> BoxFuture<'a, Result<()>>;
-}
 
-/// Bulk writes use bounded working memory in addition to caller-owned values.
-/// Native value-buffer writes group one execution batch by logical block;
-/// fills traverse lazily.
-/// Implementers provide both mutation operations.
-pub trait TensorWriteBulk: TensorWrite {
+    /// Overwrite fixed coordinates or forward stepped spans in row-major order.
     fn write_values<'a>(
         &'a self,
         range: Range,

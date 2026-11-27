@@ -14,11 +14,10 @@ creating result storage.
 
 `Tensor<FE, T>` owns storage; `tensor.view()` creates a geometric `TensorView`.
 Unary, binary, conditional, reduction, and matrix expressions remain lazy and
-read-only. Computed views implement neither `TensorWrite` nor `TensorArray`;
-geometric views retain constrained write-through access. View descriptions can
-be cloned without requiring the filesystem adapter to implement `Clone`.
-`TensorWriteBulk` implementations provide writes from buffers and fill. Each
-implementation validates supported geometry and input cardinality.
+read-only, as are geometric views. View descriptions can be cloned without
+requiring the filesystem adapter to implement `Clone`. The base tensor implements
+`TensorWrite` for points, whole-tensor fills, and buffers addressed by fixed
+coordinates and forward spans.
 
 `TensorExpression<T>` owns values composed at runtime, including their source
 handles. Concrete views retain their operands and implement their operations.
@@ -310,12 +309,9 @@ Adapters delegate sparse node encoding to `SparseNode<T>`. `b-tree` encodes the
 node fields, and `SparseNode<T>` supplies bounded rows of typed numeric values.
 fensor validates geometry and native structure.
 
-Call `tensor.sync().await?` before dropping and reopening storage. It writes blocks
-and publishes the current sparse index root; syncing only the containing directory
-does not publish that in-memory root. Quiesce writes for a precise durable boundary.
-Use `tensor.sync_all().await?` for delegated durable synchronization. Callers own
-transaction and recovery policy.
-fensor provides no commit, rollback, or isolation semantics.
+Call `tensor.sync().await?` for buffered writeback or `tensor.sync_all().await?`
+for durability. See the [native storage contract](DESIGN.md#native-storage-and-sources)
+for synchronization and caller responsibilities.
 
 `Tensor::copy_from` uses coordinate batches for dense readers and ordered
 nonzero entries for sparse readers. Converting between dense and sparse kinds
@@ -368,8 +364,9 @@ operations; creation requires empty delegated storage. See the
 See [remaining work](ROADMAP.md), [execution design](DESIGN.md),
 [benchmark reproduction](BENCHMARKS.md), and [test ownership](tests/COVERAGE.md).
 
-Geometric `TensorView` values can plan bounded `BlockUpdates` from row-major value
-batches with `plan_updates`, or consume an owned expression with `updates_from`.
+`StorageGeometry::write_selection` validates a base-coordinate write range.
+The selection can plan bounded `BlockUpdates` from row-major value batches with
+`plan_updates` or consume an owned expression with `updates_from`.
 The latter uses preferred-request-order delivery and retains the source until consumption
 or drop. These methods describe logical-block offsets; callers own write permission
 and publication. Independent native materialization uses `Tensor::copy_from`.

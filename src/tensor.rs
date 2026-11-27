@@ -1,8 +1,11 @@
-mod construction;
 mod dense_storage;
 mod sparse_storage;
 
 pub use sparse_storage::SparseBlocks;
+
+#[cfg(test)]
+#[path = "../tests/unit/tensor/construction/tests.rs"]
+mod construction_tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/tensor/physical_tests.rs"]
@@ -21,19 +24,13 @@ use safecast::AsType;
 
 use self::dense_storage::DenseStorage;
 use crate::error::{Error, Result};
-use crate::mapping::CoordinateMap;
 use crate::request::BatchRequest;
-use crate::schema::{BlockPosition, Layout, MAX_BLOCK_CAPACITY, StorageSchema, TensorSchema};
-use crate::traits::{
-    BoxFuture, TensorArray, TensorGeometry, TensorRead, TensorTransform, TensorWrite,
-    TensorWriteBulk,
-};
+use crate::schema::{Layout, MAX_BLOCK_CAPACITY, StorageSchema, TensorSchema};
+use crate::traits::{BoxFuture, TensorArray, TensorGeometry, TensorRead, TensorWrite};
 use crate::view::TensorView;
 use crate::{Range, TensorMetadata, TensorSource, validate};
 
 const BLOCKS: &str = "blocks";
-
-const INDEX: &str = "index";
 
 const METADATA: &str = "metadata";
 
@@ -101,10 +98,10 @@ impl<FE, T> Storage<FE, T> {
         }
     }
 
-    pub(crate) fn storage_schema(&self) -> &StorageSchema {
+    fn geometry(&self) -> &crate::StorageGeometry {
         match self {
-            Self::Dense(s) => s.storage_schema(),
-            Self::Sparse(s) => &s.geometry().storage,
+            Self::Dense(s) => s.geometry(),
+            Self::Sparse(s) => s.geometry(),
         }
     }
 }
@@ -112,7 +109,6 @@ impl<FE, T> Storage<FE, T> {
 pub struct Tensor<FE, T> {
     directory: DirLock<FE>,
     storage: Arc<Storage<FE, T>>,
-    schema: TensorSchema,
 }
 
 impl<FE, T> Clone for Tensor<FE, T> {
@@ -120,7 +116,6 @@ impl<FE, T> Clone for Tensor<FE, T> {
         Self {
             directory: self.directory.clone(),
             storage: self.storage.clone(),
-            schema: self.schema.clone(),
         }
     }
 }
@@ -130,21 +125,15 @@ where
     FE: TensorFileEntry<T>,
     T: TensorElement,
 {
-    /// Write pending blocks and the current sparse index root to the filesystem buffer.
+    /// Write back this native materialization through its owning directory.
     ///
-    /// Call this before dropping and reopening a tensor. Syncing the containing
-    /// directory alone does not publish the index's in-memory root. The caller
-    /// quiesces mutations for a precise persistence boundary; synchronization does
-    /// not exclude writes for its entire call. The caller owns durable directory
-    /// synchronization and transaction policy.
+    /// The caller quiesces mutations for a precise writeback boundary and uses
+    /// `sync_all` when durability is required.
     pub async fn sync(&self) -> Result<()>
     where
-        FE: freqfs::FileSave + Clone,
+        FE: freqfs::FileSave,
     {
-        match self.storage.as_ref() {
-            Storage::Dense(dense) => dense.sync().await,
-            Storage::Sparse(sparse) => sparse.sync().await,
-        }
+        self.directory.sync().await.map_err(Error::from)
     }
 
     pub async fn create(
@@ -203,7 +192,6 @@ where
             guard.create_dir(BLOCKS.to_string())?
         };
 
-        let schema = geometry.schema.clone();
         let storage = match geometry.layout() {
             Layout::Dense => Storage::Dense(DenseStorage::new(blocks, geometry)),
             Layout::Sparse { .. } => Storage::Sparse(
@@ -214,7 +202,6 @@ where
         Ok(Self {
             directory: dir,
             storage: Arc::new(storage),
-            schema,
         })
     }
 
@@ -290,7 +277,7 @@ where
         }
 
         let output = Self::unpublished(dir, schema, layout, max_capacity).await?;
-        construction::sparse(output, entries).await
+        output.initialize_sparse(entries).await
     }
 
     /// Create an independent tensor by consuming a reader in bounded batches.
@@ -334,7 +321,7 @@ where
                 .read_sparse_elements(crate::validate::full_range(source.shape()))
                 .await?;
 
-            return construction::sparse(output, entries).await;
+            return output.initialize_sparse(entries).await;
         }
 
         let output = dense_storage::Construction(output);
@@ -369,21 +356,24 @@ where
     /// Strictly reopen materialized storage without creating or repairing files.
     /// The caller excludes concurrent native writes while loading and validating.
     pub async fn load(dir: DirLock<FE>) -> Result<Self> {
-        let blocks = dir
-            .try_read()?
-            .get_dir(BLOCKS)
-            .cloned()
-            .ok_or_else(|| Error::InvalidSchema("tensor missing blocks directory".into()))?;
+        let (blocks, entries) = {
+            let root = dir.try_read()?;
+            let blocks = root.get_dir(BLOCKS).cloned().ok_or_else(|| {
+                freqfs::IntegrityError::invalid_data("missing tensor blocks directory")
+            })?;
+
+            (blocks, root.len())
+        };
 
         let geometry = load_metadata_file::<FE, T>(&blocks).await?;
         validate_tensor_dtype::<T>(geometry.schema.dtype())?;
-        let schema = geometry.schema.clone();
         let storage = match geometry.layout() {
             Layout::Dense => {
-                if dir.try_read()?.get_dir(INDEX).is_some() {
-                    return Err(Error::InvalidSchema(
-                        "dense tensor contains a sparse index".into(),
-                    ));
+                if entries != 1 {
+                    return Err(freqfs::IntegrityError::invalid_data(
+                        "unexpected dense tensor root entry",
+                    )
+                    .into());
                 }
 
                 let dense = DenseStorage::new(blocks, geometry);
@@ -398,7 +388,6 @@ where
         let tensor = Self {
             directory: dir,
             storage: Arc::new(storage),
-            schema,
         };
 
         Ok(tensor)
@@ -419,29 +408,17 @@ where
         Ok(())
     }
 
-    /// Durably synchronize only this native materialization.
+    /// Durably synchronize this native materialization through its owning directory.
+    /// The caller quiesces mutations for a precise durability boundary.
     pub async fn sync_all(&self) -> Result<()>
     where
-        FE: freqfs::FileSave + Clone,
+        FE: freqfs::FileSave,
     {
-        match self.storage.as_ref() {
-            Storage::Dense(dense) => dense.sync_all(&self.directory).await,
-            Storage::Sparse(sparse) => sparse.sync_all(&self.directory).await,
-        }
+        self.directory.sync_all().await.map_err(Error::from)
     }
 
     pub fn view(&self) -> TensorView<Self> {
         TensorView::new(self.clone())
-    }
-
-    pub(crate) fn block_position_from_base_coord(&self, base_coord: &[u64]) -> BlockPosition {
-        let flat = base_coord
-            .iter()
-            .zip(self.schema.strides())
-            .map(|(&c, &s)| c * s)
-            .sum();
-
-        self.storage.storage_schema().blocks.position(flat)
     }
 
     async fn initialize_dense_blocks(&self) -> Result<()> {
@@ -464,53 +441,45 @@ where
         Ok(())
     }
 
+    fn initialize_sparse<S, E>(
+        mut self,
+        entries: S,
+    ) -> impl std::future::Future<Output = std::result::Result<Self, E>>
+    where
+        S: futures::Stream<Item = std::result::Result<(Vec<u64>, T), E>> + Send,
+        E: From<Error>,
+    {
+        // Keep the packer and append futures off the caller's stack, including
+        // when a decoder already carries the futures for all supported dtypes.
+        Box::pin(async move {
+            let storage =
+                Arc::get_mut(&mut self.storage).expect("unpublished Tensor has one owner");
+            let Storage::Sparse(sparse) = storage else {
+                unreachable!("sparse Tensor initialization");
+            };
+
+            // The packer borrows geometry while the unpublished storage consumes its blocks.
+            let geometry = sparse.geometry().clone();
+            futures::pin_mut!(entries);
+            let blocks = geometry.pack_sparse_blocks(entries)?;
+            sparse.append_sorted(blocks).await?;
+            self.publish_metadata().await?;
+            Ok(self)
+        })
+    }
+
     // Publish metadata only after construction succeeds; synchronization is caller-owned.
     async fn publish_metadata(&self) -> Result<()> {
         let metadata = TensorMetadata::<T>::new(
-            self.schema.shape().clone(),
+            self.schema().shape().clone(),
             self.layout(),
-            self.storage.storage_schema().blocks.capacity,
+            self.storage.geometry().block_capacity(),
         )?;
 
         match self.storage.as_ref() {
             Storage::Dense(dense) => dense.publish_metadata(metadata).await,
             Storage::Sparse(sparse) => sparse.publish_metadata(metadata).await,
         }
-    }
-
-    /// Visit a bounded, strictly increasing selection of logical blocks.
-    /// Payloads are borrowed until the synchronous callback returns; sparse
-    /// absence skips the callback. No payload or native guard escapes the callback.
-    /// All IDs are validated before I/O. Errors are delivered in block order.
-    pub fn visit_blocks<'a, C>(
-        &'a self,
-        ids: &'a [u64],
-        mut consume: C,
-    ) -> BoxFuture<'a, Result<()>>
-    where
-        C: FnMut(u64, &[T]) -> Result<()> + Send + 'a,
-    {
-        Box::pin(async move {
-            match self.storage.as_ref() {
-                Storage::Dense(dense) => dense.visit_blocks(ids, &mut consume).await,
-                Storage::Sparse(sparse) => sparse.visit_blocks(ids, &mut consume).await,
-            }
-        })
-    }
-
-    /// Borrow each needed block once; all requests and results fit one execution batch.
-    pub(crate) async fn read_batch(
-        &self,
-        request: &BatchRequest,
-        mapping: Option<&CoordinateMap>,
-    ) -> Result<Vec<T>> {
-        let plan = crate::StorageRead { request, mapping }.plan(&self.storage_geometry())?;
-        let ids: Vec<_> = plan.block_ids().collect();
-        let mut values = vec![T::ZERO; plan.len()];
-        self.visit_blocks(&ids, |id, block| plan.scatter(id, block, &mut values))
-            .await?;
-
-        Ok(values)
     }
 }
 
@@ -529,11 +498,11 @@ where
     }
 
     fn layout(&self) -> Layout {
-        self.storage.storage_schema().layout
+        self.storage.geometry().layout()
     }
 
     fn shape(&self) -> &[u64] {
-        self.schema.shape()
+        self.schema().shape()
     }
 }
 
@@ -543,11 +512,7 @@ where
     T: TensorElement,
 {
     fn schema(&self) -> &TensorSchema {
-        &self.schema
-    }
-
-    fn strides(&self) -> &[u64] {
-        self.schema.strides()
+        self.storage.geometry().schema()
     }
 }
 
@@ -562,7 +527,10 @@ where
     crate::expression::reader_members!(read_blocks, read_coordinate_blocks, read_sparse_elements);
 
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
-        Box::pin(async move { Ok(self.read_batch(&BatchRequest::point(coord), None).await?[0]) })
+        Box::pin(async move {
+            let (id, offset) = self.storage_geometry().block_position(coord)?;
+            self.read_block_value(id, offset).await
+        })
     }
 }
 
@@ -581,27 +549,10 @@ where
         value: Self::DType,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            validate::validate_coord(self.schema.shape(), coord)?;
-            let BlockPosition {
-                block_id,
-                offset_in_block,
-            } = self.block_position_from_base_coord(coord);
-
-            self.write_block_updates(block_id, &[(offset_in_block, value)])
-                .await
+            let (id, offset) = self.storage_geometry().block_position(coord)?;
+            self.write_block_updates(id, &[(offset, value)]).await
         })
     }
-}
-
-// Required dense reads borrow validated payloads; consumers clone only when needed.
-// ---------------------------------------------------------------------------
-// TensorWriteBulk implementation
-// ---------------------------------------------------------------------------
-impl<FE, T> TensorWriteBulk for Tensor<FE, T>
-where
-    FE: TensorFileEntry<T>,
-    T: TensorElement,
-{
     fn write_values<'a>(
         &'a self,
         range: Range,
@@ -609,7 +560,9 @@ where
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             // Cardinality is checked without expanding the selected range.
-            let expected = validate::iter_range_coords(self.shape(), &range)?.remaining();
+            let geometry = self.storage_geometry();
+            let selection = geometry.write_selection(Some(range))?;
+            let expected = selection.size();
             if expected != values.len() as u64 {
                 return Err(Error::DataMismatch(format!(
                     "expected {} values for range but got {}",
@@ -622,8 +575,6 @@ where
                 return Ok(());
             }
 
-            let view = self.view().slice(range)?;
-            let geometry = self.storage_geometry();
             let mut values = values.into_iter();
             let mut start = 0;
 
@@ -639,7 +590,7 @@ where
 
                 let len = batch.len() as u64;
 
-                for (id, updates) in view.plan_updates(&geometry, start, batch)? {
+                for (id, updates) in selection.plan_updates(start, batch)? {
                     self.write_block_updates(id, &updates).await?;
                 }
 
@@ -652,16 +603,17 @@ where
 
     fn fill<'a>(&'a self, value: Self::DType) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            use crate::TensorSource;
+            if value == T::ZERO
+                && let Some(sparse) = self.storage.sparse()
+            {
+                return sparse.clear().await;
+            }
 
             let geometry = self.storage_geometry();
 
             for id in 0..geometry.block_count() {
-                // Validate the selected stored block before overwriting it, as scalar writes do.
-                let mut values = self.read_logical_block(id).await?;
-                values.fill(value);
-
-                self.replace_logical_block(id, values).await?;
+                self.replace_logical_block(id, vec![value; geometry.block_len(id)?])
+                    .await?;
             }
 
             Ok(())
@@ -723,7 +675,7 @@ where
         .await
         .get_file(METADATA)
         .cloned()
-        .ok_or_else(|| Error::InvalidSchema("missing tensor metadata file".into()))?;
+        .ok_or_else(|| freqfs::IntegrityError::invalid_data("missing tensor metadata file"))?;
 
     let (schema, storage) = file.read::<TensorMetadata<T>>().await?.schemas()?;
     Ok(crate::StorageGeometry { schema, storage })
@@ -763,15 +715,20 @@ mod sparse_lifecycle_tests;
 pub(crate) mod copy_metrics;
 
 impl<FE: TensorFileEntry<T>, T: TensorElement> crate::TensorSource for Tensor<FE, T> {
-    fn storage_geometry(&self) -> crate::StorageGeometry {
-        crate::StorageGeometry {
-            schema: self.schema.clone(),
-            storage: self.storage.storage_schema().clone(),
-        }
+    fn storage_geometry(&self) -> &crate::StorageGeometry {
+        self.storage.geometry()
     }
 
-    fn read_storage<'a>(&'a self, read: crate::StorageRead<'a>) -> BoxFuture<'a, Result<Vec<T>>> {
-        Box::pin(self.read_batch(read.request, read.mapping))
+    fn visit_blocks<'a, C>(&'a self, ids: &'a [u64], mut consume: C) -> BoxFuture<'a, Result<()>>
+    where
+        C: FnMut(u64, &[T]) -> Result<()> + Send + 'a,
+    {
+        Box::pin(async move {
+            match self.storage.as_ref() {
+                Storage::Dense(dense) => dense.visit_blocks(ids, &mut consume).await,
+                Storage::Sparse(sparse) => sparse.visit_blocks(ids, &mut consume).await,
+            }
+        })
     }
 
     fn occupied_blocks(
@@ -810,7 +767,9 @@ impl<FE: TensorFileEntry<T>, T: TensorElement> Tensor<FE, T> {
     /// Failure may leave partial changes; this method supplies no transaction policy.
     pub async fn replace_logical_block(&self, id: u64, block: Vec<T>) -> Result<()> {
         match self.storage.as_ref() {
-            Storage::Sparse(sparse) => sparse.replace(id, Some(block)).await?,
+            Storage::Sparse(sparse) => {
+                sparse.replace(id, Some(block)).await?;
+            }
             Storage::Dense(dense) => dense.replace(id, block).await?,
         }
 

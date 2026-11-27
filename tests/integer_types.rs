@@ -242,14 +242,9 @@ where
         )
         .await;
 
-        // Geometric writes, zero lifecycle, and repeated/concurrent consumption.
-        view.flip(0)
-            .unwrap()
-            .write_value(&[0, 1], T::ONE)
-            .await
-            .unwrap();
-
-        assert_eq!(tensor.read_value(&[1, 1]).await.unwrap(), T::ONE);
+        let flipped = view.flip(0).unwrap();
+        tensor.write_value(&[1, 1], T::ONE).await.unwrap();
+        assert_eq!(flipped.read_value(&[0, 1]).await.unwrap(), T::ONE);
         tensor.write_value(&[1, 1], T::ZERO).await.unwrap();
         assert_eq!(tensor.read_value(&[1, 1]).await.unwrap(), T::ZERO);
         let expanded = tensor

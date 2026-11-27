@@ -34,14 +34,10 @@ impl TensorArray for Source {
     fn schema(&self) -> &TensorSchema {
         self.0.schema()
     }
-
-    fn strides(&self) -> &[u64] {
-        self.0.strides()
-    }
 }
 
 impl TensorSource for Source {
-    fn storage_geometry(&self) -> StorageGeometry {
+    fn storage_geometry(&self) -> &StorageGeometry {
         self.0.storage_geometry()
     }
 

@@ -113,7 +113,7 @@ parity!(f32_parity, f32);
 parity!(f64_parity, f64);
 
 #[tokio::test]
-async fn shape_errors_and_transpose_write_through() {
+async fn shape_errors_and_transposed_reads() {
     let (root, tensor) = fixture::source(
         "matrix_shapes",
         smallvec![2, 3, 4],
@@ -126,9 +126,8 @@ async fn shape_errors_and_transpose_write_through() {
 
     let mt = tensor.view().mt().await.unwrap();
     assert_eq!(mt.shape(), &[2, 4, 3]);
-    assert!(mt.supports_write_through());
-    mt.write_value(&[1, 3, 2], 255).await.unwrap();
-    assert_eq!(tensor.read_value(&[1, 2, 3]).await.unwrap(), 255);
+    tensor.write_value(&[1, 2, 3], 255).await.unwrap();
+    assert_eq!(mt.read_value(&[1, 3, 2]).await.unwrap(), 255);
     let vector = tensor.view().reshape(smallvec![24]).unwrap();
     assert!(matches!(vector.mt().await, Err(Error::InvalidLayout(_))));
     assert!(matches!(vector.diag().await, Err(Error::InvalidLayout(_))));

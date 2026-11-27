@@ -1,7 +1,7 @@
 use number_general::DType;
 
-use crate::Shape;
 use super::*;
+use crate::Shape;
 
 #[test]
 fn block_consumers_share_order_padding_and_rank_scratch() {
@@ -227,7 +227,9 @@ async fn preferred_regions_skip_gaps_and_include_sparse_zeros() {
     let mut count = 0;
     while let Some(request) = requests.try_next().await.unwrap() {
         assert!(request.len() <= crate::MAX_BATCH_ELEMENTS);
-        let values = tensor.read_batch(&request, None).await.unwrap();
+        let values = crate::storage::read_batch(&tensor, &request, None)
+            .await
+            .unwrap();
         assert!(values.iter().all(|&value| value == 7.));
         count += values.len();
     }
@@ -268,14 +270,10 @@ impl crate::TensorArray for PlanningSource {
     fn schema(&self) -> &TensorSchema {
         self.tensor.schema()
     }
-
-    fn strides(&self) -> &[u64] {
-        self.tensor.strides()
-    }
 }
 
 impl TensorSource for PlanningSource {
-    fn storage_geometry(&self) -> StorageGeometry {
+    fn storage_geometry(&self) -> &StorageGeometry {
         self.tensor.storage_geometry()
     }
 
@@ -326,15 +324,11 @@ impl crate::TensorArray for ReadyCandidates {
     fn schema(&self) -> &TensorSchema {
         self.geometry.schema()
     }
-
-    fn strides(&self) -> &[u64] {
-        self.geometry.schema().strides()
-    }
 }
 
 impl TensorSource for ReadyCandidates {
-    fn storage_geometry(&self) -> StorageGeometry {
-        self.geometry.clone()
+    fn storage_geometry(&self) -> &StorageGeometry {
+        &self.geometry
     }
 
     fn read_logical_block(&self, _: u64) -> crate::BoxFuture<'_, Result<Vec<f64>>> {

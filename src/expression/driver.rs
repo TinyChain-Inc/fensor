@@ -16,12 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, ready};
 
 use futures::channel::oneshot;
-use number_general::{DType, NumberType};
 use tokio::task::coop;
 
 use super::{Batch, EvaluatedBatch, Expression};
 use crate::request::BatchRequest;
-use crate::{BoxFuture, Error, Layout, Result, TensorElement};
+use crate::{BoxFuture, Error, Result, TensorElement};
 
 // Cap simultaneously retained continuations so stack-safe evaluation cannot grow
 // its frame stack without limit. This bounds frame count, not aggregate bytes:
@@ -56,15 +55,7 @@ impl<'a> Context<'a> {
         let frame = Box::pin(async move {
             let result = source.build(context, request).await.and_then(|batch| {
                 batch.validate(expected)?;
-                if matches!(
-                    E::DType::dtype(),
-                    NumberType::Float(_) | NumberType::Complex(_)
-                ) && matches!(source.layout(), Layout::Sparse { .. })
-                {
-                    batch.normalize_zeros()
-                } else {
-                    Ok(batch)
-                }
+                Ok(batch)
             });
 
             let _ = send.send(result);

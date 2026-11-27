@@ -1,10 +1,10 @@
 use futures::{FutureExt, StreamExt};
 use number_general::DType;
 
+use super::*;
 use crate::tensor::copy_metrics;
 use crate::test_support::{FsEntry, cleanup, new_dir};
 use crate::{BoxFuture, Layout, Result, TensorSchema, TensorSource};
-use super::*;
 
 #[tokio::test]
 async fn dense_copy_retains_compact_requests_through_construction() {
@@ -61,6 +61,7 @@ async fn invalid_or_interrupted_inputs_withhold_metadata() {
         vec![Ok((vec![1], 0.)), Ok((vec![1], 1.))],
         vec![Ok((vec![0], 1.)), Err(InputError::Input)],
     ] {
+        let source_error = entries.iter().any(std::result::Result::is_err);
         let (root, dir) = new_dir("construction_invalid").await;
         let result = Tensor::<FsEntry, f64>::from_sparse_elements(
             dir.clone(),
@@ -71,10 +72,10 @@ async fn invalid_or_interrupted_inputs_withhold_metadata() {
         )
         .await;
 
-        match result.err().unwrap() {
-            InputError::Native(error) => assert!(matches!(error, Error::InvalidCoord(_))),
-            InputError::Input => {}
-        }
+        assert!(matches!(
+            (source_error, result.err().unwrap()),
+            (true, InputError::Input) | (false, InputError::Native(Error::InvalidCoord(_)))
+        ));
 
         assert!(Tensor::<FsEntry, f64>::load(dir).await.is_err());
         cleanup(&root).await;
@@ -87,6 +88,7 @@ async fn invalid_or_interrupted_inputs_withhold_metadata() {
         vec![Ok((vec![batch], 1.)), Ok((vec![batch], 0.))],
         vec![Err(InputError::Input)],
     ] {
+        let source_error = tail.iter().any(std::result::Result::is_err);
         let (root, dir) = new_dir("construction_batch_boundary").await;
         let entries = futures::stream::iter((0..batch).map(|i| Ok((vec![i], 0.))))
             .chain(futures::stream::iter(tail));
@@ -100,10 +102,10 @@ async fn invalid_or_interrupted_inputs_withhold_metadata() {
         )
         .await;
 
-        match result.err().unwrap() {
-            InputError::Native(error) => assert!(matches!(error, Error::InvalidCoord(_))),
-            InputError::Input => {}
-        }
+        assert!(matches!(
+            (source_error, result.err().unwrap()),
+            (true, InputError::Input) | (false, InputError::Native(Error::InvalidCoord(_)))
+        ));
 
         assert!(Tensor::<FsEntry, f64>::load(dir.clone()).await.is_err());
         assert!(dir.try_write().is_ok());
@@ -218,7 +220,6 @@ async fn sparse_stream_uses_bounded_single_pass_construction() {
 
                         assert_eq!(m.replaced_blocks, 0);
                         assert_eq!(m.payload_writes, m.constructed_blocks);
-                        assert!(m.max_staging_batch <= crate::expression::MAX_BATCH_ELEMENTS);
                         assert_eq!(
                             m.constructed_blocks as u64,
                             if full {

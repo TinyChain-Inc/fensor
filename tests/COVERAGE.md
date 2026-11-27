@@ -28,7 +28,7 @@ Special codec/error/independent-adapter fixtures remain local to their contracts
 | Corruption, boolean decision boundaries, cache pressure, cancellation and live reads | Native `tensor::physical_tests` and `tensor::dtype_storage`; dedicated copy cases |
 | Reshape/slice, repeated flips, gather/flip, slice/broadcast, and no implicit result storage | `storage_runs` (streams versus point reads across sparse axes and block capacities) |
 | Recursive operand order, first-error propagation, and final-argument ownership | Mapping unit `recursive_transforms_stop_at_first_error_and_move_the_final_argument` |
-| Transform input rejection and ordered scans for unindexed mappings | Public access, storage-source, and slice-reduction integration cases. View unit tests retain mapping and write-through coverage. |
+| Transform input rejection and ordered scans for unindexed mappings | Public access, storage-source, and slice-reduction integration cases. View unit tests cover live mapped reads. |
 | Sparse axis bounds on creation and reload | `foundations::public_create_rejects_invalid_sparse_axis_hint`, `storage_codec::reload_rejects_out_of_bounds_sparse_axis` |
 | Shared preferred/ordered walker: precedence, errors and single invocation | Expression units `request_providers_delegate_once_in_order_and_propagate_errors`, `ordered_providers_visit_operands_left_to_right` |
 | Tiled propagation, reduction boundaries and transformed current-shape coverage | Matrix `coordinate_traversal_propagates_and_preserves_coverage` |
@@ -77,7 +77,7 @@ checks and [BENCHMARKS.md](../BENCHMARKS.md) for opt-in smoke/profile runs.
   complete-group packing and duplicate scatter.
 
 - `tensor::dtype_storage`: all concrete dtypes in dense/sparse storage, spill/reload,
-  write-through, zero lifecycle, copy persistence, malformed blocks, and typed
+  base writes, zero lifecycle, copy persistence, malformed blocks, and typed
   metadata mismatch, concrete tensor/view/schema classes, typed metadata shape,
   and complex feature gating. `number_type` owns abstract-class rejection and
   computed-output classes.
@@ -134,7 +134,7 @@ bounded requests and execution with the structural suites listed above.
 | Contract | Primary coverage |
 |---|---|
 | Absent-zero, insertion, replacement, deletion, reinsertion, block presence and stable logical addressing | `sparse_point_mutation_lifecycle`; shared-node, edge and interrupted-publication fixtures remain separate |
-| Every dtype/layout, borrowed non-Unpin input, schema/type checks, write-through, original mutation/reopen, transformed copy/reopen and malformed payloads | `tensor::dtype_storage`; full block comparisons, exhaustive sparse point/entry checks, dense point probes at special values, every block boundary and the modified final element |
+| Every dtype/layout, borrowed non-Unpin input, schema/type checks, original mutation/reopen, transformed copy/reopen and malformed payloads | `tensor::dtype_storage`; full block comparisons, exhaustive sparse point/entry checks, dense point probes at special values, every block boundary and the modified final element |
 | Dense trailing regions, scalar sparsity, omitted zero blocks, compact tails, exact nonfinite bits, capacity-independent values and reopening | `dense_sparse_rows` parameterized cases |
 | Lazy dense conversion, unchanged operand clones, transformed layout and implicit zeros across batch boundaries | `dense_sparse_rows::lazy_dense_conversion_includes_implicit_zeros_across_batches` and companion geometry case |
 | Copy batch boundaries, explicit destination layout, pre-consumption rejection, independent geometry and exceptional values | `tensor_copy`; collection copy policy fixture retains axis hints; specialized errors and cancellation remain separate |
@@ -174,9 +174,8 @@ batch error boundaries, high-rank scratch, and expression integration coverage.
   output, and invalid sparse ranges. `sparse_consumers::parity` checks full
   and selected sparse reads against logical values for transformed matrix,
   diagonal, and Fourier outputs, including empty selections.
-- `traits::tests::default_sparse_reader_pulls_points_across_batches` checks
-  that the point reader starts on demand and streams across a batch boundary.
-  `strict_reopen_rejects_duplicate_ids_across_leaves`
+- `sparse_copy_requires_a_sparse_reader` checks that a point-only reader fails
+  sparse copying with a structured error. `strict_reopen_rejects_duplicate_ids_across_leaves`
   checks that two correctly ordered rows sharing a block ID fail sparse reopen.
 - `validate::tests::range_cardinality_handles_empty_selections_and_overflow`
   owns shared range-validation boundaries; `slice` unit tests retain independent

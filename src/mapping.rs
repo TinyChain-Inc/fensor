@@ -250,13 +250,6 @@ impl CoordinateMap {
         self.base_offset == 0 && self.shape.as_slice() == shape && self.is_c_contiguous()
     }
 
-    pub fn supports_write_through(&self) -> bool {
-        !self
-            .axes
-            .iter()
-            .any(|axis| matches!(axis, AxisContrib::Gather(_) | AxisContrib::Broadcast(_)))
-    }
-
     pub fn identity(shape: Shape, strides: &[u64]) -> Self {
         Self {
             base_offset: 0,
@@ -275,8 +268,7 @@ impl CoordinateMap {
     }
 
     pub fn is_identity(&self, shape: &[u64], strides: &[u64]) -> bool {
-        self.base_offset == 0 && self.shape.as_slice() == shape && self.axes.len() == strides.len()
-            && self.axes.iter().zip(strides).all(|(axis,stride)| matches!(axis, AxisContrib::Stride(s) if i128::from(*stride) == *s))
+        self.base_offset == 0 && self.shape.as_slice() == shape && self.matches_strides(strides)
     }
 
     /// Structural affine description; gather tables deliberately retain cursor mapping.
@@ -423,20 +415,13 @@ impl CoordinateMap {
     }
 
     fn is_c_contiguous(&self) -> bool {
-        if self.axes.len() != self.shape.len() {
-            return false;
-        }
+        schema::contiguous_strides(&self.shape).is_ok_and(|strides| self.matches_strides(&strides))
+    }
 
-        let Ok(expected) = schema::contiguous_strides(&self.shape) else {
-            return false;
-        };
-
-        self.axes
-            .iter()
-            .zip(expected.iter())
-            .all(|pair| match pair {
-                (AxisContrib::Stride(s), e) => *s == i128::from(*e),
-                _ => false,
+    fn matches_strides(&self, strides: &[u64]) -> bool {
+        self.axes.len() == strides.len()
+            && self.axes.iter().zip(strides).all(|(axis, stride)| {
+                matches!(axis, AxisContrib::Stride(s) if *s == i128::from(*stride))
             })
     }
 

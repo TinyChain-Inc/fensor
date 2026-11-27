@@ -87,10 +87,6 @@ fn range_cardinality_handles_empty_selections_and_overflow() {
         let (lengths, count) = validate_range(&[3], &range).unwrap();
         assert_eq!(lengths.as_slice(), &[expected]);
         assert_eq!(count, expected);
-        assert_eq!(
-            iter_range_coords(&[3], &range).unwrap().count() as u64,
-            expected
-        );
     }
 
     let long = u64::MAX / 2;
@@ -98,14 +94,11 @@ fn range_cardinality_handles_empty_selections_and_overflow() {
         smallvec::smallvec![AxisRange::In(0, long, 1), AxisRange::Of(vec![0, 1, 0])];
 
     assert!(matches!(
-        iter_range_coords(&[long, 2], &selection),
+        validate_range(&[long, 2], &selection),
         Err(Error::InvalidSchema(_))
     ));
 
     let mut empty = selection;
     empty.push(AxisRange::Of(Vec::new()));
-    let mut coords = iter_range_coords(&[long, 2, 1], &empty).unwrap();
-    assert_eq!(coords.remaining(), 0);
-    assert_eq!(coords.next(), None);
-    assert_eq!(coords.next(), None);
+    assert_eq!(validate_range(&[long, 2, 1], &empty).unwrap().1, 0);
 }

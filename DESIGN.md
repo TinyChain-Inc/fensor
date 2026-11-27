@@ -197,7 +197,7 @@ eligibility is separate from the validity of the transform; see
 [slices and reductions](#slices-and-reductions) for its rejection boundaries.
 
 `CoordinateMap` shares geometric mapping between storage views and aggregate
-outputs. Its private mapping fields own identity and write-through decisions;
+outputs. Its private mapping fields describe read addresses and identity;
 callers borrow shape metadata. Identity and affine eligibility are derived structurally, without cached
 flags. `AxisRange::Of` may allocate metadata proportional to explicitly supplied
 indices. Slicing/flipping an existing gather shares its table through offset,
@@ -222,13 +222,14 @@ lazy segment iteration. Storage owns linear block splitting; matrix products own
 tile intersection and scattering. Consumers obtain these behaviors through ordinary
 expression delegation, without selecting a planning strategy.
 
-`StorageRead::plan` validates positions into bounded logical-address groups before
-I/O. The opaque plan retains scatter positions, including repeated selections;
-callers may choose visible storage without rebuilding coordinates. Native
-`Tensor::visit_blocks` validates a bounded sorted ID selection and consumes each
-present block synchronously. Dense and sparse reads borrow payloads; sparse reads
-group consecutive requested IDs into native BTree ranges and skip absent rows. Both
-paths use the same consumer for native reads and caller-owned visibility layers.
+Batch assembly validates positions into bounded logical-address groups before I/O
+and retains scatter positions, including repeated selections.
+`TensorSource::visit_blocks` borrows the visible payload for each requested ID
+until its synchronous consumer returns. Native sparse reads group consecutive
+requested IDs into BTree ranges and skip absent rows. Transactional sources
+select visible blocks and can omit known-zero overrides in either layout.
+`TensorSource::read_block_value` uses that visitor with a checked block address
+and returns a scalar directly.
 Each BTree or file guard is released before entering another domain. Unit-stride
 runs copy slices; negative, zero, and other strides use the shared scatter loop.
 Missing sparse storage blocks yield zero; malformed stored blocks fail closed.
@@ -294,7 +295,9 @@ Reductions consume every selected logical value, including implicit sparse zeros
 Indexed traversal evaluates candidate coordinates once and accounts for the
 remaining cardinality through zero partials, without expanding absent coordinates.
 Every sparse expression delivers the dtype's canonical zero for entirely zero
-elements. Indexed reductions use that zero for gaps. ha-ndarray reduces each
+elements. Point reads and batch producers enforce this before another operation
+consumes their values. Geometry forwards those values directly. Indexed
+reductions use that zero for gaps. ha-ndarray reduces each
 bounded batch and combines partials, seeding from the first partial to preserve
 the numerical result for scalar and dense outputs. Complete small groups share one source
 request and bounded segment boundaries, then delegate each nonempty group directly
@@ -344,33 +347,30 @@ construction owner. A bounded batch updates existing construction files when
 coordinates revisit them; no incomplete-block map is retained. Published dense
 replacement instead requires one existing, correctly typed and sized file. Missing required
 files return `InvalidLayout`; replacement never creates or repairs them.
-`from_sparse_elements` and sparse copying share ordered unique ingestion and omit
-final numerical zeros. Input errors retain their original type, and borrowed
-streams are pinned locally. No consumer polls its source again after EOF.
-A private construction owner withholds metadata until successful completion.
-When geometry proves row-major block contiguity, sparse construction retains one
-dense block until complete and streams completed rows into native ordered ingestion.
-Only the current block and the bounded input batch remain live. Interleaved input
-groups each bounded batch by block
-and updates the destination's existing typed rows. All-zero storage blocks are omitted;
-successful completion publishes metadata. There is no
-incomplete-block map, extra staging table, sorting, or source reevaluation.
-Cancellation or error never exposes a completed Tensor, and missing metadata makes
-strict reopening fail. Callers continue owning cleanup and durability.
+`from_sparse_elements`, sparse copying, and full sparse assignment share ordered
+block packing and native sorted append. Geometry validates each coordinate once
+and retains one unfinished block. All-zero blocks are omitted. The native writer
+buffers a bounded batch of completed blocks. Source errors retain their original
+type, and constructors pin borrowed streams locally. Constructors publish
+metadata after the stream succeeds. Cancellation or error withholds metadata
+and strict reopening fails. Callers own cleanup and durability.
 
 Dense copying and native value-buffer writes share request-to-block planning.
 Published writes retain their read-modify-write corruption checks. Value-buffer writes validate cardinality before mutation and group at
-most one execution batch by logical block, preserving repeated-offset input order.
-Native fills validate and replace one compact block at a time.
+most one execution batch by logical block.
+Native fills construct one compact replacement at a time and validate the old
+payload under the replacement guard. Sparse zero fills delete occupied blocks
+through the same validated replacement path.
 Sparse nodes encode complete block/payload leaf rows and typed routing prefixes,
 including block-only separators. Recreate storage containing old copied-minimum
 internal nodes; loading does not migrate it.
 Sparse replacement, construction, and strict reopening share bounded payload
 validation. The geometry visitor reuses rank-sized coordinate scratch without
 per-element allocations.
-Geometric views expose bounded `BlockUpdates` through `plan_updates` and
-`updates_from`. Both use the storage-run planner; affine updates do not expand
-coordinate lists. Owned expression updates share sequential request evaluation with
+Base write selections expose bounded `BlockUpdates` through `plan_updates` and
+`updates_from`. Fixed coordinates and forward spans give one affine selection
+in base coordinates. Both methods use the storage-run planner. Affine updates
+keep compact requests. Owned expression updates share sequential evaluation with
 coordinate consumption, retaining source handles until consumed or dropped.
 Planning describes addresses only; callers enforce write permissions.
 Creation alone initializes dense blocks; mutation fails on missing storage.
@@ -461,9 +461,8 @@ payload file per block. The tree groups sparse rows in leaf nodes by block ID.
 
 `tensor/dense_storage.rs` and `tensor/sparse_storage.rs` own their concrete reads,
 updates, replacements, validation, metadata publication, synchronization, and
-unpublished `Construction` processes. Storage handles remain private. Shared Tensor
-request planning uses `StorageRead::plan`; `Tensor::visit_blocks` delegates I/O
-to the native owner. Construction stream validation remains in
+unpublished `Construction` processes. Storage handles remain private.
+`TensorSource::visit_blocks` delegates I/O to the native owner. Construction stream validation remains in
 `tensor/construction.rs`.
 
 Native creation and loading select dense or sparse storage directly. The sparse
@@ -472,12 +471,21 @@ loading never enters creation code. Creation requires empty delegated storage an
 withholds metadata until construction succeeds. Metadata publication is
 creation-only: existing metadata is an error, never an overwrite.
 
-`TensorSource` is the statically typed storage boundary. Native tensors and caller
-sources share `TensorView<Source>`, geometry, logical reads, occupied traversal,
-and numerical evaluation. `StorageGeometry` exposes logical block positions,
+`TensorSource` is the statically typed storage boundary. Sources lend their
+immutable `StorageGeometry`. Native tensors and caller sources share
+`TensorView<Source>`, logical reads, occupied traversal, and numerical evaluation.
+`StorageGeometry` exposes logical block positions,
 bounds, and valid offsets. `occupied_blocks(range)` delivers sorted unique logical
 block IDs within a half-open range, with bounded lookahead, and releases index guards
-before delivery. Resume after an ID with `id + 1..range.end`.
+before delivery. Resume after an ID with `id + 1..range.end`. Ordered sparse entries
+pack into logical destination blocks with one unfinished block of lookahead.
+`SparseBlocks::replace` reports whether the native owner stored a payload.
+Callers use this result when their own representation distinguishes an explicit
+zero replacement from an absent block.
+`SparseBlocks::fill_empty` constructs constant contents with the same payload
+rule and appends blocks in order. An implicit zero needs no block traversal.
+`visit_occupied` checks a bounded block selection under one native read guard
+using the same selection traversal as block reads.
 
 Lazy operation constructors return statically dispatched `Send` futures; `.await`
 performs validation and builds the view without evaluating its values. Unpolled
@@ -527,9 +535,12 @@ storage-index fields.
 
 An absent storage block is all-zero. Removing a block's last nonzero value
 removes its row. Malformed lengths, empty stored blocks, and
-incorrect block IDs are errors. Batch reads borrow native rows for synchronous
-payload validation and consumption, sharing a BTree range for consecutive requested
-block IDs. Exact singleton reads resolve semantic uniqueness before the callback.
+incorrect block IDs are errors. Ordered initialization validates streamed blocks
+and appends bounded batches to an empty, exclusively delegated store. It releases
+the destination guard before pulling more input. Batch reads borrow native rows
+for synchronous payload validation and consumption, sharing a BTree range for
+consecutive requested block IDs. Exact singleton reads resolve semantic uniqueness
+before the callback.
 Gaps retain separate reads so unrelated payload corruption remains outside the
 selection. Borrowed row references cannot escape the callback or span asynchronous
 consumer work; owned block reads remain available for read-modify-write.
@@ -548,13 +559,15 @@ transaction cleanup and safe reuse; fensor retains no recovery state and neither
 marks clones invalid nor repairs partial writes.
 
 Strict loading requires typed metadata, directories, every dense file, and a valid
-sparse BTree. The tree visits borrowed leaf rows in order during structural
-validation. The sparse schema checks block geometry and payloads, and the
-sparse owner verifies strict block ID order across leaves.
+sparse BTree. Missing required storage entries and malformed native directory
+layouts carry the storage integrity marker. The tree visits borrowed leaf rows
+in order during structural validation. The sparse schema checks block geometry
+and payloads, and the sparse owner verifies strict block ID order across leaves.
 
-`sync` writes native payloads and the sparse BTree root. `sync_all` additionally
-performs delegated durable synchronization. Neither method creates transaction visibility or records
-a commit decision. Synchronization does not exclude mutation for its entire call;
+`sync` delegates buffered writeback of the owning directory to freqfs.
+`sync_all` delegates durable synchronization of the same directory.
+Callers own transaction visibility and commit decisions.
+Synchronization does not exclude mutation for its entire call;
 callers quiesce writes when they require a precise durable boundary. Structural
 validation and payload validation also do not form a transaction snapshot during
 concurrent writes. Callers own recovery from failed materialization.

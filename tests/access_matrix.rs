@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 use fensor::{
     AxisRange, Error, Layout, Range, Shape, Tensor, TensorArray, TensorGeometry, TensorRead,
-    TensorSchema, TensorTransform, TensorWrite, TensorWriteBulk,
+    TensorSchema, TensorTransform, TensorWrite,
 };
 use futures::TryStreamExt;
 use ha_ndarray::{axes, range, shape};
@@ -1392,11 +1392,11 @@ mod section_d_bulk_io {
     }
 
     #[tokio::test]
-    async fn copy_dense_values_to_sparse() {
+    async fn sparse_copy_requires_a_sparse_reader() {
         let (dense_root, dense, _) = create_dense("d_wt_dense", shape![2, 3, 4], 4).await;
         seed_values(&dense).await;
 
-        // A caller-provided reader chooses sparse materialization at the copy boundary.
+        // A point reader alone does not provide a sparse stream.
         struct SparseReader<'a>(&'a Tensor<FsEntry, f32>);
 
         impl fensor::TensorGeometry for SparseReader<'_> {
@@ -1425,20 +1425,15 @@ mod section_d_bulk_io {
         }
 
         let (sparse_root, dir) = new_dir("d_copy_sparse").await;
-        let sparse = Tensor::copy_from(
+        let result = Tensor::copy_from(
             dir,
             &SparseReader(&dense),
             Layout::Sparse { axis: Some(1) },
             4,
         )
-        .await
-        .unwrap();
+        .await;
 
-        for coord in iter_coords(dense.shape()) {
-            let d = dense.read_value(&coord).await.expect("dense");
-            let s = sparse.read_value(&coord).await.expect("sparse");
-            assert_eq!(d, s, "coord {:?}", coord);
-        }
+        assert!(matches!(result, Err(Error::Unsupported(_))));
 
         cleanup(&dense_root).await;
         cleanup(&sparse_root).await;
@@ -1448,138 +1443,6 @@ mod section_d_bulk_io {
 // ====================================================================
 // Section E — Sparse zero-write lifecycle
 // ====================================================================
-
-// ====================================================================
-// Section F — View semantics / writeability
-// ====================================================================
-
-mod section_f_view_semantics {
-    use super::*;
-
-    #[tokio::test]
-    async fn is_base_tensor_true_only_for_identity_view() {
-        let (root, tensor, _) = create_dense("f_is_base", shape![2, 3, 4], 4).await;
-
-        assert!(tensor.view().is_base_tensor(), "fresh tensor is the base");
-
-        let sliced = tensor
-            .view()
-            .slice(range![
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        assert!(!sliced.is_base_tensor(), "sliced view is not the base");
-
-        let transposed = tensor.view().transpose(Some(axes![2, 0, 1])).expect("tx");
-        assert!(
-            !transposed.is_base_tensor(),
-            "transposed view is not the base"
-        );
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn supports_write_through_true_for_slice_and_transpose() {
-        let (root, tensor, _) = create_dense("f_writethrough", shape![2, 3, 4], 4).await;
-
-        let sliced = tensor
-            .view()
-            .slice(range![
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(1, 3, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        assert!(sliced.supports_write_through());
-
-        sliced
-            .write_value(&[0, 0, 0], 42.0)
-            .await
-            .expect("write through slice");
-
-        // The slice maps view-coord [0,0,0] to base-coord [0,1,0].
-        let from_base = tensor.read_value(&[0, 1, 0]).await.expect("base read");
-        assert_eq!(from_base, 42.0, "write must reach base storage");
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn write_through_rejected_for_broadcast() {
-        let (root, tensor, _) = create_dense("f_no_wt", shape![1, 3, 4], 4).await;
-        let broadcasted = tensor.view().broadcast(shape![2, 3, 4]).expect("broadcast");
-
-        assert!(
-            !broadcasted.supports_write_through(),
-            "broadcast view must NOT be write-through"
-        );
-
-        let err = broadcasted
-            .write_value(&[1, 0, 0], 1.0)
-            .await
-            .expect_err("write must be rejected on broadcast view");
-
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn write_through_rejected_for_gather_slice() {
-        let (root, tensor, _) = create_dense("f_no_wt_gather", shape![4, 3, 4], 4).await;
-        let gathered = tensor
-            .view()
-            .slice(range![
-                AxisRange::Of(vec![0, 2]),
-                AxisRange::In(0, 3, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        assert!(
-            !gathered.supports_write_through(),
-            "gather-sliced view must NOT be write-through"
-        );
-
-        let err = gathered
-            .write_value(&[0, 0, 0], 1.0)
-            .await
-            .expect_err("write must be rejected on gather-sliced view");
-
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn reshape_view_writeability_documented() {
-        let (root, tensor, _) = create_dense("f_reshape_view", shape![2, 3, 4], 4).await;
-
-        // Reshape over identity is fine.
-        let reshaped = tensor.view().reshape(shape![6, 4]).expect("reshape ok");
-        assert!(reshaped.supports_write_through());
-
-        // Reshape over a transformed view is rejected (current contract).
-        let sliced = tensor
-            .view()
-            .slice(range![
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        let err = sliced.reshape(shape![16]).err().expect("must reject");
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-
-        cleanup(&root).await;
-    }
-}
 
 // ====================================================================
 // Section G — sparse iteration
