@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::*;
 use crate::read_metrics::{CURRENT, Metrics};
+use super::*;
 
 #[tokio::test]
 async fn wide_sparse_candidates_retain_compact_requests_and_release_sources() {

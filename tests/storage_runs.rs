@@ -1,12 +1,11 @@
 //! Filesystem parity between compact/affine stream requests and explicit point reads.
 
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
-
 use fensor::{
     AxisRange, Layout, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
     TensorTransform, TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
 
 mod common;
 

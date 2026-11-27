@@ -1,12 +1,11 @@
-use futures::TryStreamExt;
-use futures::stream::BoxStream;
-use number_general::DType;
-
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorArray, TensorExpression,
     TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorStatistics, TensorTransform,
     TensorTrig, TensorUnary, TensorView, TensorWrite,
 };
+use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use number_general::DType;
 
 mod common;
 
@@ -35,14 +34,10 @@ impl TensorArray for Source {
     fn schema(&self) -> &TensorSchema {
         self.0.schema()
     }
-
-    fn strides(&self) -> &[u64] {
-        self.0.strides()
-    }
 }
 
 impl TensorSource for Source {
-    fn storage_geometry(&self) -> StorageGeometry {
+    fn storage_geometry(&self) -> &StorageGeometry {
         self.0.storage_geometry()
     }
 
@@ -408,10 +403,13 @@ async fn lazy_dense_conversion_includes_implicit_zeros_across_batches() {
     ));
 
     let output = TensorExpression::new(dense.exp().await.unwrap()).unwrap();
-    let mut entries = output.into_sparse_elements().unwrap();
+    let mut entries = output
+        .into_blocks()
+        .unwrap()
+        .map_ok(|values| futures::stream::iter(values.into_iter().map(Ok::<_, fensor::Error>)))
+        .try_flatten();
     for coordinate in common::iter_coords(&[2, 4097]) {
-        let (actual, value) = entries.try_next().await.unwrap().unwrap();
-        assert_eq!(actual, coordinate);
+        let value = entries.try_next().await.unwrap().unwrap();
         assert_eq!(
             value,
             if coordinate == [0, 0] {

@@ -1,12 +1,11 @@
 //! Downstream public API smoke coverage, not a transaction or storage-provider test.
 
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
-
 use fensor::{
     AxisRange, Layout, Tensor, TensorExpression, TensorGeometry, TensorMathScalar, TensorRead,
     TensorReduce, TensorSource, TensorTransform, TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
 
 mod common;
 
@@ -43,13 +42,13 @@ async fn public_composition_storage_access_and_persistence() {
         )
         .await;
 
-        // Logical block access does not expose native table pages.
+        // Logical block access delegates traversal to the storage owner.
         let geometry = source.storage_geometry();
         let (id, offset) = geometry.block_position(&[0, 0]).unwrap();
         assert_eq!(source.read_logical_block(id).await.unwrap()[offset], 1.0);
 
         let geometric = source.view().transpose(Some(axes![1, 0])).unwrap();
-        geometric.write_value(&[0, 0], 0.0).await.unwrap();
+        source.write_value(&[0, 0], 0.0).await.unwrap();
         assert_eq!(geometric.read_value(&[0, 0]).await.unwrap(), 0.0);
         assert_eq!(geometric.read_value(&[0, 1]).await.unwrap(), 4.0);
 

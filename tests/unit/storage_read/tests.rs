@@ -1,10 +1,10 @@
 use ha_ndarray::{axes, range, shape};
 
-use super::*;
 use crate::AxisRange;
 use crate::mapping::test_support::affine;
 use crate::request::{Axis, Cartesian};
 use crate::schema::contiguous_strides;
+use super::*;
 
 fn compare(storage: &StorageShape<'_>, map: &CoordinateMap, request: BatchRequest) {
     let planned = storage.plan(&request, Some(map)).unwrap();

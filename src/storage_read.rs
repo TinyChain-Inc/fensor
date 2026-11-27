@@ -60,6 +60,26 @@ pub(crate) struct StorageShape<'a> {
     pub geometry: &'a crate::StorageGeometry,
 }
 
+struct PendingRuns<'a> {
+    geometry: &'a crate::StorageGeometry,
+    groups: LogicalGroups,
+    len: usize,
+    end: usize,
+}
+
+impl PendingRuns<'_> {
+    fn push(&mut self, key: u64, run: Run) -> Result<()> {
+        run.validate(self.geometry.block_len(key)?, self.len)?;
+        if run.output != self.end {
+            return Err(invalid());
+        }
+
+        self.end += run.len;
+        push_run(self.groups.entry(key).or_default(), run);
+        Ok(())
+    }
+}
+
 fn invalid() -> Error {
     Error::InvalidLayout("invalid storage run bounds or arithmetic overflow".into())
 }
@@ -99,14 +119,15 @@ impl StorageShape<'_> {
 
         request.validate(shape)?;
 
-        let affine = if matches!(request.kind(), RequestKind::Explicit(_))
-            || (matches!(request.kind(), RequestKind::FlatRuns(_))
-                && mapping.is_none_or(|m| {
-                    m.is_identity(
-                        self.geometry.schema().shape(),
-                        self.geometry.schema().strides(),
-                    )
-                })) {
+        let base_order = matches!(request.kind(), RequestKind::FlatRuns(_))
+            && mapping.is_none_or(|m| {
+                m.is_identity(
+                    self.geometry.schema().shape(),
+                    self.geometry.schema().strides(),
+                )
+            });
+
+        let affine = if base_order || matches!(request.kind(), RequestKind::Explicit(_)) {
             None
         } else {
             match mapping {
@@ -123,37 +144,18 @@ impl StorageShape<'_> {
             }
         };
 
-        let mut groups = LogicalGroups::new();
-
-        let mut end = 0;
-        let mut emit = |key, run: Run| {
-            run.validate(self.geometry.block_len(key)?, request.len())?;
-            if run.output != end {
-                return Err(invalid());
-            }
-
-            end += run.len;
-            push_run(groups.entry(key).or_default(), run);
-            Ok(())
-        };
-
-        match (request.kind(), affine) {
-            (RequestKind::FlatRuns(runs), _)
-                if mapping.is_none_or(|m| {
-                    m.is_identity(
-                        self.geometry.schema().shape(),
-                        self.geometry.schema().strides(),
-                    )
-                }) =>
-            {
+        self.plan_runs(request.len(), |pending| match (request.kind(), affine) {
+            (RequestKind::FlatRuns(runs), _) if base_order => {
                 for run in runs {
-                    self.split(&mut emit, *run)?;
+                    self.split(pending, *run)?;
                 }
+
+                Ok(())
             }
             (_, Some((offset, strides))) => {
                 progressions(request, shape, offset, &strides, |progression| {
-                    self.split(&mut emit, progression)
-                })?;
+                    self.split(pending, progression)
+                })
             }
             _ => {
                 let mut cursor = request.cursor(shape)?;
@@ -179,7 +181,7 @@ impl StorageShape<'_> {
                     };
 
                     let (block, offset) = self.position(coord);
-                    emit(
+                    pending.push(
                         block,
                         Run {
                             output,
@@ -191,20 +193,50 @@ impl StorageShape<'_> {
 
                     output += 1;
                 }
-            }
-        }
 
-        if end != request.len() {
+                Ok(())
+            }
+        })
+    }
+
+    pub(crate) fn plan_affine(
+        &self,
+        request: &BatchRequest,
+        shape: &[u64],
+        offset: i128,
+        strides: &[i128],
+    ) -> Result<LogicalGroups> {
+        request.validate(shape)?;
+        self.plan_runs(request.len(), |pending| {
+            progressions(request, shape, offset, strides, |run| {
+                self.split(pending, run)
+            })
+        })
+    }
+
+    fn plan_runs(
+        &self,
+        len: usize,
+        visit: impl FnOnce(&mut PendingRuns<'_>) -> Result<()>,
+    ) -> Result<LogicalGroups> {
+        let mut pending = PendingRuns {
+            geometry: self.geometry,
+            groups: LogicalGroups::new(),
+            len,
+            end: 0,
+        };
+        visit(&mut pending)?;
+        if pending.end != len {
             return Err(invalid());
         }
 
         #[cfg(test)]
         crate::read_metrics::record(|m| {
-            m.runs += groups.values().map(Vec::len).sum::<usize>();
-            m.requested += request.len();
+            m.runs += pending.groups.values().map(Vec::len).sum::<usize>();
+            m.requested += len;
         });
 
-        Ok(groups)
+        Ok(pending.groups)
     }
 
     fn position(&self, coord: &[u64]) -> (u64, usize) {
@@ -213,17 +245,13 @@ impl StorageShape<'_> {
             .expect("validated source coordinates")
     }
 
-    fn split(
-        &self,
-        emit: &mut impl FnMut(u64, Run) -> Result<()>,
-        progression: Progression,
-    ) -> Result<()> {
+    fn split(&self, pending: &mut PendingRuns<'_>, progression: Progression) -> Result<()> {
         self.geometry.storage.blocks.split(
             progression.start,
             progression.step,
             progression.len,
             |id, offset, stride, len, done| {
-                emit(
+                pending.push(
                     id,
                     Run {
                         output: progression.output + done,

@@ -3,15 +3,20 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use fensor::{StatisticsElement, TensorFileEntry, TensorStatistics};
 use ha_ndarray::{axes, shape};
+
+use fensor::reduce::{Mean, Norm, ReduceOp, StandardDeviation};
+use fensor::{TensorElement, TensorFileEntry, TensorStatistics};
 
 use super::benchmark;
 use super::common::{FsEntry, fixture};
 
-async fn case<T: StatisticsElement>(dtype: &str, value: impl Fn(u64) -> T)
+async fn case<T: TensorElement>(dtype: &str, value: impl Fn(u64) -> T)
 where
     FsEntry: TensorFileEntry<T>,
+    Mean: ReduceOp<T>,
+    StandardDeviation: ReduceOp<T, Output = f64>,
+    Norm: ReduceOp<T, Output = f64>,
 {
     for sparse in [false, true] {
         for capacity in [256, 4096] {

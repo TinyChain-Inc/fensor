@@ -1,17 +1,16 @@
 //! Native u8 storage and lazy boolean expressions over real filesystem tensors.
 
+use common::{FsEntry, new_dir};
+use fensor::{
+    AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorGeometry, TensorNumeric,
+    TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
+};
 use futures::TryStreamExt;
 use ha_ndarray::{
     Array, ArrayAccess, Buffer, NDArrayNumeric, NDArrayRead, NDArrayUnaryBoolean, axes, range,
     shape,
 };
 use number_general::{FloatType, NumberType, UIntType};
-
-use common::{FsEntry, new_dir};
-use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorCast, TensorExpression, TensorGeometry, TensorNumeric,
-    TensorRead, TensorSchema, TensorTransform, TensorUnaryBoolean, TensorWrite,
-};
 
 mod common;
 
@@ -98,9 +97,9 @@ async fn u8_storage_views_not_and_reload() {
         }
 
         let flipped = tensor.view().flip(0).unwrap();
-        flipped.write_value(&[0], 254).await.unwrap();
-        assert_eq!(tensor.read_value(&[3]).await.unwrap(), 254);
-        flipped.write_value(&[0], 255).await.unwrap();
+        tensor.write_value(&[3], 254).await.unwrap();
+        assert_eq!(flipped.read_value(&[0]).await.unwrap(), 254);
+        tensor.write_value(&[3], 255).await.unwrap();
         // Deleting a sparse value, then recreating it, retains zero-write semantics.
         tensor.write_value(&[1], 0).await.unwrap();
         assert_eq!(tensor.read_value(&[1]).await.unwrap(), 0);

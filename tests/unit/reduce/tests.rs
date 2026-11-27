@@ -5,16 +5,18 @@ use number_general::DType;
 use super::*;
 use crate::read_metrics::{CURRENT, Metrics};
 use crate::test_support::{FsEntry, new_dir};
-use crate::{Tensor, TensorExpression, TensorMath, TensorMathScalar, TensorSchema, TensorWrite};
+use crate::{
+    Tensor, TensorExpression, TensorMath, TensorMathScalar, TensorSchema, TensorSource, TensorWrite,
+};
 
 #[tokio::test]
-async fn zero_gap_products_preserve_expression_signed_zeros() {
+async fn sparse_zeros_are_canonical_in_reads_and_reductions() {
     for len in [3, expression::MAX_BATCH_ELEMENTS as u64 + 1] {
         let (_root, dir) = new_dir("reduce_signed_zero").await;
         let tensor = Tensor::<FsEntry, f64>::create(
             dir,
             TensorSchema::new(f64::dtype(), vec![1, len].into()).unwrap(),
-            Layout::Sparse { axis: None },
+            Layout::Sparse { axis: Some(0) },
             31,
         )
         .await
@@ -22,11 +24,38 @@ async fn zero_gap_products_preserve_expression_signed_zeros() {
 
         for first in [0., 1.] {
             tensor.write_value(&[0, 0], first).await.unwrap();
+            tensor.write_value(&[0, 1], -0.).await.unwrap();
+            if first != 0. {
+                let stored = tensor.read_logical_block(0).await.unwrap();
+                assert_eq!(stored[1].to_bits(), (-0.0_f64).to_bits());
+            }
+
+            assert_eq!(
+                tensor.read_value(&[0, 1]).await.unwrap().to_bits(),
+                0.0_f64.to_bits()
+            );
+            let flipped = tensor.view().flip(1).unwrap();
+            let point = flipped.read_value(&[0, len - 2]).await.unwrap();
+            assert_eq!(point.to_bits(), 0.0_f64.to_bits());
+
+            let values = tensor
+                .read_blocks()
+                .unwrap()
+                .try_next()
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(values[1].to_bits(), 0.0_f64.to_bits());
+
             let sparse = tensor.view().mul_scalar(-1.).await.unwrap();
             let owned = TensorExpression::new(sparse.clone()).unwrap();
             let dense = owned.clone().into_dense();
             let expected = dense.product_all().await.unwrap().to_bits();
-            assert_eq!(expected, (-0.0_f64).to_bits());
+            assert_eq!(
+                dense.read_value(&[0, len - 1]).await.unwrap().to_bits(),
+                0.0_f64.to_bits()
+            );
             assert_eq!(sparse.product_all().await.unwrap().to_bits(), expected);
             assert_eq!(owned.product_all().await.unwrap().to_bits(), expected);
             assert_eq!(
@@ -38,7 +67,7 @@ async fn zero_gap_products_preserve_expression_signed_zeros() {
                     .await
                     .unwrap()
                     .to_bits(),
-                expected
+                0.0_f64.to_bits()
             );
         }
     }

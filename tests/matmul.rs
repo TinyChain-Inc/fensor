@@ -1,15 +1,14 @@
 //! Filesystem-backed tiled matrix multiplication and zero-extended sparse values.
 
-use futures::TryStreamExt;
-use ha_ndarray::{Array, Buffer, MatrixDual, NDArrayRead, Number, axes, range, shape};
-use number_general::DType;
-
 use fensor::{
     AxisRange, Layout, Shape, Tensor, TensorCast, TensorCompareScalar, TensorElement,
     TensorExpression, TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorRead,
     TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere,
     TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{Array, Buffer, MatrixDual, NDArrayRead, Number, axes, range, shape};
+use number_general::DType;
 
 mod common;
 

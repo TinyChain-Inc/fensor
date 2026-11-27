@@ -1,10 +1,10 @@
 //! Shared evaluation-only cases; production timing and test-only profiling use the same inputs.
 
+use fensor::{TensorMatMul, TensorRead, TensorReduceAll, TensorTransform, TensorUnary};
 use ha_ndarray::shape;
 
 use super::benchmark;
 use super::benchmark_source::source;
-use fensor::{TensorMatMul, TensorRead, TensorReduceAll, TensorTransform, TensorUnary};
 
 async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(name: &str, view: &V) {
     benchmark::streams(name, view, &["row", "coordinate"]).await;

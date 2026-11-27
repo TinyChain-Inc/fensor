@@ -1,6 +1,6 @@
-use super::*;
 use crate::complex::Complex64;
 use crate::test_support::{cleanup, fixture};
+use super::*;
 
 #[tokio::test]
 async fn complete_groups_pack_without_materialization() {

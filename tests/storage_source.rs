@@ -1,14 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures::{StreamExt, TryStreamExt};
-use number_general::FloatType;
-
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorAbs, TensorArray,
     TensorExpression, TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorSchema,
     TensorSource, TensorTransform, TensorUnary, TensorView, TensorWrite,
 };
+use futures::{StreamExt, TryStreamExt};
+use number_general::FloatType;
 
 mod common;
 
@@ -41,14 +40,10 @@ impl TensorArray for Source {
     fn schema(&self) -> &TensorSchema {
         self.tensor.schema()
     }
-
-    fn strides(&self) -> &[u64] {
-        self.tensor.strides()
-    }
 }
 
 impl TensorSource for Source {
-    fn storage_geometry(&self) -> StorageGeometry {
+    fn storage_geometry(&self) -> &StorageGeometry {
         self.tensor.storage_geometry()
     }
 
@@ -111,9 +106,61 @@ async fn custom_owned_source_feeds_existing_lazy_operations() {
 }
 
 #[tokio::test]
+async fn sparse_block_reads_split_and_join_occupied_spans() {
+    let (root, dir) = new_dir("sparse_reblock").await;
+    let schema =
+        TensorSchema::new(NumberType::Float(FloatType::F64), vec![2, 2, 5].into()).unwrap();
+    let source =
+        Tensor::<FsEntry, f64>::create(dir, schema.clone(), Layout::Sparse { axis: Some(0) }, 4)
+            .await
+            .unwrap();
+
+    for (coord, value) in [
+        ([0, 0, 3], 3.0),
+        ([0, 0, 4], 4.0),
+        ([0, 1, 4], 9.0),
+        ([1, 0, 0], 10.0),
+        ([1, 0, 3], 13.0),
+        ([1, 1, 4], 19.0),
+    ] {
+        source.write_value(&coord, value).await.unwrap();
+    }
+
+    assert_eq!(
+        source.read_value(&[0, 0, 0]).await.unwrap().to_bits(),
+        0.0f64.to_bits()
+    );
+    assert_eq!(source.read_value(&[1, 1, 4]).await.unwrap(), 19.);
+    let geometry = StorageGeometry::new(schema, Layout::Sparse { axis: Some(1) }, 3).unwrap();
+    let blocks: Vec<_> = geometry
+        .read_blocks(&source)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        blocks,
+        [
+            (1, vec![3.0, 4.0]),
+            (3, vec![0.0, 9.0]),
+            (4, vec![10.0, 0.0, 0.0]),
+            (5, vec![13.0, 0.0]),
+            (7, vec![0.0, 19.0]),
+        ]
+    );
+
+    drop(source);
+    cleanup(&root).await;
+}
+
+#[tokio::test]
 async fn strict_load_never_initializes_missing_storage() {
     let (root, dir) = new_dir("strict_empty").await;
-    assert!(Tensor::<FsEntry, f64>::load(dir.clone()).await.is_err());
+    assert!(matches!(
+        Tensor::<FsEntry, f64>::load(dir.clone()).await,
+        Err(fensor::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
+    ));
     assert!(dir.read().await.is_empty());
     let schema = TensorSchema::new(NumberType::Float(FloatType::F64), vec![4].into()).unwrap();
     let tensor = Tensor::<FsEntry, f64>::create(dir.clone(), schema, Layout::Dense, 2)
@@ -121,6 +168,13 @@ async fn strict_load_never_initializes_missing_storage() {
         .unwrap();
 
     tensor.sync().await.unwrap();
+    dir.write().await.create_dir("values".into()).unwrap();
+    assert!(matches!(
+        Tensor::<FsEntry, f64>::load(dir.clone()).await,
+        Err(fensor::Error::Io(error)) if freqfs::IntegrityError::is_marked(&error)
+    ));
+    dir.write().await.delete("values").await;
+
     let blocks = dir.read().await.get_dir("blocks").cloned().unwrap();
     blocks.write().await.delete("0").await;
     assert!(Tensor::<FsEntry, f64>::load(dir.clone()).await.is_err());
@@ -135,10 +189,16 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
 
     let (root, dir) = new_dir("block_bounds").await;
     let schema = TensorSchema::new(NumberType::Float(FloatType::F64), vec![4, 8].into()).unwrap();
-    let tensor = Tensor::<FsEntry, f64>::create(dir, schema, Layout::Dense, 4)
+    let tensor = Tensor::<FsEntry, f64>::create(dir, schema, Layout::Dense, 3)
         .await
         .unwrap();
 
+    tensor.write_value(&[3, 7], -0.0).await.unwrap();
+    tensor.write_value(&[2, 7], 7.0).await.unwrap();
+    assert_eq!(
+        tensor.read_value(&[3, 7]).await.unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
     let geometry = tensor.storage_geometry();
     let point = tensor
         .view()
@@ -146,7 +206,8 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
         .unwrap();
 
     let id = geometry.block_position(&[2, 7]).unwrap().0;
-    assert_eq!(point.logical_block_range(&geometry).unwrap(), id..id + 1);
+    assert_eq!(point.logical_block_range(geometry).unwrap(), id..id + 1);
+    assert_eq!(point.read_value(&[]).await.unwrap(), 7.);
     for view in [
         tensor
             .view()
@@ -159,14 +220,17 @@ async fn geometric_block_bounds_enclose_transformed_coordinates_without_expansio
             .slice(vec![AxisRange::Of(vec![3, 1]), AxisRange::In(1, 8, 2)].into())
             .unwrap(),
     ] {
-        let bounds = view.logical_block_range(&geometry).unwrap();
+        let bounds = view.logical_block_range(geometry).unwrap();
         for coord in fensor::row_major_coords(view.shape()).unwrap() {
-            let block = geometry
-                .block_position(&view.resolve_base_coord(&coord).unwrap())
-                .unwrap()
-                .0;
+            let base = view.resolve_base_coord(&coord).unwrap();
+            let block = geometry.block_position(&base).unwrap().0;
 
             assert!(bounds.contains(&block));
+            let value = view.read_value(&coord).await.unwrap();
+            assert_eq!(
+                value.to_bits(),
+                tensor.read_value(&base).await.unwrap().to_bits()
+            );
         }
     }
 
@@ -249,25 +313,24 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
                 .unwrap();
 
             same(&borrowed, &owned);
-            let entries: Vec<_> = value
-                .clone()
-                .into_sparse_elements()
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-
-            assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
             if matches!(layout, Layout::Sparse { .. }) {
+                let entries: Vec<_> = value
+                    .clone()
+                    .into_sparse_elements()
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+
+                assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
                 let range = value
                     .shape()
                     .iter()
                     .map(|&dim| fensor::AxisRange::In(0, dim, 1))
                     .collect();
 
-                let order = (0..value.ndim()).collect();
                 let borrowed: Vec<_> = value
-                    .read_sparse_elements_in_order(range, order)
+                    .read_sparse_elements(range)
                     .await
                     .unwrap()
                     .try_collect()
@@ -286,6 +349,11 @@ async fn owned_and_borrowed_consumers_preserve_geometry_zeros_and_nonfinite_valu
 
                 assert!(entries.iter().any(|(_, value)| *value == 2.0));
                 assert_eq!(entries.len(), 5);
+            } else {
+                assert!(matches!(
+                    value.into_sparse_elements(),
+                    Err(fensor::Error::Unsupported(_))
+                ));
             }
         }
 
@@ -413,27 +481,24 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
 
     let transposed = expression.clone().transpose(None).unwrap();
     scans.store(0, Ordering::Relaxed);
-    assert!(matches!(
-        transposed.clone().into_sparse_elements(),
-        Err(fensor::Error::Unsupported(_))
-    ));
-
-    assert_eq!(scans.load(Ordering::Relaxed), 0);
-    let mut blocks = transposed.read_coordinate_blocks().unwrap();
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(batch) = blocks.try_next().await.unwrap() {
-        let (coordinates, values) = batch.into_coordinates(transposed.shape()).unwrap();
-        assert_eq!(coordinates.len(), values.len());
-        for (coord, value) in coordinates.into_iter().zip(values) {
-            assert!(seen.insert(coord));
-            assert_eq!(value, 2.);
+    {
+        let mut blocks = transposed.read_coordinate_blocks().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(batch) = blocks.try_next().await.unwrap() {
+            let (coordinates, values) = batch.into_coordinates(transposed.shape()).unwrap();
+            assert_eq!(coordinates.len(), values.len());
+            for (coord, value) in coordinates.into_iter().zip(values) {
+                assert!(seen.insert(coord));
+                assert_eq!(value, 2.);
+            }
         }
-    }
 
-    assert_eq!(seen.len() as u64, rows * 2);
+        assert_eq!(seen.len() as u64, rows * 2);
+    }
     assert_eq!(scans.load(Ordering::Relaxed), 0);
 
-    for unsupported in [
+    for view in [
+        transposed,
         expression.clone().flip(0).unwrap(),
         expression
             .slice(
@@ -445,21 +510,22 @@ async fn sparse_consumption_retains_one_source_scan_across_pages_and_batches() {
             )
             .unwrap(),
     ] {
-        assert!(matches!(
-            unsupported.clone().into_sparse_elements(),
-            Err(fensor::Error::Unsupported(_))
-        ));
+        let shape = view.shape().to_vec();
+        let range = shape
+            .iter()
+            .map(|&dim| fensor::AxisRange::In(0, dim, 1))
+            .collect();
+        let mut borrowed = view.read_sparse_elements(range).await.unwrap();
+        let mut owned = view.clone().into_sparse_elements().unwrap();
 
-        assert_eq!(unsupported.read_value(&[0, 0]).await.unwrap(), 2.);
-        assert_eq!(
-            unsupported
-                .read_blocks()
-                .unwrap()
-                .try_concat()
-                .await
-                .unwrap()
-                .len() as u64,
-            rows * 2
-        );
+        for coord in common::iter_coords(&shape) {
+            let expected = Some((coord, 2.));
+            assert_eq!(borrowed.try_next().await.unwrap(), expected);
+            assert_eq!(owned.try_next().await.unwrap(), expected);
+        }
+
+        assert!(borrowed.try_next().await.unwrap().is_none());
+        assert!(owned.try_next().await.unwrap().is_none());
+        assert_eq!(scans.load(Ordering::Relaxed), 0);
     }
 }

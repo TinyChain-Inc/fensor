@@ -4,7 +4,10 @@ use crate::{Tensor, TensorElement, TensorFileEntry};
 pub(in crate::tensor) async fn sparse_row<F: TensorFileEntry<T>, T: TensorElement>(
     tensor: &Tensor<F, T>,
     id: u64,
-) -> (freqfs::FileReadGuardOwned<F, crate::SparseNode<T>>, usize) {
+) -> (
+    freqfs::FileReadGuardOwned<F, b_tree::Node<Vec<Vec<crate::SparseCell<T>>>>>,
+    usize,
+) {
     let values = tensor
         .directory
         .read()
@@ -20,7 +23,7 @@ pub(in crate::tensor) async fn sparse_row<F: TensorFileEntry<T>, T: TensorElemen
             .as_file()
             .unwrap()
             .clone()
-            .into_read::<crate::SparseNode<T>>()
+            .into_read::<b_tree::Node<Vec<Vec<crate::SparseCell<T>>>>>()
             .await
             .unwrap();
 
@@ -58,7 +61,7 @@ pub(in crate::tensor) async fn corrupt_sparse_row<F: TensorFileEntry<T>, T: Tens
         let mut node = entry
             .as_file()
             .unwrap()
-            .write::<crate::SparseNode<T>>()
+            .write::<b_tree::Node<Vec<Vec<crate::SparseCell<T>>>>>()
             .await
             .unwrap();
 

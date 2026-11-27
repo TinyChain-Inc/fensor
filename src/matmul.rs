@@ -10,7 +10,7 @@ use crate::request::{Axis, BatchRequest, Cartesian, RequestKind};
 use crate::schema::Coord;
 use crate::{
     BoxFuture, Layout, Result, Shape, TensorElement, TensorGeometry, TensorMatMul, TensorRead,
-    TensorTransform, TensorViewSemantics, expression, request,
+    TensorTransform, expression, request,
 };
 
 /// Maximum rows and columns per spatial tile; result size is TILE_SIDE squared.
@@ -521,6 +521,7 @@ where
             )?;
 
             let mut values = vec![L::DType::ZERO; coords.len()];
+            let output_value = expression::output_value(self.layout());
             let inner = self.left.shape()[self.left.ndim() - 1];
 
             for MatrixPlan {
@@ -570,7 +571,7 @@ where
 
                 let accumulated = accumulated.expect("nonzero contraction dimension");
                 scatter.each(columns.len(), |position, offset| {
-                    values[position] = accumulated[offset];
+                    values[position] = output_value(accumulated[offset]);
                 });
             }
 
@@ -603,17 +604,6 @@ where
     }
 }
 
-impl<L, R> TensorViewSemantics for MatMulView<L, R>
-where
-    L: TensorGeometry,
-    R: TensorGeometry<DType = L::DType>,
-    L::DType: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 impl<L, R> TensorRead for MatMulView<L, R>
 where
     L: Expression,
@@ -624,7 +614,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 

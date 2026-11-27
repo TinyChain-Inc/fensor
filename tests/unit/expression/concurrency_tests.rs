@@ -377,7 +377,16 @@ where
     };
 
     if !release_first {
-        assert!(futures::poll!(terminal.as_mut()).is_pending());
+        // Cooperative yielding can pause evaluation before it enters the source.
+        std::future::poll_fn(|cx| {
+            assert!(terminal.as_mut().poll(cx).is_pending());
+            if source.started.read() == 0 {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
         assert_eq!(source.started.read(), 1);
         assert_eq!(source.completed.read(), 0);
     }

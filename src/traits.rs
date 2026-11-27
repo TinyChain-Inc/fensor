@@ -34,8 +34,6 @@ pub trait TensorGeometry: Send + Sync {
 /// Adds the persistent, storage-backed schema -- implemented ONLY by base tensors.
 pub trait TensorArray: TensorGeometry {
     fn schema(&self) -> &TensorSchema;
-
-    fn strides(&self) -> &[u64];
 }
 
 /// A lazily-produced, row-major-ordered stream of populated sparse elements.
@@ -159,47 +157,38 @@ pub trait TensorRead: TensorGeometry {
         )
     }
 
-    fn read_sparse_elements_in_order<'a>(
+    /// Read nonzero elements in logical row-major order. Readers that support
+    /// sparse iteration provide their own stream.
+    fn read_sparse_elements<'a>(
         &'a self,
-        range: Range,
-        requested_order: Axes,
+        _range: Range,
     ) -> BoxFuture<'a, Result<SparseElementStream<'a, Self::DType>>>
     where
         Self::DType: Default + PartialEq,
     {
-        Box::pin(async move {
-            let coords = sparse_coords(self, range, requested_order)?;
-            let elements = futures::stream::iter(coordinate_batches(coords))
-                .then(move |coords| async move {
-                    let mut elements = Vec::new();
-
-                    for coord in coords {
-                        let value = self.read_value(&coord).await?;
-                        if value != Self::DType::default() {
-                            elements.push((coord, value));
-                        }
-                    }
-
-                    Ok::<_, Error>(futures::stream::iter(elements.into_iter().map(Ok)))
-                })
-                .try_flatten();
-
-            Ok(elements.boxed())
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "reader does not expose sparse elements".into(),
+            ))
         })
     }
 }
 
-/// Async value writes aligned with ndarray coordinate semantics.
+/// Write a base tensor using its own coordinates. Bulk writes use bounded
+/// working memory in addition to caller-owned values.
+///
+/// ```compile_fail
+/// use fensor::{Tensor, TensorFileEntry, TensorTransform, TensorWrite};
+/// fn writable(_: impl TensorWrite) {}
+/// fn example<F: TensorFileEntry<f32>>(tensor: &Tensor<F, f32>) {
+///     writable(tensor.view().transpose(None).unwrap());
+/// }
+/// ```
 pub trait TensorWrite: TensorGeometry {
     fn write_value<'a>(&'a self, coord: &'a [u64], value: Self::DType)
     -> BoxFuture<'a, Result<()>>;
-}
 
-/// Bulk writes use bounded working memory in addition to caller-owned values.
-/// Native value-buffer writes group one execution batch by logical block;
-/// fills traverse lazily.
-/// Implementers provide both mutation operations.
-pub trait TensorWriteBulk: TensorWrite {
+    /// Overwrite fixed coordinates or forward stepped spans in row-major order.
     fn write_values<'a>(
         &'a self,
         range: Range,
@@ -225,17 +214,6 @@ pub trait TensorTransform: TensorGeometry + Sized {
     fn transpose(self, permutation: Option<Axes>) -> Result<Self>;
 
     fn unsqueeze(self, axes: Axes) -> Result<Self>;
-}
-
-/// Base/view capability contract, aligned with v1 writeability semantics.
-pub trait TensorViewSemantics: TensorGeometry {
-    fn is_base_tensor(&self) -> bool {
-        true
-    }
-
-    fn supports_write_through(&self) -> bool {
-        false
-    }
 }
 
 /// Unary tensor math operations.
@@ -835,21 +813,11 @@ fn coordinate_batches(
     })
 }
 
-fn sparse_coords<V: TensorGeometry + ?Sized>(
-    tensor: &V,
-    range: Range,
-    requested_order: Axes,
-) -> Result<validate::RangeCoords> {
-    let range = sparse_range(tensor, range, requested_order)?;
-    validate::iter_range_coords(tensor.shape(), &range)
-}
-
 pub(crate) fn sparse_slice<V: TensorGeometry + ?Sized>(
     tensor: &V,
     range: Range,
-    order: Axes,
 ) -> Result<crate::slice::Slice> {
-    let range = sparse_range(tensor, range, order)?;
+    let range = sparse_range(tensor, range)?;
     let (lengths, _) = validate::validate_range(tensor.shape(), &range)?;
     let axes = range
         .into_iter()
@@ -864,21 +832,7 @@ pub(crate) fn sparse_slice<V: TensorGeometry + ?Sized>(
     crate::slice::Slice::new(tensor.shape(), axes)
 }
 
-fn sparse_range<V: TensorGeometry + ?Sized>(
-    tensor: &V,
-    range: Range,
-    requested_order: Axes,
-) -> Result<Range> {
-    let base_order: Vec<_> = (0..tensor.ndim()).collect();
-
-    if requested_order.as_slice() != base_order.as_slice() {
-        return Err(Error::UnsupportedSparseIterationOrder {
-            requested_order: requested_order.to_vec(),
-            base_order,
-            hint: "materialize or perform external sort for incompatible order".into(),
-        });
-    }
-
+fn sparse_range<V: TensorGeometry + ?Sized>(tensor: &V, mut range: Range) -> Result<Range> {
     if !matches!(tensor.layout(), Layout::Sparse { .. }) {
         return Err(Error::Unsupported(
             "sparse iteration requires sparse layout".into(),
@@ -887,8 +841,6 @@ fn sparse_range<V: TensorGeometry + ?Sized>(
 
     crate::schema::validate_shape_dims(tensor.shape())?;
     // Sparse ranges select a set of coordinates, independent of selection order.
-    let mut range = range;
-
     for axis in &mut range {
         if let crate::AxisRange::Of(indices) = axis {
             indices.sort_unstable();

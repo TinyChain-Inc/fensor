@@ -1,13 +1,13 @@
 //! Identical cases for production timing and test-only structural profiling.
 
-use ha_ndarray::{axes, shape};
-use number_general::DType;
-
-use super::common;
 use fensor::{
     AxisRange, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
     TensorTrig, TensorUnary, TensorWrite,
 };
+use ha_ndarray::{axes, shape};
+use number_general::DType;
+
+use super::common;
 
 async fn measure<V: TensorRead<DType = f32> + TensorReduceAll>(name: &str, view: &V) {
     super::benchmark::streams(

@@ -6,14 +6,14 @@ use std::ops::Deref;
 
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use ha_ndarray::{
-    Array, ArrayBuf, Buffer, BufferConverter, NDArray, NDArrayRead, Number, Platform,
-};
+use ha_ndarray::{Array, ArrayBuf, Buffer, BufferConverter, NDArray, NDArrayRead, Platform};
+use number_general::NumberType;
 
 use crate::request::BatchRequest;
 use crate::traits::BoxFuture;
 use crate::{
-    Error, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView, request,
+    Error, Layout, Result, Tensor, TensorElement, TensorFileEntry, TensorGeometry, TensorView,
+    request,
 };
 
 mod driver;
@@ -24,7 +24,7 @@ pub(crate) use driver::evaluate_batch;
 pub(crate) mod traversal;
 
 /// Maximum element count per execution batch, custom-reader batch, or
-/// [`crate::TensorView::plan_updates`] call.
+/// [`crate::WriteSelection::plan_updates`] call.
 ///
 /// Independent of [`crate::MAX_BLOCK_CAPACITY`]. This is not an aggregate memory
 /// limit: independent consumers and suspended expression frames retain buffers.
@@ -55,12 +55,6 @@ pub trait Expression: TensorGeometry + traversal::Plan
 where
     Self::DType: TensorElement,
 {
-    /// Value of an omitted coordinate, including the sign of numerical zero.
-    /// Computed owners cache this scalar; querying it never traverses operands.
-    fn implicit_zero(&self) -> Self::DType {
-        Self::DType::ZERO
-    }
-
     /// Count retained descriptions for admission at the dynamic value boundary.
     fn expression_nodes(&self) -> Result<usize> {
         Ok(1)
@@ -69,6 +63,7 @@ where
     /// Detach runtime-owned operands before releasing this expression description.
     fn detach_sources(&mut self, _pending: &mut Vec<Box<dyn crate::owned::Drain>>) {}
 
+    /// Produce a bounded batch with canonical zeros for sparse output.
     fn build<'a>(
         &'a self,
         context: Context<'a>,
@@ -78,6 +73,22 @@ where
 
 /// Owned bounded requests; expression types themselves use static dispatch.
 pub(crate) type RequestIterator = Box<dyn Iterator<Item = BatchRequest> + Send>;
+
+fn requires_canonical_zeros<T: TensorElement>(layout: Layout) -> bool {
+    matches!(layout, Layout::Sparse { .. })
+        && matches!(T::dtype(), NumberType::Float(_) | NumberType::Complex(_))
+}
+
+pub(crate) fn output_value<T: TensorElement>(layout: Layout) -> impl Fn(T) -> T {
+    let canonicalize = requires_canonical_zeros::<T>(layout);
+    move |value| {
+        if canonicalize && value == T::ZERO {
+            T::ZERO
+        } else {
+            value
+        }
+    }
+}
 
 pub(crate) async fn read_value<E: Expression + ?Sized>(
     source: &E,
@@ -124,11 +135,11 @@ macro_rules! reader_members {
             $crate::expression::coordinate_blocks(self)
         }
     };
-    (@member read_sparse_elements_in_order) => {
-        fn read_sparse_elements_in_order<'a>(&'a self, range: $crate::Range, order: $crate::Axes)
+    (@member read_sparse_elements) => {
+        fn read_sparse_elements<'a>(&'a self, range: $crate::Range)
             -> $crate::BoxFuture<'a, $crate::Result<$crate::SparseElementStream<'a, Self::DType>>>
         {
-            Box::pin(async move { $crate::expression::ordered_sparse(self, range, order) })
+            Box::pin(async move { $crate::expression::ordered_sparse(self, range) })
         }
     };
 }
@@ -205,6 +216,16 @@ impl<T: TensorElement> Batch<T> {
     fn validate(&self, expected: usize) -> Result<()> {
         validate_bound("batch expression", self.array.size())?;
         validate_len("batch expression", self.array.size(), expected)
+    }
+
+    /// Canonicalize a buffer returned by a storage source or numerical kernel.
+    pub(crate) fn normalize_sparse(mut self, layout: Layout, expected: usize) -> Result<Self> {
+        if requires_canonical_zeros::<T>(layout) {
+            validate_len("batch expression", self.array.size(), expected)?;
+            self.array = self.array.normalize_zeros()?;
+        }
+
+        Ok(self)
     }
 
     fn into_evaluated(self) -> Result<EvaluatedBatch<T>> {
@@ -337,7 +358,7 @@ where
         Box::pin(async move {
             let values = self.read_batch(&coords).await?;
 
-            Batch::from_values(values)
+            Batch::from_values(values)?.normalize_sparse(self.layout(), coords.len())
         })
     }
 }
@@ -383,8 +404,8 @@ where
         coords: std::sync::Arc<BatchRequest>,
     ) -> BoxFuture<'a, Result<Batch<T>>> {
         Box::pin(async move {
-            let values = self.read_batch(&coords, None).await?;
-            Batch::from_values(values)
+            let values = crate::storage::read_batch(self, &coords, None).await?;
+            Batch::from_values(values)?.normalize_sparse(self.layout(), coords.len())
         })
     }
 }
@@ -400,14 +421,13 @@ mod concurrency_tests;
 pub(crate) fn ordered_sparse<'a, H>(
     source: H,
     range: crate::Range,
-    order: crate::Axes,
 ) -> Result<crate::SparseElementStream<'a, <H::Target as TensorGeometry>::DType>>
 where
     H: Deref + Send + Sync + 'a,
     H::Target: Expression,
     <H::Target as TensorGeometry>::DType: TensorElement,
 {
-    let slice = crate::traits::sparse_slice(&*source, range, order)?;
+    let slice = crate::traits::sparse_slice(&*source, range)?;
     let requests = traversal::ordered(&*source, slice, None)?;
     Ok(sparse_stream(source, requests))
 }

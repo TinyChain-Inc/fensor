@@ -2,15 +2,14 @@ mod common;
 
 use std::collections::HashMap;
 
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
-use number_general::{FloatType, NumberType};
-
 use common::{FsEntry, cleanup, iter_coords, new_dir, open_dir};
 use fensor::{
     AxisRange, Error, Layout, Range, Shape, Tensor, TensorArray, TensorGeometry, TensorRead,
-    TensorSchema, TensorTransform, TensorViewSemantics, TensorWrite, TensorWriteBulk,
+    TensorSchema, TensorTransform, TensorWrite,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType};
 
 fn schema_f32(shape: Shape) -> TensorSchema {
     TensorSchema::new(NumberType::Float(FloatType::F32), shape).expect("schema")
@@ -941,10 +940,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject squeeze on size>1 axis");
 
-        assert!(
-            matches!(err, Error::InvalidLayout(_) | Error::Unsupported(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, Error::InvalidCoord(_)), "got {err:?}");
 
         cleanup(&root).await;
     }
@@ -958,7 +954,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject duplicate axis");
 
-        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        assert!(matches!(err, Error::InvalidCoord(_)), "got {err:?}");
         cleanup(&root).await;
     }
 
@@ -971,7 +967,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject out of bounds");
 
-        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        assert!(matches!(err, Error::InvalidCoord(_)), "got {err:?}");
         cleanup(&root).await;
     }
 
@@ -984,7 +980,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject duplicate axis");
 
-        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        assert!(matches!(err, Error::InvalidCoord(_)), "got {err:?}");
         cleanup(&root).await;
     }
 
@@ -998,7 +994,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject axis 2");
 
-        assert!(matches!(err2, Error::InvalidLayout(_)), "got {err2:?}");
+        assert!(matches!(err2, Error::InvalidCoord(_)), "got {err2:?}");
 
         let err3 = tensor
             .view()
@@ -1006,7 +1002,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject axis 3");
 
-        assert!(matches!(err3, Error::InvalidLayout(_)), "got {err3:?}");
+        assert!(matches!(err3, Error::InvalidCoord(_)), "got {err3:?}");
         cleanup(&root).await;
     }
 
@@ -1019,7 +1015,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject empty axes");
 
-        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        assert!(matches!(err, Error::InvalidCoord(_)), "got {err:?}");
         cleanup(&root).await;
     }
 
@@ -1032,7 +1028,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject empty axes");
 
-        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        assert!(matches!(err, Error::InvalidCoord(_)), "got {err:?}");
         cleanup(&root).await;
     }
 
@@ -1045,7 +1041,7 @@ mod section_c_new_transforms {
             .err()
             .expect("must reject squeezing all axes");
 
-        assert!(matches!(err, Error::InvalidLayout(_)), "got {err:?}");
+        assert!(matches!(err, Error::InvalidSchema(_)), "got {err:?}");
         cleanup(&root).await;
     }
 }
@@ -1396,11 +1392,11 @@ mod section_d_bulk_io {
     }
 
     #[tokio::test]
-    async fn copy_dense_values_to_sparse() {
+    async fn sparse_copy_requires_a_sparse_reader() {
         let (dense_root, dense, _) = create_dense("d_wt_dense", shape![2, 3, 4], 4).await;
         seed_values(&dense).await;
 
-        // A caller-provided reader chooses sparse materialization at the copy boundary.
+        // A point reader alone does not provide a sparse stream.
         struct SparseReader<'a>(&'a Tensor<FsEntry, f32>);
 
         impl fensor::TensorGeometry for SparseReader<'_> {
@@ -1429,20 +1425,15 @@ mod section_d_bulk_io {
         }
 
         let (sparse_root, dir) = new_dir("d_copy_sparse").await;
-        let sparse = Tensor::copy_from(
+        let result = Tensor::copy_from(
             dir,
             &SparseReader(&dense),
             Layout::Sparse { axis: Some(1) },
             4,
         )
-        .await
-        .unwrap();
+        .await;
 
-        for coord in iter_coords(dense.shape()) {
-            let d = dense.read_value(&coord).await.expect("dense");
-            let s = sparse.read_value(&coord).await.expect("sparse");
-            assert_eq!(d, s, "coord {:?}", coord);
-        }
+        assert!(matches!(result, Err(Error::Unsupported(_))));
 
         cleanup(&dense_root).await;
         cleanup(&sparse_root).await;
@@ -1454,159 +1445,24 @@ mod section_d_bulk_io {
 // ====================================================================
 
 // ====================================================================
-// Section F — View semantics / writeability
-// ====================================================================
-
-mod section_f_view_semantics {
-    use super::*;
-
-    #[tokio::test]
-    async fn is_base_tensor_true_only_for_identity_view() {
-        let (root, tensor, _) = create_dense("f_is_base", shape![2, 3, 4], 4).await;
-
-        assert!(tensor.view().is_base_tensor(), "fresh tensor is the base");
-
-        let sliced = tensor
-            .view()
-            .slice(range![
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        assert!(!sliced.is_base_tensor(), "sliced view is not the base");
-
-        let transposed = tensor.view().transpose(Some(axes![2, 0, 1])).expect("tx");
-        assert!(
-            !transposed.is_base_tensor(),
-            "transposed view is not the base"
-        );
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn supports_write_through_true_for_slice_and_transpose() {
-        let (root, tensor, _) = create_dense("f_writethrough", shape![2, 3, 4], 4).await;
-
-        let sliced = tensor
-            .view()
-            .slice(range![
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(1, 3, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        assert!(sliced.supports_write_through());
-
-        sliced
-            .write_value(&[0, 0, 0], 42.0)
-            .await
-            .expect("write through slice");
-
-        // The slice maps view-coord [0,0,0] to base-coord [0,1,0].
-        let from_base = tensor.read_value(&[0, 1, 0]).await.expect("base read");
-        assert_eq!(from_base, 42.0, "write must reach base storage");
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn write_through_rejected_for_broadcast() {
-        let (root, tensor, _) = create_dense("f_no_wt", shape![1, 3, 4], 4).await;
-        let broadcasted = tensor.view().broadcast(shape![2, 3, 4]).expect("broadcast");
-
-        assert!(
-            !broadcasted.supports_write_through(),
-            "broadcast view must NOT be write-through"
-        );
-
-        let err = broadcasted
-            .write_value(&[1, 0, 0], 1.0)
-            .await
-            .expect_err("write must be rejected on broadcast view");
-
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn write_through_rejected_for_gather_slice() {
-        let (root, tensor, _) = create_dense("f_no_wt_gather", shape![4, 3, 4], 4).await;
-        let gathered = tensor
-            .view()
-            .slice(range![
-                AxisRange::Of(vec![0, 2]),
-                AxisRange::In(0, 3, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        assert!(
-            !gathered.supports_write_through(),
-            "gather-sliced view must NOT be write-through"
-        );
-
-        let err = gathered
-            .write_value(&[0, 0, 0], 1.0)
-            .await
-            .expect_err("write must be rejected on gather-sliced view");
-
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-
-        cleanup(&root).await;
-    }
-
-    #[tokio::test]
-    async fn reshape_view_writeability_documented() {
-        let (root, tensor, _) = create_dense("f_reshape_view", shape![2, 3, 4], 4).await;
-
-        // Reshape over identity is fine.
-        let reshaped = tensor.view().reshape(shape![6, 4]).expect("reshape ok");
-        assert!(reshaped.supports_write_through());
-
-        // Reshape over a transformed view is rejected (current contract).
-        let sliced = tensor
-            .view()
-            .slice(range![
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 2, 1),
-                AxisRange::In(0, 4, 1)
-            ])
-            .expect("slice");
-
-        let err = sliced.reshape(shape![16]).err().expect("must reject");
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-
-        cleanup(&root).await;
-    }
-}
-
-// ====================================================================
-// Section G — `read_sparse_elements_in_order` semantics
+// Section G — sparse iteration
 // ====================================================================
 
 mod section_g_sparse_iteration {
     use super::*;
 
     #[tokio::test]
-    async fn in_order_iteration_matches_base_order() {
+    async fn sparse_iteration_is_row_major() {
         let (root, tensor, _) = create_sparse("g_in_order", shape![2, 3, 4], 4, Some(0)).await;
         tensor.write_value(&[0, 0, 0], 1.0).await.expect("w");
         tensor.write_value(&[1, 2, 3], 9.0).await.expect("w");
 
         let partial: Vec<(Vec<u64>, f32)> = tensor
-            .read_sparse_elements_in_order(
-                range![
-                    AxisRange::In(1, 2, 1),
-                    AxisRange::In(0, 3, 1),
-                    AxisRange::In(0, 4, 1)
-                ],
-                axes![0, 1, 2],
-            )
+            .read_sparse_elements(range![
+                AxisRange::In(1, 2, 1),
+                AxisRange::In(0, 3, 1),
+                AxisRange::In(0, 4, 1)
+            ])
             .await
             .expect("partial range supported")
             .try_collect()
@@ -1617,16 +1473,13 @@ mod section_g_sparse_iteration {
 
         tensor.write_value(&[1, 0, 1], 4.0).await.expect("w");
         let rows: Vec<(Vec<u64>, f32)> = tensor
-            .read_sparse_elements_in_order(
-                range![
-                    AxisRange::In(0, 2, 1),
-                    AxisRange::In(0, 3, 1),
-                    AxisRange::In(0, 4, 1)
-                ],
-                axes![0, 1, 2],
-            )
+            .read_sparse_elements(range![
+                AxisRange::In(0, 2, 1),
+                AxisRange::In(0, 3, 1),
+                AxisRange::In(0, 4, 1)
+            ])
             .await
-            .expect("compatible order must succeed")
+            .expect("full range supported")
             .try_collect()
             .await
             .expect("stream must not error");
@@ -1638,36 +1491,8 @@ mod section_g_sparse_iteration {
     }
 
     #[tokio::test]
-    async fn incompatible_order_returns_structured_error() {
-        let (root, tensor, _) = create_sparse("g_bad_order", shape![2, 3, 4], 4, Some(0)).await;
-
-        let err = match tensor
-            .read_sparse_elements_in_order(
-                range![
-                    AxisRange::In(0, 2, 1),
-                    AxisRange::In(0, 3, 1),
-                    AxisRange::In(0, 4, 1)
-                ],
-                axes![2, 0, 1],
-            )
-            .await
-        {
-            Ok(_) => panic!("incompatible order must fail"),
-            Err(e) => e,
-        };
-
-        match err {
-            Error::UnsupportedSparseIterationOrder {
-                requested_order,
-                base_order,
-                hint,
-            } => {
-                assert_eq!(requested_order, vec![2, 0, 1]);
-                assert_eq!(base_order, vec![0, 1, 2]);
-                assert!(!hint.is_empty(), "hint must be actionable");
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+    async fn sparse_iteration_rejects_invalid_ranges() {
+        let (root, tensor, _) = create_sparse("g_bad_range", shape![2, 3, 4], 4, Some(0)).await;
 
         for (name, first) in [
             ("point out of bounds", AxisRange::At(2)),
@@ -1680,20 +1505,19 @@ mod section_g_sparse_iteration {
             ),
         ] {
             let result = tensor
-                .read_sparse_elements_in_order(
-                    range![first, AxisRange::In(0, 3, 1), AxisRange::In(0, 4, 1)],
-                    axes![0, 1, 2],
-                )
+                .read_sparse_elements(range![
+                    first,
+                    AxisRange::In(0, 3, 1),
+                    AxisRange::In(0, 4, 1)
+                ])
                 .await;
 
-            assert!(matches!(result, Err(Error::InvalidLayout(_))), "{name}");
+            assert!(matches!(result, Err(Error::InvalidCoord(_))), "{name}");
         }
 
         assert!(matches!(
-            tensor
-                .read_sparse_elements_in_order(range![], axes![0, 1, 2])
-                .await,
-            Err(Error::InvalidLayout(_))
+            tensor.read_sparse_elements(range![]).await,
+            Err(Error::InvalidCoord(_))
         ));
 
         cleanup(&root).await;
@@ -1715,30 +1539,19 @@ mod section_g_sparse_iteration {
             ])
             .expect("slice");
 
-        let result = sliced
-            .read_sparse_elements_in_order(
-                range![
-                    AxisRange::In(0, 2, 1),
-                    AxisRange::In(0, 3, 1),
-                    AxisRange::In(0, 4, 1)
-                ],
-                axes![0, 1, 2],
-            )
-            .await;
+        let rows: Vec<_> = sliced
+            .read_sparse_elements(range![
+                AxisRange::In(0, 2, 1),
+                AxisRange::In(0, 3, 1),
+                AxisRange::In(0, 4, 1)
+            ])
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
 
-        match result {
-            Ok(stream) => {
-                let rows: Vec<(Vec<u64>, f32)> =
-                    stream.try_collect().await.expect("stream must not error");
-
-                assert_eq!(rows.len(), 2);
-            }
-            Err(Error::UnsupportedSparseIterationOrder { hint, .. }) => {
-                assert!(!hint.is_empty(), "hint must be actionable");
-            }
-            Err(other) => panic!("unexpected error variant: {other}"),
-        }
-
+        assert_eq!(rows, [(vec![0, 0, 0], 2.), (vec![1, 0, 0], 3.)]);
         cleanup(&root).await;
     }
 }
@@ -1919,7 +1732,7 @@ mod section_h_persistence {
         let primary = values.read().await.get_dir("primary").cloned().unwrap();
         let name = primary.read().await.names().next().cloned().unwrap();
         primary.write().await.delete(&name).await;
-        primary.sync().await.expect("sync deleted page");
+        primary.sync().await.expect("sync deleted node");
         assert!(tensor.read_value(&[0, 0, 2]).await.is_err());
         assert!(Tensor::<FsEntry, f32>::load(dir).await.is_err());
         assert!(

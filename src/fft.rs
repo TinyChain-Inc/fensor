@@ -16,7 +16,7 @@ use crate::schema::Coord;
 use crate::slice::Slice;
 use crate::{
     Axes, BoxFuture, Error, Layout, Result, Shape, Strides, TensorElement, TensorFourier,
-    TensorGeometry, TensorRead, TensorTransform, TensorViewSemantics, expression,
+    TensorGeometry, TensorRead, TensorTransform, expression,
 };
 
 mod sealed {
@@ -231,12 +231,6 @@ impl<S: TensorGeometry, O: Send + Sync> TensorGeometry for FourierView<S, O> {
     }
 }
 
-impl<S: TensorGeometry, O: Send + Sync> TensorViewSemantics for FourierView<S, O> {
-    fn is_base_tensor(&self) -> bool {
-        false
-    }
-}
-
 // Group keys and scatter entries contain at most one entry per requested output.
 type Groups = BTreeMap<Coord, Vec<(usize, usize)>>;
 
@@ -301,6 +295,7 @@ where
             let width = *self.shape.last().expect("validated Fourier rank") as usize;
             let mut groups = groups.into_iter().peekable();
             let mut values = vec![S::DType::ZERO; request.len()];
+            let output_value = expression::output_value(self.layout());
 
             while groups.peek().is_some() {
                 let pack: Vec<_> = groups.by_ref().take(MAX_BATCH_ELEMENTS / width).collect();
@@ -343,7 +338,7 @@ where
                 for (group, (_, destinations)) in pack.into_iter().enumerate() {
                     let start = group * width;
                     for (destination, frequency) in destinations {
-                        values[destination] = transformed[start + frequency];
+                        values[destination] = output_value(transformed[start + frequency]);
                     }
                 }
             }
@@ -363,7 +358,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 

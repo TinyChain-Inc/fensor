@@ -2,10 +2,10 @@
 
 use std::time::Instant;
 
+use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
 use number_general::DType;
 
 use super::{benchmark, common};
-use fensor::{Layout, Tensor, TensorGeometry, TensorRead, TensorSchema, TensorSource, TensorWrite};
 
 pub async fn storage() {
     let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();
@@ -57,7 +57,7 @@ pub async fn storage() {
         let start = Instant::now();
         for _ in 0..workload_repetitions(1) {
             for id in 0..g.block_count() {
-                let (_, coord) = common::block_entries(&g, id).next().unwrap();
+                let (_, coord) = common::block_entries(g, id).next().unwrap();
 
                 t.write_value(&coord, 2.).await.unwrap();
             }
@@ -78,7 +78,7 @@ pub async fn storage() {
         benchmark::storage(name, "copy", &copy_root).await;
         let copy_geometry = copy.storage_geometry();
         for id in 0..g.block_count() {
-            let (_, coord) = common::block_entries(&g, id).next().unwrap();
+            let (_, coord) = common::block_entries(g, id).next().unwrap();
 
             assert_eq!(
                 copy.read_value(&coord).await.unwrap(),
@@ -134,7 +134,7 @@ pub async fn storage() {
 }
 
 pub async fn mutation() {
-    use fensor::{StorageGeometry, TensorWriteBulk};
+    use fensor::{StorageGeometry, TensorWrite};
 
     for (layout, capacities) in [
         (Layout::Dense, [64, 256]),
@@ -276,7 +276,7 @@ pub async fn traversal() {
 
         for id in 0..g.block_count() {
             let mut values = vec![0.; g.block_len(id).unwrap()];
-            for (offset, coord) in common::block_entries(&g, id) {
+            for (offset, coord) in common::block_entries(g, id) {
                 values[offset] = if coord[1] % 4 == 0 { 2. } else { 0. };
             }
 
@@ -620,7 +620,7 @@ pub async fn reopen() {
         .await
         .unwrap();
 
-        let geometry = tensor.storage_geometry();
+        let geometry = tensor.storage_geometry().clone();
         for id in 0..geometry.block_count() {
             let values = vec![1.; geometry.block_len(id).unwrap()];
 

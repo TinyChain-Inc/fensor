@@ -4,7 +4,6 @@ use crate::test_support as common;
 
 #[path = "../common/benchmark.rs"]
 mod benchmark;
-
 #[path = "../common/workloads.rs"]
 mod workloads;
 
@@ -50,7 +49,6 @@ async fn observe(
                         ("copy_block_updates", m.block_updates as u128),
                         ("copy_constructed_blocks", m.constructed_blocks as u128),
                         ("copy_payload_writes", m.payload_writes as u128),
-                        ("copy_staged_elements", m.staged_elements as u128),
                     ] {
                         benchmark::record(name, operation, temperature, metric, "count", value);
                     }

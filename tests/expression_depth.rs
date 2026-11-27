@@ -7,13 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::TryStreamExt;
-
 use fensor::{
     BoxFuture, Layout, NumberType, StorageGeometry, Tensor, TensorAbs, TensorArray,
     TensorExpression, TensorGeometry, TensorMath, TensorMathScalar, TensorRead, TensorReduce,
     TensorSchema, TensorSource, TensorTransform, TensorView,
 };
+use futures::TryStreamExt;
 
 mod common;
 
@@ -48,14 +47,10 @@ impl TensorArray for Source {
     fn schema(&self) -> &TensorSchema {
         self.tensor.schema()
     }
-
-    fn strides(&self) -> &[u64] {
-        self.tensor.strides()
-    }
 }
 
 impl TensorSource for Source {
-    fn storage_geometry(&self) -> StorageGeometry {
+    fn storage_geometry(&self) -> &StorageGeometry {
         self.tensor.storage_geometry()
     }
 

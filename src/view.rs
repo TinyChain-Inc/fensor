@@ -6,7 +6,7 @@ use crate::mapping::CoordinateMap;
 use crate::schema::Layout;
 use crate::{
     BoxFuture, Error, Result, TensorArray, TensorElement, TensorGeometry, TensorRead, TensorSource,
-    TensorTransform, TensorViewSemantics, TensorWrite,
+    TensorTransform,
 };
 
 /// A geometric view of filesystem-backed tensor storage.
@@ -21,8 +21,13 @@ where
     S::DType: TensorElement,
 {
     pub fn new(tensor: S) -> Self {
-        let mapping = CoordinateMap::identity(tensor.shape().into(), tensor.strides());
+        let mapping = CoordinateMap::identity(tensor.shape().into(), tensor.schema().strides());
         Self { tensor, mapping }
+    }
+
+    fn is_identity(&self) -> bool {
+        let schema = self.tensor.schema();
+        self.mapping.is_identity(schema.shape(), schema.strides())
     }
 
     pub fn source(&self) -> &S {
@@ -30,7 +35,10 @@ where
     }
 
     /// Replace a source with identical base geometry, retaining this view's mapping.
-    pub fn with_source<R: TensorArray<DType = S::DType>>(self, source: R) -> Result<TensorView<R>> {
+    pub fn with_source<R: TensorArray<DType = S::DType>>(
+        &self,
+        source: R,
+    ) -> Result<TensorView<R>> {
         if self.tensor.schema() != source.schema() || self.tensor.layout() != source.layout() {
             return Err(Error::InvalidLayout(
                 "replacement source geometry differs".into(),
@@ -39,7 +47,7 @@ where
 
         Ok(TensorView {
             tensor: source,
-            mapping: self.mapping,
+            mapping: self.mapping.clone(),
         })
     }
 
@@ -51,47 +59,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// Map at most [`crate::MAX_BATCH_ELEMENTS`] row-major values to logical-block updates.
-    /// This plans addresses only; callers enforce write-through and reserve storage.
-    pub fn plan_updates(
-        &self,
-        geometry: &crate::StorageGeometry,
-        start: u64,
-        values: Vec<S::DType>,
-    ) -> Result<crate::BlockUpdates<S::DType>> {
-        self.validate_geometry(geometry)?;
-        let request = crate::request::BatchRequest::linear(start, values.len())?;
-        crate::storage::plan_updates(geometry, Some(&self.mapping), &request, values)
-    }
-
-    /// Consume an owned expression into bounded destination updates in source request order.
-    /// Dropping the stream releases its source handles. This acquires no write permission.
-    pub fn updates_from(
-        &self,
-        geometry: &crate::StorageGeometry,
-        source: crate::TensorExpression<S::DType>,
-    ) -> Result<futures::stream::BoxStream<'static, Result<crate::BlockUpdates<S::DType>>>> {
-        use futures::StreamExt;
-
-        self.validate_geometry(geometry)?;
-        if self.shape() != source.shape() {
-            return Err(Error::InvalidLayout(
-                "update source and destination shapes differ".into(),
-            ));
-        }
-
-        let geometry = geometry.clone();
-        let mapping = self.mapping.clone();
-        Ok(
-            crate::expression::preferred_batches(std::sync::Arc::new(source))?
-                .map(move |result| {
-                    let (request, batch) = result?;
-                    crate::storage::plan_updates(&geometry, Some(&mapping), &request, batch.values)
-                })
-                .boxed(),
-        )
     }
 
     /// Conservative logical storage-block interval without enumerating the selection.
@@ -112,7 +79,7 @@ where
 
     pub fn resolve_base_coord(&self, coord: &[u64]) -> Result<Vec<u64>> {
         self.mapping
-            .resolve(coord, self.tensor.shape(), self.tensor.strides())
+            .resolve(coord, self.tensor.shape(), self.tensor.schema().strides())
     }
 }
 
@@ -128,32 +95,13 @@ where
 
     fn layout(&self) -> Layout {
         match self.tensor.layout() {
-            Layout::Sparse { .. }
-                if !self
-                    .mapping
-                    .is_identity(self.tensor.shape(), self.tensor.strides()) =>
-            {
-                Layout::Sparse { axis: None }
-            }
+            Layout::Sparse { .. } if !self.is_identity() => Layout::Sparse { axis: None },
             layout => layout,
         }
     }
 
     fn shape(&self) -> &[u64] {
         self.mapping.shape()
-    }
-}
-
-impl<S: TensorArray> TensorViewSemantics for TensorView<S>
-where
-    S::DType: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        self.mapping.is_base_mapping(self.tensor.shape())
-    }
-
-    fn supports_write_through(&self) -> bool {
-        self.mapping.supports_write_through()
     }
 }
 
@@ -168,38 +116,24 @@ impl<S: TensorSource> TensorRead for TensorView<S>
 where
     S::DType: TensorElement,
 {
-    crate::expression::reader_members!(
-        read_blocks,
-        read_coordinate_blocks,
-        read_sparse_elements_in_order
-    );
+    crate::expression::reader_members!(read_blocks, read_coordinate_blocks, read_sparse_elements);
 
     fn read_value<'a>(&'a self, coord: &'a [u64]) -> BoxFuture<'a, Result<Self::DType>> {
         Box::pin(async move {
-            let request = crate::request::BatchRequest::point(coord);
-            Ok(self.read_batch(&request).await?[0])
-        })
-    }
-}
+            crate::validate::validate_coord(self.shape(), coord)?;
+            let flat = self.mapping.flat_offset(coord)?;
+            let blocks = &self.tensor.storage_geometry().storage.blocks;
+            let flat = u64::try_from(flat)
+                .ok()
+                .filter(|flat| *flat < blocks.size)
+                .ok_or_else(|| {
+                    crate::Error::InvalidCoord("mapped coordinate out of bounds".into())
+                })?;
 
-impl<S: TensorSource + TensorWrite> TensorWrite for TensorView<S>
-where
-    S::DType: TensorElement,
-{
-    fn write_value<'a>(
-        &'a self,
-        coord: &'a [u64],
-        value: Self::DType,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            if !self.supports_write_through() {
-                return Err(Error::Unsupported(
-                    "this view does not support write-through to the base tensor".to_string(),
-                ));
-            }
-
-            let base_coord = self.resolve_base_coord(coord)?;
-            self.tensor.write_value(&base_coord, value).await
+            let position = blocks.position(flat);
+            self.tensor
+                .read_block_value(position.block_id, position.offset_in_block)
+                .await
         })
     }
 }
@@ -212,12 +146,7 @@ where
         &self,
         request: &crate::request::BatchRequest,
     ) -> Result<Vec<S::DType>> {
-        self.tensor
-            .read_storage(crate::StorageRead {
-                request,
-                mapping: Some(&self.mapping),
-            })
-            .await
+        crate::storage::read_batch(&self.tensor, request, Some(&self.mapping)).await
     }
 }
 
@@ -230,15 +159,12 @@ where
         shape: &'a [u64],
         mapping: Option<crate::mapping::StorageSlice>,
     ) -> Result<crate::expression::traversal::Preferred<'a>> {
-        let mapping = if self
-            .mapping
-            .is_identity(self.tensor.shape(), self.tensor.strides())
-        {
+        let mapping = if self.is_identity() {
             mapping
         } else {
             let Some(local) = self
                 .mapping
-                .storage_slice(self.tensor.shape(), self.tensor.strides())?
+                .storage_slice(self.tensor.shape(), self.tensor.schema().strides())?
             else {
                 return Ok(crate::expression::traversal::Preferred::Ready(None));
             };
@@ -262,16 +188,17 @@ where
             ));
         }
 
-        let mapping = if self
-            .mapping
-            .is_identity(self.tensor.shape(), self.tensor.strides())
-        {
+        let mapping = if self.is_identity() {
             mapping
         } else {
-            let local = self.mapping.storage_slice(self.tensor.shape(), self.tensor.strides())?
-                .ok_or_else(|| Error::Unsupported(
-                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
-                ))?;
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.tensor.shape(), self.tensor.schema().strides())?
+            else {
+                return Ok(crate::expression::traversal::Selection::Ready(
+                    slice.stream(),
+                ));
+            };
 
             Some(local.compose(mapping)?)
         };
@@ -290,16 +217,15 @@ where
             return Ok(crate::expression::traversal::Ordered::Ready(slice.stream()));
         }
 
-        let mapping = if self
-            .mapping
-            .is_identity(self.tensor.shape(), self.tensor.strides())
-        {
+        let mapping = if self.is_identity() {
             mapping
         } else {
-            let local = self.mapping.storage_slice(self.tensor.shape(), self.tensor.strides())?
-                .ok_or_else(|| Error::Unsupported(
-                    "sparse indexed traversal requires a positive separable mapping; use copy_from_values to materialize this layout".into()
-                ))?;
+            let Some(local) = self
+                .mapping
+                .storage_slice(self.tensor.shape(), self.tensor.schema().strides())?
+            else {
+                return Ok(crate::expression::traversal::Ordered::Ready(slice.stream()));
+            };
 
             Some(local.compose(mapping)?)
         };

@@ -1,11 +1,11 @@
+use fensor::AxisRange;
 use ha_ndarray::{axes, range, shape};
 use number_general::{FloatType, NumberType};
 
 use super::*;
 use crate::schema::row_major_coords;
 use crate::test_support::{FsEntry as TestFE, cleanup, new_dir};
-use crate::{Error, Layout, Shape, Tensor, TensorSchema};
-use fensor::AxisRange;
+use crate::{Error, Layout, Shape, Tensor, TensorSchema, TensorWrite};
 
 async fn create_dense(
     name: &str,
@@ -368,7 +368,7 @@ async fn broadcast_rejects_lower_rank_target() {
     let view = tensor.view();
     assert!(matches!(
         view.broadcast(shape![3]),
-        Err(Error::InvalidLayout(_))
+        Err(Error::InvalidSchema(_))
     ));
 
     cleanup(&root).await;
@@ -382,34 +382,55 @@ async fn broadcast_rejects_incompatible_dim() {
     let view = tensor.view();
     assert!(matches!(
         view.broadcast(shape![2, 5]),
-        Err(Error::InvalidLayout(_))
+        Err(Error::InvalidSchema(_))
     ));
 
     cleanup(&root).await;
 }
 
 #[tokio::test]
-async fn broadcast_noop_same_shape_preserves_write_through() {
-    // broadcasting to the current shape is a no-op: axes unchanged, still fully write-through
-    let (root, tensor) = create_dense(
-        "broadcast_noop_same_shape_preserves_write_through",
-        shape![2, 3],
-        1000,
-    )
-    .await;
+async fn broadcast_noop_same_shape_preserves_sparse_layout() {
+    use futures::TryStreamExt;
+
+    let width = crate::MAX_BATCH_ELEMENTS as u64 + 1;
+    let layout = Layout::Sparse { axis: Some(0) };
+    let (root, dir) = new_dir("sparse_broadcast_noop").await;
+    let schema = TensorSchema::new(NumberType::Float(FloatType::F32), shape![1, width]).unwrap();
+    let tensor = Tensor::<TestFE, f32>::create(dir, schema, layout, 128)
+        .await
+        .unwrap();
 
     let view = tensor.view();
-    let broadcasted = view
-        .broadcast(shape![2, 3])
-        .expect("no-op broadcast must be supported");
+    let broadcasted = view.clone().broadcast(shape![1, width]).unwrap();
 
-    assert!(broadcasted.supports_write_through());
-    broadcasted
-        .write_value(&[1, 2], 5.0)
+    assert_eq!(broadcasted.layout(), layout);
+    tensor
+        .write_value(&[0, width - 1], 5.0)
         .await
-        .expect("write through no-op broadcast");
+        .expect("base write");
 
-    assert_eq!(tensor.read_value(&[1, 2]).await.expect("base read"), 5.0);
+    let entries: Vec<_> = broadcasted
+        .read_sparse_elements(range![AxisRange::At(0), AxisRange::In(0, width, 1)])
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(entries, [(vec![0, width - 1], 5.)]);
+    let expanded = view
+        .unsqueeze(axes![0])
+        .unwrap()
+        .broadcast(shape![2, 1, width])
+        .unwrap();
+    let selected = expanded
+        .slice(range![
+            AxisRange::At(1),
+            AxisRange::In(0, 1, 1),
+            AxisRange::In(0, width, 1)
+        ])
+        .unwrap();
+    assert_eq!(selected.read_value(&[0, width - 1]).await.unwrap(), 5.);
     cleanup(&root).await;
 }
 
@@ -693,7 +714,7 @@ async fn flip_invalid_axis_out_of_bounds() {
         create_dense("flip_invalid_axis_out_of_bounds", shape![3, 4, 5], 1000).await;
 
     let view = tensor.view();
-    assert!(matches!(view.flip(3), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.flip(3), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -712,17 +733,12 @@ async fn flip_then_reshape_rejected() {
 }
 
 #[tokio::test]
-async fn flip_write_through_roundtrip() {
-    // flip axis 1 (dim 4) of [3,4]; write through flipped[1,1] must land on tensor[1,2]
-    let (root, tensor) = create_dense("flip_write_through_roundtrip", shape![3, 4], 1000).await;
+async fn flipped_view_reads_live_base() {
+    let (root, tensor) = create_dense("flipped_view_reads_live_base", shape![3, 4], 1000).await;
     let view = tensor.view();
     let flipped = view.flip(1).expect("flip");
-    flipped
-        .write_value(&[1, 1], 9.0)
-        .await
-        .expect("write through flipped");
-
-    assert_eq!(tensor.read_value(&[1, 2]).await.expect("base read"), 9.0);
+    tensor.write_value(&[1, 2], 9.).await.unwrap();
+    assert_eq!(flipped.read_value(&[1, 1]).await.unwrap(), 9.);
     cleanup(&root).await;
 }
 
@@ -937,7 +953,7 @@ async fn slice_rank_mismatch_rejected() {
     let (root, tensor) = create_dense("slice_rank_mismatch_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::In(0, 3, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -946,7 +962,7 @@ async fn at_slice_out_of_bounds_rejected() {
     let (root, tensor) = create_dense("at_slice_out_of_bounds_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::At(3), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -955,7 +971,7 @@ async fn in_slice_step_zero_rejected() {
     let (root, tensor) = create_dense("in_slice_step_zero_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::In(0, 3, 0), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -966,7 +982,7 @@ async fn in_slice_start_after_stop_rejected() {
 
     let view = tensor.view();
     let r = range![AxisRange::In(2, 1, 1), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -977,7 +993,7 @@ async fn in_slice_stop_exceeds_dim_rejected() {
 
     let view = tensor.view();
     let r = range![AxisRange::In(0, 5, 1), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -986,7 +1002,7 @@ async fn of_slice_out_of_bounds_rejected() {
     let (root, tensor) = create_dense("of_slice_out_of_bounds_rejected", shape![3, 4], 1000).await;
     let view = tensor.view();
     let r = range![AxisRange::Of(vec![0, 5]), AxisRange::In(0, 4, 1)];
-    assert!(matches!(view.slice(r), Err(Error::InvalidLayout(_))));
+    assert!(matches!(view.slice(r), Err(Error::InvalidCoord(_))));
     cleanup(&root).await;
 }
 
@@ -1124,39 +1140,20 @@ async fn squeeze_broadcast_axis_folds_constant() {
 }
 
 #[tokio::test]
-async fn squeeze_removes_gather_axis_restores_write_through() {
-    // [4,4], strides [4,1]. Of([3]) on axis 0 -> Gather([12]), shape [1,4]
-    // Before squeeze: supports_write_through() is false (has Gather)
-    // After squeeze: supports_write_through() should be true, and write_value should work
-    let (root, tensor) = create_dense(
-        "squeeze_removes_gather_axis_restores_write_through",
-        shape![4, 4],
-        1000,
-    )
-    .await;
+async fn squeeze_removes_a_gather_axis() {
+    let (root, tensor) = create_dense("squeeze_removes_a_gather_axis", shape![4, 4], 1000).await;
 
     let view = tensor.view();
     let gathered = view
         .slice(range![AxisRange::Of(vec![3]), AxisRange::In(0, 4, 1)])
         .expect("slice Of");
 
-    assert!(
-        !gathered.supports_write_through(),
-        "gathered should have Gather axis"
-    );
-
     let squeezed = gathered
         .squeeze(axes![0])
         .expect("squeeze must be supported");
 
-    assert!(
-        squeezed.supports_write_through(),
-        "squeezed should support write_through"
-    );
-
-    squeezed.write_value(&[2], 9.0).await.expect("write");
-    let v = tensor.read_value(&[3, 2]).await.expect("read from base");
-    assert_eq!(v, 9.0);
+    tensor.write_value(&[3, 2], 9.).await.unwrap();
+    assert_eq!(squeezed.read_value(&[2]).await.unwrap(), 9.);
     cleanup(&root).await;
 }
 
@@ -1254,11 +1251,8 @@ async fn unsqueeze_before_first_middle_and_last_original_axis() {
 }
 
 #[tokio::test]
-async fn unsqueeze_write_through_roundtrip() {
-    // shape [3,4], .unsqueeze(axes![0]) -> shape [1,3,4]
-    // write_value at [0,1,2] should write to [1,2] on base tensor
-    let (root, tensor) =
-        create_dense("unsqueeze_write_through_roundtrip", shape![3, 4], 1000).await;
+async fn unsqueezed_view_reads_live_base() {
+    let (root, tensor) = create_dense("unsqueezed_view_reads_live_base", shape![3, 4], 1000).await;
 
     let view = tensor.view();
     let unsqueezed = view
@@ -1267,13 +1261,8 @@ async fn unsqueeze_write_through_roundtrip() {
 
     assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
 
-    unsqueezed
-        .write_value(&[0, 1, 2], 9.0)
-        .await
-        .expect("write");
-
-    let v = tensor.read_value(&[1, 2]).await.expect("read from base");
-    assert_eq!(v, 9.0);
+    tensor.write_value(&[1, 2], 9.).await.unwrap();
+    assert_eq!(unsqueezed.read_value(&[0, 1, 2]).await.unwrap(), 9.);
     cleanup(&root).await;
 }
 
@@ -1354,124 +1343,91 @@ async fn unsqueeze_then_squeeze_round_trip() {
 }
 
 #[tokio::test]
-async fn update_planning_matches_coordinates_without_affine_expansion() {
-    use crate::TensorSource;
-
-    // The destination exceeds the batch limit, so rejection cannot be a shape error.
+async fn update_planning_matches_base_slices_without_affine_expansion() {
     let limit = crate::MAX_BATCH_ELEMENTS;
-    let (root, tensor) = create_dense("update_plan_limit", shape![(limit + 1) as u64], 256).await;
-    let geometry = tensor.storage_geometry();
-    let view = tensor.view();
-    let updates = view.plan_updates(&geometry, 0, vec![1.; limit]).unwrap();
-    assert_eq!(updates.values().map(Vec::len).sum::<usize>(), limit);
+    let dtype = NumberType::Float(FloatType::F32);
+    let geometry = crate::StorageGeometry::new(
+        TensorSchema::new(dtype, shape![(limit + 1) as u64]).unwrap(),
+        Layout::Dense,
+        256,
+    )
+    .unwrap();
+
+    let all = geometry.write_selection(None).unwrap();
+    assert!(all.is_full());
+    assert_eq!(all.block_range(), 0..geometry.block_count());
     assert!(matches!(
-        view.plan_updates(&geometry, 0, vec![1.; limit + 1]),
+        all.plan_updates(0, vec![1.; limit + 1]),
         Err(Error::InvalidLayout(_))
     ));
-
-    for id in 0..geometry.block_count() {
-        assert!(
-            tensor
-                .read_logical_block(id)
-                .await
-                .unwrap()
-                .iter()
-                .all(|v| *v == 0.)
-        );
-    }
-
-    cleanup(&root).await;
+    assert_eq!(
+        all.plan_updates(0, vec![1.; limit])
+            .unwrap()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        limit
+    );
 
     for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
-        for block_shape in [shape![2, 3], shape![4, 64]] {
-            let block_shape: crate::Shape = block_shape;
-            let (root, dir) = new_dir("update_plans").await;
+        for capacity in [6, 256] {
             let geometry = crate::StorageGeometry::new(
-                TensorSchema::new(NumberType::Float(FloatType::F32), shape![5, 131]).unwrap(),
+                TensorSchema::new(dtype, shape![5, 131]).unwrap(),
                 layout,
-                block_shape.iter().copied().product::<u64>() as usize,
+                capacity,
             )
             .unwrap();
 
-            let tensor = Tensor::<TestFE, f32>::create_with_geometry(dir, geometry.clone())
-                .await
-                .unwrap();
+            let slice = range![AxisRange::In(1, 5, 2), AxisRange::In(1, 131, 3)];
+            let selection = geometry.write_selection(Some(slice)).unwrap();
+            let coordinates: Vec<_> = [1, 3]
+                .into_iter()
+                .flat_map(|row| (1..131).step_by(3).map(move |col| [row, col]))
+                .collect();
 
-            let base = tensor.view();
-            let views = [
-                base.clone(),
-                base.clone().transpose(None).unwrap(),
-                base.clone().flip(1).unwrap(),
-                base.clone().reshape(shape![131, 5]).unwrap(),
-                base.clone()
-                    .slice(range![
-                        AxisRange::Of(vec![4, 0, 4]),
-                        AxisRange::In(1, 131, 3)
-                    ])
-                    .unwrap(),
-            ];
+            assert_eq!(selection.shape(), &[2, 44]);
+            assert!(!selection.is_full());
+            let first = geometry
+                .block_position(coordinates.first().unwrap())
+                .unwrap()
+                .0;
+            let last = geometry
+                .block_position(coordinates.last().unwrap())
+                .unwrap()
+                .0;
+            assert_eq!(selection.block_range(), first..last + 1);
 
-            for (index, view) in views.into_iter().enumerate() {
-                let coordinates: Vec<_> = row_major_coords(view.shape()).unwrap().collect();
+            for start in (0..coordinates.len()).step_by(73) {
+                let end = (start + 73).min(coordinates.len());
+                let values: Vec<_> = (start..end).map(|i| i as f32).collect();
+                let mut expected = crate::BlockUpdates::new();
 
-                for start in (0..coordinates.len()).step_by(73) {
-                    let len = (coordinates.len() - start).min(73);
-                    let values: Vec<_> = (start..start + len).map(|i| i as f32).collect();
-                    let mut expected = crate::BlockUpdates::new();
-
-                    for (coord, value) in coordinates[start..start + len].iter().zip(&values) {
-                        let mapped = view.resolve_base_coord(coord).unwrap();
-                        let (id, offset) = geometry.block_position(&mapped).unwrap();
-                        expected.entry(id).or_default().push((offset, *value));
-                    }
-
-                    crate::read_metrics::CURRENT
-                        .scope(Default::default(), async {
-                            assert_eq!(
-                                view.plan_updates(&geometry, start as u64, values).unwrap(),
-                                expected
-                            );
-
-                            crate::read_metrics::CURRENT.with(|m| {
-                                assert_eq!(m.borrow().expanded_coordinates, 0);
-                                if index < 4 {
-                                    assert_eq!(m.borrow().coordinate_resolutions, 0);
-                                }
-                            });
-                        })
-                        .await;
+                for (coord, value) in coordinates[start..end].iter().zip(&values) {
+                    let (id, offset) = geometry.block_position(coord).unwrap();
+                    expected.entry(id).or_default().push((offset, *value));
                 }
 
-                assert!(
-                    view.plan_updates(&geometry, view.size().unwrap(), vec![])
-                        .unwrap()
-                        .is_empty()
-                );
-
-                assert!(
-                    view.plan_updates(&geometry, view.size().unwrap(), vec![1.])
-                        .is_err()
-                );
+                crate::read_metrics::CURRENT
+                    .scope(Default::default(), async {
+                        assert_eq!(
+                            selection.plan_updates(start as u64, values).unwrap(),
+                            expected
+                        );
+                        crate::read_metrics::CURRENT.with(|m| {
+                            assert_eq!(m.borrow().expanded_coordinates, 0);
+                            assert_eq!(m.borrow().coordinate_resolutions, 0);
+                        });
+                    })
+                    .await;
             }
 
-            let wrong = crate::StorageGeometry::new(
-                tensor.schema().clone(),
-                if matches!(layout, Layout::Dense) {
-                    Layout::Sparse { axis: Some(0) }
-                } else {
-                    Layout::Dense
-                },
-                geometry.block_capacity(),
-            )
-            .unwrap();
-
-            assert!(base.plan_updates(&wrong, 0, vec![1.]).is_err());
-            assert_eq!(
-                crate::TensorSource::storage_geometry(&tensor).block_capacity(),
-                geometry.block_capacity()
+            assert!(
+                selection
+                    .plan_updates::<f32>(selection.size(), vec![])
+                    .unwrap()
+                    .is_empty()
             );
-
-            cleanup(&root).await;
+            assert!(selection.plan_updates(selection.size(), vec![1.]).is_err());
         }
     }
 }
@@ -1526,6 +1482,8 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
     }
 
     let (root, tensor) = create_dense("update_stream", shape![8193], 64).await;
+    let geometry = tensor.storage_geometry();
+    let selection = geometry.write_selection(None).unwrap();
 
     for fail in [false, true] {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1535,10 +1493,7 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
         })
         .unwrap();
 
-        let mut stream = tensor
-            .view()
-            .updates_from(&tensor.storage_geometry(), source)
-            .unwrap();
+        let mut stream = selection.updates_from(source).unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         if fail {
@@ -1564,10 +1519,7 @@ async fn update_stream_evaluates_once_and_owns_its_source() {
         })
         .unwrap();
 
-        let stream = tensor
-            .view()
-            .updates_from(&tensor.storage_geometry(), source)
-            .unwrap();
+        let stream = selection.updates_from(source).unwrap();
 
         drop(stream);
         assert_eq!(Arc::strong_count(&calls), 1);
@@ -1588,7 +1540,7 @@ async fn owned_transforms_use_compact_runs_through_native_consumption() {
     for id in 0..geometry.block_count() {
         let mut values = vec![0.; geometry.block_len(id).unwrap()];
 
-        for (offset, coord) in crate::test_support::block_entries(&geometry, id) {
+        for (offset, coord) in crate::test_support::block_entries(geometry, id) {
             values[offset] = (coord[0] * 4097 + coord[1]) as f32;
         }
 

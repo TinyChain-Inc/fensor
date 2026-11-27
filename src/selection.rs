@@ -6,7 +6,7 @@ use crate::expression::{Batch, Expression};
 use crate::request::BatchRequest;
 use crate::{
     BoxFuture, Error, Layout, Result, TensorElement, TensorGeometry, TensorRead, TensorTransform,
-    TensorViewSemantics, TensorWhere, expression,
+    TensorWhere, expression,
 };
 
 /// Read-only selection over the condition and both branches.
@@ -66,7 +66,6 @@ where
     condition: Condition,
     then: Then,
     or_else: Else,
-    zero: Then::DType,
 }
 
 impl<C, L, R> TensorWhere<L, R> for C
@@ -89,7 +88,6 @@ where
         }
 
         Ok(WhereView {
-            zero: or_else.implicit_zero(),
             condition: self.clone(),
             then: then.clone(),
             or_else: or_else.clone(),
@@ -125,18 +123,6 @@ where
             }
             _ => Layout::Dense,
         }
-    }
-}
-
-impl<C, L, R> TensorViewSemantics for WhereView<C, L, R>
-where
-    C: TensorGeometry<DType = u8>,
-    L: TensorGeometry,
-    R: TensorGeometry<DType = L::DType>,
-    L::DType: TensorElement,
-{
-    fn is_base_tensor(&self) -> bool {
-        false
     }
 }
 
@@ -194,10 +180,6 @@ where
     R: Expression<DType = L::DType>,
     L::DType: TensorElement,
 {
-    fn implicit_zero(&self) -> Self::DType {
-        self.zero
-    }
-
     fn expression_nodes(&self) -> Result<usize> {
         crate::expression::traversal::node_count([
             self.condition.expression_nodes()?,
@@ -222,6 +204,7 @@ where
             let then = context.batch(&self.then, coords.clone()).await?;
             let or_else = context.batch(&self.or_else, coords).await?;
 
+            // A sparse result selects between two already-canonical sparse batches.
             Batch::from_array(
                 condition
                     .into_array()
@@ -242,7 +225,7 @@ where
         read_value,
         read_blocks,
         read_coordinate_blocks,
-        read_sparse_elements_in_order
+        read_sparse_elements
     );
 }
 
@@ -253,5 +236,5 @@ where
     R: TensorTransform<DType = L::DType>,
     L::DType: TensorElement,
 {
-    crate::mapping::transform_methods!(operands: condition, then, or_else; preserve_rest);
+    crate::mapping::transform_methods!(operands: condition, then, or_else);
 }

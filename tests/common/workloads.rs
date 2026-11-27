@@ -10,16 +10,12 @@ mod completion_cases;
 
 #[path = "copy_cases.rs"]
 mod copy_cases;
-
 #[path = "layout_cases.rs"]
 mod layout_cases;
-
 #[path = "pipeline_cases.rs"]
 mod pipeline_cases;
-
 #[path = "read_ahead_cases.rs"]
 mod read_ahead_cases;
-
 #[path = "read_cases.rs"]
 mod read_cases;
 
@@ -28,7 +24,6 @@ mod slice_cases;
 
 #[path = "sparse_cases.rs"]
 mod sparse_cases;
-
 #[path = "storage_cases.rs"]
 mod storage_cases;
 

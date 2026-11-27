@@ -1,9 +1,9 @@
 //! Focused sparse allocation and final-value reclamation measurements.
+use fensor::{Layout, Tensor, TensorRead, TensorSchema, TensorWrite};
 use ha_ndarray::shape;
 use number_general::DType;
 
 use super::{benchmark, common};
-use fensor::{Layout, Tensor, TensorRead, TensorSchema, TensorWrite};
 
 pub async fn run() {
     let smoke = std::env::var_os("FENSOR_BENCH_SMOKE").is_some();

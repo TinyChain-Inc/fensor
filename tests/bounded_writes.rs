@@ -1,9 +1,6 @@
+use fensor::{AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorWrite};
 use ha_ndarray::{range, shape};
 use number_general::DType;
-
-use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorRead, TensorSchema, TensorWrite, TensorWriteBulk,
-};
 
 mod common;
 
@@ -40,13 +37,22 @@ async fn writes_validate_cardinality_before_mutation() {
             }
         }
 
+        for indices in [vec![5, 1], vec![5, 1, 5]] {
+            let values = vec![9; indices.len()];
+            assert!(matches!(
+                tensor
+                    .write_values(range![AxisRange::Of(indices)], values)
+                    .await,
+                Err(Error::Unsupported(_))
+            ));
+        }
+
+        assert_eq!(tensor.read_value(&[5]).await.unwrap(), 6);
+        assert_eq!(tensor.read_value(&[1]).await.unwrap(), 2);
         tensor
-            .write_values(range![AxisRange::Of(vec![5, 1, 5])], vec![3, 4, 7])
+            .write_values(range![AxisRange::In(6, 6, 1)], vec![])
             .await
             .unwrap();
-
-        assert_eq!(tensor.read_value(&[5]).await.unwrap(), 7);
-        assert_eq!(tensor.read_value(&[1]).await.unwrap(), 4);
         tensor
             .write_values(range![AxisRange::In(0, 6, 2)], vec![8, 9, 10])
             .await
@@ -78,7 +84,7 @@ async fn writes_validate_cardinality_before_mutation() {
             .await
             .unwrap();
 
-        let geometry = tensor.storage_geometry();
+        let geometry = tensor.storage_geometry().clone();
         assert_eq!(geometry.block_count(), expected_blocks);
         let mut stored = 0;
         for id in 0..geometry.block_count() {
@@ -110,7 +116,7 @@ async fn writes_validate_cardinality_before_mutation() {
         drop(tensor);
         let tensor = Tensor::<FsEntry, u8>::load(dir).await.unwrap();
         assert_eq!(tensor.read_value(&[2, 4]).await.unwrap(), 15);
-        assert_eq!(tensor.storage_geometry(), geometry);
+        assert_eq!(tensor.storage_geometry(), &geometry);
 
         let (_workspace, workspace) = new_dir("compact_delta_blocks").await;
         let blocks = fensor::SparseBlocks::<FsEntry, u8>::create(workspace, geometry.clone())
@@ -118,13 +124,10 @@ async fn writes_validate_cardinality_before_mutation() {
             .unwrap();
 
         let last = geometry.block_count() - 1;
-        assert_eq!(
-            blocks.read(last).await.unwrap(),
-            vec![0; geometry.block_len(last).unwrap()]
-        );
+        assert_eq!(blocks.read(last).await.unwrap(), None);
 
         blocks
-            .replace(last, vec![7; geometry.block_len(last).unwrap()])
+            .replace(last, Some(vec![7; geometry.block_len(last).unwrap()]))
             .await
             .unwrap();
 
@@ -139,10 +142,7 @@ async fn writes_validate_cardinality_before_mutation() {
 
         let retained = blocks.clone();
         drop(blocks);
-        retained
-            .replace(last, vec![0; geometry.block_len(last).unwrap()])
-            .await
-            .unwrap();
+        retained.replace(last, None).await.unwrap();
 
         assert!(
             retained

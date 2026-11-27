@@ -1,4 +1,3 @@
-use crate::schema::Coord;
 use crate::{Axes, AxisRange, Error, Range, Result, Shape};
 
 pub(crate) fn validate_coord(shape: &[u64], coord: &[u64]) -> Result<()> {
@@ -148,7 +147,7 @@ pub fn matmul_output_shape(left: &[u64], right: &[u64]) -> Result<Shape> {
 /// Validate range bounds and cardinality without cloning explicit selections.
 pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64)> {
     if range.len() != shape.len() {
-        return Err(Error::InvalidLayout(
+        return Err(Error::InvalidCoord(
             "range rank must match tensor rank".into(),
         ));
     }
@@ -157,7 +156,7 @@ pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64
 
     for (axis, (bound, &dim)) in range.iter().zip(shape).enumerate() {
         let invalid =
-            || Error::InvalidLayout(format!("range bound at axis {axis} is out of bounds"));
+            || Error::InvalidCoord(format!("range bound at axis {axis} is out of bounds"));
 
         let len = match bound {
             AxisRange::At(i) if *i < dim => 1,
@@ -174,84 +173,14 @@ pub(crate) fn validate_range(shape: &[u64], range: &Range) -> Result<(Shape, u64
     let remaining = if lengths.contains(&0) {
         0
     } else {
-        crate::schema::checked_product(&lengths)
-            .map_err(|_| Error::InvalidLayout("range size overflow".into()))?
+        crate::schema::checked_product(&lengths)?
     };
 
     Ok((lengths, remaining))
 }
 
-/// Validate ranges without expanding interval axes into coordinate buffers.
-pub(crate) fn iter_range_coords(shape: &[u64], range: &Range) -> Result<RangeCoords> {
-    let (lengths, remaining) = validate_range(shape, range)?;
-    Ok(RangeCoords {
-        range: range.clone(),
-        coord: Coord::from_elem(0, range.len()),
-        lengths,
-        remaining,
-    })
-}
-
 pub(crate) fn full_range(shape: &[u64]) -> Range {
     shape.iter().map(|&dim| AxisRange::In(0, dim, 1)).collect()
-}
-
-// Rank-sized traversal state plus caller-sized explicit selections, if supplied.
-// Interval axes are descriptors; no range-sized coordinate table is constructed.
-pub(crate) struct RangeCoords {
-    range: Range,
-    lengths: crate::Shape,
-    coord: Coord,
-    remaining: u64,
-}
-
-// Checked cardinality allows write-length validation without visiting coordinates.
-impl RangeCoords {
-    pub(crate) fn remaining(&self) -> u64 {
-        self.remaining
-    }
-}
-
-impl Iterator for RangeCoords {
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match usize::try_from(self.remaining) {
-            Ok(n) => (n, Some(n)),
-            Err(_) => (usize::MAX, None),
-        }
-    }
-
-    type Item = Vec<u64>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-
-        let out = self
-            .coord
-            .iter()
-            .zip(&self.range)
-            .map(|(&i, bound)| match bound {
-                AxisRange::At(at) => *at,
-                AxisRange::In(start, _, step) => start + i * step,
-                AxisRange::Of(indices) => indices[i as usize],
-            })
-            .collect();
-
-        self.remaining -= 1;
-        if self.remaining > 0 {
-            for axis in (0..self.coord.len()).rev() {
-                self.coord[axis] += 1;
-                if self.coord[axis] < self.lengths[axis] {
-                    break;
-                }
-
-                self.coord[axis] = 0;
-            }
-        }
-
-        Some(out)
-    }
 }
 
 #[cfg(test)]

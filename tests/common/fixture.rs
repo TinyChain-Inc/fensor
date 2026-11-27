@@ -1,13 +1,13 @@
 //! Concrete filesystem fixtures and consumer checks. Comparators belong to the
 //! numerical case: exact equality, signed zeros, NaNs, and tolerances differ.
 
+use fensor::{
+    AxisRange, Layout, Shape, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
+};
 use futures::TryStreamExt;
 use ha_ndarray::Number;
 
 use super::{Directory, FsEntry, cleanup, iter_coords, new_dir, open_dir};
-use fensor::{
-    AxisRange, Layout, Shape, Tensor, TensorElement, TensorFileEntry, TensorRead, TensorSchema,
-};
 
 pub fn layout(sparse: bool) -> Layout {
     if sparse {
@@ -79,10 +79,10 @@ pub async fn blocks<V: TensorRead>(
         assert!(values.len() <= 4096);
         for value in values {
             assert!(offset < expected.len(), "unexpected output at {offset}");
+            let reference = logical_value(view.layout(), expected[offset]);
             assert!(
-                equal(value, expected[offset]),
-                "at {offset}: actual {value:?}, expected {:?}",
-                expected[offset]
+                equal(value, reference),
+                "at {offset}: actual {value:?}, expected {reference:?}",
             );
 
             offset += 1;
@@ -90,6 +90,14 @@ pub async fn blocks<V: TensorRead>(
     }
 
     assert_eq!(offset, expected.len(), "output count");
+}
+
+pub fn logical_value<T: TensorElement>(layout: Layout, value: T) -> T {
+    if matches!(layout, Layout::Sparse { .. }) && value == T::ZERO {
+        T::ZERO
+    } else {
+        value
+    }
 }
 
 pub async fn reads<V: TensorRead>(
@@ -102,20 +110,20 @@ pub async fn reads<V: TensorRead>(
     blocks(view, expected, &equal).await;
     for (coord, value) in iter_coords(view.shape()).zip(expected) {
         let actual = view.read_value(&coord).await.unwrap();
+        let expected = logical_value(view.layout(), *value);
         assert!(
-            equal(actual, *value),
-            "at {coord:?}: {actual:?} != {value:?}"
+            equal(actual, expected),
+            "at {coord:?}: {actual:?} != {expected:?}"
         );
     }
 
     if matches!(view.layout(), Layout::Sparse { .. }) {
         let mut entries = view
-            .read_sparse_elements_in_order(
+            .read_sparse_elements(
                 view.shape()
                     .iter()
                     .map(|d| AxisRange::In(0, *d, 1))
                     .collect(),
-                (0..view.ndim()).collect(),
             )
             .await
             .unwrap();

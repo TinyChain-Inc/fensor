@@ -5,7 +5,6 @@ use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{Storage, Tensor, TensorElement, TensorFileEntry, apply_block_updates};
 use crate::request::BatchRequest;
-use crate::schema::StorageSchema;
 use crate::{BoxFuture, Error, Result, StorageGeometry, TensorSource};
 
 pub(super) struct DenseStorage<FE> {
@@ -22,8 +21,8 @@ impl<FE> DenseStorage<FE> {
         }
     }
 
-    pub(super) fn storage_schema(&self) -> &StorageSchema {
-        &self.geometry.storage
+    pub(super) fn geometry(&self) -> &StorageGeometry {
+        &self.geometry
     }
 
     pub(super) async fn initialize<T>(&self) -> Result<()>
@@ -61,22 +60,6 @@ impl<FE> DenseStorage<FE> {
         T: TensorElement,
     {
         super::create_metadata_file(&self.blocks, metadata).await
-    }
-
-    pub(super) async fn sync(&self) -> Result<()>
-    where
-        FE: freqfs::FileSave + Clone,
-    {
-        self.blocks.sync().await.map_err(Error::from)
-    }
-
-    pub(super) async fn sync_all(&self, directory: &DirLock<FE>) -> Result<()>
-    where
-        FE: freqfs::FileSave + Clone,
-    {
-        self.sync().await?;
-        directory.sync_all().await?;
-        Ok(())
     }
 
     fn validate_id(&self, id: u64) -> Result<()> {
@@ -211,8 +194,8 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
                 ));
             };
 
-            let updates =
-                crate::storage::plan_updates(&tensor.storage_geometry(), None, &request, values)?;
+            let geometry = tensor.storage_geometry();
+            let updates = geometry.plan_base_updates(&request, values)?;
 
             #[cfg(test)]
             super::copy_metrics::record(|m| m.groups += updates.len());
@@ -222,18 +205,10 @@ impl<F: TensorFileEntry<T>, T: TensorElement> Construction<F, T> {
 
                 if let Some(file) = file {
                     let mut block = file.write::<Vec<T>>().await?;
-                    super::apply_block_updates(
-                        &mut block,
-                        tensor.storage_geometry().block_len(id)?,
-                        &updates,
-                    )?;
+                    super::apply_block_updates(&mut block, geometry.block_len(id)?, &updates)?;
                 } else {
-                    let mut block = vec![T::ZERO; tensor.storage_geometry().block_len(id)?];
-                    super::apply_block_updates(
-                        &mut block,
-                        tensor.storage_geometry().block_len(id)?,
-                        &updates,
-                    )?;
+                    let mut block = vec![T::ZERO; geometry.block_len(id)?];
+                    super::apply_block_updates(&mut block, geometry.block_len(id)?, &updates)?;
 
                     dense
                         .blocks

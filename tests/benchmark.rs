@@ -3,10 +3,8 @@
 mod benchmark;
 
 mod common;
-
 #[path = "common/statistics_benchmark.rs"]
 mod statistics;
-
 #[path = "common/workloads.rs"]
 mod workloads;
 

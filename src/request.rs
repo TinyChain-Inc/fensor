@@ -823,8 +823,15 @@ pub(crate) fn progressions(
                 }
             }
         }
-        RequestKind::Explicit(_) => {
-            unreachable!("explicit requests use the coordinate cursor")
+        RequestKind::Explicit(coords) => {
+            for (output, coord) in coords.iter().enumerate() {
+                emit(Progression {
+                    output,
+                    start: flat(coord)?,
+                    step: 0,
+                    len: 1,
+                })?;
+            }
         }
     }
 

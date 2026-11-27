@@ -1,16 +1,15 @@
 //! Shared execution paths for all real storage widths; integer edge expectations are independent.
 
-use futures::TryStreamExt;
-use ha_ndarray::{
-    Array, Buffer, NDArrayMath, NDArrayMathScalar, NDArrayRead, Number, Real, axes, shape,
-};
-
 use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Layout, TensorAbs, TensorBoolean, TensorBooleanScalar, TensorCompare, TensorCompareScalar,
     TensorElement, TensorExpression, TensorFileEntry, TensorMatMul, TensorMath, TensorMathScalar,
     TensorMatrixUnary, TensorRead, TensorReduce, TensorReduceAll, TensorReduceBoolean,
     TensorTransform, TensorUnaryBoolean, TensorWhere, TensorWrite,
+};
+use futures::TryStreamExt;
+use ha_ndarray::{
+    Array, Buffer, NDArrayMath, NDArrayMathScalar, NDArrayRead, Number, Real, axes, shape,
 };
 
 mod common;
@@ -243,14 +242,9 @@ where
         )
         .await;
 
-        // Geometric writes, zero lifecycle, and repeated/concurrent consumption.
-        view.flip(0)
-            .unwrap()
-            .write_value(&[0, 1], T::ONE)
-            .await
-            .unwrap();
-
-        assert_eq!(tensor.read_value(&[1, 1]).await.unwrap(), T::ONE);
+        let flipped = view.flip(0).unwrap();
+        tensor.write_value(&[1, 1], T::ONE).await.unwrap();
+        assert_eq!(flipped.read_value(&[0, 1]).await.unwrap(), T::ONE);
         tensor.write_value(&[1, 1], T::ZERO).await.unwrap();
         assert_eq!(tensor.read_value(&[1, 1]).await.unwrap(), T::ZERO);
         let expanded = tensor

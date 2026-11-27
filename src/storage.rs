@@ -3,23 +3,149 @@
 //! Implementations own their visibility and mutation policy. fensor only maps and
 //! evaluates bounded requests; it does not acquire transaction reservations.
 
-use futures::stream::BoxStream;
+use std::ops::Range;
+use std::pin::Pin;
+
+use futures::stream::{BoxStream, Peekable, Stream, try_unfold};
 use futures::{StreamExt, TryStreamExt};
+use ha_ndarray::Number;
+use number_general::DType;
 
 use crate::mapping::{CoordinateMap, StorageSlice};
 use crate::request::BatchRequest;
 use crate::schema::{StorageSchema, TensorSchema};
-use crate::{BoxFuture, Error, Layout, Result, TensorArray, TensorElement};
+use crate::{
+    AxisRange, BoxFuture, Error, Layout, Result, Shape, TensorArray, TensorElement,
+    TensorExpression, TensorGeometry,
+};
 
 /// Logical-block updates from one bounded batch, in input order within each block.
 /// Coordinates are block-local offsets, never physical payload identifiers.
 pub type BlockUpdates<T> = std::collections::BTreeMap<u64, Vec<(usize, T)>>;
 
-pub(crate) fn plan_updates<T: Copy>(
-    geometry: &StorageGeometry,
-    mapping: Option<&CoordinateMap>,
+/// Pack ordered entries with at most one unfinished destination block.
+#[derive(Default)]
+struct SparseBlockBuilder<T>(Option<(u64, Vec<T>)>);
+
+impl<T: TensorElement> SparseBlockBuilder<T> {
+    fn push(
+        &mut self,
+        geometry: &StorageGeometry,
+        (id, offset): (u64, usize),
+        value: T,
+    ) -> Option<(u64, Vec<T>)> {
+        let previous = if self.0.as_ref().is_some_and(|(current, _)| *current != id) {
+            self.take()
+        } else {
+            None
+        };
+
+        let (_, values) = self.0.get_or_insert_with(|| {
+            let len = geometry.block_len(id).expect("validated block address");
+            (id, vec![T::ZERO; len])
+        });
+        values[offset] = value;
+        previous
+    }
+
+    fn take(&mut self) -> Option<(u64, Vec<T>)> {
+        self.0
+            .take()
+            .filter(|(_, values)| values.iter().any(|&value| value != T::ZERO))
+    }
+}
+
+/// A validated base-coordinate selection used to plan bounded block updates.
+pub struct WriteSelection<'a> {
+    geometry: &'a StorageGeometry,
+    shape: Shape,
+    strides: Vec<i128>,
+    offset: i128,
+    size: u64,
+}
+
+impl WriteSelection<'_> {
+    pub fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Whether the write covers the base in its original shape and order.
+    pub fn is_full(&self) -> bool {
+        self.shape() == self.geometry.schema().shape().as_slice()
+    }
+
+    /// Conservative interval of logical blocks addressed by the selection.
+    pub fn block_range(&self) -> Range<u64> {
+        if self.size == 0 {
+            return 0..0;
+        }
+
+        let last = self
+            .shape
+            .iter()
+            .zip(&self.strides)
+            .fold(self.offset, |last, (&len, stride)| {
+                last + i128::from(len - 1) * stride
+            });
+
+        // Validated forward spans bound both endpoints to the base.
+        let blocks = &self.geometry.storage.blocks;
+        blocks.position(self.offset as u64).block_id..blocks.position(last as u64).block_id + 1
+    }
+
+    /// Plan one bounded batch of row-major values beginning at `start`.
+    pub fn plan_updates<T: Copy>(&self, start: u64, values: Vec<T>) -> Result<BlockUpdates<T>> {
+        let request = BatchRequest::linear(start, values.len())?;
+        self.plan_batch(&request, values)
+    }
+
+    /// Consume an expression in its preferred request order.
+    pub fn updates_from<T: TensorElement>(
+        &self,
+        source: TensorExpression<T>,
+    ) -> Result<BoxStream<'_, Result<BlockUpdates<T>>>> {
+        if self.shape() != source.shape() {
+            return Err(Error::InvalidCoord(
+                "update source and destination shapes differ".into(),
+            ));
+        }
+
+        Ok(
+            crate::expression::preferred_batches(std::sync::Arc::new(source))?
+                .map(move |result| {
+                    let (request, batch) = result?;
+                    self.plan_batch(&request, batch.values)
+                })
+                .boxed(),
+        )
+    }
+
+    fn plan_batch<T: Copy>(
+        &self,
+        request: &BatchRequest,
+        values: Vec<T>,
+    ) -> Result<BlockUpdates<T>> {
+        if self.is_full() {
+            return self.geometry.plan_base_updates(request, values);
+        }
+
+        let geometry = crate::storage_read::StorageShape {
+            geometry: self.geometry,
+        };
+        collect_updates(request, values, || {
+            geometry.plan_affine(request, &self.shape, self.offset, &self.strides)
+        })
+    }
+}
+
+fn collect_updates<T: Copy>(
     request: &BatchRequest,
     values: Vec<T>,
+    plan: impl FnOnce() -> Result<crate::storage_read::LogicalGroups>,
 ) -> Result<BlockUpdates<T>> {
     if values.len() != request.len() {
         return Err(Error::InvalidLayout(
@@ -27,15 +153,12 @@ pub(crate) fn plan_updates<T: Copy>(
         ));
     }
 
-    let shape = crate::storage_read::StorageShape { geometry };
-    let groups = shape.plan(request, mapping)?;
     let mut updates = BlockUpdates::new();
-
-    for (id, runs) in groups {
+    for (id, runs) in plan()? {
         let block = updates.entry(id).or_default();
 
         for run in runs {
-            // The storage planner validates both source positions and block offsets.
+            // The planner validates source positions and block offsets.
             for i in 0..run.len {
                 let offset = (run.offset as i128 + i as i128 * run.stride as i128) as usize;
                 block.push((offset, values[run.output + i]));
@@ -63,6 +186,56 @@ impl StorageGeometry {
         &self.schema
     }
 
+    pub(crate) fn plan_base_updates<T: Copy>(
+        &self,
+        request: &BatchRequest,
+        values: Vec<T>,
+    ) -> Result<BlockUpdates<T>> {
+        collect_updates(request, values, || {
+            crate::storage_read::StorageShape { geometry: self }.plan(request, None)
+        })
+    }
+
+    /// Plan a write in base coordinates. `None` selects the whole tensor.
+    pub fn write_selection(&self, range: Option<crate::Range>) -> Result<WriteSelection<'_>> {
+        let base = self.schema.shape();
+        let range = range.unwrap_or_else(|| crate::validate::full_range(base));
+        if range.iter().any(|axis| matches!(axis, AxisRange::Of(_))) {
+            return Err(Error::Unsupported("gather selections are read-only".into()));
+        }
+
+        let (lengths, size) = crate::validate::validate_range(base, &range)?;
+        let mut shape = Shape::with_capacity(base.len());
+        let mut strides = Vec::with_capacity(base.len());
+        let mut offset = 0;
+
+        for ((axis, len), &stride) in range.into_iter().zip(lengths).zip(self.schema.strides()) {
+            let start = match axis {
+                AxisRange::At(at) => at,
+                AxisRange::In(start, _, step) => {
+                    shape.push(len);
+                    // A singleton has no address advance. Its base stride also
+                    // preserves the identity of whole-base singleton axes.
+                    strides.push(i128::from(stride) * i128::from(if len > 1 { step } else { 1 }));
+                    start
+                }
+                AxisRange::Of(_) => unreachable!("gather writes were rejected"),
+            };
+
+            if size > 0 {
+                offset += i128::from(stride) * i128::from(start);
+            }
+        }
+
+        Ok(WriteSelection {
+            geometry: self,
+            shape,
+            strides,
+            offset,
+            size,
+        })
+    }
+
     pub fn layout(&self) -> Layout {
         self.storage.layout
     }
@@ -84,7 +257,8 @@ impl StorageGeometry {
         Ok((range.end - range.start) as usize)
     }
 
-    pub(crate) fn validate_block_ids(&self, ids: &[u64]) -> Result<()> {
+    /// Validate a bounded, sorted, unique selection for a block source visitor.
+    pub fn validate_block_ids(&self, ids: &[u64]) -> Result<()> {
         if ids.len() > crate::MAX_BATCH_ELEMENTS {
             return Err(Error::InvalidLayout(
                 "too many logical blocks in read batch".into(),
@@ -137,75 +311,230 @@ impl StorageGeometry {
             Layout::Sparse { axis } => Some(axis.unwrap_or(self.schema.shape().len() - 1)),
         }
     }
-}
 
-/// A validated bounded read request produced by the geometric mapper.
-pub struct StorageRead<'a> {
-    pub(crate) request: &'a BatchRequest,
-    pub(crate) mapping: Option<&'a CoordinateMap>,
-}
-
-impl StorageRead<'_> {
-    pub fn plan(&self, geometry: &StorageGeometry) -> Result<StorageReadPlan> {
-        let groups =
-            crate::storage_read::StorageShape { geometry }.plan(self.request, self.mapping)?;
-
-        Ok(StorageReadPlan {
-            groups,
-            len: self.request.len(),
-            blocks: geometry.storage.blocks.clone(),
-        })
-    }
-}
-
-/// A bounded logical-block selection with validated scatter positions.
-/// Callers select visible storage; the plan preserves request order and duplicates.
-pub struct StorageReadPlan {
-    groups: crate::storage_read::LogicalGroups,
-    len: usize,
-    blocks: crate::schema::LinearBlocks,
-}
-
-impl StorageReadPlan {
-    /// Number of requested numerical values, including repeated selections.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Requested logical block IDs in strictly increasing order.
-    pub fn block_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.groups.keys().copied()
-    }
-
-    /// Copy one complete logical block into its requested output positions.
-    /// Unrequested IDs and incorrect buffer lengths are rejected before scattering.
-    pub fn scatter<T: Copy>(&self, id: u64, block: &[T], output: &mut [T]) -> Result<()> {
-        let range = self.blocks.range(id)?;
-        if block.len() as u64 != range.end - range.start {
-            return Err(Error::InvalidLayout("invalid logical block length".into()));
-        }
-
-        if output.len() != self.len {
-            return Err(Error::InvalidLayout(
-                "invalid storage read output length".into(),
+    /// Pack an ordered stream of logical sparse entries into destination blocks.
+    /// Coordinates must be unique and in row-major order. Zero blocks are omitted.
+    /// Source errors are returned unchanged.
+    /// Pin streams that are not `Unpin` before passing them here.
+    pub fn pack_sparse_blocks<'a, T: TensorElement, E: From<Error>>(
+        &'a self,
+        entries: impl Stream<Item = std::result::Result<(Vec<u64>, T), E>> + Send + Unpin + 'a,
+    ) -> Result<impl Stream<Item = std::result::Result<(u64, Vec<T>), E>> + Send + 'a> {
+        if self.layout() == Layout::Dense || self.schema().dtype() != T::dtype() {
+            return Err(Error::InvalidSchema(
+                "sparse block packing requires matching sparse geometry".into(),
             ));
         }
 
-        let runs = self
-            .groups
-            .get(&id)
-            .ok_or_else(|| Error::InvalidCoord("logical block is not in the read plan".into()))?;
+        Ok(try_unfold(
+            (entries.fuse(), SparseBlockBuilder::default(), None),
+            move |(mut entries, mut blocks, mut previous)| async move {
+                let ready = loop {
+                    let Some((coord, value)) = entries.try_next().await? else {
+                        break blocks.take();
+                    };
 
-        for run in runs {
-            run.scatter(block, output)?;
+                    tokio::task::coop::consume_budget().await;
+                    let address = self.block_position(&coord)?;
+                    if previous.is_some_and(|prior| prior >= address) {
+                        return Err(Error::InvalidCoord(
+                            "sparse entries must be ordered and unique".into(),
+                        )
+                        .into());
+                    }
+
+                    previous = Some(address);
+                    if let Some(block) = blocks.push(self, address, value) {
+                        break Some(block);
+                    }
+                };
+
+                Ok(ready.map(|block| (block, (entries, blocks, previous))))
+            },
+        ))
+    }
+
+    /// Stream payloads in destination block order. Sparse output omits zero blocks.
+    /// The shape, dtype, and layout kind must match. Retains one bounded source
+    /// read and one destination block between items.
+    pub fn read_blocks<'a, S: TensorSource>(
+        &'a self,
+        source: &'a S,
+    ) -> Result<impl Stream<Item = Result<(u64, Vec<S::DType>)>> + Send + 'a>
+    where
+        S::DType: TensorElement,
+    {
+        let geometry = source.storage_geometry();
+        let sparse = self.sparse_axis().is_some();
+        if self.schema() != geometry.schema()
+            || self.schema().dtype() != S::DType::dtype()
+            || sparse != geometry.sparse_axis().is_some()
+        {
+            return Err(Error::InvalidSchema(
+                "block copy requires matching shapes, dtypes, and layout kinds".into(),
+            ));
         }
 
-        Ok(())
+        let blocks = 0..geometry.block_count();
+        let keys = if sparse {
+            source.occupied_blocks(blocks).left_stream()
+        } else {
+            futures::stream::iter(blocks.map(Ok)).right_stream()
+        };
+
+        Ok(try_unfold(
+            (keys.peekable(), geometry, None, None, None),
+            move |(mut keys, geometry, mut previous, mut input, mut output)| async move {
+                let ready = loop {
+                    tokio::task::coop::consume_budget().await;
+                    let (range, start, values) = match input.take() {
+                        Some(block) => block,
+                        None => {
+                            let Some((range, values)) =
+                                read_block_span(source, geometry, &mut keys, &mut previous).await?
+                            else {
+                                break output.take();
+                            };
+
+                            let start = range.start;
+                            (range, start, values)
+                        }
+                    };
+
+                    let id = self.storage.blocks.position(start).block_id;
+                    if output.as_ref().is_some_and(|(current, _)| *current != id) {
+                        // The next input starts beyond the current destination block.
+                        input = Some((range, start, values));
+                        break output.take();
+                    }
+
+                    let target = self.block_range(id)?;
+                    if range == target {
+                        if !sparse || values.iter().any(|value| *value != S::DType::ZERO) {
+                            break Some((id, values));
+                        }
+
+                        continue;
+                    }
+
+                    let end = range.end.min(target.end);
+                    let fragment =
+                        &values[(start - range.start) as usize..(end - range.start) as usize];
+                    if !sparse || fragment.iter().any(|value| *value != S::DType::ZERO) {
+                        let (_, block) = output.get_or_insert_with(|| {
+                            (
+                                id,
+                                vec![S::DType::ZERO; (target.end - target.start) as usize],
+                            )
+                        });
+
+                        let offset = (start - target.start) as usize;
+                        block[offset..offset + fragment.len()].copy_from_slice(fragment);
+                    }
+
+                    if end < range.end {
+                        input = Some((range, end, values));
+                    }
+
+                    if end == target.end && output.is_some() {
+                        break output.take();
+                    }
+                };
+
+                Ok(ready.map(|block| (block, (keys, geometry, previous, input, output))))
+            },
+        ))
     }
+}
+
+// Group adjacent blocks through the ordinary bounded native reader.
+// Keep gaps out of the request and move a single block's buffer when possible.
+async fn read_block_span<S: TensorSource>(
+    source: &S,
+    geometry: &StorageGeometry,
+    keys: &mut Peekable<impl Stream<Item = Result<u64>> + Unpin>,
+    previous: &mut Option<u64>,
+) -> Result<Option<(Range<u64>, Vec<S::DType>)>>
+where
+    S::DType: TensorElement,
+{
+    let Some(first) = keys.try_next().await? else {
+        return Ok(None);
+    };
+
+    if previous.is_some_and(|previous| previous >= first) {
+        return Err(Error::InvalidCoord("invalid source block order".into()));
+    }
+
+    let mut range = geometry.block_range(first)?;
+    let mut last = first;
+    while let Some(&Ok(next)) = Pin::new(&mut *keys).peek().await {
+        if last.checked_add(1) != Some(next) {
+            break;
+        }
+
+        let end = geometry.block_range(next)?.end;
+        if end - range.start > crate::MAX_BATCH_ELEMENTS as u64 {
+            break;
+        }
+
+        keys.try_next().await?;
+        range.end = end;
+        last = next;
+    }
+
+    *previous = Some(last);
+    let len = (range.end - range.start) as usize;
+    let values = if first == last {
+        source.read_logical_block(first).await?
+    } else {
+        let request = BatchRequest::linear(range.start, len)?;
+        read_batch(source, &request, None).await?
+    };
+
+    if values.len() != len {
+        return Err(Error::InvalidLayout(
+            "invalid source block span length".into(),
+        ));
+    }
+
+    Ok(Some((range, values)))
+}
+
+/// Assemble one validated batch from source-owned logical blocks.
+pub(crate) async fn read_batch<S: TensorSource>(
+    source: &S,
+    request: &BatchRequest,
+    mapping: Option<&CoordinateMap>,
+) -> Result<Vec<S::DType>>
+where
+    S::DType: TensorElement,
+{
+    let geometry = source.storage_geometry();
+    let groups = crate::storage_read::StorageShape { geometry }.plan(request, mapping)?;
+    let ids: Vec<_> = groups.keys().copied().collect();
+    let mut groups = groups.iter();
+    let mut values = vec![S::DType::ZERO; request.len()];
+
+    source
+        .visit_blocks(&ids, |id, block| {
+            let (_, runs) = groups
+                .find(|(expected, _)| **expected >= id)
+                .filter(|(expected, _)| **expected == id)
+                .ok_or_else(|| {
+                    Error::InvalidCoord("storage source returned an unexpected block ID".into())
+                })?;
+
+            geometry.validate_block(id, block)?;
+            for run in runs {
+                run.scatter(block, &mut values)?;
+            }
+
+            Ok(())
+        })
+        .await?;
+
+    Ok(values)
 }
 
 /// A statically typed source for fensor's existing geometric and computed views.
@@ -214,9 +543,43 @@ pub trait TensorSource: TensorArray + Clone + 'static
 where
     Self::DType: TensorElement,
 {
-    fn storage_geometry(&self) -> StorageGeometry;
+    fn storage_geometry(&self) -> &StorageGeometry;
 
     fn read_logical_block(&self, id: u64) -> BoxFuture<'_, Result<Vec<Self::DType>>>;
+
+    /// Read one value at a checked logical block address.
+    fn read_block_value(
+        &self,
+        id: u64,
+        offset: usize,
+    ) -> impl std::future::Future<Output = Result<Self::DType>> + Send {
+        async move {
+            let geometry = self.storage_geometry();
+            if offset >= geometry.block_len(id)? {
+                return Err(Error::InvalidCoord(
+                    "offset out of bounds for logical block".into(),
+                ));
+            }
+
+            let mut value = None;
+            self.visit_blocks(&[id], |actual, block| {
+                if actual != id || value.is_some() {
+                    return Err(Error::InvalidCoord(
+                        "storage source returned an unexpected block ID".into(),
+                    ));
+                }
+
+                geometry.validate_block(id, block)?;
+                value = Some(block[offset]);
+                Ok(())
+            })
+            .await?;
+
+            Ok(crate::expression::output_value(self.layout())(
+                value.unwrap_or(Self::DType::ZERO),
+            ))
+        }
+    }
 
     /// Own a scan of sorted unique occupied logical block IDs in `range`.
     /// Retain bounded lookahead until completion or drop and release index guards
@@ -224,21 +587,23 @@ where
     /// Dense sources return an error when consumed.
     fn occupied_blocks(&self, range: std::ops::Range<u64>) -> BoxStream<'static, Result<u64>>;
 
-    /// Read numerical values through one bounded storage plan, filling sparse absence with zeros.
-    fn read_storage<'a>(
-        &'a self,
-        read: StorageRead<'a>,
-    ) -> BoxFuture<'a, Result<Vec<Self::DType>>> {
+    /// Visit a bounded, strictly increasing selection of logical blocks.
+    /// Borrow each payload for the duration of the synchronous callback. A source
+    /// may omit known-zero blocks. A missing required payload is a storage error.
+    fn visit_blocks<'a, C>(&'a self, ids: &'a [u64], mut consume: C) -> BoxFuture<'a, Result<()>>
+    where
+        C: FnMut(u64, &[Self::DType]) -> Result<()> + Send + 'a,
+    {
         Box::pin(async move {
-            let plan = read.plan(&self.storage_geometry())?;
-            let mut values = vec![Self::DType::default(); plan.len()];
-
-            for id in plan.block_ids() {
+            let geometry = self.storage_geometry();
+            geometry.validate_block_ids(ids)?;
+            for &id in ids {
                 let block = self.read_logical_block(id).await?;
-                plan.scatter(id, &block, &mut values)?;
+                geometry.validate_block(id, &block)?;
+                consume(id, &block)?;
             }
 
-            Ok(values)
+            Ok(())
         })
     }
 }
@@ -257,7 +622,7 @@ where
         return Ok(slice.stream());
     }
 
-    let geometry = source.storage_geometry();
+    let geometry = source.storage_geometry().clone();
     let mapping = mapping.unwrap_or_else(|| crate::mapping::StorageSlice::identity(source.shape()));
     // Bound the selection in block order using only rank-sized mapping metadata.
     // Inner-axis slices can include unrelated occupied blocks in this interval;
@@ -383,7 +748,7 @@ where
     .boxed())
 }
 
-/// Preserve row-major candidate order without sorting or scanning implicit zeros.
+/// Use occupied blocks when they preserve logical row-major candidate order.
 pub(crate) fn ordered_requests<S: TensorSource>(
     source: &S,
     slice: crate::slice::Slice,
@@ -404,7 +769,7 @@ where
         }
 
         if previous.is_some_and(|previous| previous >= base) {
-            return Err(Error::Unsupported("sparse block order does not preserve this selection's row-major order; use copy_from_values to materialize this layout".into()));
+            return Ok(slice.stream());
         }
 
         previous = Some(base);
@@ -451,6 +816,7 @@ where
         selected[base] = (mapping.origins[base], step, shape[axis]);
     }
 
+    let geometry = geometry.clone();
     let mut next = 0;
     let mut coord = crate::schema::Coord::new();
     let mut pending = None;

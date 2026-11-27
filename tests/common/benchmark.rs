@@ -2,12 +2,12 @@
 
 use std::time::Instant;
 
+use fensor::{Tensor, TensorRead, TensorReduceAll};
 use futures::TryStreamExt;
 use get_size::GetSize;
 
 use super::common;
 use super::common::{FsEntry, counters};
-use fensor::{Tensor, TensorRead, TensorReduceAll};
 
 pub async fn consume<V: TensorRead>(view: &V, mode: &str) -> usize {
     let mut count = 0;
@@ -177,9 +177,9 @@ pub async fn copy<V: TensorRead<DType = f32>>(
     common::cleanup(&root).await;
 }
 
-/// Inspect synchronized storage one native page at a time, outside measurement.
-/// Encoded bytes and retained node memory are distinct costs. Row-backed sparse
-/// payloads reside in table pages, so dense payload files alone are not storage.
+/// Inspect synchronized storage one native file at a time, outside measurement.
+/// Report encoded bytes and retained node memory separately, including sparse
+/// payloads stored in tree leaves.
 pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
     let mut dirs = vec![root.to_owned()];
     let (mut files, mut nodes, mut payload_files) = (0u128, 0u128, 0u128);
@@ -217,8 +217,8 @@ pub async fn storage(name: &str, phase: &str, root: &std::path::Path) {
             // The benchmark workloads use f32/f64; this is adapter-owned
             // accounting, not a native storage introspection API.
             let (leaf, rows, memory) = match node {
-                FsEntry::SparseF32(node) => node_metrics(&node),
-                FsEntry::SparseF64(node) => node_metrics(&node),
+                FsEntry::SparseF32(node) => node_metrics(&node.0),
+                FsEntry::SparseF64(node) => node_metrics(&node.0),
                 _ => panic!("unexpected benchmark node"),
             };
 

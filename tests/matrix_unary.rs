@@ -2,17 +2,16 @@
 
 use std::collections::BTreeSet;
 
+use fensor::{
+    AxisRange, Error, Layout, Tensor, TensorCompareScalar, TensorElement, TensorExpression,
+    TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnary, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorWhere,
+    TensorWrite,
+};
 use futures::TryStreamExt;
 use ha_ndarray::{Array, Buffer, MatrixUnary, NDArrayRead};
 use number_general::DType;
 use smallvec::smallvec;
-
-use fensor::{
-    AxisRange, Error, Layout, Tensor, TensorCompareScalar, TensorElement, TensorExpression,
-    TensorFileEntry, TensorGeometry, TensorMatMul, TensorMath, TensorMatrixUnary, TensorRead,
-    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorUnary, TensorViewSemantics,
-    TensorWhere, TensorWrite,
-};
 
 mod common;
 
@@ -91,8 +90,7 @@ macro_rules! parity {
                             .unwrap()
                             .to_vec();
                         let diag = tensor.view().diag().await.unwrap();
-                        assert!(!diag.is_base_tensor());
-                        assert!(!diag.supports_write_through());
+
                         assert_eq!(diag.layout(), fixture::layout(sparse));
                         consumers(&diag, &expected, |a, b| a == b).await;
                     } else {
@@ -115,7 +113,7 @@ parity!(f32_parity, f32);
 parity!(f64_parity, f64);
 
 #[tokio::test]
-async fn shape_errors_and_transpose_write_through() {
+async fn shape_errors_and_transposed_reads() {
     let (root, tensor) = fixture::source(
         "matrix_shapes",
         smallvec![2, 3, 4],
@@ -128,9 +126,8 @@ async fn shape_errors_and_transpose_write_through() {
 
     let mt = tensor.view().mt().await.unwrap();
     assert_eq!(mt.shape(), &[2, 4, 3]);
-    assert!(mt.supports_write_through());
-    mt.write_value(&[1, 3, 2], 255).await.unwrap();
-    assert_eq!(tensor.read_value(&[1, 2, 3]).await.unwrap(), 255);
+    tensor.write_value(&[1, 2, 3], 255).await.unwrap();
+    assert_eq!(mt.read_value(&[1, 3, 2]).await.unwrap(), 255);
     let vector = tensor.view().reshape(smallvec![24]).unwrap();
     assert!(matches!(vector.mt().await, Err(Error::InvalidLayout(_))));
     assert!(matches!(vector.diag().await, Err(Error::InvalidLayout(_))));
@@ -408,15 +405,20 @@ async fn bounded_batches_reuse_and_live_reads() {
     expected[0] = 0.2;
     expected[n as usize - 1] = 0.2;
     fixture::blocks(&diag, &expected, |a, b| a == b).await;
-    let entries: Vec<_> = diag
-        .read_sparse_elements_in_order(smallvec![AxisRange::In(0, n, 1)], smallvec![0])
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
+    for (end, expected) in [
+        (n - 1, vec![(vec![0], 0.2)]),
+        (n, vec![(vec![0], 0.2), (vec![n - 1], 0.2)]),
+    ] {
+        let entries: Vec<_> = diag
+            .read_sparse_elements(smallvec![AxisRange::In(0, end, 1)])
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
 
-    assert_eq!(entries, vec![(vec![0], 0.2), (vec![n - 1], 0.2)]);
+        assert_eq!(entries, expected);
+    }
     cleanup(&root).await;
 }
 

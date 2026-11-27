@@ -279,7 +279,11 @@ pub(crate) struct BlockPosition {
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum Layout {
     Dense,
-    Sparse { axis: Option<usize> },
+    /// A coordinate prefix through `axis` selects a dense subtensor.
+    /// `None` selects one scalar per storage block.
+    Sparse {
+        axis: Option<usize>,
+    },
 }
 
 pub(crate) fn validate_shape_dims<T>(shape: &[T]) -> FResult<()>

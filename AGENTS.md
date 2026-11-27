@@ -33,8 +33,10 @@ non-transactional, and explicit about supported and unsupported behavior.
   and sequential destination updates. Optimize against adequately provisioned
   production workloads; constrained-cache fixtures check bounded failure and
   cleanup, not a separate performance policy.
-- Do not add transaction lifecycle, recovery, or codec policy. Malformed metadata
-  and blocks fail closed; callers own cleanup, durability, and transactions.
+- Semantic storage types own their format-neutral destream codecs. File adapters
+  own dtype envelopes, byte-format selection, and I/O policy. Do not add transaction
+  lifecycle or recovery. Malformed metadata and blocks fail closed; callers own
+  cleanup, durability, and transactions.
 
 ## Bounded execution
 
@@ -45,8 +47,8 @@ bounded batches. Each collection must have an identifiable bound; name it locall
 for non-obvious allocations. Do not size implicit working buffers from total
 logical cardinality. Streamed filesystem materialization and caller-supplied
 literal buffers are permitted, not permission to collect tensor streams in RAM.
-Keep execution batches, storage blocks, metadata ranks, and index pages independent,
-even when their limits have equal values.
+Keep execution batches, storage blocks, metadata ranks, and index scan batches
+independent, even when their limits have equal values.
 
 Rank-sized metadata, caller-owned values/explicit selections, filesystem/cache
 metadata, and independent consumers are separate costs, not permission to collect
@@ -56,14 +58,13 @@ No whole-result collectors or whole-index compaction APIs.
 
 ## Semantics and validation
 
-- Preserve one writable base and constrained geometric write-through. Computed
-  views remain read-only; numerical definitions belong to ha-ndarray.
+- Base tensors own writes in base coordinates. Views are read-only. Numerical
+  definitions belong to ha-ndarray.
 - Sparse absence is numerical zero. Reductions count logical cardinality; sparse
   pointwise construction rejects nonzero implicit backgrounds unless explicitly
   converted to dense. Candidate traversal is an index optimization, never a
-  numerical mask. Cache only the typed implicit-zero result needed to preserve
-  backend zero signs through expressions and indexed reductions. Preserve ordered
-  sparse reads and all-zero storage-block deletion.
+  numerical mask. Use the dtype's canonical zero for wholly zero sparse values.
+  Preserve ordered sparse reads and all-zero storage-block deletion.
 - Logical shapes, strides, coordinates, and cardinalities use `u64`; runtime
   axes and bounded buffer indices use `usize`. Follow the collection rules in
   `CODE_STYLE.md`. Preserve adapter-owned payload typing.

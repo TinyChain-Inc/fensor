@@ -1,17 +1,15 @@
 //! Integration tests for `TensorUnary` (`exp`, `ln`, `round`) via lazy
 //! typed `UnaryView` chains over filesystem-backed geometric views.
 
-use futures::TryStreamExt;
-use ha_ndarray::{axes, range, shape};
-use number_general::{FloatType, NumberType};
-
 use common::{FsEntry, create_dense_tensor, create_sparse_tensor, iter_coords, new_dir};
 use fensor::unary::{Exp, Round};
 use fensor::{
     AxisRange, Error, Layout, Tensor, TensorAbs, TensorExpression, TensorGeometry, TensorRead,
-    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorViewSemantics,
-    TensorWrite, UnaryView,
+    TensorSchema, TensorTransform, TensorTrig, TensorUnary, TensorView, TensorWrite, UnaryView,
 };
+use futures::TryStreamExt;
+use ha_ndarray::{axes, range, shape};
+use number_general::{FloatType, NumberType};
 
 mod common;
 
@@ -381,8 +379,6 @@ async fn computed_f64_view_agrees_across_consumers_and_reuse() {
             .await
             .unwrap();
 
-    assert!(!expression.is_base_tensor());
-    assert!(!expression.supports_write_through());
     let (first, second): (Vec<Vec<f64>>, Vec<Vec<f64>>) = futures::try_join!(
         expression.read_blocks().unwrap().try_collect(),
         expression.read_blocks().unwrap().try_collect(),
@@ -434,10 +430,7 @@ async fn sparse_chain_keeps_intermediate_zeros_through_transforms() {
     assert_eq!(expression.read_value(&[2, 1]).await.unwrap(), 0.0);
     assert_eq!(expression.read_value(&[0, 0]).await.unwrap(), 0.0);
     let rows: Vec<_> = expression
-        .read_sparse_elements_in_order(
-            range![AxisRange::In(0, 3, 1), AxisRange::In(0, 2, 1)],
-            axes![0, 1],
-        )
+        .read_sparse_elements(range![AxisRange::In(0, 3, 1), AxisRange::In(0, 2, 1)])
         .await
         .unwrap()
         .try_collect()
@@ -584,7 +577,7 @@ async fn large_sparse_shape_constructs_streams_without_expanding_axes() {
 
     let expression = tensor.view().round().await.unwrap();
     let sparse = expression
-        .read_sparse_elements_in_order(range![AxisRange::In(0, length, 1)], axes![0])
+        .read_sparse_elements(range![AxisRange::In(0, length, 1)])
         .await
         .unwrap();
 
@@ -756,7 +749,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             expected_coords: &[Vec<u64>],
         ) {
             let rows: Vec<_> = reader
-                .read_sparse_elements_in_order(selection.clone(), axes![0])
+                .read_sparse_elements(selection.clone())
                 .await
                 .unwrap()
                 .try_collect()
@@ -771,10 +764,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             );
 
             let stepped: Vec<_> = reader
-                .read_sparse_elements_in_order(
-                    range![AxisRange::In(length - 5, length, 2)],
-                    axes![0],
-                )
+                .read_sparse_elements(range![AxisRange::In(length - 5, length, 2)])
                 .await
                 .unwrap()
                 .try_collect()
@@ -783,7 +773,7 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
 
             assert_eq!(rows, stepped);
             let empty: Vec<_> = reader
-                .read_sparse_elements_in_order(range![AxisRange::In(length, length, 1)], axes![0])
+                .read_sparse_elements(range![AxisRange::In(length, length, 1)])
                 .await
                 .unwrap()
                 .try_collect()
@@ -793,24 +783,17 @@ async fn sparse_ranges_are_ordered_unique_and_bounded_by_selection() {
             assert!(empty.is_empty());
             assert!(
                 reader
-                    .read_sparse_elements_in_order(range![AxisRange::At(length)], axes![0])
+                    .read_sparse_elements(range![AxisRange::At(length)])
                     .await
                     .is_err()
             );
-
-            assert!(matches!(
-                reader
-                    .read_sparse_elements_in_order(selection.clone(), axes![1])
-                    .await,
-                Err(Error::UnsupportedSparseIterationOrder { .. })
-            ));
         }
 
         check(&tensor, length, selection.clone(), &expected_coords).await;
         check(&view, length, selection.clone(), &expected_coords).await;
         check(&unary, length, selection.clone(), &expected_coords).await;
         let rows: Vec<_> = unary
-            .read_sparse_elements_in_order(selection, axes![0])
+            .read_sparse_elements(selection)
             .await
             .unwrap()
             .try_collect()
@@ -839,19 +822,19 @@ async fn sparse_unary_batches_filter_zeros_and_preserve_independent_consumption(
     let expression = tensor.view().abs().await.unwrap();
     let range = range![AxisRange::At(0), AxisRange::In(0, 4100, 1)];
     let mut dropped = expression
-        .read_sparse_elements_in_order(range.clone(), axes![0, 1])
+        .read_sparse_elements(range.clone())
         .await
         .unwrap();
 
     assert_eq!(dropped.try_next().await.unwrap(), Some((vec![0, 0], 0.2)));
     drop(dropped);
     let first = expression
-        .read_sparse_elements_in_order(range.clone(), axes![0, 1])
+        .read_sparse_elements(range.clone())
         .await
         .unwrap();
 
     let second = expression
-        .read_sparse_elements_in_order(range.clone(), axes![0, 1])
+        .read_sparse_elements(range.clone())
         .await
         .unwrap();
 
@@ -869,7 +852,7 @@ async fn sparse_unary_batches_filter_zeros_and_preserve_independent_consumption(
 
     let final_zeros = expression.round().await.unwrap();
     let rows: Vec<_> = final_zeros
-        .read_sparse_elements_in_order(range, axes![0, 1])
+        .read_sparse_elements(range)
         .await
         .unwrap()
         .try_collect()

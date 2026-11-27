@@ -1,12 +1,11 @@
 mod common;
 
-use ha_ndarray::{axes, shape};
-use number_general::DType;
-
 use fensor::{
     Layout, Tensor, TensorRead, TensorReduce, TensorReduceAll, TensorSchema, TensorTransform,
     TensorWrite,
 };
+use ha_ndarray::{axes, shape};
+use number_general::DType;
 
 macro_rules! indexed_dtype {
     ($test:ident,$dtype:ty) => {
@@ -36,29 +35,10 @@ macro_rules! indexed_dtype {
 
                 let flipped = tensor.view().flip(1).unwrap();
                 let reduced = flipped.product(axes![1], false).await.unwrap();
-                for row in [0, 1] {
-                    assert!(matches!(
-                        reduced.read_value(&[row]).await,
-                        Err(fensor::Error::Unsupported(_))
-                    ));
-                }
-                drop(reduced);
-                let (copy_root, copy_dir) = common::new_dir("slice_dtype_values").await;
-                let copied = Tensor::<common::FsEntry, $dtype>::copy_from_values(
-                    copy_dir,
-                    &flipped,
-                    Layout::Sparse { axis },
-                    31,
-                )
-                .await
-                .unwrap();
-                let reduced = copied.view().product(axes![1], false).await.unwrap();
                 assert_eq!(reduced.read_value(&[0]).await.unwrap(), 0 as $dtype);
                 assert_eq!(reduced.read_value(&[1]).await.unwrap(), 0 as $dtype);
                 drop(reduced);
-                drop(copied);
-                drop(flipped);
-                common::cleanup(&copy_root).await;
+                assert_eq!(flipped.sum_all().await.unwrap(), 5 as $dtype);
                 tensor.sync().await.unwrap();
                 drop(tensor);
                 let loaded =

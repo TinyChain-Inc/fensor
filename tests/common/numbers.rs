@@ -1,8 +1,7 @@
 //! Comparators preserve floating classifications and signed zeros, including components.
 
-use number_general::{Complex, Float, Number};
-
 use fensor::TensorElement;
+use number_general::{Complex, Float, Number};
 
 fn real(a: f64, b: f64) -> bool {
     (a.is_nan() && b.is_nan())

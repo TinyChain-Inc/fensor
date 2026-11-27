@@ -1,14 +1,14 @@
 //! Storage contracts are parameterized independently of the numerical matrix.
 
-use ha_ndarray::shape;
-
-use crate::test_support as common;
 use common::numbers::same;
 use common::{FsEntry, cleanup, fixture};
 use fensor::{
     Error, Layout, Tensor, TensorArray, TensorElement, TensorFileEntry, TensorGeometry, TensorRead,
-    TensorSchema, TensorTransform, TensorWrite, TensorWriteBulk,
+    TensorSchema, TensorTransform, TensorWrite,
 };
+use ha_ndarray::shape;
+
+use crate::test_support as common;
 
 async fn storage<T: TensorElement>(samples: Option<[T; 2]>)
 where
@@ -65,10 +65,7 @@ where
         assert_eq!(tensor.schema().dtype(), T::dtype());
 
         tensor
-            .view()
-            .flip(0)
-            .unwrap()
-            .write_value(&[0], T::ONE)
+            .write_value(&[(len - 1) as u64], T::ONE)
             .await
             .unwrap();
 
@@ -76,7 +73,7 @@ where
         if matches!(layout, Layout::Dense) {
             fixture::blocks(&tensor.view(), &expected, same).await;
             // Sample point access independently of the complete stream comparison.
-            // Cover special values, every block boundary, and the write-through value.
+            // Cover special values, every block boundary, and the updated value.
             let block_len = crate::TensorSource::storage_geometry(&tensor).block_capacity();
 
             for (i, &value) in expected.iter().enumerate() {
@@ -204,13 +201,7 @@ where
             tensor
         };
 
-        tensor
-            .view()
-            .transpose(None)
-            .unwrap()
-            .write_value(&[0, 0], T::ZERO)
-            .await
-            .unwrap();
+        tensor.write_value(&[0, 0], T::ZERO).await.unwrap();
 
         assert_eq!(tensor.read_value(&[0, 1]).await.unwrap(), T::ONE);
         tensor

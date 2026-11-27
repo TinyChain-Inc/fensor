@@ -3,18 +3,17 @@
 use std::io;
 use std::path::Path;
 
+use fensor::{
+    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorExpression,
+    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMetadata, TensorRead,
+    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorWhere, TensorWrite,
+};
 use freqfs::{Cache, FileLoad, FileSave};
 use futures::TryStreamExt;
 use get_size::GetSize;
 use ha_ndarray::shape;
 use safecast::AsType;
 use tokio::io::AsyncWriteExt;
-
-use fensor::{
-    Layout, Tensor, TensorBooleanScalar, TensorCast, TensorCompare, TensorExpression,
-    TensorGeometry, TensorMatMul, TensorMath, TensorMathScalar, TensorMetadata, TensorRead,
-    TensorReduce, TensorReduceAll, TensorSchema, TensorTransform, TensorWhere, TensorWrite,
-};
 
 mod common;
 
@@ -86,24 +85,33 @@ async fn file_decoding_preserves_containers_and_rejects_malformed_payloads() {
         FsEntry::U8(vec![3; 7]),
         FsEntry::F64(vec![0.; 65]),
         FsEntry::MetadataF32(TensorMetadata::new(vec![1; rank].into(), Layout::Dense, 1).unwrap()),
-        FsEntry::SparseF64(b_tree::Node::Leaf(vec![
-            vec![
-                fensor::SparseCell::Key(1),
-                fensor::SparseCell::Payload(vec![3.]),
-            ];
-            17
-        ])),
-        FsEntry::SparseF64(b_tree::Node::Index(
-            vec![vec![fensor::SparseCell::Key(2)]],
-            vec![Default::default(); 2],
-        )),
-        FsEntry::SparseF64(b_tree::Node::Index(
-            vec![vec![
-                fensor::SparseCell::Key(2),
-                fensor::SparseCell::Payload(vec![3., -0.]),
-            ]],
-            vec![Default::default(); 2],
-        )),
+        FsEntry::SparseF64(
+            b_tree::Node::Leaf(vec![
+                vec![
+                    fensor::SparseCell::Key(1),
+                    fensor::SparseCell::Payload(vec![3.]),
+                ];
+                17
+            ])
+            .into(),
+        ),
+        FsEntry::SparseF64(
+            b_tree::Node::Index(
+                vec![vec![fensor::SparseCell::Key(2)]],
+                vec![Default::default(); 2],
+            )
+            .into(),
+        ),
+        FsEntry::SparseF64(
+            b_tree::Node::Index(
+                vec![vec![
+                    fensor::SparseCell::Key(2),
+                    fensor::SparseCell::Payload(vec![3., -0.]),
+                ]],
+                vec![Default::default(); 2],
+            )
+            .into(),
+        ),
     ];
 
     for entry in entries {
@@ -120,69 +128,23 @@ async fn file_decoding_preserves_containers_and_rejects_malformed_payloads() {
         assert!(tbon.get_size() >= std::mem::size_of::<FsEntry>());
     }
 
-    // This decoded page fits 16 KiB including retained row and payload capacities.
-    let tiny_page = FsEntry::SparseF64(b_tree::Node::Leaf(vec![
-        vec![
-            fensor::SparseCell::Key(1),
-            fensor::SparseCell::Payload(vec![3.]),
-        ];
-        128
-    ]));
+    // This decoded node fits 16 KiB including retained row and payload capacities.
+    let tiny_page = FsEntry::SparseF64(
+        b_tree::Node::Leaf(vec![
+            vec![
+                fensor::SparseCell::Key(1),
+                fensor::SparseCell::Payload(vec![3.]),
+            ];
+            128
+        ])
+        .into(),
+    );
 
     let decoded: FsEntry = tbon::de::try_decode((), tbon::en::encode(&tiny_page).unwrap())
         .await
         .unwrap();
 
     assert!(decoded.get_size() <= 16 * 1024);
-
-    async fn reject_node(leaf: bool, rows: Vec<Vec<u64>>, child_count: usize) {
-        use futures::{TryStreamExt, stream};
-
-        let b_tree::Node::Index(_, children) =
-            b_tree::Node::<Vec<Vec<u64>>>::Index(Vec::new(), vec![Default::default(); child_count])
-        else {
-            unreachable!()
-        };
-
-        let value = (39u8, (leaf, rows, children));
-        let json = destream_json::en::encode(&value)
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert!(
-            destream_json::de::try_decode::<_, _, FsEntry>(
-                (),
-                stream::iter(json.clone().into_iter().map(Ok::<_, std::io::Error>)),
-            )
-            .await
-            .is_err()
-        );
-
-        let tbon = tbon::en::encode(&value)
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert!(
-            tbon::de::try_decode::<_, _, FsEntry>(
-                (),
-                stream::iter(tbon.clone().into_iter().map(Ok::<_, std::io::Error>)),
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    for children in [0, 1, 3] {
-        reject_node(false, vec![vec![1]], children).await;
-    }
-
-    reject_node(true, vec![vec![1]], 0).await;
-    reject_node(false, vec![vec![]], 2).await;
-    reject_node(false, vec![vec![1, 2, 3]], 2).await;
 
     let oversized = (1u8, vec![0f32; fensor::MAX_BLOCK_CAPACITY + 1]);
     assert!(

@@ -1,4 +1,5 @@
-//! Test/benchmark filesystem adapter, not fensor's production storage format.
+//! Test/benchmark file envelope and byte-format selection.
+//! Sparse tree nodes delegate to fensor's native codec.
 //!
 //! Each entry encodes as `(tag, payload)`. Tags distinguish dense blocks,
 //! metadata, and sparse nodes by dtype; the encoder and decoder share the same
@@ -8,10 +9,10 @@
 use destream::{de, en};
 use futures::TryStreamExt;
 use get_size::GetSize;
-use safecast::as_type;
+use safecast::{AsType, as_type};
 use tokio::io::AsyncWriteExt;
 
-use super::{counters, sparse_codec};
+use super::counters;
 
 // Private adapter tags, grouped by dtype. Gaps have no decoding meaning.
 mod tag {
@@ -201,44 +202,20 @@ impl<'en> en::ToStream<'en> for FsEntry {
         encoder: E,
     ) -> std::result::Result<E::Ok, E::Error> {
         match self {
-            Self::SparseU8(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_U8, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseU16(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_U16, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseU32(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_U32, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseU64(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_U64, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseI8(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_I8, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseI16(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_I16, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseI32(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_I32, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseI64(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_I64, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseF32(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_F32, sparse_codec::Encoded(node)), encoder)
-            }
-            Self::SparseF64(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_F64, sparse_codec::Encoded(node)), encoder)
-            }
+            Self::SparseU8(node) => en::IntoStream::into_stream((tag::SPARSE_U8, node), encoder),
+            Self::SparseU16(node) => en::IntoStream::into_stream((tag::SPARSE_U16, node), encoder),
+            Self::SparseU32(node) => en::IntoStream::into_stream((tag::SPARSE_U32, node), encoder),
+            Self::SparseU64(node) => en::IntoStream::into_stream((tag::SPARSE_U64, node), encoder),
+            Self::SparseI8(node) => en::IntoStream::into_stream((tag::SPARSE_I8, node), encoder),
+            Self::SparseI16(node) => en::IntoStream::into_stream((tag::SPARSE_I16, node), encoder),
+            Self::SparseI32(node) => en::IntoStream::into_stream((tag::SPARSE_I32, node), encoder),
+            Self::SparseI64(node) => en::IntoStream::into_stream((tag::SPARSE_I64, node), encoder),
+            Self::SparseF32(node) => en::IntoStream::into_stream((tag::SPARSE_F32, node), encoder),
+            Self::SparseF64(node) => en::IntoStream::into_stream((tag::SPARSE_F64, node), encoder),
             #[cfg(feature = "complex")]
-            Self::SparseC32(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_C32, sparse_codec::Encoded(node)), encoder)
-            }
+            Self::SparseC32(node) => en::IntoStream::into_stream((tag::SPARSE_C32, node), encoder),
             #[cfg(feature = "complex")]
-            Self::SparseC64(node) => {
-                en::IntoStream::into_stream((tag::SPARSE_C64, sparse_codec::Encoded(node)), encoder)
-            }
+            Self::SparseC64(node) => en::IntoStream::into_stream((tag::SPARSE_C64, node), encoder),
             Self::U16(value) => en::IntoStream::into_stream((tag::BLOCK_U16, value), encoder),
             Self::MetadataU16(value) => {
                 en::IntoStream::into_stream((tag::METADATA_U16, value), encoder)
@@ -359,46 +336,44 @@ impl de::Visitor for FsEntryVisitor {
     ) -> std::result::Result<Self::Value, A::Error> {
         let entry = match seq.expect_next::<u8>(()).await? {
             tag::SPARSE_U8 => {
-                FsEntry::SparseU8(seq.expect_next::<sparse_codec::Decoded<u8>>(()).await?.0)
+                FsEntry::SparseU8(seq.expect_next::<fensor::SparseNode<u8>>(()).await?)
             }
             tag::SPARSE_U16 => {
-                FsEntry::SparseU16(seq.expect_next::<sparse_codec::Decoded<u16>>(()).await?.0)
+                FsEntry::SparseU16(seq.expect_next::<fensor::SparseNode<u16>>(()).await?)
             }
             tag::SPARSE_U32 => {
-                FsEntry::SparseU32(seq.expect_next::<sparse_codec::Decoded<u32>>(()).await?.0)
+                FsEntry::SparseU32(seq.expect_next::<fensor::SparseNode<u32>>(()).await?)
             }
             tag::SPARSE_U64 => {
-                FsEntry::SparseU64(seq.expect_next::<sparse_codec::Decoded<u64>>(()).await?.0)
+                FsEntry::SparseU64(seq.expect_next::<fensor::SparseNode<u64>>(()).await?)
             }
             tag::SPARSE_I8 => {
-                FsEntry::SparseI8(seq.expect_next::<sparse_codec::Decoded<i8>>(()).await?.0)
+                FsEntry::SparseI8(seq.expect_next::<fensor::SparseNode<i8>>(()).await?)
             }
             tag::SPARSE_I16 => {
-                FsEntry::SparseI16(seq.expect_next::<sparse_codec::Decoded<i16>>(()).await?.0)
+                FsEntry::SparseI16(seq.expect_next::<fensor::SparseNode<i16>>(()).await?)
             }
             tag::SPARSE_I32 => {
-                FsEntry::SparseI32(seq.expect_next::<sparse_codec::Decoded<i32>>(()).await?.0)
+                FsEntry::SparseI32(seq.expect_next::<fensor::SparseNode<i32>>(()).await?)
             }
             tag::SPARSE_I64 => {
-                FsEntry::SparseI64(seq.expect_next::<sparse_codec::Decoded<i64>>(()).await?.0)
+                FsEntry::SparseI64(seq.expect_next::<fensor::SparseNode<i64>>(()).await?)
             }
             tag::SPARSE_F32 => {
-                FsEntry::SparseF32(seq.expect_next::<sparse_codec::Decoded<f32>>(()).await?.0)
+                FsEntry::SparseF32(seq.expect_next::<fensor::SparseNode<f32>>(()).await?)
             }
             tag::SPARSE_F64 => {
-                FsEntry::SparseF64(seq.expect_next::<sparse_codec::Decoded<f64>>(()).await?.0)
+                FsEntry::SparseF64(seq.expect_next::<fensor::SparseNode<f64>>(()).await?)
             }
             #[cfg(feature = "complex")]
             tag::SPARSE_C32 => FsEntry::SparseC32(
-                seq.expect_next::<sparse_codec::Decoded<fensor::complex::Complex32>>(())
-                    .await?
-                    .0,
+                seq.expect_next::<fensor::SparseNode<fensor::complex::Complex32>>(())
+                    .await?,
             ),
             #[cfg(feature = "complex")]
             tag::SPARSE_C64 => FsEntry::SparseC64(
-                seq.expect_next::<sparse_codec::Decoded<fensor::complex::Complex64>>(())
-                    .await?
-                    .0,
+                seq.expect_next::<fensor::SparseNode<fensor::complex::Complex64>>(())
+                    .await?,
             ),
             tag::BLOCK_F32 => FsEntry::F32(seq.expect_next::<BlockValues<f32>>(()).await?.0),
             tag::METADATA_F32 => FsEntry::MetadataF32(seq.expect_next(MAX_METADATA_RANK).await?),
@@ -588,3 +563,29 @@ as_type!(
     SparseC64,
     fensor::SparseNode<fensor::complex::Complex64>
 );
+
+impl<T: fensor::TensorElement> From<b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> for FsEntry
+where
+    Self: From<fensor::SparseNode<T>>,
+{
+    fn from(node: b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>) -> Self {
+        Self::from(fensor::SparseNode::from(node))
+    }
+}
+
+impl<T: fensor::TensorElement> AsType<b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> for FsEntry
+where
+    Self: AsType<fensor::SparseNode<T>>,
+{
+    fn as_type(&self) -> Option<&b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> {
+        <Self as AsType<fensor::SparseNode<T>>>::as_type(self).map(|node| &node.0)
+    }
+
+    fn as_type_mut(&mut self) -> Option<&mut b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> {
+        <Self as AsType<fensor::SparseNode<T>>>::as_type_mut(self).map(|node| &mut node.0)
+    }
+
+    fn into_type(self) -> Option<b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> {
+        <Self as AsType<fensor::SparseNode<T>>>::into_type(self).map(|node| node.0)
+    }
+}

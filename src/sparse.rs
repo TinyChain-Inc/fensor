@@ -1,4 +1,4 @@
-//! Typed, paged sparse payloads. Serialization belongs to file adapters.
+//! Typed sparse tree rows and their bounded, format-neutral codec.
 
 use std::cmp::Ordering;
 use std::io;
@@ -6,9 +6,11 @@ use std::marker::PhantomData;
 
 use b_tree::Schema;
 use collate::Collate;
-use number_general::{Float, Number, NumberInstance};
+use number_general::{Float, Number, NumberCollator, NumberType};
 
-use crate::TensorElement;
+use crate::{Layout, TensorElement};
+
+mod codec;
 
 /// A native table cell, not a numerical cast or an erased storage value.
 #[derive(Clone, Debug)]
@@ -32,44 +34,6 @@ impl<T> Default for SparseCell<T> {
     }
 }
 
-// NaNs form one semantic equality class after all non-NaN values. Signed zeros
-// compare equally. Replacement still writes the caller's supplied representation.
-fn float_cmp(a: f64, b: f64) -> Ordering {
-    a.partial_cmp(&b)
-        .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
-}
-
-fn number_cmp(a: Number, b: Number) -> Ordering {
-    match (a, b) {
-        (Number::Float(a), Number::Float(b)) => float_cmp(a.into(), b.into()),
-        (Number::Complex(a), Number::Complex(b)) => {
-            let (ar, ai): (Float, Float) = a.into();
-            let (br, bi): (Float, Float) = b.into();
-
-            float_cmp(
-                f64::from(ar).hypot(ai.into()),
-                f64::from(br).hypot(bi.into()),
-            )
-        }
-        (Number::Int(a), Number::Int(b)) => a.cmp(&b),
-        (Number::UInt(a), Number::UInt(b)) => a.cmp(&b),
-        (Number::Bool(a), Number::Bool(b)) => bool::from(a).cmp(&bool::from(b)),
-        (a, b) => a.class().cmp(&b.class()),
-    }
-}
-
-fn same_number(a: Number, b: Number) -> bool {
-    match (a, b) {
-        (Number::Complex(a), Number::Complex(b)) => {
-            let (ar, ai): (Float, Float) = a.into();
-            let (br, bi): (Float, Float) = b.into();
-
-            float_cmp(ar.into(), br.into()).is_eq() && float_cmp(ai.into(), bi.into()).is_eq()
-        }
-        (a, b) => number_cmp(a, b).is_eq(),
-    }
-}
-
 impl<T: TensorElement> PartialEq for SparseCell<T> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -78,7 +42,7 @@ impl<T: TensorElement> PartialEq for SparseCell<T> {
                 a.len() == b.len()
                     && a.iter()
                         .zip(b)
-                        .all(|(&a, &b)| same_number(a.into(), b.into()))
+                        .all(|(&a, &b)| Into::<Number>::into(a) == Into::<Number>::into(b))
             }
             _ => false,
         }
@@ -87,8 +51,6 @@ impl<T: TensorElement> PartialEq for SparseCell<T> {
 
 impl<T: TensorElement> Eq for SparseCell<T> {}
 
-// Collation deliberately groups unequal complex values with the same norm.
-// It therefore belongs to Collate, not SparseCell's Eq/Ord implementation.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SparseCollator<T>(PhantomData<T>);
 
@@ -107,8 +69,9 @@ impl<T: TensorElement> Collate for SparseCollator<T> {
         match (a, b) {
             (SparseCell::Key(a), SparseCell::Key(b)) => a.cmp(b),
             (SparseCell::Payload(a), SparseCell::Payload(b)) => {
+                let collator = NumberCollator::default();
                 for (&a, &b) in a.iter().zip(b) {
-                    let order = number_cmp(a.into(), b.into());
+                    let order = collator.cmp(&a.into(), &b.into());
                     if !order.is_eq() {
                         return order;
                     }
@@ -124,7 +87,20 @@ impl<T: TensorElement> Collate for SparseCollator<T> {
 
 /// Caller-owned native payload node. Leaves contain a block key and dense payload;
 /// internal separators may retain only the block key.
-pub type SparseNode<T> = b_tree::Node<Vec<Vec<SparseCell<T>>>>;
+#[derive(Clone, Debug)]
+pub struct SparseNode<T>(pub b_tree::Node<Vec<Vec<SparseCell<T>>>>);
+
+impl<T> From<b_tree::Node<Vec<Vec<SparseCell<T>>>>> for SparseNode<T> {
+    fn from(node: b_tree::Node<Vec<Vec<SparseCell<T>>>>) -> Self {
+        Self(node)
+    }
+}
+
+impl<T: TensorElement> get_size::GetSize for SparseNode<T> {
+    fn get_heap_size(&self) -> usize {
+        self.0.get_heap_size()
+    }
+}
 
 // Sparse blocks use one native index keyed by their logical block ID.
 #[derive(Clone, Debug)]
@@ -140,6 +116,10 @@ impl<T> PayloadSchema<T> {
             dtype: PhantomData,
         }
     }
+
+    pub(crate) fn geometry(&self) -> &crate::StorageGeometry {
+        &self.geometry
+    }
 }
 
 impl<T> PartialEq for PayloadSchema<T> {
@@ -152,6 +132,25 @@ impl<T> Eq for PayloadSchema<T> {}
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid sparse payload row")
+}
+
+pub(crate) fn has_payload<T: TensorElement>(layout: Layout, values: &[T]) -> bool {
+    if values.iter().any(|value| *value != T::ZERO) {
+        return true;
+    }
+
+    // Absence decodes to canonical zero. Dense transactional blocks with a
+    // negative zero component still need a payload row.
+    layout == Layout::Dense
+        && matches!(T::dtype(), NumberType::Float(_) | NumberType::Complex(_))
+        && values.iter().any(|&value| match value.into() {
+            Number::Float(value) => f64::from(value).is_sign_negative(),
+            Number::Complex(value) => {
+                let (re, im): (Float, Float) = value.into();
+                f64::from(re).is_sign_negative() || f64::from(im).is_sign_negative()
+            }
+            _ => false,
+        })
 }
 
 impl<T: TensorElement> Schema for PayloadSchema<T> {
@@ -174,7 +173,7 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
             + self.geometry.block_capacity() * std::mem::size_of::<T>()
             + 16;
 
-        // Packing policy: choose an even order of at least four for sparse pages.
+        // Choose an even B+ tree order of at least four.
         ((crate::schema::SPARSE_NODE_MEMORY - header) / row / 2 * 2).max(4)
     }
 
@@ -189,13 +188,21 @@ impl<T: TensorElement> Schema for PayloadSchema<T> {
         }
     }
 
-    fn validate_key(&self, row: Vec<Self::Value>) -> io::Result<Vec<Self::Value>> {
-        if row.len() != 2 {
+    fn validate_key(&self, row: &[Self::Value]) -> io::Result<()> {
+        let [SparseCell::Key(id), SparseCell::Payload(values)] = row else {
             return Err(invalid());
+        };
+
+        self.geometry
+            .validate_block(*id, values)
+            .map_err(io::Error::other)?;
+        if !has_payload(self.geometry.layout(), values) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty sparse payload",
+            ));
         }
 
-        self.validate_prefix(&row)?;
-
-        Ok(row)
+        Ok(())
     }
 }
